@@ -109,6 +109,7 @@
 - [Manual Desk order](manual-desk-order.md) — flag-gated (MANUAL_ORDER_ENABLED default OFF) discretionary override firing REAL order via source=manual_desk gateway; server-built ATR bracket; fail-closed, single-slot, owner-only.
 - [Unified Learning Brain](unified-learning-brain.md) — PER_MODE_STATS global (inst,mode key) feeds compute_playbook_selector + compute_unified_learning; display-only cognitive seam; goldens byte-identical.
 - [Candidate Preview Panel](candidate-preview-panel.md) — TradePlanPanel reads p.candidate_preview (not strategy_scanner.trade_plan); 5-state model; _mb_candidate_preview() is the backend source; 18 tests.
+- [Cleanest Trade Available button](cleanest-trade-button.md) — frontend-only scan (8 /api/status calls); rankCandidates() in cleanestTrade.ts is the sole algorithm; 29 tests; button between MarketStrip and panels; modal outside scroll container.
 - [Learning Engine Audit (Phase 7I)](learning-engine-audit.md) — 4 confirmed defects; win_rate SQL case mismatch is latent at n<20; key format mismatch may persist even at n≥20; diagnostics layer added.
 - [Coach and Manager Interface v1 semantics](coach-manager-interface-semantics.md) — weight_updated=updated_at (not ready); thesis_resolved=False in full_analysis; active_trade/managed_trade must be dict-copied before return.
 - [Left Brain obs-infra closure](lb-obs-infra.md) — maxlen 5000, dedup guard, renamed fit_score field, endpoint v2 (inst/limit/summary/metadata), playbook sort fix; production needs re-publish.

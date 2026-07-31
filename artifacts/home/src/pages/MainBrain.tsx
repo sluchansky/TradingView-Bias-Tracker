@@ -12,6 +12,12 @@ import { Link, useLocation, useParams } from 'wouter';
 import { normalizeMainBrainPayload } from '../lib/mainBrainNormalizer';
 import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
 import { audioManager, SoundEvent } from '../lib/audioManager';
+import {
+  rankCandidates, getPlanFromRecord, getRankingReasons,
+  isActionableVerdict,
+  SCAN_INSTRUMENTS, SCAN_MODES,
+  type StatusRecord, type CleanestCandidate, type RankInput,
+} from '../lib/cleanestTrade';
 
 // ── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -740,6 +746,386 @@ const ScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 };
 
 // ── Trade Plan Panel ──────────────────────────────────────────────────────────
+// ── Cleanest Trade Available ──────────────────────────────────────────────────
+
+type CleanestScanResult = {
+  candidate: CleanestCandidate | null;
+  error:     string | null;
+  allInputs: RankInput[];
+  scannedAt: number;
+};
+
+// ── Cleanest Trade Modal ──────────────────────────────────────────────────────
+const CleanestTradeModal: React.FC<{
+  open:             boolean;
+  onClose:          () => void;
+  scanResult:       CleanestScanResult | null;
+  activeInstrument: string;
+  hasActiveTrade:   boolean;
+}> = ({ open, onClose, scanResult, activeInstrument, hasActiveTrade }) => {
+  // Close on Escape
+  useEffect(() => {
+    if (!open) return;
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  const cand  = scanResult?.candidate ?? null;
+  const err   = scanResult?.error ?? null;
+  const allInputs = scanResult?.allInputs ?? [];
+  const age   = scanResult ? fmtAge(new Date(scanResult.scannedAt).toISOString()) : 'n/a';
+
+  const plan  = cand ? getPlanFromRecord(cand.record, cand.direction) : null;
+  const reasons = cand ? getRankingReasons(cand, allInputs) : [];
+
+  const isReady = cand != null && cand.act === 1;
+  const isPot   = cand != null && cand.act === 0;
+
+  const titleColor = isReady ? T.green : isPot ? T.amber : T.txtMuted;
+  const titleLabel = isReady ? '✓ READY TO TRADE'
+                  : isPot   ? '⏳ POTENTIAL — NOT READY'
+                  : err     ? '✗ SCAN UNAVAILABLE'
+                             : '— NO QUALIFYING TRADE';
+
+  // Active trade conflict: same instrument AND same direction as candidate
+  const conflictWarning =
+    hasActiveTrade && cand &&
+    cand.instrument === activeInstrument;
+
+  // Edge grade
+  const edge  = cand?.edge ?? null;
+  const grade = edge == null ? '—'
+              : edge >= 85  ? 'A+'
+              : edge >= 70  ? 'A'
+              : edge >= 50  ? 'B'
+              : 'WAIT';
+  const gradeColor = edge == null ? T.txtMuted
+                   : edge >= 85   ? T.green
+                   : edge >= 70   ? '#4ade80'
+                   : edge >= 50   ? T.amber
+                   : T.red;
+
+  // Strategy name
+  const stratName = safeStr(
+    (cand?.record.strategy_engine as Record<string, unknown> | undefined)?.active_strategy, '—'
+  );
+
+  // Blockers
+  const blocker = safeStr(cand?.record.strict_reason, '');
+
+  // Opposing structure
+  const opp   = cand?.record.opposing_structure;
+  const oppStr = opp && typeof opp === 'object' && (opp as Record<string, unknown>).side
+    ? `${(opp as Record<string, unknown>).side} structure (${safeStr((opp as Record<string, unknown>).type, '?')})`
+    : opp ? String(opp) : 'None detected';
+
+  // Data freshness from the record
+  const freshness = safeStr(cand?.record.generated_at, '');
+
+  return (
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Cleanest Trade Available"
+      onClick={e => { if (e.target === e.currentTarget) onClose(); }}
+      style={{
+        position:'fixed', inset:0, zIndex:999,
+        background:'rgba(3,11,26,0.85)', backdropFilter:'blur(4px)',
+        display:'flex', alignItems:'center', justifyContent:'center',
+        padding:'20px 12px',
+      }}
+    >
+      <div style={{
+        background:'#08162a', border:`1px solid ${T.border}`, borderRadius:14,
+        width:'100%', maxWidth:560, maxHeight:'90vh', overflowY:'auto',
+        display:'flex', flexDirection:'column', boxShadow:`0 20px 60px rgba(0,0,0,0.7)`,
+      }}>
+        {/* Header */}
+        <div style={{
+          display:'flex', alignItems:'center', gap:10, padding:'14px 18px',
+          borderBottom:`1px solid ${T.border}`,
+          position:'sticky', top:0, background:'#08162a', zIndex:2,
+        }}>
+          <div style={{ flex:1 }}>
+            <div style={{ fontSize:9, fontWeight:700, letterSpacing:'0.12em', color:T.txtMuted, textTransform:'uppercase', marginBottom:2 }}>
+              Cleanest Trade Available
+            </div>
+            <div style={{ fontSize:13, fontWeight:800, color:titleColor, letterSpacing:'0.04em' }}>
+              {titleLabel}
+            </div>
+          </div>
+          <button
+            onClick={onClose}
+            aria-label="Close"
+            style={{ background:'transparent', border:`1px solid ${T.border}`, color:T.txtSec,
+              borderRadius:6, width:28, height:28, cursor:'pointer', fontSize:14, lineHeight:1,
+              display:'flex', alignItems:'center', justifyContent:'center' }}
+          >×</button>
+        </div>
+
+        {/* Body */}
+        <div style={{ padding:'16px 18px', display:'flex', flexDirection:'column', gap:14 }}>
+
+          {/* Error / empty */}
+          {err && (
+            <div style={{ background:`${T.red}12`, border:`1px solid ${T.red}33`, borderRadius:8,
+              padding:'12px 14px', fontSize:11, color:T.red }}>
+              {err}
+            </div>
+          )}
+          {!err && !cand && (
+            <div style={{ textAlign:'center', padding:'20px 0', color:T.txtMuted, fontSize:12 }}>
+              No qualifying setup found across all scanned instruments and modes.
+            </div>
+          )}
+
+          {/* Candidate summary */}
+          {cand && (
+            <>
+              {/* ─ Active trade conflict ─ */}
+              {conflictWarning && (
+                <div style={{ background:`${T.amber}14`, border:`1px solid ${T.amber}44`, borderRadius:8,
+                  padding:'10px 14px', fontSize:11, color:T.amber, display:'flex', gap:8, alignItems:'center' }}>
+                  <span>⚠</span>
+                  <span>An active {activeInstrument} trade is already open. This preview is informational only — it will not execute.</span>
+                </div>
+              )}
+
+              {/* ─ Instrument / mode / direction header ─ */}
+              <div style={{ background:`${T.panel}`, border:`1px solid ${T.border}`, borderRadius:10,
+                padding:'12px 14px', display:'flex', alignItems:'center', gap:12, flexWrap:'wrap' }}>
+                <div>
+                  <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:3 }}>Instrument · Mode</div>
+                  <div style={{ fontSize:18, fontWeight:800, color:T.cyan, letterSpacing:'0.04em' }}>
+                    {cand.instrument}
+                    <span style={{ fontSize:11, fontWeight:600, color:T.txtSec, marginLeft:8 }}>{cand.mode}</span>
+                  </div>
+                </div>
+                <div style={{ width:1, height:36, background:T.border }} />
+                <div>
+                  <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:3 }}>Direction</div>
+                  <Pill text={cand.direction} color={dirColor(cand.direction)} />
+                </div>
+                <div style={{ width:1, height:36, background:T.border }} />
+                <div>
+                  <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:3 }}>Status</div>
+                  <Pill text={isReady ? 'READY' : 'POTENTIAL'} color={isReady ? T.green : T.amber} />
+                </div>
+                <div style={{ marginLeft:'auto', textAlign:'center' }}>
+                  <div style={{ fontSize:22, fontWeight:800, color:gradeColor, fontFamily:T.mono }}>{Math.round(cand.edge)}</div>
+                  <div style={{ fontSize:8, color:T.txtMuted, letterSpacing:'0.1em' }}>/ 110</div>
+                  <div style={{ fontSize:10, fontWeight:700, color:gradeColor, marginTop:2 }}>Grade {grade}</div>
+                </div>
+              </div>
+
+              {/* ─ Strategy ─ */}
+              {stratName !== '—' && (
+                <div style={{ fontSize:11, color:T.txtSec }}>
+                  <span style={{ color:T.txtMuted, fontSize:10 }}>Strategy: </span>{stratName}
+                </div>
+              )}
+
+              {/* ─ Trade plan ─ */}
+              {plan ? (
+                <div>
+                  <div style={{ fontSize:9.5, fontWeight:700, letterSpacing:'0.1em', textTransform:'uppercase',
+                    color:T.txtMuted, marginBottom:8, display:'flex', alignItems:'center', gap:6 }}>
+                    Trade Plan
+                    {isPot && <span style={{ color:T.amber, fontWeight:600, fontSize:8.5 }}>(preview — not yet READY)</span>}
+                  </div>
+                  {plan.entry_zone  != null && <KV label="Entry Zone"    value={String(plan.entry_zone)}  mono valueColor={T.cyan}  />}
+                  {plan.stop_loss   != null && <KV label="Stop Loss"     value={String(plan.stop_loss)}   mono valueColor={T.red}   />}
+                  {plan.target1     != null && <KV label="Target 1"      value={String(plan.target1)}     mono valueColor={T.green} />}
+                  {plan.target2     != null && <KV label="Target 2"      value={String(plan.target2)}     mono valueColor={T.green} />}
+                  {plan.rr          != null && <KV label="R : R"         value={String(plan.rr)}          mono />}
+                  {plan.risk_points != null && <KV label="Risk Points"   value={`${plan.risk_points} pts`} mono />}
+                  {plan.risk_dollars_per_contract != null && (
+                    <KV label="Risk / Contract"
+                      value={`$${Number(plan.risk_dollars_per_contract).toFixed(2)}`}
+                      mono valueColor={T.amber} />
+                  )}
+                  {plan.reward_points != null && plan.point_value != null && (
+                    <KV label="Expected Profit / Contract"
+                      value={`$${(Number(plan.reward_points) * Number(plan.point_value)).toFixed(2)}`}
+                      mono valueColor={T.green} />
+                  )}
+                  {plan.atr_pts != null && <KV label="ATR (pts)"      value={`${plan.atr_pts}`}  mono />}
+                </div>
+              ) : (
+                <div style={{ fontSize:11, color:T.txtMuted, fontStyle:'italic' }}>
+                  No entry/stop plan available for this candidate.
+                </div>
+              )}
+
+              {/* ─ Blockers ─ */}
+              {blocker && (
+                <div style={{ background:`${T.amber}10`, border:`1px solid ${T.amber}33`, borderRadius:8,
+                  padding:'10px 14px' }}>
+                  <div style={{ fontSize:9, color:T.amber, fontWeight:700, letterSpacing:'0.1em', textTransform:'uppercase', marginBottom:4 }}>
+                    Current Blockers
+                  </div>
+                  <div style={{ fontSize:11, color:T.txtSec }}>{blocker}</div>
+                </div>
+              )}
+
+              {/* ─ Opposing structure ─ */}
+              <KV label="Opposing Structure" value={oppStr} />
+
+              {/* ─ Why this ranked first ─ */}
+              <div style={{ background:`${T.cyan}08`, border:`1px solid ${T.cyan}22`, borderRadius:8, padding:'12px 14px' }}>
+                <div style={{ fontSize:9, fontWeight:700, letterSpacing:'0.1em', textTransform:'uppercase', color:T.cyan, marginBottom:8 }}>
+                  Why this candidate ranked first
+                </div>
+                <ul style={{ margin:0, padding:'0 0 0 16px', display:'flex', flexDirection:'column', gap:4 }}>
+                  {reasons.map((r, i) => (
+                    <li key={i} style={{ fontSize:10.5, color:T.txtSec, lineHeight:1.5 }}>{r}</li>
+                  ))}
+                </ul>
+              </div>
+            </>
+          )}
+
+          {/* ─ Scan metadata ─ */}
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center',
+            fontSize:9, color:T.txtMuted, paddingTop:4, borderTop:`1px solid ${T.border}` }}>
+            <span>Scanned {age}</span>
+            {freshness && <span>Data as of: {freshness}</span>}
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+// ── Cleanest Trade Button strip ────────────────────────────────────────────────
+const CleanestTradeButton: React.FC<{
+  scanResult:   CleanestScanResult | null;
+  scanning:     boolean;
+  onScan:       () => void;
+  setOpen:      () => void;
+}> = ({ scanResult, scanning, onScan, setOpen }) => {
+  const cand = scanResult?.candidate ?? null;
+
+  // Derive button appearance state
+  let btnLabel: string;
+  let btnColor: string;
+  let btnBg:    string;
+  let supportEl: React.ReactNode;
+
+  if (scanning) {
+    btnLabel = '🔎  Scanning all instruments…';
+    btnColor = T.txtMuted;
+    btnBg    = 'transparent';
+    supportEl = null;
+  } else if (!scanResult) {
+    // Never scanned
+    btnLabel  = '✨  Cleanest Trade Available';
+    btnColor  = T.cyan;
+    btnBg     = `${T.cyan}12`;
+    supportEl = (
+      <span style={{ fontSize:9.5, color:T.txtMuted }}>
+        Click to scan all instruments × modes for the best current setup
+      </span>
+    );
+  } else if (scanResult.error) {
+    // State D — unavailable
+    btnLabel  = '✨  Cleanest Trade Available';
+    btnColor  = T.red;
+    btnBg     = `${T.red}10`;
+    supportEl = (
+      <span style={{ fontSize:9.5, color:T.red }}>TRADE RANKING UNAVAILABLE — {scanResult.error}</span>
+    );
+  } else if (!cand) {
+    // State C — no qualifying trade
+    btnLabel  = '✨  Cleanest Trade Available';
+    btnColor  = T.txtMuted;
+    btnBg     = 'transparent';
+    supportEl = (
+      <span style={{ fontSize:9.5, color:T.txtMuted }}>
+        NO QUALIFYING TRADE — no actionable or potential setups found across scanned instruments
+      </span>
+    );
+  } else if (cand.act === 1) {
+    // State A — clean ready trade
+    const stratLabel = safeStr(
+      (cand.record.strategy_engine as Record<string, unknown> | undefined)?.active_strategy, ''
+    );
+    btnLabel  = '✨  Cleanest Trade Available';
+    btnColor  = T.green;
+    btnBg     = `${T.green}10`;
+    supportEl = (
+      <span style={{ fontSize:9.5, color:T.green, letterSpacing:'0.04em' }}>
+        ✓ {cand.instrument} {cand.direction}
+        {stratLabel ? ` · ${stratLabel}` : ''}
+        {' · '}{Math.round(cand.edge)}/110
+      </span>
+    );
+  } else {
+    // State B — potential only
+    btnLabel  = '✨  Cleanest Trade Available';
+    btnColor  = T.amber;
+    btnBg     = `${T.amber}10`;
+    supportEl = (
+      <span style={{ fontSize:9.5, color:T.amber, letterSpacing:'0.04em' }}>
+        ⏳ POTENTIAL — {cand.instrument} {cand.direction} · {Math.round(cand.edge)}/110
+      </span>
+    );
+  }
+
+  const handleClick = () => {
+    if (scanning) return;
+    if (!scanResult) {
+      onScan();
+    } else {
+      setOpen();
+    }
+  };
+
+  return (
+    <div style={{
+      display:'flex', alignItems:'center', gap:14, flexWrap:'wrap',
+      background:`${T.panel}`, border:`1px solid ${T.border}`, borderRadius:10,
+      padding:'10px 16px', marginBottom:12,
+    }}>
+      <button
+        onClick={handleClick}
+        disabled={scanning}
+        aria-label="Scan all instruments for the cleanest trade"
+        style={{
+          background:btnBg, border:`1.5px solid ${btnColor}44`, color:btnColor,
+          borderRadius:8, padding:'7px 18px', cursor: scanning ? 'not-allowed' : 'pointer',
+          fontSize:11, fontWeight:700, letterSpacing:'0.07em', opacity: scanning ? 0.7 : 1,
+          transition:'all 0.2s', whiteSpace:'nowrap',
+        }}
+      >
+        {btnLabel}
+      </button>
+      {supportEl && (
+        <div style={{ flex:1, minWidth:0, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>
+          {supportEl}
+        </div>
+      )}
+      {/* Re-scan button shown after first scan */}
+      {scanResult && !scanning && (
+        <button
+          onClick={onScan}
+          aria-label="Re-scan for cleanest trade"
+          style={{
+            background:'transparent', border:`1px solid ${T.border}`, color:T.txtMuted,
+            borderRadius:6, padding:'4px 10px', cursor:'pointer', fontSize:9.5, fontWeight:600,
+            transition:'opacity 0.2s', marginLeft:'auto', whiteSpace:'nowrap',
+          }}
+        >
+          ↻ Re-scan
+        </button>
+      )}
+    </div>
+  );
+};
+
 const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   // Source: p.candidate_preview — normalised by _mb_candidate_preview() on the backend.
   // States: READY | POTENTIAL | NO_CANDIDATE | UNAVAILABLE
@@ -1365,6 +1751,44 @@ export default function MainBrain() {
   const isLoading = fetchState === 'loading' && !payload;
   const isError   = (fetchState === 'error' || isAuthFail) && !payload;
 
+  // ── Cleanest Trade state ──────────────────────────────────────────────────
+  const [cleanestOpen,     setCleanestOpen]     = useState(false);
+  const [cleanestScanning, setCleanestScanning] = useState(false);
+  const [cleanestScan,     setCleanestScan]     = useState<CleanestScanResult | null>(null);
+
+  const handleScanCleanest = useCallback(async () => {
+    if (cleanestScanning) return;
+    setCleanestScanning(true);
+    try {
+      const requests = SCAN_INSTRUMENTS.flatMap(inst =>
+        SCAN_MODES.map(mode => ({ instrument: inst, mode }))
+      );
+      const resolved = await Promise.all(
+        requests.map(async ({ instrument, mode }) => {
+          try {
+            const r = await fetch(
+              `/api/status?ticker=${encodeURIComponent(instrument)}&mode=${encodeURIComponent(mode)}`,
+              { credentials: 'include', headers: getAuthHeader() }
+            );
+            if (!r.ok) return { instrument, mode, record: null };
+            const data = await r.json();
+            return { instrument, mode, record: data as StatusRecord };
+          } catch {
+            return { instrument, mode, record: null };
+          }
+        })
+      ) as RankInput[];
+      const candidate = rankCandidates(resolved);
+      setCleanestScan({ candidate, error: null, allInputs: resolved, scannedAt: Date.now() });
+      setCleanestOpen(true);
+    } catch {
+      setCleanestScan({ candidate: null, error: 'Scan failed — check connection', allInputs: [], scannedAt: Date.now() });
+      setCleanestOpen(true);
+    } finally {
+      setCleanestScanning(false);
+    }
+  }, [cleanestScanning]);
+
   // ── Audio notification transitions ────────────────────────────────────────
   // Refs hold the PREVIOUS value so we can detect state changes without
   // re-running the effect on every render. All audio calls go through
@@ -1513,6 +1937,14 @@ export default function MainBrain() {
                 <MarketStrip p={p} />
               </div>
 
+              {/* ── Cleanest Trade Available button strip ──────────────────── */}
+              <CleanestTradeButton
+                scanResult={cleanestScan}
+                scanning={cleanestScanning}
+                onScan={handleScanCleanest}
+                setOpen={() => setCleanestOpen(true)}
+              />
+
               {/* Section breadcrumb — visible on sub-section pages */}
               {section !== '' && KNOWN_SECTIONS.includes(section) && (
                 <div style={{ marginBottom:12, display:'flex', alignItems:'center', gap:10 }}>
@@ -1539,6 +1971,18 @@ export default function MainBrain() {
           <span style={{ fontSize:9.5, color:T.txtMuted, fontFamily:T.mono }}>Poll: {POLL_INTERVAL_MS / 1000}s</span>
         </footer>
       </div>
+
+      {/* Cleanest Trade modal — rendered outside the scroll container */}
+      <CleanestTradeModal
+        open={cleanestOpen}
+        onClose={() => setCleanestOpen(false)}
+        scanResult={cleanestScan}
+        activeInstrument={ticker}
+        hasActiveTrade={
+          Array.isArray(((p.active_trades ?? {}) as Record<string, unknown>).trades) &&
+          ((((p.active_trades ?? {}) as Record<string, unknown>).trades) as unknown[]).length > 0
+        }
+      />
 
       {/* Responsive styles */}
       <style>{`
