@@ -536,6 +536,58 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             </div>
           )}
 
+          {/* ── Opposing-Structure Block Diagnostic ──────────────────────── */}
+          {(() => {
+            const os = v.opposing_structure as Record<string, unknown> | null | undefined;
+            if (os === undefined) return null; // server hasn't sent the field yet
+            const detected  = os != null && os.detected === true;
+            const effect    = safeStr((os ?? {}).effect, 'NONE');
+            const isBlocking = detected && effect !== 'NONE' && effect !== 'OBSERVED';
+            const ageS      = safeNum((os ?? {}).age_seconds);
+            const remS      = safeNum((os ?? {}).remaining_seconds);
+            const fmtTime   = (s: number | null): string => {
+              if (s == null) return '—';
+              return `${Math.floor(s / 60)}m ${String(s % 60).padStart(2, '0')}s`;
+            };
+            const evType    = safeStr((os ?? {}).event_type, '');
+            const oppDir    = safeStr((os ?? {}).direction, '');
+            const candDir   = safeStr((os ?? {}).candidate_direction, '');
+            const instrName = safeStr((os ?? {}).instrument, '');
+            const sameTs    = safeStr((os ?? {}).same_direction_ts, '');
+
+            if (!detected || !isBlocking) {
+              return (
+                <div style={{ marginBottom:10, padding:'7px 10px', background:'rgba(34,197,94,0.05)', borderRadius:7, border:`1px solid rgba(34,197,94,0.15)` }}>
+                  <div style={{ fontSize:9, color:T.green, letterSpacing:'0.08em', fontWeight:700 }}>NO HARD ALERT BLOCK</div>
+                  {detected && effect === 'OBSERVED' && (
+                    <div style={{ fontSize:9.5, color:T.txtMuted, marginTop:4 }}>
+                      Opposing {oppDir.toLowerCase()} {evType} detected — dominant side clear (not blocking)
+                      {ageS != null && `, age ${fmtTime(ageS)}`}
+                    </div>
+                  )}
+                </div>
+              );
+            }
+
+            const effectLabel = effect === 'HARD_BLOCK' ? 'Hard block' : 'Score-aware block';
+            return (
+              <div style={{ marginBottom:10, padding:'9px 10px', background:'rgba(239,68,68,0.07)', borderRadius:7, border:`1px solid rgba(239,68,68,0.28)`, borderLeft:`3px solid ${T.red}` }}>
+                <div style={{ fontSize:9, color:T.red, letterSpacing:'0.08em', fontWeight:700, marginBottom:6 }}>BLOCKING ALERT</div>
+                <div style={{ fontSize:11, color:T.txtPri, fontWeight:600, marginBottom:4 }}>
+                  Recent {oppDir.toLowerCase()} {evType}
+                </div>
+                <div style={{ display:'grid', gridTemplateColumns:'auto 1fr', gap:'3px 10px', fontSize:9.5 }}>
+                  {ageS  != null && <><span style={{ color:T.txtMuted }}>Age</span>          <span style={{ color:T.txtSec, fontFamily:T.mono }}>{fmtTime(ageS)}</span></>}
+                  {remS  != null && <><span style={{ color:T.txtMuted }}>Window remaining</span> <span style={{ color:T.amber, fontFamily:T.mono }}>{fmtTime(remS)}</span></>}
+                  {candDir        && <><span style={{ color:T.txtMuted }}>Candidate</span>    <span style={{ color:T.txtSec }}>{candDir}</span></>}
+                  <><span style={{ color:T.txtMuted }}>Effect</span>           <span style={{ color:T.red }}>{effectLabel}</span></>
+                  {instrName      && <><span style={{ color:T.txtMuted }}>Source</span>       <span style={{ color:T.txtSec }}>{instrName} structure cache</span></>}
+                  {sameTs         && <><span style={{ color:T.txtMuted }}>Same-dir struct</span> <span style={{ color:T.green, fontFamily:T.mono, fontSize:9 }}>{sameTs.substring(11,19)} UTC</span></>}
+                </div>
+              </div>
+            );
+          })()}
+
           {/* ── Brain Reasoning ──────────────────────────────────────────── */}
           {explanation && (
             <div style={{ padding:'8px 10px', background:'rgba(56,189,248,0.04)', borderRadius:7, border:`1px solid rgba(56,189,248,0.12)`, borderLeft:`3px solid ${T.cyan}33` }}>

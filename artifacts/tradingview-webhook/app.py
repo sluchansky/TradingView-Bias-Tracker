@@ -7502,6 +7502,99 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     else:
         true_conflict = opposing_present
 
+    # ── Opposing-structure diagnostic — READ-ONLY, display-only, never gates ──
+    # Built from the same timestamps and flags already used by opposing_present /
+    # true_conflict. The UI reads this to show exactly WHY the system is blocked.
+    # No trading decision, score, or gate value is touched here.
+    def _build_opp_struct():
+        try:
+            _now_dt = datetime.now(timezone.utc)
+            if not opposing_present:
+                return {
+                    "detected": False, "direction": None, "candidate_direction": None,
+                    "event_type": None, "instrument": inst,
+                    "event_time": None, "age_seconds": None, "remaining_seconds": None,
+                    "window_seconds": CONFLICT_WINDOW_MIN * 60,
+                    "status": None, "effect": "NONE", "source": "alert_history",
+                    "reason": None, "superseded": False, "invalidated": False,
+                }
+            # candidate = dominant (higher-Edge) side; "opposing" = the conflicting side.
+            cand = dominant_direction if dominant_direction != "Neutral" else "Long"
+            if cand == "Long":
+                opp_ts  = short_struct_ts
+                opp_dir = "BEARISH"
+                _ev_cands = [
+                    ("CHOCH SUPPLY", choch_sup_ts),
+                    ("BOS SUPPLY",   bos_sup_ts),
+                    ("LH",           lh_ts),
+                    ("LL",           ll_ts),
+                ]
+                same_ts = long_struct_ts
+            else:
+                opp_ts  = long_struct_ts
+                opp_dir = "BULLISH"
+                _ev_cands = [
+                    ("CHOCH DEMAND", choch_dem_ts),
+                    ("BOS DEMAND",   bos_dem_ts),
+                    ("HH",           hh_ts),
+                    ("HL",           hl_ts),
+                ]
+                same_ts = short_struct_ts
+            # Identify which specific event type matches opp_ts
+            opp_type = None
+            for _etype, _ets in _ev_cands:
+                if _ets is not None and _ets == opp_ts:
+                    opp_type = _etype
+                    break
+            if opp_type is None:
+                _valid = [(ets, etype) for etype, ets in _ev_cands if ets is not None]
+                if _valid:
+                    opp_ts, opp_type = max(_valid, key=lambda x: x[0])
+            # Age and remaining window
+            age_s = remaining_s = None
+            if opp_ts is not None:
+                _ots = opp_ts if opp_ts.tzinfo else opp_ts.replace(tzinfo=timezone.utc)
+                age_s = max(0, int((_now_dt - _ots).total_seconds()))
+                remaining_s = max(0, CONFLICT_WINDOW_MIN * 60 - age_s)
+            # Effect classification
+            if true_conflict:
+                effect = "SCORE_AWARE_BLOCK" if score_aware_conflict else "HARD_BLOCK"
+            else:
+                effect = "OBSERVED"   # detected but not blocking (dominant SCALP side clear)
+            # Human-readable reason
+            opp_type_short = (opp_type or "structure").split()[0]
+            if age_s is not None:
+                age_label = f"{age_s // 60}m {age_s % 60:02d}s"
+            else:
+                age_label = "unknown"
+            return {
+                "detected":            True,
+                "direction":           opp_dir,
+                "candidate_direction": cand,
+                "event_type":          opp_type,
+                "instrument":          inst,
+                "event_time":          (opp_ts.isoformat() if opp_ts is not None else None),
+                "age_seconds":         age_s,
+                "remaining_seconds":   remaining_s,
+                "window_seconds":      CONFLICT_WINDOW_MIN * 60,
+                "status":              "ACTIVE",
+                "effect":              effect,
+                "source":              "alert_history",
+                "reason":              f"{opp_dir.title()} {opp_type_short} occurred {age_label} ago",
+                "superseded":          False,   # no supersession tracking exists currently
+                "invalidated":         False,   # no invalidation tracking exists currently
+                # Additional context for the UI panel
+                "same_direction_ts":   (same_ts.isoformat() if same_ts is not None else None),
+                "score_aware":         score_aware_conflict,
+                "conflict_gap":        conflict_gap,
+                "conflict_wait_gap":   conflict_wait_gap,
+            }
+        except Exception:
+            return {"detected": False, "effect": "NONE", "status": None,
+                    "source": "alert_history", "error": "diagnostic_build_failed"}
+
+    _opp_struct = _build_opp_struct()
+
     def _confirmations(direction):
         """Count the REAL confirmations present for `direction`. Display/diagnostic
         only now — both modes set MIN_CONFIRMATIONS=0, so the gate is structure +
@@ -7841,6 +7934,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         payload.setdefault("volume_confirmed", volume_confirmed)
         payload.setdefault("volume_data_present", volume_data_present)
         payload.setdefault("volume_state", volume_state)
+        # Opposing-structure diagnostic (display-only, never gates).
+        payload.setdefault("opposing_structure", _opp_struct)
         return payload
 
     # ── True conflict → stand aside (both sides). SCALP only reaches here when the
@@ -23212,6 +23307,10 @@ def _mb_verdict(result, errors):
             "score_breakdown":     list(eb.get("score_breakdown") or []),
             "failed_confirmations": list(eb.get("failed_confirmations") or []),
             "risks":               list(eb.get("risks") or []),
+            # Opposing-structure diagnostic (display-only, Part 3 of audit task).
+            # Exposes exactly the evidence the conflict gate used: event type, age,
+            # remaining block window, effect classification. Never feeds the gate.
+            "opposing_structure":  r.get("opposing_structure"),
         }
     except Exception as _exc:
         logger.debug("_mb_verdict: %s", _exc)
@@ -23224,6 +23323,7 @@ def _mb_verdict(result, errors):
             # Phase 7C.2 transparency fields — must mirror the success path schema
             "edge_components": [], "score_breakdown": [],
             "failed_confirmations": [], "risks": [],
+            "opposing_structure": None,
         }
 
 
@@ -23513,7 +23613,45 @@ def _mb_decision_timeline(inst, errors):
     except Exception as _exc:
         logger.debug("_mb_decision_timeline ready_signal: %s", _exc)
 
-    # 3. Last gateway send epoch — derived from _TRADERSPOST_LAST
+    # 3. Recent structure events (BOS/CHOCH) for this instrument — real events
+    #    from ALERT_HISTORY, surfaced so the operator can see the opposing-structure
+    #    timeline without navigating away. Shows last 10 relevant events.
+    _STRUCTURE_TYPES = {
+        "BOS DEMAND", "CHOCH DEMAND", "BOS SUPPLY", "CHOCH SUPPLY",
+        "HH", "HL", "LH", "LL",
+    }
+    try:
+        _struct_count = 0
+        for alert in list(ALERT_HISTORY):
+            if _struct_count >= 10:
+                break
+            if alert.get("alert_type") not in _STRUCTURE_TYPES:
+                continue
+            a_inst = (alert.get("instrument")
+                      or _instrument_from_text(alert.get("ticker"))
+                      or _instrument_from_text(alert.get("alert_type")))
+            if a_inst != inst:
+                continue
+            atype = alert.get("alert_type", "")
+            is_bearish = "SUPPLY" in atype or atype in ("LH", "LL")
+            events.append({
+                "event_type": "STRUCTURE_EVENT",
+                "ts":         alert.get("timestamp"),
+                "label":      atype,
+                "details": {
+                    "direction":       "BEARISH" if is_bearish else "BULLISH",
+                    "alert_type":      atype,
+                    "instrument":      a_inst,
+                    "candidate_direction": "SHORT" if is_bearish else "LONG",
+                },
+                "is_derived": False,
+                "persisted":  False,
+            })
+            _struct_count += 1
+    except Exception as _exc:
+        logger.debug("_mb_decision_timeline structure_events: %s", _exc)
+
+    # 4. Last gateway send epoch — derived from _TRADERSPOST_LAST
     try:
         tp = _TRADERSPOST_LAST.get(inst)
         if tp is not None:
@@ -23539,10 +23677,10 @@ def _mb_decision_timeline(inst, errors):
         pass
 
     return {
-        "events":               events[:20],
+        "events":               events[:25],
         "partial":              True,
         "completeness":         "PARTIAL",
-        "real_event_types":     ["THESIS_TRANSITION"],
+        "real_event_types":     ["THESIS_TRANSITION", "STRUCTURE_EVENT"],
         "derived_event_types":  ["READY_SIGNAL", "GATEWAY_SEND"],
         "missing_event_types":  [
             "VERDICT_GENERATED", "TRADE_OPENED", "TRADE_CLOSED",
