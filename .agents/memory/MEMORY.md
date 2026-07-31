@@ -8,6 +8,7 @@
 - [Right Brain Trade Management v1](rbtm-shadow-mode.md) — Phase 6B.2 shadow advisory; flag default-OFF; _right_brain_orchestrate() is sole full_analysis seam; 47 tests; RBTM_VALID_RECOMMENDATIONS frozenset; near-stop CRITICAL not HIGH.
 - [Flask zombie-prevention guards](flask-zombie-prevention.md) — 3 os._exit guards (SIGTERM + sys.excepthook + app.run() finally) stop non-daemon Timer threads from keeping zombie Flask alive.
 - [Databento live feed integration](databento-integration.md) — flag-gated (DATABENTO_ENABLED=1 + DATABENTO_API_KEY); routes return disabled-JSON not 404; dashboard panel shows OFFLINE safely.
+- [Databento MGC overnight silence + partial-flush fix](databento-mgc-overnight-silence.md) — MGC has 0 Databento records overnight (genuine COMEX silence); partial-flush daemon closes stale low-volume bars within 70s; thread-safety via _partial_lock.
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); MGC/MNQ string symmetry; any scoring change must keep invariants.
