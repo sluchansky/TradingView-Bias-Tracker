@@ -1,0 +1,318 @@
+TASK: Add a safely gated Send to TradersPost button to Main Brain.
+
+GOAL
+
+Allow the operator to manually send the current canonical READY trade plan to the existing TradersPost integration from Main Brain.
+
+This is not a new execution pathway.
+
+Reuse the existing TradersPost endpoint, payload builder, authentication, duplicate guard, risk guard, and execution logging.
+
+CRITICAL SAFETY REQUIREMENT
+
+The button must never bypass any existing execution gate.
+
+It must not send:
+
+- WAIT setups
+- POTENTIAL setups
+- NOT ACTIONABLE setups
+- blocked setups
+- stale plans
+- invalid stops
+- missing risk plans
+- plans that conflict with active-trade restrictions
+- plans blocked by daily loss or prop rules
+
+STRICT SCOPE
+
+DO NOT modify:
+
+- strategy selection
+- Edge Score
+- readiness
+- risk thresholds
+- position sizing
+- entry/stop/target calculations
+- opposing-structure rules
+- learning
+- Databento
+- TradersPost payload semantics
+- broker credentials
+- duplicate-trade rules
+- active-trade logic
+
+PART 1 — TRACE THE EXISTING SEND PATH
+
+Locate the current production path that sends a trade to TradersPost.
+
+Document:
+
+- frontend trigger, if one exists
+- backend endpoint
+- canonical payload builder
+- authentication
+- readiness validation
+- risk validation
+- duplicate guard
+- active-position guard
+- broker-ready guard
+- audit logging
+- success response
+- rejection response
+- retry behavior
+
+Do not create a second webhook implementation.
+
+PART 2 — BUTTON PLACEMENT
+
+Place the button inside the Main Brain TRADE PLAN panel.
+
+Label when enabled:
+
+SEND TO TRADERSPOST
+
+Do not place it in the page header because the action must stay visually tied to the exact trade plan being sent.
+
+PART 3 — BUTTON ELIGIBILITY
+
+Enable only when all existing canonical requirements pass.
+
+At minimum, verify:
+
+- candidate status is READY
+- verdict is actionable
+- trade plan is valid
+- instrument is supported
+- direction is present
+- entry is present
+- stop is present and valid
+- target is present
+- risk sizing is valid
+- TradersPost is configured
+- broker is ready
+- database is ready
+- no hard alert block
+- no execution lock
+- no duplicate signal
+- no conflicting active-trade restriction
+- plan is fresh
+
+The backend must revalidate all requirements.
+
+Frontend disablement alone is not sufficient.
+
+PART 4 — DISABLED STATES
+
+When disabled, show the exact reason.
+
+Examples:
+
+WAITING FOR BULLISH BOS
+TRADE NOT ACTIONABLE
+RISK STATE BLOCKED
+TRADERSPOST UNAVAILABLE
+STOP INVALID
+PLAN STALE
+DUPLICATE SIGNAL
+ACTIVE TRADE CONFLICT
+
+Do not show a clickable enabled button when a required field is missing.
+
+PART 5 — CONFIRMATION STEP
+
+Before sending, require a confirmation dialog showing:
+
+- instrument
+- direction
+- strategy
+- mode
+- entry
+- stop
+- targets
+- contracts
+- dollar risk
+- risk/reward
+- current readiness
+- data age
+
+Confirmation action:
+
+CONFIRM AND SEND
+
+Cancel action:
+
+CANCEL
+
+Do not allow accidental one-click transmission.
+
+PART 6 — IDEMPOTENCY
+
+Generate or reuse a stable signal/trade-plan identifier.
+
+Repeated clicks or network retries must not create duplicate orders.
+
+The backend must reject a duplicate safely and return an explicit response.
+
+PART 7 — SUCCESS AND FAILURE STATES
+
+Success:
+
+SENT TO TRADERSPOST
+Include timestamp and existing request/trade identifier.
+
+Rejected:
+
+NOT SENT
+Show the exact backend rejection reason.
+
+Unknown network result:
+
+STATUS UNKNOWN — VERIFY BEFORE RETRYING
+
+Do not automatically retry an uncertain execution request.
+
+PART 8 — AUDIT TRAIL
+
+Use the existing execution/audit store.
+
+Record:
+
+- operator initiation
+- confirmation
+- payload identity
+- backend validation result
+- TradersPost response
+- duplicate result
+- timestamp
+- final status
+
+Do not log secrets, tokens, or full authorization headers.
+
+PART 9 — TESTS
+
+CASE A
+READY valid plan.
+Expected:
+button enabled.
+
+CASE B
+POTENTIAL plan.
+Expected:
+disabled, no request.
+
+CASE C
+WAIT verdict.
+Expected:
+disabled.
+
+CASE D
+Invalid stop.
+Expected:
+disabled.
+
+CASE E
+Risk block.
+Expected:
+disabled.
+
+CASE F
+TradersPost not ready.
+Expected:
+disabled.
+
+CASE G
+Confirmation canceled.
+Expected:
+nothing sent.
+
+CASE H
+Confirmed valid request.
+Expected:
+one existing TradersPost call.
+
+CASE I
+Double click.
+Expected:
+one send only.
+
+CASE J
+Backend state changes after modal opens.
+Expected:
+backend revalidation rejects stale/invalid plan.
+
+CASE K
+Duplicate plan identifier.
+Expected:
+safe duplicate rejection.
+
+CASE L
+Network timeout after submission.
+Expected:
+status unknown, no automatic retry.
+
+CASE M
+Active trade conflict.
+Expected:
+existing guard preserved.
+
+CASE N
+Authentication failure.
+Expected:
+nothing sent.
+
+PART 10 — LIVE SAFETY VERIFICATION
+
+Use a non-live or test-safe TradersPost destination for browser validation unless an existing production-safe dry-run mode exists.
+
+Do not send a real order merely to prove the UI works.
+
+Capture:
+
+- disabled POTENTIAL state
+- enabled READY state using deterministic fixture/dry-run
+- confirmation dialog
+- successful test-safe response
+- backend rejection state
+
+VALIDATION
+
+Run:
+
+- TradersPost integration tests
+- execution guard tests
+- duplicate guard tests
+- risk guard tests
+- trade-plan tests
+- Main Brain regressions
+- TypeScript typecheck
+- production build
+- git diff --check
+
+STOP CONDITIONS
+
+Stop and report if:
+
+- there is no canonical existing TradersPost send path
+- backend readiness is not revalidated
+- duplicate protection cannot be proven
+- test-safe validation is unavailable
+- the only way to test is to transmit a real order
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Existing endpoint and payload builder reused
+4. Button eligibility rules
+5. Backend revalidation rules
+6. Confirmation-dialog fields
+7. Duplicate protection
+8. Audit trail
+9. Tests
+10. TypeScript/build results
+11. Screenshot locations
+12. Confirmation that no trading, risk, sizing, or execution semantics were weakened
+13. Confirmation that no real order was sent during testing
