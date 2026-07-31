@@ -3895,6 +3895,15 @@ JOURNAL        = []          # list of journal dicts, newest-first, max 500
 JOURNAL_KEYS   = set()       # dedup: (ticker, setup_stage, entry_zone_rounded)
 JOURNAL_STAGES = frozenset(("Setup Forming", "Confirmation Candle", "Trade Ready"))
 
+# Phase 7O.1: rating column whitelist for drill-down filter.
+# Exposed at module level so tests can reference APP._RATING_FIELDS directly.
+# rating_field is the ONLY param whose value is interpolated into a SQL column
+# name; all other params are fully parameterised. Any value not in this set is
+# silently ignored before it reaches the query.
+_RATING_FIELDS = frozenset({
+    "setup_quality", "execution_quality", "discipline_quality", "overall_quality",
+})
+
 
 # ---------------------------------------------------------------------------
 # Time helpers
@@ -43683,7 +43692,24 @@ def _journal_db_guard():
 @app.route("/journal/trades", methods=["GET"])
 def journal_trades_list():
     """Unified paginated trade list from strategy_trades + tradezella_trades.
-    Params: page, limit, instrument, direction, source, result, search, sort, order."""
+
+    Standard params:
+      page, limit, instrument, direction, source, result, search, sort, order
+
+    Phase 7O.1 drill-down params (AND semantics, server-side, parameterised):
+      mistake_tag   — trade has this tag in jr.mistake_tags  (JSONB string array)
+      positive_tag  — trade has this tag in jr.positive_tags (JSONB string array)
+      emotion_tag   — trade has this emotion in jr.emotion_tags (JSONB object array, keyed 'tag')
+      followed_plan — exact match on jr.followed_plan ('YES','PARTIALLY','NO','NOT_APPLICABLE')
+      strategy      — ILIKE match on strategy_name
+      session       — exact match on session column
+      review_status — exact match on review_status ('REVIEWED','UNREVIEWED','EXCLUDED','INCOMPLETE')
+      rating_field  — one of: setup_quality / execution_quality / discipline_quality / overall_quality
+      rating_value  — integer 1-5 (requires rating_field to also be set)
+      mode          — exact match on trading_mode (SCALP / SWING / MICRO_SCALP)
+      date_from     — inclusive lower bound on trade date (ISO 8601)
+      date_to       — inclusive upper bound on trade date (ISO 8601)
+    """
     conn, err = _journal_db_guard()
     if err:
         return err
@@ -43695,6 +43721,7 @@ def journal_trades_list():
             page, limit = 1, 50
         offset = (page - 1) * limit
 
+        # ── Standard filters (applied inner, per source) ──────────────────────
         flt_inst  = (request.args.get("instrument") or "").strip().upper() or None
         flt_dir   = (request.args.get("direction") or "").strip().lower() or None
         flt_src   = (request.args.get("source") or "").strip().lower() or None
@@ -43710,6 +43737,27 @@ def journal_trades_list():
         }
         sort_col = _SORT.get(sort_col, "date")
 
+        # ── Phase 7O.1 drill-down filters (applied outer, after UNION ALL) ────
+        # _RATING_FIELDS is defined at module level (search "_RATING_FIELDS =")
+        # so tests can reference it directly as APP._RATING_FIELDS.
+        mistake_tag   = (request.args.get("mistake_tag")   or "").strip().lower() or None
+        positive_tag  = (request.args.get("positive_tag")  or "").strip().lower() or None
+        emotion_tag   = (request.args.get("emotion_tag")   or "").strip().lower() or None
+        followed_plan = (request.args.get("followed_plan") or "").strip().upper() or None
+        flt_strategy  = (request.args.get("strategy")      or "").strip() or None
+        flt_session   = (request.args.get("session")       or "").strip().lower() or None
+        review_status = (request.args.get("review_status") or "").strip().upper() or None
+        flt_mode      = (request.args.get("mode")          or "").strip().upper() or None
+        date_from     = (request.args.get("date_from")     or "").strip() or None
+        date_to       = (request.args.get("date_to")       or "").strip() or None
+        _rf = (request.args.get("rating_field") or "").strip().lower() or None
+        rating_field  = _rf if _rf in _RATING_FIELDS else None  # silently reject unknown fields
+        try:
+            rating_value = int(request.args.get("rating_value", "")) if rating_field else None
+        except (TypeError, ValueError):
+            rating_value = None
+
+        # ── Per-source inner WHERE builders ───────────────────────────────────
         sys_w, sys_p = ["1=1"], []
         tz_w,  tz_p  = ["1=1"], []
 
@@ -43729,31 +43777,42 @@ def journal_trades_list():
             tz_w.append("(LOWER(tt.symbol) LIKE %s OR LOWER(tt.setup) LIKE %s OR LOWER(COALESCE(tt.notes,'')) LIKE %s)")
             tz_p += [like, like, like]
 
+        # ── Inner SELECT — system trades ──────────────────────────────────────
         sys_sql = (
             "SELECT st.id, 'system' AS source,"
             " COALESCE(st.opened_at, st.created_at) AS date,"
             " st.symbol AS instrument, st.direction,"
             " COALESCE(st.strategy, st.strategy_key, '') AS strategy_name,"
             " CAST(st.entry AS double precision) AS entry,"
-            # Use actual fill price for closed trades; fall back to target for open ones
             " COALESCE(CAST(st.exit_price AS double precision),"
             "          CAST(st.target    AS double precision)) AS exit,"
             " COALESCE(st.result, '') AS result,"
             " COALESCE(CAST(st.r_multiple AS double precision), 0) AS r_multiple,"
             " NULL::double precision AS pnl,"
-            # Phase 7N: real review status from journal_reviews (not a hardcoded label)
+            # Phase 7N: real review status from journal_reviews
             " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
             " COALESCE(CAST(st.edge_score AS double precision), 0) AS edge_score,"
             " CASE WHEN st.opened_at IS NOT NULL AND st.closed_at IS NOT NULL"
             "      THEN EXTRACT(EPOCH FROM (st.closed_at - st.opened_at))/60.0"
             "      ELSE NULL END AS duration_min,"
-            " COALESCE(st.trading_mode, 'SWING') AS trading_mode"
+            " COALESCE(st.trading_mode, 'SWING') AS trading_mode,"
+            " COALESCE(st.session, '') AS session,"
+            # Phase 7O.1: review detail columns for coaching drill-down filtering
+            " COALESCE(jr.mistake_tags,  '[]'::jsonb) AS mistake_tags,"
+            " COALESCE(jr.positive_tags, '[]'::jsonb) AS positive_tags,"
+            " COALESCE(jr.emotion_tags,  '[]'::jsonb) AS emotion_tags,"
+            " jr.followed_plan,"
+            " jr.setup_quality,"
+            " jr.execution_quality,"
+            " jr.discipline_quality,"
+            " jr.overall_quality"
             " FROM strategy_trades st"
             " LEFT JOIN journal_reviews jr"
             "   ON jr.source = 'system' AND jr.trade_id = st.id"
             " WHERE " + " AND ".join(sys_w)
         ) if flt_src in (None, "system") else None
 
+        # ── Inner SELECT — tradezella trades ──────────────────────────────────
         tz_sql = (
             "SELECT tt.id, 'tradzella' AS source,"
             " tt.entry_time AS date,"
@@ -43763,13 +43822,22 @@ def journal_trades_list():
             " COALESCE(tt.outcome, '') AS result,"
             " COALESCE(tt.r_multiple, 0) AS r_multiple,"
             " COALESCE(tt.pnl, 0) AS pnl,"
-            # Phase 7N: real review status from journal_reviews
             " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
             " NULL::double precision AS edge_score,"
             " CASE WHEN tt.entry_time IS NOT NULL AND tt.exit_time IS NOT NULL"
             "      THEN EXTRACT(EPOCH FROM (tt.exit_time - tt.entry_time))/60.0"
             "      ELSE NULL END AS duration_min,"
-            " COALESCE(tt.mode, 'UNKNOWN') AS trading_mode"
+            " COALESCE(tt.mode, 'UNKNOWN') AS trading_mode,"
+            " COALESCE(tt.session_bucket, '') AS session,"
+            # Phase 7O.1: review detail columns for coaching drill-down filtering
+            " COALESCE(jr.mistake_tags,  '[]'::jsonb) AS mistake_tags,"
+            " COALESCE(jr.positive_tags, '[]'::jsonb) AS positive_tags,"
+            " COALESCE(jr.emotion_tags,  '[]'::jsonb) AS emotion_tags,"
+            " jr.followed_plan,"
+            " jr.setup_quality,"
+            " jr.execution_quality,"
+            " jr.discipline_quality,"
+            " jr.overall_quality"
             " FROM tradezella_trades tt"
             " LEFT JOIN journal_reviews jr"
             "   ON jr.source = 'tradzella' AND jr.trade_id = tt.id"
@@ -43783,19 +43851,77 @@ def journal_trades_list():
         elif tz_sql:
             union_sql, all_p = tz_sql, tz_p
         else:
-            return jsonify({"ok": True, "trades": [], "total": 0, "page": 1, "limit": limit, "pages": 1})
+            return jsonify({"ok": True, "trades": [], "total": 0,
+                            "page": 1, "limit": limit, "pages": 1})
 
-        count_sql = f"SELECT COUNT(*) FROM ({union_sql}) AS _t"
-        page_sql  = (
-            f"SELECT * FROM ({union_sql}) AS _t"
+        # ── Phase 7O.1: outer WHERE applied after UNION ALL ───────────────────
+        # All filters here use parameterised queries — no string concatenation of values.
+        # rating_field is the only column name interpolated; it is validated against
+        # _RATING_FIELDS (a frozenset of known safe column names) before reaching here.
+        outer_w, outer_p = [], []
+
+        if review_status:
+            outer_w.append("review_status = %s")
+            outer_p.append(review_status)
+        if date_from:
+            outer_w.append("date >= %s::timestamptz")
+            outer_p.append(date_from)
+        if date_to:
+            outer_w.append("date <= %s::timestamptz")
+            outer_p.append(date_to)
+        if flt_mode:
+            outer_w.append("UPPER(trading_mode) = %s")
+            outer_p.append(flt_mode)
+        if mistake_tag:
+            # Check JSONB string array contains the exact tag value
+            outer_w.append(
+                "EXISTS (SELECT 1 FROM jsonb_array_elements_text("
+                "  COALESCE(mistake_tags,'[]'::jsonb)) AS _t WHERE _t = %s)"
+            )
+            outer_p.append(mistake_tag)
+        if positive_tag:
+            outer_w.append(
+                "EXISTS (SELECT 1 FROM jsonb_array_elements_text("
+                "  COALESCE(positive_tags,'[]'::jsonb)) AS _t WHERE _t = %s)"
+            )
+            outer_p.append(positive_tag)
+        if emotion_tag:
+            # emotion_tags is a JSONB array of objects: [{"tag":"fomo","intensity":3},…]
+            outer_w.append(
+                "EXISTS (SELECT 1 FROM jsonb_array_elements("
+                "  COALESCE(emotion_tags,'[]'::jsonb)) AS _e WHERE _e->>'tag' = %s)"
+            )
+            outer_p.append(emotion_tag)
+        if followed_plan:
+            outer_w.append("followed_plan = %s")
+            outer_p.append(followed_plan)
+        if flt_strategy:
+            outer_w.append("strategy_name ILIKE %s")
+            outer_p.append("%" + flt_strategy + "%")
+        if flt_session:
+            outer_w.append("session = %s")
+            outer_p.append(flt_session)
+        if rating_field and rating_value is not None:
+            # rating_field already validated against _RATING_FIELDS — safe to interpolate
+            outer_w.append(f"{rating_field} = %s")
+            outer_p.append(rating_value)
+
+        outer_clause = (" WHERE " + " AND ".join(outer_w)) if outer_w else ""
+        all_outer_p  = all_p + outer_p
+
+        count_sql = (
+            f"SELECT COUNT(*) FROM ({union_sql}) AS _u{outer_clause}"
+        )
+        page_sql = (
+            f"SELECT * FROM ({union_sql}) AS _u{outer_clause}"
             f" ORDER BY {sort_col} {sort_ord} NULLS LAST"
             f" LIMIT %s OFFSET %s"
         )
 
         with conn.cursor() as cur:
-            cur.execute(count_sql, all_p)
+            cur.execute(count_sql, all_outer_p)
             total = int((cur.fetchone() or (0,))[0])
-            cur.execute(page_sql, all_p + [limit, offset])
+            cur.execute(page_sql, all_outer_p + [limit, offset])
             cols = [d[0] for d in cur.description]
             rows = cur.fetchall()
 
@@ -43810,6 +43936,11 @@ def journal_trades_list():
                         d[k] = float(d[k])
                     except (TypeError, ValueError):
                         d[k] = None
+            # Serialise JSONB columns — psycopg2 returns dicts/lists already, but guard anyway
+            for k in ("mistake_tags", "positive_tags", "emotion_tags"):
+                v = d.get(k)
+                if v is not None and not isinstance(v, (list, dict)):
+                    d[k] = []
             trades.append(d)
 
         return jsonify({

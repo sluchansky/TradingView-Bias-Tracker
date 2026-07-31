@@ -2414,6 +2414,7 @@ interface JTrade {
   strategy_name: string; entry: number | null; exit: number | null; result: string;
   r_multiple: number | null; pnl: number | null; review_status: string;
   edge_score: number | null; duration_min: number | null; trading_mode: string;
+  session?: string;
 }
 
 interface JTradeDetail extends JTrade {
@@ -2427,6 +2428,31 @@ interface JTradeDetail extends JTrade {
   strategy?: string; strategy_key?: string;
   entry_time?: string; exit_time?: string; fees?: number | null;
   mistakes?: string; notes?: string; screenshots?: string;
+}
+
+/** Phase 7O.1 — Canonical drill-down filter contract.
+ *  Built by coaching cards; consumed by JTradesTab + /api/journal/trades.
+ *  label/count are display-only and never sent to the server.
+ *  All filter values that are sent server-side use AND semantics. */
+interface JDrillFilter {
+  label:         string;          // human-readable source description e.g. "Mistake: CHASED ENTRY"
+  count?:        number;          // n from the coaching metric (shown in the banner)
+  // ── server-side filter params (all optional, AND semantics) ──────────────
+  review_status?: string;         // 'REVIEWED' | 'UNREVIEWED' | 'EXCLUDED' | 'INCOMPLETE'
+  mistake_tag?:   string;         // exact match in jr.mistake_tags (JSONB string array)
+  positive_tag?:  string;         // exact match in jr.positive_tags
+  emotion_tag?:   string;         // exact match in jr.emotion_tags[*].tag
+  followed_plan?: string;         // 'YES' | 'PARTIALLY' | 'NO' | 'NOT_APPLICABLE'
+  strategy?:      string;         // ILIKE match on strategy_name
+  session?:       string;         // exact match on session column
+  instrument?:    string;         // exact match after UPPER()
+  mode?:          string;         // exact match on trading_mode (SCALP/SWING/MICRO_SCALP)
+  source?:        string;         // 'system' | 'tradzella'
+  date_from?:     string;         // ISO date (inclusive lower bound)
+  date_to?:       string;         // ISO date (inclusive upper bound)
+  rating_field?:  string;         // setup_quality|execution_quality|discipline_quality|overall_quality
+  rating_value?:  number;         // integer 1-5 (requires rating_field)
+  result?:        string;         // 'win' | 'loss' | 'scratch'
 }
 
 interface JBatch {
@@ -3420,7 +3446,70 @@ const JTabBar: React.FC<{ active: JTab; onChange: (t: JTab) => void; queueBadge?
 };
 
 // ── Trades tab ────────────────────────────────────────────────────────────────
-const JTradesTab: React.FC = () => {
+// ── Phase 7O.1 — URL helpers for drill-down state persistence ────────────────
+const _J_TAB_PARAM   = 'j_tab';
+const _J_DRILL_PARAM = 'j_drill';
+
+function _urlReadJState(): { tab: JTab | null; drill: JDrillFilter | null } {
+  try {
+    const p = new URLSearchParams(window.location.search);
+    const tab = p.get(_J_TAB_PARAM) as JTab | null;
+    const drillStr = p.get(_J_DRILL_PARAM);
+    let drill: JDrillFilter | null = null;
+    if (drillStr) { try { drill = JSON.parse(drillStr); } catch { /* ignore */ } }
+    return { tab, drill };
+  } catch { return { tab: null, drill: null }; }
+}
+
+function _urlSetJState(tab: JTab, drill: JDrillFilter | null, push: boolean) {
+  try {
+    const p = new URLSearchParams(window.location.search);
+    p.set(_J_TAB_PARAM, tab);
+    if (drill) { p.set(_J_DRILL_PARAM, JSON.stringify(drill)); }
+    else        { p.delete(_J_DRILL_PARAM); }
+    const url = '?' + p.toString();
+    if (push) { window.history.pushState(null, '', url); }
+    else      { window.history.replaceState(null, '', url); }
+  } catch { /* non-critical */ }
+}
+
+/** Returns a list of {key, label} pairs for each active filter in a JDrillFilter */
+function _drillChips(drill: JDrillFilter): { key: keyof JDrillFilter; label: string }[] {
+  type K = keyof JDrillFilter;
+  const chips: { key: K; label: string }[] = [];
+  const tag = (s: string) => s.replace(/_/g, ' ').toUpperCase();
+  if (drill.review_status) chips.push({ key: 'review_status', label: drill.review_status });
+  if (drill.mistake_tag)   chips.push({ key: 'mistake_tag',   label: `MISTAKE: ${tag(drill.mistake_tag)}` });
+  if (drill.positive_tag)  chips.push({ key: 'positive_tag',  label: `BEHAVIOR: ${tag(drill.positive_tag)}` });
+  if (drill.emotion_tag)   chips.push({ key: 'emotion_tag',   label: `EMOTION: ${tag(drill.emotion_tag)}` });
+  if (drill.followed_plan) chips.push({ key: 'followed_plan', label: `PLAN: ${drill.followed_plan}` });
+  if (drill.strategy)      chips.push({ key: 'strategy',      label: `STRATEGY: ${tag(drill.strategy)}` });
+  if (drill.session)       chips.push({ key: 'session',       label: `SESSION: ${tag(drill.session)}` });
+  if (drill.instrument)    chips.push({ key: 'instrument',    label: `INST: ${drill.instrument}` });
+  if (drill.mode)          chips.push({ key: 'mode',          label: `MODE: ${drill.mode}` });
+  if (drill.source)        chips.push({ key: 'source',        label: `SOURCE: ${drill.source.toUpperCase()}` });
+  if (drill.date_from)     chips.push({ key: 'date_from',     label: `FROM: ${drill.date_from}` });
+  if (drill.date_to)       chips.push({ key: 'date_to',       label: `TO: ${drill.date_to}` });
+  if (drill.rating_field && drill.rating_value != null)
+    chips.push({ key: 'rating_field', label: `${drill.rating_field.replace(/_quality$/, '').toUpperCase()}: ${drill.rating_value}★` });
+  if (drill.result)        chips.push({ key: 'result',        label: `RESULT: ${drill.result.toUpperCase()}` });
+  return chips;
+}
+
+/** Filter keys that represent actual server params (not display-only) */
+const _DRILL_SERVER_KEYS: (keyof JDrillFilter)[] = [
+  'review_status','mistake_tag','positive_tag','emotion_tag','followed_plan',
+  'strategy','session','instrument','mode','source','date_from','date_to',
+  'rating_field','rating_value','result',
+];
+
+// ── Journal Trades Tab ────────────────────────────────────────────────────────
+const JTradesTab: React.FC<{
+  drillFilter?: JDrillFilter | null;
+  onClearDrill?: () => void;
+  onClearOneDrill?: (key: keyof JDrillFilter) => void;
+  onGoCoaching?: () => void;
+}> = ({ drillFilter, onClearDrill, onClearOneDrill, onGoCoaching }) => {
   const [trades, setTrades] = useState<JTrade[]>([]);
   const [total, setTotal] = useState(0);
   const [pages, setPages] = useState(1);
@@ -3457,12 +3546,31 @@ const JTradesTab: React.FC = () => {
       const params = new URLSearchParams({
         page: String(pg), limit: '50',
         sort: sortCol, order: sortOrd,
-        ...(search    ? { search }     : {}),
-        ...(fInst     ? { instrument: fInst } : {}),
-        ...(fDir      ? { direction: fDir }  : {}),
-        ...(fSrc      ? { source: fSrc }     : {}),
-        ...(fRes      ? { result: fRes }     : {}),
+        ...(search    ? { search }               : {}),
+        ...(fInst     ? { instrument: fInst }    : {}),
+        ...(fDir      ? { direction: fDir }      : {}),
+        ...(fSrc      ? { source: fSrc }         : {}),
+        ...(fRes      ? { result: fRes }         : {}),
       });
+      // Phase 7O.1: merge drill-down filter params (server-side AND semantics)
+      if (drillFilter) {
+        const df = drillFilter;
+        if (df.review_status) params.set('review_status', df.review_status);
+        if (df.mistake_tag)   params.set('mistake_tag',   df.mistake_tag);
+        if (df.positive_tag)  params.set('positive_tag',  df.positive_tag);
+        if (df.emotion_tag)   params.set('emotion_tag',   df.emotion_tag);
+        if (df.followed_plan) params.set('followed_plan', df.followed_plan);
+        if (df.strategy)      params.set('strategy',      df.strategy);
+        if (df.session)       params.set('session',       df.session);
+        if (df.instrument && !fInst) params.set('instrument', df.instrument);
+        if (df.mode)          params.set('mode',          df.mode);
+        if (df.source && !fSrc)      params.set('source',     df.source);
+        if (df.date_from)     params.set('date_from',     df.date_from);
+        if (df.date_to)       params.set('date_to',       df.date_to);
+        if (df.rating_field)  params.set('rating_field',  df.rating_field);
+        if (df.rating_value != null) params.set('rating_value', String(df.rating_value));
+        if (df.result && !fRes)      params.set('result',      df.result);
+      }
       const r = await fetch(`/api/journal/trades?${params}`, { headers: getAuthHeader() });
       if (!r.ok) throw new Error(await r.text());
       const data = await r.json();
@@ -3476,7 +3584,7 @@ const JTradesTab: React.FC = () => {
     } finally {
       setLoading(false);
     }
-  }, [search, fInst, fDir, fSrc, fRes, sortCol, sortOrd]);
+  }, [search, fInst, fDir, fSrc, fRes, sortCol, sortOrd, drillFilter]);
 
   useEffect(() => { fetchTrades(1); }, [fetchTrades]);
 
@@ -3589,8 +3697,74 @@ const JTradesTab: React.FC = () => {
     </th>
   );
 
+  // Compute drill chips once for rendering
+  const drillChips = drillFilter ? _drillChips(drillFilter) : [];
+
   return (
     <div>
+      {/* Phase 7O.1: Evidence banner — shown when drilling from a coaching insight */}
+      {drillFilter && (
+        <div style={{ background: T.cyan + '11', border: `1px solid ${T.cyan}44`,
+          borderRadius: 8, padding: '10px 14px', marginBottom: 10 }}>
+          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+            flexWrap: 'wrap', gap: 8 }}>
+            <div>
+              <span style={{ fontSize: 8, color: T.cyan, fontWeight: 800, letterSpacing: '0.08em',
+                textTransform: 'uppercase' }}>Evidence View</span>
+              <span style={{ fontSize: 10, color: T.txtSec, marginLeft: 10, fontWeight: 600 }}>
+                {drillFilter.label}
+              </span>
+              {drillFilter.count != null && (
+                <span style={{ fontSize: 9, color: T.txtMuted, marginLeft: 8 }}>
+                  · {drillFilter.count} reviewed trades
+                </span>
+              )}
+            </div>
+            <div style={{ display: 'flex', gap: 6 }}>
+              {onGoCoaching && (
+                <button onClick={onGoCoaching}
+                  style={{ background: 'transparent', border: `1px solid ${T.border}`,
+                    borderRadius: 4, color: T.txtMuted, padding: '3px 10px', fontSize: 9,
+                    cursor: 'pointer' }}>
+                  ← Back to Coaching
+                </button>
+              )}
+              {onClearDrill && (
+                <button onClick={onClearDrill}
+                  style={{ background: T.red + '22', border: `1px solid ${T.red}44`,
+                    borderRadius: 4, color: T.red, padding: '3px 10px', fontSize: 9,
+                    cursor: 'pointer' }}>
+                  Clear filter
+                </button>
+              )}
+            </div>
+          </div>
+          {/* Filter chips */}
+          {drillChips.length > 0 && (
+            <div style={{ display: 'flex', gap: 5, flexWrap: 'wrap', marginTop: 8 }}>
+              {drillChips.map(chip => (
+                <span key={String(chip.key)} style={{
+                  background: T.panelAlt, border: `1px solid ${T.border}`,
+                  borderRadius: 12, padding: '2px 8px', fontSize: 8,
+                  color: T.txtSec, display: 'flex', alignItems: 'center', gap: 4,
+                }}>
+                  {chip.label}
+                  {onClearOneDrill && (
+                    <button
+                      onClick={() => onClearOneDrill(chip.key)}
+                      aria-label={`Remove filter ${chip.label}`}
+                      style={{ background: 'none', border: 'none', cursor: 'pointer',
+                        color: T.txtMuted, padding: '0 1px', lineHeight: 1, fontSize: 9 }}>
+                      ×
+                    </button>
+                  )}
+                </span>
+              ))}
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Phase 7N: Review Next Trade bar */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 10,
         background: T.panelAlt, borderRadius: 6, padding: '8px 12px',
@@ -3733,7 +3907,29 @@ const JTradesTab: React.FC = () => {
                 })}
                 {trades.length === 0 && (
                   <tr><td colSpan={11} style={{ textAlign: 'center', color: T.txtMuted,
-                    padding: '16px 0', fontSize: 11 }}>No trades</td></tr>
+                    padding: '20px 0', fontSize: 11 }}>
+                    {drillFilter
+                      ? (
+                        <div>
+                          <div style={{ fontWeight: 700, color: T.amber, marginBottom: 6 }}>
+                            NO MATCHING TRADES
+                          </div>
+                          <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 8 }}>
+                            Filters applied: {drillChips.map(c => c.label).join(' · ') || 'none'}
+                          </div>
+                          {onClearDrill && (
+                            <button onClick={onClearDrill}
+                              style={{ background: T.panelAlt, border: `1px solid ${T.border}`,
+                                borderRadius: 4, color: T.txtSec, padding: '4px 12px',
+                                fontSize: 9, cursor: 'pointer' }}>
+                              Clear filters
+                            </button>
+                          )}
+                        </div>
+                      )
+                      : 'No trades'
+                    }
+                  </td></tr>
                 )}
               </tbody>
             </table>
@@ -4985,6 +5181,8 @@ const JDirectionalTab: React.FC = () => {
 
 // ── Phase 7O: Journal Coaching Dashboard ─────────────────────────────────────
 // Read-only coaching analytics — never modifies trading logic or learning formulas.
+// Phase 7O.1 adds onDrill: clicking any insight switches to the Trade Log filtered
+// to exactly the trades that produced that coaching metric.
 
 interface JCoachCoverage {
   total: number; reviewed: number; excluded: number; incomplete: number;
@@ -5081,10 +5279,16 @@ function _confBadge(confidence: string) {
   );
 }
 
-const JCoachingTab: React.FC = () => {
+const JCoachingTab: React.FC<{
+  onDrill?: (f: JDrillFilter) => void;
+}> = ({ onDrill }) => {
   const [data,    setData]    = useState<JCoachData | null>(null);
   const [loading, setLoading] = useState(false);
   const [error,   setError]   = useState<string | null>(null);
+
+  // Hover state for drill-down highlighting: [section, rowIndex]
+  const [hovSec, setHovSec] = useState<string | null>(null);
+  const [hovIdx, setHovIdx] = useState<number>(-1);
 
   // Filters
   const [dateFrom,    setDateFrom]    = useState('');
@@ -5109,6 +5313,49 @@ const JCoachingTab: React.FC = () => {
     } catch (e) { setError(String(e)); }
     setLoading(false);
   }, [dateFrom, dateTo, fSource, fInstrument, fMode]);
+
+  /** Build a JDrillFilter that carries both the current coaching filter context
+   *  (date/source/instrument/mode) and the specific drill-down key(s). */
+  const _mkDrill = useCallback((
+    label: string,
+    count: number | undefined,
+    extra: Partial<JDrillFilter>,
+  ): JDrillFilter => ({
+    label,
+    count,
+    review_status: 'REVIEWED',
+    ...(dateFrom    ? { date_from:   dateFrom    } : {}),
+    ...(dateTo      ? { date_to:     dateTo      } : {}),
+    ...(fSource     ? { source:      fSource     } : {}),
+    ...(fInstrument ? { instrument:  fInstrument } : {}),
+    ...(fMode       ? { mode:        fMode       } : {}),
+    ...extra,
+  }), [dateFrom, dateTo, fSource, fInstrument, fMode]);
+
+  /** Keyboard handler for drill-able rows (Enter or Space activates) */
+  const _rowKey = (fn: () => void) => (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); fn(); }
+  };
+
+  /** Row style with hover highlight when onDrill is available */
+  const _rowSt = (sec: string, i: number): React.CSSProperties => ({
+    borderTop: `1px solid ${T.border}`,
+    cursor:    onDrill ? 'pointer' : 'default',
+    background: (hovSec === sec && hovIdx === i) ? T.panelAlt : 'transparent',
+    outline:   'none',
+  });
+
+  /** Last cell: show VIEW N TRADES on hover, confidence badge otherwise */
+  const _lastCell = (sec: string, i: number, n: number, conf: string, fn: () => void) =>
+    hovSec === sec && hovIdx === i && onDrill
+      ? <button onClick={e => { e.stopPropagation(); fn(); }}
+          style={{ fontSize: 7, background: T.cyan + '22', border: `1px solid ${T.cyan}55`,
+            borderRadius: 3, color: T.cyan, padding: '2px 5px', cursor: 'pointer',
+            whiteSpace: 'nowrap', fontWeight: 700 }}
+          aria-label={`View ${n} trades`}>
+          VIEW {n}
+        </button>
+      : _confBadge(conf);
 
   useEffect(() => { fetchCoaching(); }, [fetchCoaching]);
 
@@ -5243,8 +5490,17 @@ const JCoachingTab: React.FC = () => {
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <TableHead cols={['Mistake', 'N', 'Net R', 'Avg R', 'Win%', '']} />
                   <tbody>
-                    {data.costliest_mistakes.slice(0, 8).map((m, i) => (
-                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                    {data.costliest_mistakes.slice(0, 8).map((m, i) => {
+                      const doDrill = () => onDrill && onDrill(_mkDrill(
+                        `Mistake: ${m.tag.replace(/_/g,' ').toUpperCase()}`, m.n,
+                        { mistake_tag: m.tag.toLowerCase() }));
+                      return (
+                      <tr key={i} tabIndex={onDrill ? 0 : -1} role={onDrill ? 'button' : undefined}
+                        aria-label={onDrill ? `View ${m.n} trades tagged ${m.tag}` : undefined}
+                        onClick={doDrill} onKeyDown={_rowKey(doDrill)}
+                        onMouseEnter={() => { setHovSec('mst'); setHovIdx(i); }}
+                        onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                        style={_rowSt('mst', i)}>
                         <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtSec }}>
                           {m.tag.replace(/_/g, ' ').toLowerCase()}
                         </td>
@@ -5258,9 +5514,10 @@ const JCoachingTab: React.FC = () => {
                         <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>
                           {m.win_rate != null ? m.win_rate.toFixed(0) + '%' : '—'}
                         </td>
-                        <td style={{ padding: '3px 0' }}>{_confBadge(m.confidence)}</td>
+                        <td style={{ padding: '3px 0' }}>{_lastCell('mst', i, m.n, m.confidence, doDrill)}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
@@ -5278,8 +5535,17 @@ const JCoachingTab: React.FC = () => {
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <TableHead cols={['Behavior', 'N', 'Avg R', 'Win%', 'Plan%', '']} />
                   <tbody>
-                    {data.best_behaviors.slice(0, 8).map((b, i) => (
-                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                    {data.best_behaviors.slice(0, 8).map((b, i) => {
+                      const doDrill = () => onDrill && onDrill(_mkDrill(
+                        `Behavior: ${b.tag.replace(/_/g,' ').toUpperCase()}`, b.n,
+                        { positive_tag: b.tag.toLowerCase() }));
+                      return (
+                      <tr key={i} tabIndex={onDrill ? 0 : -1} role={onDrill ? 'button' : undefined}
+                        aria-label={onDrill ? `View ${b.n} trades with behavior ${b.tag}` : undefined}
+                        onClick={doDrill} onKeyDown={_rowKey(doDrill)}
+                        onMouseEnter={() => { setHovSec('beh'); setHovIdx(i); }}
+                        onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                        style={_rowSt('beh', i)}>
                         <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtSec }}>
                           {b.tag.replace(/_/g, ' ').toLowerCase()}
                         </td>
@@ -5293,9 +5559,10 @@ const JCoachingTab: React.FC = () => {
                         <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>
                           {b.plan_follow_pct != null ? b.plan_follow_pct.toFixed(0) + '%' : '—'}
                         </td>
-                        <td style={{ padding: '3px 0' }}>{_confBadge(b.confidence)}</td>
+                        <td style={{ padding: '3px 0' }}>{_lastCell('beh', i, b.n, b.confidence, doDrill)}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
@@ -5314,8 +5581,16 @@ const JCoachingTab: React.FC = () => {
                   <tbody>
                     {data.followed_plan_analytics.map((p, i) => {
                       const col = _PLAN_COLOR[p.followed_plan ?? ''] ?? T.txtMuted;
+                      const doDrill = () => onDrill && onDrill(_mkDrill(
+                        `Plan: ${(p.followed_plan || 'N/A').replace(/_/g,' ')}`, p.n,
+                        { followed_plan: p.followed_plan || undefined }));
                       return (
-                        <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                        <tr key={i} tabIndex={onDrill ? 0 : -1} role={onDrill ? 'button' : undefined}
+                          aria-label={onDrill ? `View ${p.n} trades with plan=${p.followed_plan}` : undefined}
+                          onClick={doDrill} onKeyDown={_rowKey(doDrill)}
+                          onMouseEnter={() => { setHovSec('pln'); setHovIdx(i); }}
+                          onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                          style={_rowSt('pln', i)}>
                           <td style={{ padding: '4px 10px 4px 0', fontSize: 10, color: col, fontWeight: 700 }}>
                             {(p.followed_plan || 'N/A').replace(/_/g, ' ')}
                           </td>
@@ -5325,7 +5600,7 @@ const JCoachingTab: React.FC = () => {
                           <td style={{ padding: '4px 10px 4px 0', fontSize: 9, color: T.txtMuted }}>{p.win_rate != null ? p.win_rate.toFixed(0) + '%' : '—'}</td>
                           <td style={{ padding: '4px 10px 4px 0', fontSize: 9, color: T.txtMuted }}>{p.avg_setup?.toFixed(1) ?? '—'}</td>
                           <td style={{ padding: '4px 10px 4px 0', fontSize: 9, color: T.txtMuted }}>{p.avg_execution?.toFixed(1) ?? '—'}</td>
-                          <td style={{ padding: '4px 0',           fontSize: 9, color: T.txtMuted }}>{p.avg_discipline?.toFixed(1) ?? '—'}</td>
+                          <td style={{ padding: '4px 0', fontSize: 9, color: T.txtMuted }}>{p.avg_discipline?.toFixed(1) ?? '—'}</td>
                         </tr>
                       );
                     })}
@@ -5349,8 +5624,18 @@ const JCoachingTab: React.FC = () => {
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <TableHead cols={['Strategy', 'N', 'Avg R', 'Win%', 'Plan%', '']} />
                   <tbody>
-                    {data.strategy_coaching.slice(0, 8).map((s, i) => (
-                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                    {data.strategy_coaching.slice(0, 8).map((s, i) => {
+                      const doDrill = () => onDrill && s.strategy_name && onDrill(_mkDrill(
+                        `Strategy: ${s.strategy_name.replace(/_/g,' ')}`, s.n,
+                        { strategy: s.strategy_name }));
+                      return (
+                      <tr key={i} tabIndex={onDrill && s.strategy_name ? 0 : -1}
+                        role={onDrill && s.strategy_name ? 'button' : undefined}
+                        aria-label={onDrill ? `View ${s.n} trades for strategy ${s.strategy_name}` : undefined}
+                        onClick={doDrill} onKeyDown={_rowKey(doDrill)}
+                        onMouseEnter={() => { setHovSec('str'); setHovIdx(i); }}
+                        onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                        style={_rowSt('str', i)}>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 8, color: T.txtSec,
                           maxWidth: 90, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
                           {s.strategy_name || '—'}
@@ -5359,9 +5644,10 @@ const JCoachingTab: React.FC = () => {
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(s.avg_r), fontWeight: 700 }}>{rFmt(s.avg_r)}</td>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{s.win_rate != null ? s.win_rate.toFixed(0) + '%' : '—'}</td>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{s.plan_follow_pct != null ? s.plan_follow_pct.toFixed(0) + '%' : '—'}</td>
-                        <td style={{ padding: '3px 0' }}>{_confBadge(s.confidence)}</td>
+                        <td style={{ padding: '3px 0' }}>{_lastCell('str', i, s.n, s.confidence, doDrill)}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
@@ -5376,16 +5662,27 @@ const JCoachingTab: React.FC = () => {
                 <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                   <TableHead cols={['Session', 'DOW', 'N', 'Net R', 'Win%', '']} />
                   <tbody>
-                    {data.session_analytics.slice(0, 10).map((s, i) => (
-                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                    {data.session_analytics.slice(0, 10).map((s, i) => {
+                      const doDrill = () => onDrill && s.session && onDrill(_mkDrill(
+                        `Session: ${s.session.replace(/_/g,' ').toUpperCase()}`, s.n,
+                        { session: s.session }));
+                      return (
+                      <tr key={i} tabIndex={onDrill && s.session ? 0 : -1}
+                        role={onDrill && s.session ? 'button' : undefined}
+                        aria-label={onDrill ? `View ${s.n} trades in session ${s.session}` : undefined}
+                        onClick={doDrill} onKeyDown={_rowKey(doDrill)}
+                        onMouseEnter={() => { setHovSec('ses'); setHovIdx(i); }}
+                        onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                        style={_rowSt('ses', i)}>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtSec }}>{s.session}</td>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{_DOW_LABEL[s.dow] ?? s.dow}</td>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>{s.n}</td>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(s.net_r), fontWeight: 700 }}>{rFmt(s.net_r)}</td>
                         <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{s.win_rate != null ? s.win_rate.toFixed(0) + '%' : '—'}</td>
-                        <td style={{ padding: '3px 0' }}>{_confBadge(s.confidence)}</td>
+                        <td style={{ padding: '3px 0' }}>{_lastCell('ses', i, s.n, s.confidence, doDrill)}</td>
                       </tr>
-                    ))}
+                      );
+                    })}
                   </tbody>
                 </table>
               )}
@@ -5401,8 +5698,17 @@ const JCoachingTab: React.FC = () => {
               <table style={{ width: '100%', borderCollapse: 'collapse' }}>
                 <TableHead cols={['Emotion', 'N', 'Avg Intensity', 'Net R', 'Win%', 'Plan%', '']} />
                 <tbody>
-                  {data.emotion_analytics.slice(0, 8).map((e, i) => (
-                    <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                  {data.emotion_analytics.slice(0, 8).map((e, i) => {
+                    const doDrill = () => onDrill && onDrill(_mkDrill(
+                      `Emotion: ${e.emotion.replace(/_/g,' ').toUpperCase()}`, e.n,
+                      { emotion_tag: e.emotion.toLowerCase() }));
+                    return (
+                    <tr key={i} tabIndex={onDrill ? 0 : -1} role={onDrill ? 'button' : undefined}
+                      aria-label={onDrill ? `View ${e.n} trades with emotion ${e.emotion}` : undefined}
+                      onClick={doDrill} onKeyDown={_rowKey(doDrill)}
+                      onMouseEnter={() => { setHovSec('emo'); setHovIdx(i); }}
+                      onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                      style={_rowSt('emo', i)}>
                       <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtSec }}>
                         {e.emotion.replace(/_/g, ' ').toLowerCase()}
                       </td>
@@ -5413,9 +5719,10 @@ const JCoachingTab: React.FC = () => {
                       <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(e.net_r), fontWeight: 700 }}>{rFmt(e.net_r)}</td>
                       <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>{e.win_rate != null ? e.win_rate.toFixed(0) + '%' : '—'}</td>
                       <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>{e.plan_follow_pct != null ? e.plan_follow_pct.toFixed(0) + '%' : '—'}</td>
-                      <td style={{ padding: '3px 0' }}>{_confBadge(e.confidence)}</td>
+                      <td style={{ padding: '3px 0' }}>{_lastCell('emo', i, e.n, e.confidence, doDrill)}</td>
                     </tr>
-                  ))}
+                    );
+                  })}
                 </tbody>
               </table>
             </div>
@@ -5471,9 +5778,24 @@ const JCoachingTab: React.FC = () => {
                   priority = (|net R|×2 + count×1) × min(1, n/20)
                 </span>
               </div>
-              {data.coaching_priority.slice(0, 10).map((p, i) => (
-                <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'center',
-                  padding: '5px 0', borderTop: i === 0 ? 'none' : `1px solid ${T.border}` }}>
+              {data.coaching_priority.slice(0, 10).map((p, i) => {
+                const doDrill = () => {
+                  if (!onDrill) return;
+                  const extra: Partial<JDrillFilter> = p.type === 'mistake'
+                    ? { mistake_tag: p.tag.toLowerCase() }
+                    : { positive_tag: p.tag.toLowerCase() };
+                  onDrill(_mkDrill(`Priority: ${p.tag.replace(/_/g,' ').toUpperCase()}`, undefined, extra));
+                };
+                return (
+                <div key={i} tabIndex={onDrill ? 0 : -1} role={onDrill ? 'button' : undefined}
+                  aria-label={onDrill ? `Drill into priority: ${p.tag}` : undefined}
+                  onClick={doDrill} onKeyDown={_rowKey(doDrill)}
+                  onMouseEnter={() => { setHovSec('pri'); setHovIdx(i); }}
+                  onMouseLeave={() => { setHovSec(null); setHovIdx(-1); }}
+                  style={{ display: 'flex', gap: 10, alignItems: 'center',
+                    padding: '5px 4px', borderTop: i === 0 ? 'none' : `1px solid ${T.border}`,
+                    cursor: onDrill ? 'pointer' : 'default', outline: 'none', borderRadius: 4,
+                    background: (hovSec === 'pri' && hovIdx === i) ? T.panelAlt : 'transparent' }}>
                   <span style={{ fontSize: 10, color: T.txtMuted, fontFamily: T.mono,
                     minWidth: 18, textAlign: 'right' }}>{i + 1}.</span>
                   <span style={{ fontSize: 9, color: T.red, fontWeight: 700, minWidth: 50, textAlign: 'center',
@@ -5484,9 +5806,16 @@ const JCoachingTab: React.FC = () => {
                     {p.tag.replace(/_/g, ' ').toUpperCase()}
                     <span style={{ color: T.txtMuted, fontWeight: 400 }}> — {p.description}</span>
                   </span>
-                  {_confBadge(p.confidence)}
+                  {hovSec === 'pri' && hovIdx === i && onDrill
+                    ? <button onClick={e => { e.stopPropagation(); doDrill(); }}
+                        style={{ fontSize: 7, background: T.cyan + '22', border: `1px solid ${T.cyan}55`,
+                          borderRadius: 3, color: T.cyan, padding: '2px 5px', cursor: 'pointer',
+                          fontWeight: 700 }}>OPEN</button>
+                    : _confBadge(p.confidence)
+                  }
                 </div>
-              ))}
+                );
+              })}
             </div>
           )}
 
@@ -5514,9 +5843,12 @@ const JCoachingTab: React.FC = () => {
   );
 };
 
-// ── Journal Full Page (outer shell) ──────────────────────────────────────────
+// ── Journal Full Page (outer shell) — Phase 7O.1 drill-down state + URL sync ──
 const JournalFullPage: React.FC = () => {
-  const [tab,        setTab]        = useState<JTab>('trades');
+  // Initialise from URL so refresh / shared links restore state
+  const _init = _urlReadJState();
+  const [tab,        setTab]        = useState<JTab>(_init.tab || 'trades');
+  const [drillFilter, setDrillFilter] = useState<JDrillFilter | null>(_init.drill);
   const [queueBadge, setQueueBadge] = useState<number | null>(null);
 
   // Keep the Review Queue badge count fresh when the page mounts and when
@@ -5531,10 +5863,52 @@ const JournalFullPage: React.FC = () => {
 
   useEffect(() => { refreshBadge(); }, [refreshBadge]);
 
+  // Sync URL when tab or drill changes (replaceState — no history entry)
+  useEffect(() => {
+    _urlSetJState(tab, drillFilter, false);
+  }, [tab, drillFilter]);
+
+  // Handle browser Back / Forward
+  useEffect(() => {
+    const handler = () => {
+      const { tab: t, drill: d } = _urlReadJState();
+      if (t) setTab(t);
+      setDrillFilter(d);
+    };
+    window.addEventListener('popstate', handler);
+    return () => window.removeEventListener('popstate', handler);
+  }, []);
+
+  /** Drill from coaching → trades: pushState so Back returns to coaching */
+  const handleDrill = useCallback((f: JDrillFilter) => {
+    setDrillFilter(f);
+    setTab('trades');
+    _urlSetJState('trades', f, true);
+  }, []);
+
+  const handleClearDrill = useCallback(() => {
+    setDrillFilter(null);
+  }, []);
+
+  const handleClearOneDrill = useCallback((key: keyof JDrillFilter) => {
+    setDrillFilter(prev => {
+      if (!prev) return null;
+      const next = { ...prev } as JDrillFilter;
+      // Remove rating_value together with rating_field
+      if (key === 'rating_field') { delete next.rating_field; delete next.rating_value; }
+      else { (next as unknown as Record<string, unknown>)[key as string] = undefined; }
+      // If no server-side filter keys remain, clear the whole drill
+      if (_DRILL_SERVER_KEYS.every(k => !next[k])) return null;
+      return next;
+    });
+  }, []);
+
   const handleTabChange = (t: JTab) => {
     setTab(t);
     // Refresh badge when leaving the queue tab (reviews may have been completed)
     if (t === 'trades') refreshBadge();
+    // Clear drill when operator manually clicks a tab
+    if (t !== 'trades') setDrillFilter(null);
   };
 
   return (
@@ -5544,17 +5918,22 @@ const JournalFullPage: React.FC = () => {
         <div style={{ fontSize: 13, fontWeight: 700, color: T.txtPri, letterSpacing: '0.04em' }}>
           Journal
         </div>
-        <div style={{ fontSize: 9, color: T.txtMuted }}>Phase 7N</div>
+        <div style={{ fontSize: 9, color: T.txtMuted }}>Phase 7O</div>
       </div>
       <JTabBar active={tab} onChange={handleTabChange} queueBadge={queueBadge} />
-      {tab === 'trades'      && <JTradesTab />}
+      {tab === 'trades'      && <JTradesTab
+        drillFilter={drillFilter}
+        onClearDrill={handleClearDrill}
+        onClearOneDrill={handleClearOneDrill}
+        onGoCoaching={() => { setDrillFilter(null); setTab('coaching'); }}
+      />}
       {tab === 'queue'       && <JReviewQueueTab onOpenReview={undefined} />}
       {tab === 'import'      && <JImportTab />}
       {tab === 'analytics'   && <JAnalyticsTab />}
       {tab === 'playbook'    && <JPlaybookTab />}
       {tab === 'learning'    && <JLearningTab />}
       {tab === 'directional' && <JDirectionalTab />}
-      {tab === 'coaching'    && <JCoachingTab />}
+      {tab === 'coaching'    && <JCoachingTab onDrill={handleDrill} />}
     </div>
   );
 };
