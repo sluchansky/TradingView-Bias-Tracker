@@ -24408,6 +24408,16 @@ def build_main_brain_payload(result, instrument=None):
     except Exception:
         pass
 
+    # ── prop_firm: operator risk snapshot (display-only, fail-open) ──────────────
+    # prop_firm_status_view() has its own internal try/except and always returns a
+    # safe dict.  We wrap the call here for belt-and-suspenders isolation so a
+    # broken prop-guard state can never fail the entire payload build.
+    prop_firm_snap: dict = {}
+    try:
+        prop_firm_snap = prop_firm_status_view()
+    except Exception as _pfexc:
+        logger.debug("build_main_brain_payload prop_firm: %s", _pfexc)
+
     return {
         "_version":          "v1",
         "generated_at":      now_utc().isoformat(),
@@ -24427,6 +24437,7 @@ def build_main_brain_payload(result, instrument=None):
         "alerts":            alerts,
         "system_status":     system_status,
         "candidate_preview": candidate_preview,
+        "prop_firm":         prop_firm_snap,
         "availability":      availability,
         "errors":            errors,
     }

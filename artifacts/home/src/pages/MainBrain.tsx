@@ -185,7 +185,8 @@ function buildMbContext(p: Record<string, unknown>, ticker: string): string {
   const at      = (p.active_trades     ?? {}) as Record<string, unknown>;
   const coach   = (p.coach             ?? {}) as Record<string, unknown>;
   const sys     = (p.system_status     ?? {}) as Record<string, unknown>;
-  const risk    = (p.risk_state        ?? {}) as Record<string, unknown>;
+  const propFirm    = (p.prop_firm ?? {}) as Record<string, unknown>;
+  const propMetrics = (propFirm.metrics ?? {}) as Record<string, unknown>;
 
   const edgeScore = Math.round(safeNum(eb.score ?? eb.total) ?? 0);
   const edgeGrade = safeStr(eb.grade ?? eb.label, '');
@@ -244,7 +245,10 @@ function buildMbContext(p: Record<string, unknown>, ticker: string): string {
       : 'No candidate developing',
     '',
     'RISK',
-    `Daily Losses: ${safeStr(risk.daily_losses_today, '—')}/${safeStr(risk.max_losses_per_day, '—')}`,
+    // Read operator risk fields from prop_firm.metrics (backend-calculated, not recalculated here)
+    `P&L Today: $${safeStr(propMetrics.pnl_today, '—')} | Limit: $${safeStr(propMetrics.daily_loss_limit, '—')} | Remaining: $${safeStr(propMetrics.daily_loss_remaining, '—')}`,
+    `Exposure: ${safeStr(propMetrics.open_contracts, '—')} contracts | Max: ${safeStr(propMetrics.max_contracts, '—')}`,
+    propFirm.enabled !== true ? 'Prop Protection: OFF' : `Prop Protection: ON (${safeStr((propFirm.account as Record<string,unknown> | null | undefined)?.name ?? propFirm.headline, 'active')})`,
     '',
     'ACTIVE TRADES',
     tradeSum,
@@ -515,18 +519,90 @@ const SideNav: React.FC<{ systemOk: boolean }> = ({ systemOk }) => {
 };
 
 // ── Market State Strip ────────────────────────────────────────────────────────
-const MarketStrip: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
-  const mkt   = (p.market   ?? {}) as Record<string, unknown>;
-  const ms    = (p.market_state ?? {}) as Record<string, unknown>;
-  const sys   = (p.system_status ?? {}) as Record<string, unknown>;
+// ── Operator risk state classifier ──────────────────────────────────────────
+// Derives a concise display state from the prop_firm block that
+// build_main_brain_payload() now includes.  Reads only existing backend-
+// calculated fields — never recalculates any trading threshold.
+//
+// Display labels match the operator states documented in the spec:
+//   UNAVAILABLE   — payload key absent (backend pre-fix, or connection issue)
+//   PROT OFF      — prop guard explicitly disabled
+//   NO ACCOUNT    — protection ON but no active account; live orders blocked
+//   DAILY LIMIT   — daily_loss_remaining ≤ 0 (limit hit or exceeded)
+//   DRAWDOWN      — drawdown_remaining ≤ 0 (floor breached)
+//   CAUTION       — < 20 % of daily budget remaining OR config warnings
+//   NORMAL        — all checks clear
+function computeOperatorRisk(p: Record<string, unknown>): {
+  label:  string;
+  detail: string | null;
+  color:  string;
+} {
+  const prop = (p.prop_firm ?? p.risk_ops ?? null) as Record<string, unknown> | null;
 
-  const cards = [
+  // Key absent — backend hasn't provided data yet (pre-fix deployment or error)
+  if (prop === null || typeof prop !== 'object' || Object.keys(prop).length === 0) {
+    return { label: 'UNAVAILABLE', detail: null, color: T.txtMuted };
+  }
+
+  const enabled = prop.enabled === true;
+  if (!enabled) {
+    return { label: 'PROT OFF', detail: null, color: T.txtMuted };
+  }
+
+  const account = (prop.account ?? null) as Record<string, unknown> | null;
+  if (!account || typeof account !== 'object') {
+    return { label: 'NO ACCOUNT', detail: 'Live orders blocked', color: T.red };
+  }
+
+  // Read backend-computed metrics — no recalculation here
+  const metrics = (prop.metrics ?? {}) as Record<string, unknown>;
+  const phase2  = Array.isArray(prop.phase2) ? (prop.phase2 as string[]) : [];
+  const dll     = safeNum(metrics.daily_loss_limit);
+  const dlr     = safeNum(metrics.daily_loss_remaining);
+  const ddr     = safeNum(metrics.drawdown_remaining);
+
+  // Hard blocks — budget exhausted (backend computed)
+  if (dll !== null && dlr !== null && dlr <= 0) {
+    return { label: 'DAILY LIMIT', detail: 'Daily limit reached', color: T.red };
+  }
+  if (ddr !== null && ddr <= 0) {
+    return { label: 'DRAWDOWN', detail: 'Floor breached', color: T.red };
+  }
+
+  // Caution zone: < 20 % of daily budget remaining (display-only threshold)
+  if (dll !== null && dlr !== null && dll > 0 && dlr < dll * 0.20) {
+    return { label: 'CAUTION', detail: `$${Math.round(dlr)} remaining`, color: T.amber };
+  }
+
+  // Prop configuration warnings (e.g. balance missing, intraday drawdown display-only)
+  if (phase2.length > 0) {
+    const msg = phase2[0];
+    const truncated = msg.length > 38 ? msg.slice(0, 38) + '…' : msg;
+    return { label: 'CAUTION', detail: truncated, color: T.amber };
+  }
+
+  // All clear — optionally show remaining budget as reassurance
+  const detail = (dll !== null && dlr !== null)
+    ? `$${Math.round(dlr)} of $${Math.round(dll)} remaining`
+    : null;
+  return { label: 'NORMAL', detail, color: T.green };
+}
+
+const MarketStrip: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  const mkt   = (p.market       ?? {}) as Record<string, unknown>;
+  const ms    = (p.market_state  ?? {}) as Record<string, unknown>;
+  const sys   = (p.system_status ?? {}) as Record<string, unknown>;
+  const risk  = computeOperatorRisk(p);
+
+  // Cards support an optional `detail` sub-label shown below the value.
+  type Card = { label: string; value: string; color: string; detail?: string | null };
+  const cards: Card[] = [
     { label:'MARKET',      value: safeStr(mkt.session_status, 'UNKNOWN'),  color: /open/i.test(String(mkt.session_status)) ? T.green : T.amber },
     { label:'INSTRUMENT',  value: safeStr(mkt.instrument, '—'),             color: T.cyan },
     { label:'MODE',        value: safeStr(mkt.trading_mode, '—'),           color: T.blue },
     { label:'EXECUTION',   value: safeStr(mkt.execution_mode, '—'),         color: T.amber },
     { label:'REGIME',      value: safeStr(ms.regime, '—'),                  color: T.txtSec },
-    { label:'RISK STATE',  value: safeStr(ms.risk_state, '—'),              color: /shock|off/i.test(String(ms.risk_state)) ? T.red : T.txtSec },
+    { label:'RISK STATE',  value: risk.label,                               color: risk.color, detail: risk.detail },
     { label:'DATABENTO',   value: sys.databento_ready ? 'LIVE' : 'OFFLINE', color: sys.databento_ready ? T.green : T.red },
   ];
 
@@ -539,6 +615,12 @@ const MarketStrip: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
         }}>
           <div style={{ fontSize:8.5, color:T.txtMuted, letterSpacing:'0.1em', marginBottom:4 }}>{c.label}</div>
           <div style={{ fontSize:12.5, fontWeight:700, color:c.color, fontFamily:T.mono, whiteSpace:'nowrap' }}>{c.value}</div>
+          {c.detail && (
+            <div style={{ fontSize:9, color:T.txtMuted, marginTop:3, fontFamily:T.mono,
+              whiteSpace:'nowrap', overflow:'hidden', textOverflow:'ellipsis', maxWidth:120 }}>
+              {c.detail}
+            </div>
+          )}
         </div>
       ))}
     </div>

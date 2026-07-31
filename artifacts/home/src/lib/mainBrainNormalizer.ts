@@ -41,6 +41,37 @@ export function mapStrategyResult(r: string): string {
   return r.toUpperCase() || '—';
 }
 
+// ── Operator risk state classifier ──────────────────────────────────────────
+// Pure function (no theme tokens, no React) — reads the prop_firm block that
+// build_main_brain_payload() now includes and returns a machine-readable state
+// token.  This is the canonical source for the Main Brain risk strip display.
+// Nothing here calculates or changes any trading threshold.
+//
+// State tokens:
+//   UNAVAILABLE  — prop_firm key absent or payload not yet loaded
+//   PROT_OFF     — prop guard explicitly disabled (operator config choice)
+//   NO_ACCOUNT   — protection ON but no active account; live orders will block
+//   DAILY_LIMIT  — daily_loss_remaining <= 0 (limit hit)
+//   DRAWDOWN     — drawdown_remaining <= 0 (floor breached)
+//   CAUTION      — daily budget < 20 % remaining OR config warnings present
+//   NORMAL       — all checks clear
+export function computeRiskOpsState(pf: Record<string, unknown>): string {
+  if (!pf || typeof pf !== 'object' || Object.keys(pf).length === 0) return 'UNAVAILABLE';
+  if (pf.enabled !== true) return 'PROT_OFF';
+  const acct    = pf.account;
+  if (acct == null || typeof acct !== 'object') return 'NO_ACCOUNT';
+  const m       = (pf.metrics  ?? {}) as Record<string, unknown>;
+  const dll     = safeNum(m.daily_loss_limit);
+  const dlr     = safeNum(m.daily_loss_remaining);
+  const ddr     = safeNum(m.drawdown_remaining);
+  if (dll !== null && dlr !== null && dlr <= 0) return 'DAILY_LIMIT';
+  if (ddr !== null && ddr <= 0) return 'DRAWDOWN';
+  if (dll !== null && dlr !== null && dll > 0 && dlr < dll * 0.20) return 'CAUTION';
+  const phase2  = Array.isArray(pf.phase2) ? pf.phase2 as unknown[] : [];
+  if (phase2.length > 0) return 'CAUTION';
+  return 'NORMAL';
+}
+
 // ── Normalizer ───────────────────────────────────────────────────────────────
 
 /**
@@ -230,6 +261,39 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
   // status: "READY" | "POTENTIAL" | "NO_CANDIDATE" | "UNAVAILABLE"
   const candidate_preview = (raw.candidate_preview ?? { status: 'NO_CANDIDATE', direction: null }) as Record<string, unknown>;
 
+  // ── risk_ops: flat operator risk snapshot (Part 4 schema) ────────────────────
+  // Sources: raw.prop_firm (from prop_firm_status_view() in build_main_brain_payload).
+  // No trading values computed — only reads existing backend-calculated fields.
+  // All numeric fields are null when the account is not configured.
+  const pf       = (raw.prop_firm  ?? {}) as Record<string, unknown>;
+  const pfM      = (pf.metrics    ?? {}) as Record<string, unknown>;
+  const pfLastD  = (pf.last_decision ?? {}) as Record<string, unknown>;
+  const pfAcct   = (pf.account    ?? {}) as Record<string, unknown>;
+  const pfPhase2 = Array.isArray(pf.phase2) ? pf.phase2 as string[] : [];
+  const risk_ops: Record<string, unknown> = {
+    state:                computeRiskOpsState(pf),
+    source:               pf.enabled === true ? 'prop_guard' : 'none',
+    enabled:              pf.enabled === true,
+    daily_pnl:            safeNum(pfM.pnl_today),
+    daily_loss_limit:     safeNum(pfM.daily_loss_limit),
+    remaining_daily_loss: safeNum(pfM.daily_loss_remaining),
+    drawdown_remaining:   safeNum(pfM.drawdown_remaining),
+    current_exposure:     safeNum(pfM.open_contracts),
+    max_contracts:        safeNum(pfM.max_contracts),
+    // execution_allowed: protection OFF or account present (else live orders block)
+    execution_allowed:    pf.enabled !== true || pfAcct.name != null,
+    // blocked_reason: present only when last prop eval was 'block'
+    blocked_reason:       pfLastD.decision === 'block'
+      ? ((pfLastD.reasons as string[] | null)?.[0] ?? null)
+      : null,
+    // config_warnings: forwarded from prop_firm phase2 array
+    config_warnings:      pfPhase2,
+    // account meta (display)
+    account_name:         pfAcct.name  ?? null,
+    account_firm:         pfAcct.firm  ?? null,
+    updated_at:           raw.generated_at ?? null,
+  };
+
   return {
     ...raw,
     market,
@@ -246,5 +310,6 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
     decision_timeline,
     main_brain,
     candidate_preview,
+    risk_ops,
   };
 }
