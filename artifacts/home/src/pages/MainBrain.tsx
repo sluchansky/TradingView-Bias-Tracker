@@ -1602,6 +1602,362 @@ const CleanestTradeButton: React.FC<{
   );
 };
 
+// ── Send-to-TradersPost eligibility (pure, no side-effects) — exported for tests
+//
+// Frontend gate: any check here that returns eligible=false disables the button
+// with an exact reason. Backend ALWAYS revalidates all conditions before any
+// order is placed — this layer exists only for UX clarity.
+//
+// Checked conditions:
+//   1.  Plan status must be READY (not POTENTIAL, NO_CANDIDATE, UNAVAILABLE)
+//   2.  Verdict.is_actionable must be true (not false/undefined)
+//   3.  Direction must be present
+//   4.  Entry zone must be present
+//   5.  Stop loss must be present and stop_valid !== false
+//   6.  Take profit target must be present
+//   7.  No hard blockers in verdict
+//   8.  Database must be ready (sys.db_ready)
+//   9.  Risk ops must not be in a blocking state
+//   10. No active trade conflict (backend also blocks, but surface here)
+//   11. Plan must be fresh (< 5 minutes old based on generated_at)
+export type MbSendEligibility = { eligible: boolean; disabledLabel: string };
+
+export function getMbSendEligibility(p: Record<string, unknown>): MbSendEligibility {
+  const cp     = (p.candidate_preview ?? {}) as Record<string, unknown>;
+  const vrd    = (p.verdict           ?? {}) as Record<string, unknown>;
+  const at     = (p.active_trades     ?? {}) as Record<string, unknown>;
+  const trades = Array.isArray(at.trades) ? at.trades as unknown[] : [];
+  const sys    = (p.system_status     ?? {}) as Record<string, unknown>;
+  const ro     = (p.risk_ops          ?? {}) as Record<string, unknown>;
+
+  // 1. Plan status
+  const planStatus = safeStr(cp.status, '');
+  if (planStatus !== 'READY') {
+    const miss = Array.isArray(cp.missing_confirmations)
+      ? (cp.missing_confirmations as string[]) : [];
+    return { eligible: false,
+             disabledLabel: miss.length > 0
+               ? 'WAITING FOR ' + String(miss[0]).toUpperCase().slice(0, 28)
+               : planStatus === 'POTENTIAL' ? 'SETUP STILL FORMING'
+               : 'TRADE NOT READY' };
+  }
+
+  // 2. Verdict actionable — is_actionable is explicitly false (undefined means we can't tell,
+  //    defer to backend rather than block)
+  if (vrd.is_actionable === false) {
+    return { eligible: false, disabledLabel: 'TRADE NOT ACTIONABLE' };
+  }
+
+  // 3. Direction
+  if (!cp.direction) {
+    return { eligible: false, disabledLabel: 'DIRECTION MISSING' };
+  }
+
+  // 4. Entry
+  if (cp.entry_zone == null) {
+    return { eligible: false, disabledLabel: 'ENTRY UNAVAILABLE' };
+  }
+
+  // 5. Stop — present and valid
+  if (cp.stop_loss == null) {
+    return { eligible: false, disabledLabel: 'STOP MISSING' };
+  }
+  if (cp.stop_valid === false) {
+    return { eligible: false, disabledLabel: 'STOP INVALID' };
+  }
+
+  // 6. Target
+  if (cp.take_profit == null) {
+    return { eligible: false, disabledLabel: 'TARGET MISSING' };
+  }
+
+  // 7. Hard blockers from verdict
+  const blockers = Array.isArray(vrd.hard_blockers) ? vrd.hard_blockers as string[] : [];
+  if (blockers.length > 0) {
+    return { eligible: false,
+             disabledLabel: 'VETO — ' + String(blockers[0]).slice(0, 32) };
+  }
+
+  // 8. Database
+  if (sys.db_ready === false) {
+    return { eligible: false, disabledLabel: 'DATABASE NOT READY' };
+  }
+
+  // 9. Risk ops
+  const roState = safeStr(ro.state, '');
+  if (roState === 'DAILY_LIMIT')      return { eligible: false, disabledLabel: 'DAILY LIMIT REACHED' };
+  if (roState === 'DRAWDOWN')         return { eligible: false, disabledLabel: 'DRAWDOWN LIMIT HIT' };
+  if (roState === 'NO_ACCOUNT')       return { eligible: false, disabledLabel: 'NO PROP ACCOUNT' };
+  if (ro.execution_allowed === false) return { eligible: false, disabledLabel: 'RISK STATE BLOCKED' };
+
+  // 10. Active trade conflict
+  if (trades.length > 0) {
+    return { eligible: false, disabledLabel: 'ACTIVE TRADE CONFLICT' };
+  }
+
+  // 11. Plan freshness (5-minute cap — backend check is authoritative, this avoids obvious stale UI)
+  const genAt = cp.generated_at as string | null | undefined;
+  if (genAt) {
+    const ageMs = Date.now() - new Date(String(genAt)).getTime();
+    if (!isNaN(ageMs) && ageMs > 5 * 60 * 1000) {
+      return { eligible: false, disabledLabel: 'PLAN STALE' };
+    }
+  }
+
+  return { eligible: true, disabledLabel: '' };
+}
+
+// ── MbSendModal — two-phase modal: confirm → sending → done ──────────────────
+//
+// Phase 1 (confirm): shows trade details for operator review.
+//   • CANCEL — closes, nothing sent.
+//   • CONFIRM AND SEND — calls onConfirm() once (sentRef prevents double-fire).
+//
+// Phase 2 (sending): spinner while awaiting backend response.
+//
+// Phase 3 (done): shows outcome:
+//   • success  → SENT TO TRADERSPOST / PAPER ORDER SIMULATED / MANUAL PLAN RETURNED
+//   • rejected → NOT SENT + exact backend reason
+//   • unknown  → STATUS UNKNOWN — VERIFY BEFORE RETRYING (no auto-retry ever)
+//
+// Idempotency: sentRef blocks double-clicks. The backend also enforces a 60-second
+// fingerprint-based dedup cooldown (TRADERSPOST_COOLDOWN_SEC) — if a retry within
+// that window would match, the backend returns 429 "Duplicate order suppressed".
+type MbSendOutcome =
+  | { type: 'success';  status: string; message: string;
+      plan: Record<string, unknown> | null; ts: string }
+  | { type: 'rejected'; reason: string; ts: string }
+  | { type: 'unknown';  ts: string };
+
+const MbSendModal: React.FC<{
+  p:         Record<string, unknown>;
+  onClose:   () => void;
+  onConfirm: () => Promise<MbSendOutcome>;
+}> = ({ p, onClose, onConfirm }) => {
+  const [phase,  setPhase]  = useState<'confirm' | 'sending' | 'done'>('confirm');
+  const [result, setResult] = useState<MbSendOutcome | null>(null);
+  const sentRef = useRef(false);
+
+  const cp  = (p.candidate_preview ?? {}) as Record<string, unknown>;
+  const mkt = (p.market            ?? {}) as Record<string, unknown>;
+  const sc  = (p.strategy_scanner  ?? {}) as Record<string, unknown>;
+  const vrd = (p.verdict           ?? {}) as Record<string, unknown>;
+
+  const instrument = safeStr(mkt.instrument,    '—');
+  const direction  = safeStr(cp.direction,      '—');
+  const strategy   = safeStr(
+    (sc.selected_strategy ?? sc.selected) as unknown, '—');
+  const mode       = safeStr(
+    (mkt.mode ?? mkt.trading_mode) as unknown, '—');
+  const entryZone  = safeStr(cp.entry_zone,     '—');
+  const stopLoss   = safeStr(cp.stop_loss,      '—');
+  const target     = safeStr(cp.take_profit,    '—');
+  const rr         = safeStr(cp.risk_reward,    '—');
+  const riskDollar = cp.risk_dollars_per_contract != null
+    ? `$${fmtNum(cp.risk_dollars_per_contract, 0)}` : '—';
+  const readiness  = safeStr(vrd.readiness_label as unknown ?? 'READY');
+  const dataAge    = fmtAge(cp.generated_at) || '—';
+  const isLong     = /long/i.test(direction);
+  const dirC       = isLong ? T.green : T.red;
+
+  const handleConfirm = async () => {
+    if (sentRef.current) return;          // idempotency guard
+    sentRef.current = true;
+    setPhase('sending');
+    const r = await onConfirm();
+    setResult(r);
+    setPhase('done');
+  };
+
+  const overlay: React.CSSProperties = {
+    position:'fixed', inset:0, zIndex:9990,
+    background:'rgba(0,0,0,0.72)',
+    display:'flex', alignItems:'center', justifyContent:'center',
+    backdropFilter:'blur(4px)',
+  };
+  const box: React.CSSProperties = {
+    background:T.panel, border:`1px solid ${T.borderMid}`,
+    borderRadius:14, width:420, maxWidth:'calc(100vw - 32px)',
+    padding:'22px 24px',
+    animation:'mbSendSlideIn 0.17s ease-out',
+    boxShadow:'0 16px 48px rgba(0,0,0,0.6)',
+    maxHeight:'90vh', overflowY:'auto',
+  };
+
+  // Detail row — used inside both confirm and result views
+  const SRow = ({ label, value, color }: { label:string; value:string; color?:string }) => (
+    <div style={{ display:'flex', justifyContent:'space-between',
+                  alignItems:'baseline',
+                  borderBottom:`1px solid ${T.border}`, padding:'5px 0' }}>
+      <span style={{ fontSize:10.5, color:T.txtMuted, letterSpacing:'0.03em',
+                     flexShrink:0 }}>{label}</span>
+      <span style={{ fontSize:11.5, color:color??T.txtPri, fontFamily:T.mono,
+                     fontWeight:600, textAlign:'right', marginLeft:8 }}>{value}</span>
+    </div>
+  );
+
+  // ── Confirm / Sending phases ──────────────────────────────────────────────
+  if (phase === 'confirm' || phase === 'sending') {
+    return (
+      <div style={overlay} onClick={phase==='confirm' ? onClose : undefined}>
+        <div style={box} onClick={e => e.stopPropagation()}>
+
+          {/* Header */}
+          <div style={{ display:'flex', justifyContent:'space-between',
+                        alignItems:'center', marginBottom:14 }}>
+            <div style={{ fontSize:12, fontWeight:700, color:T.cyan,
+                          letterSpacing:'0.07em' }}>
+              CONFIRM ORDER
+            </div>
+            {phase === 'confirm' && (
+              <button onClick={onClose} aria-label="Cancel"
+                style={{ background:'transparent', border:'none',
+                         color:T.txtMuted, cursor:'pointer',
+                         fontSize:20, lineHeight:1, padding:0 }}>×</button>
+            )}
+          </div>
+
+          {/* Trade detail rows */}
+          <SRow label="Instrument"    value={instrument} />
+          <SRow label="Direction"     value={direction.toUpperCase()} color={dirC} />
+          <SRow label="Strategy"      value={strategy} />
+          <SRow label="Mode"          value={mode} />
+          <SRow label="Entry Zone"    value={entryZone} color={T.cyan} />
+          <SRow label="Stop Loss"     value={stopLoss}  color={T.red} />
+          <SRow label="Take Profit"   value={target}    color={T.green} />
+          <SRow label="Risk / Reward" value={rr} />
+          <SRow label="Contracts"     value="1 (server-sized to risk cap)" />
+          <SRow label="Dollar Risk"   value={riskDollar} />
+          <SRow label="Readiness"     value={readiness}  color={T.green} />
+          <SRow label="Data Age"      value={dataAge}    color={T.amber} />
+
+          {/* Safety notice */}
+          <div style={{ marginTop:10, padding:'7px 10px', borderRadius:6,
+                        background:'rgba(239,68,68,0.07)',
+                        border:`1px solid rgba(239,68,68,0.18)` }}>
+            <div style={{ fontSize:9.5, color:'rgba(239,68,68,0.75)', lineHeight:1.5 }}>
+              ⚠ This sends a LIVE order through the existing TradersPost execution
+              gateway. The backend revalidates all safety conditions before
+              any order is placed. Contracts are sized server-side to your risk cap.
+            </div>
+          </div>
+
+          {/* Actions */}
+          {phase === 'confirm' ? (
+            <div style={{ display:'flex', gap:10, marginTop:14 }}>
+              <button onClick={onClose}
+                style={{ flex:1, padding:'9px 0', borderRadius:8, cursor:'pointer',
+                         fontSize:11, fontWeight:700,
+                         background:'transparent', border:`1px solid ${T.border}`,
+                         color:T.txtSec, letterSpacing:'0.06em' }}>
+                CANCEL
+              </button>
+              <button onClick={handleConfirm}
+                style={{ flex:2, padding:'9px 0', borderRadius:8, cursor:'pointer',
+                         fontSize:11, fontWeight:700,
+                         background: isLong
+                           ? 'rgba(34,197,94,0.13)' : 'rgba(239,68,68,0.13)',
+                         border:`1px solid ${dirC}`,
+                         color:dirC, letterSpacing:'0.06em' }}>
+                CONFIRM AND SEND
+              </button>
+            </div>
+          ) : (
+            <div style={{ marginTop:14, textAlign:'center',
+                          color:T.txtMuted, fontSize:11 }}>
+              <span style={{ animation:'mbDot 0.8s infinite', marginRight:6 }}>◌</span>
+              Sending to TradersPost…
+            </div>
+          )}
+        </div>
+      </div>
+    );
+  }
+
+  // ── Done phase ────────────────────────────────────────────────────────────
+  const r         = result!;
+  const isSuccess = r.type === 'success';
+  const isUnknown = r.type === 'unknown';
+  const outColor  = isSuccess ? T.green : isUnknown ? T.amber : T.red;
+  const outIcon   = isSuccess ? '✓' : isUnknown ? '⚠' : '✗';
+  const outLabel  = isSuccess
+    ? (r.status === 'sent'           ? 'SENT TO TRADERSPOST'
+     : r.status === 'simulated'      ? 'PAPER ORDER SIMULATED'
+     :                                  'MANUAL PLAN RETURNED')
+    : isUnknown
+    ? 'STATUS UNKNOWN — VERIFY BEFORE RETRYING'
+    : 'NOT SENT';
+
+  const tsStr = r.ts
+    ? new Date(r.ts).toLocaleTimeString('en-US',
+        { hour:'2-digit', minute:'2-digit', second:'2-digit',
+          hour12:true, timeZone:'America/New_York' }) + ' ET'
+    : '';
+
+  const successPlan = isSuccess
+    ? (r as Extract<MbSendOutcome, {type:'success'}>).plan : null;
+  const rejectedReason = !isSuccess && !isUnknown
+    ? (r as Extract<MbSendOutcome, {type:'rejected'}>).reason : null;
+  const successMsg = isSuccess
+    ? (r as Extract<MbSendOutcome, {type:'success'}>).message : '';
+
+  return (
+    <div style={overlay}>
+      <div style={box} onClick={e => e.stopPropagation()}>
+
+        {/* Result header */}
+        <div style={{ textAlign:'center', padding:'10px 0 6px' }}>
+          <div style={{ fontSize:30, color:outColor }}>{outIcon}</div>
+          <div style={{ fontSize:13, fontWeight:700, color:outColor,
+                        letterSpacing:'0.07em', marginTop:8 }}>
+            {outLabel}
+          </div>
+          <div style={{ fontSize:11, color:T.txtSec, marginTop:6, minHeight:16,
+                        lineHeight:1.5 }}>
+            {isUnknown
+              ? 'Network error — verify on your broker before retrying.'
+              : rejectedReason ?? successMsg}
+          </div>
+          {tsStr && (
+            <div style={{ fontSize:10, color:T.txtMuted, marginTop:6,
+                          fontFamily:T.mono }}>
+              {tsStr}
+            </div>
+          )}
+        </div>
+
+        {/* Confirmed plan detail block (success only) */}
+        {successPlan && (
+          <div style={{ marginTop:10, padding:'8px 10px', borderRadius:6,
+                        background:'rgba(56,189,248,0.05)',
+                        border:`1px solid rgba(56,189,248,0.12)` }}>
+            {successPlan.direction  != null &&
+              <SRow label="Direction"   value={String(successPlan.direction)}  color={dirC}   />}
+            {successPlan.entry      != null &&
+              <SRow label="Entry"       value={String(successPlan.entry)}      color={T.cyan} />}
+            {successPlan.stopLoss   != null &&
+              <SRow label="Stop"        value={String(successPlan.stopLoss)}   color={T.red}  />}
+            {successPlan.takeProfit != null &&
+              <SRow label="TP"          value={String(successPlan.takeProfit)} color={T.green}/>}
+            {successPlan.quantity   != null &&
+              <SRow label="Qty"         value={String(successPlan.quantity)}   />}
+          </div>
+        )}
+
+        {/* Close */}
+        <button onClick={onClose}
+          style={{ width:'100%', marginTop:16, padding:'9px 0', borderRadius:8,
+                   cursor:'pointer', fontSize:11, fontWeight:700,
+                   background:'transparent', border:`1px solid ${T.border}`,
+                   color:T.txtSec, letterSpacing:'0.06em' }}>
+          CLOSE
+        </button>
+      </div>
+    </div>
+  );
+};
+
+// ── Trade Plan Panel ──────────────────────────────────────────────────────────
 const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   // Source: p.candidate_preview — normalised by _mb_candidate_preview() on the backend.
   // States: READY | POTENTIAL | NO_CANDIDATE | UNAVAILABLE
@@ -1626,75 +1982,217 @@ const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     ? (cp.missing_confirmations as string[])
     : [];
 
+  // ── Send-to-TradersPost state ─────────────────────────────────────────────
+  const [modalOpen,  setModalOpen]  = useState(false);
+  const [sendResult, setSendResult] = useState<MbSendOutcome | null>(null);
+  const sendingRef = useRef(false);
+
+  const eligibility = getMbSendEligibility(p);
+
+  // Calls /api/traderspost via the existing endpoint (same path as Home.tsx ENTER button).
+  // Server-authoritative: backend recomputes full_analysis, re-runs every gate (market,
+  // risk cap, prop guard, training, dedup cooldown, is_actionable, stop validity, etc.)
+  // regardless of frontend eligibility state. Client sends only ticker + contracts: 1.
+  const handleMbSend = useCallback(async (): Promise<MbSendOutcome> => {
+    const ts         = new Date().toISOString();
+    const instrument = safeStr((p.market as Record<string, unknown>)?.instrument, '');
+    if (!instrument) return { type: 'rejected', reason: 'No instrument selected.', ts };
+    try {
+      const r = await fetch('/api/traderspost', {
+        method:      'POST',
+        credentials: 'include',
+        headers:     { 'Content-Type': 'application/json', ...getAuthHeader() },
+        body:        JSON.stringify({ ticker: instrument, contracts: 1 }),
+      });
+      let j: Record<string, unknown> = {};
+      try { j = await r.json() as Record<string, unknown>; } catch { /* leave empty */ }
+      const status = String(j.status ?? '');
+      if (status === 'sent' || status === 'simulated' || status === 'manual_required') {
+        return { type: 'success', status,
+                 message: String(j.message ?? ''),
+                 plan: (j.plan as Record<string, unknown> | null) ?? null, ts };
+      }
+      // 429 = duplicate suppressed; other 4xx/5xx = gateway rejection
+      const reason = String(j.reason ?? j.error ?? 'Gateway rejected.');
+      return { type: 'rejected', reason, ts };
+    } catch {
+      // Network-level failure — outcome unknown; never auto-retry
+      return { type: 'unknown', ts };
+    } finally {
+      sendingRef.current = false;
+    }
+  }, [p]);
+
+  const openModal = () => {
+    if (!eligibility.eligible) return;
+    sendingRef.current = false;   // reset guard so a fresh confirmation can fire
+    setSendResult(null);
+    setModalOpen(true);
+  };
+
   return (
-    <Panel title="Trade Plan">
-      {status === 'UNAVAILABLE' ? (
-        <UnavailableNote msg="Preview unavailable" />
-      ) : !hasPlan ? (
-        <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
-          No trade candidate developing
-        </div>
-      ) : (
-        <>
-          {/* Status header ─────────────────────────────────────────────────── */}
-          <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap', alignItems: 'center' }}>
-            {direction != null && <Pill text={String(direction)} color={dirColor(direction)} />}
-            <Pill text={statusLabel} color={statusColor} />
-            {hasActiveTrade && isPotential && (
-              <span style={{ fontSize: 9, color: T.amber, marginLeft: 'auto', letterSpacing: '0.06em', fontFamily: T.mono }}>
-                FUTURE CANDIDATE
-              </span>
-            )}
+    <>
+      <Panel title="Trade Plan">
+        {status === 'UNAVAILABLE' ? (
+          <UnavailableNote msg="Preview unavailable" />
+        ) : !hasPlan ? (
+          <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
+            No trade candidate developing
           </div>
-
-          {/* Core trade levels ──────────────────────────────────────────────── */}
-          {cp.entry_zone   != null && <KV label="Entry Zone"    value={safeStr(cp.entry_zone)}   mono valueColor={T.cyan}  />}
-          {cp.stop_loss    != null && <KV label="Stop Loss"     value={safeStr(cp.stop_loss)}    mono valueColor={T.red}   />}
-          {cp.take_profit  != null && <KV label="Take Profit"   value={safeStr(cp.take_profit)}  mono valueColor={T.green} />}
-          {cp.risk_reward  != null && <KV label="Risk / Reward" value={safeStr(cp.risk_reward)}  mono />}
-
-          {/* Risk sizing ───────────────────────────────────────────────────── */}
-          {cp.risk_points               != null && <KV label="Risk (pts)"      value={fmtNum(cp.risk_points, 2)}               mono />}
-          {cp.risk_dollars_per_contract != null && <KV label="Risk / Contract" value={`$${fmtNum(cp.risk_dollars_per_contract, 0)}`} mono />}
-
-          {/* ATR stop metadata ─────────────────────────────────────────────── */}
-          {(cp.atr != null || cp.stop_ticks != null) && (
-            <div style={{ marginTop: 7, paddingTop: 7, borderTop: `1px solid ${T.border}` }}>
-              {cp.atr != null && cp.atr_multiplier != null && (
-                <KV label="ATR Stop" value={`${fmtNum(cp.atr, 4)} pts × ${fmtNum(cp.atr_multiplier, 1)}`} mono />
-              )}
-              {cp.stop_ticks != null && (
-                <KV label="Stop Distance" value={`${String(cp.stop_ticks)} ticks`} mono />
-              )}
-              {cp.stop_valid === false && cp.stop_invalid_reason != null && (
-                <div style={{ marginTop: 4, fontSize: 10, color: T.red }}>
-                  ⚠ {safeStr(cp.stop_invalid_reason)}
-                </div>
+        ) : (
+          <>
+            {/* Status header ─────────────────────────────────────────────────── */}
+            <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+              {direction != null && <Pill text={String(direction)} color={dirColor(direction)} />}
+              <Pill text={statusLabel} color={statusColor} />
+              {hasActiveTrade && isPotential && (
+                <span style={{ fontSize: 9, color: T.amber, marginLeft: 'auto', letterSpacing: '0.06em', fontFamily: T.mono }}>
+                  FUTURE CANDIDATE
+                </span>
               )}
             </div>
-          )}
 
-          {/* Missing confirmations (POTENTIAL only) ─────────────────────── */}
-          {isPotential && missing.length > 0 && (
-            <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${T.border}` }}>
-              <div style={{ fontSize: 9, color: T.amber, letterSpacing: '0.06em', marginBottom: 4, fontFamily: T.mono }}>
-                WAITING FOR
+            {/* Core trade levels ──────────────────────────────────────────────── */}
+            {cp.entry_zone   != null && <KV label="Entry Zone"    value={safeStr(cp.entry_zone)}   mono valueColor={T.cyan}  />}
+            {cp.stop_loss    != null && <KV label="Stop Loss"     value={safeStr(cp.stop_loss)}    mono valueColor={T.red}   />}
+            {cp.take_profit  != null && <KV label="Take Profit"   value={safeStr(cp.take_profit)}  mono valueColor={T.green} />}
+            {cp.risk_reward  != null && <KV label="Risk / Reward" value={safeStr(cp.risk_reward)}  mono />}
+
+            {/* Risk sizing ───────────────────────────────────────────────────── */}
+            {cp.risk_points               != null && <KV label="Risk (pts)"      value={fmtNum(cp.risk_points, 2)}               mono />}
+            {cp.risk_dollars_per_contract != null && <KV label="Risk / Contract" value={`$${fmtNum(cp.risk_dollars_per_contract, 0)}`} mono />}
+
+            {/* ATR stop metadata ─────────────────────────────────────────────── */}
+            {(cp.atr != null || cp.stop_ticks != null) && (
+              <div style={{ marginTop: 7, paddingTop: 7, borderTop: `1px solid ${T.border}` }}>
+                {cp.atr != null && cp.atr_multiplier != null && (
+                  <KV label="ATR Stop" value={`${fmtNum(cp.atr, 4)} pts × ${fmtNum(cp.atr_multiplier, 1)}`} mono />
+                )}
+                {cp.stop_ticks != null && (
+                  <KV label="Stop Distance" value={`${String(cp.stop_ticks)} ticks`} mono />
+                )}
+                {cp.stop_valid === false && cp.stop_invalid_reason != null && (
+                  <div style={{ marginTop: 4, fontSize: 10, color: T.red }}>
+                    ⚠ {safeStr(cp.stop_invalid_reason)}
+                  </div>
+                )}
               </div>
-              {missing.map((m, i) => (
-                <div key={i} style={{ fontSize: 10, color: T.txtSec, paddingLeft: 8 }}>• {m}</div>
-              ))}
-            </div>
-          )}
+            )}
 
-          {/* Preview disclaimer ─────────────────────────────────────────── */}
-          {isPotential && (
-            <div style={{ marginTop: 8, fontSize: 9, color: T.txtMuted, fontStyle: 'italic' }}>
-              Preview only — setup developing, no order will be sent
-            </div>
-          )}
-        </>
+            {/* Missing confirmations (POTENTIAL only) ─────────────────────── */}
+            {isPotential && missing.length > 0 && (
+              <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${T.border}` }}>
+                <div style={{ fontSize: 9, color: T.amber, letterSpacing: '0.06em', marginBottom: 4, fontFamily: T.mono }}>
+                  WAITING FOR
+                </div>
+                {missing.map((m, i) => (
+                  <div key={i} style={{ fontSize: 10, color: T.txtSec, paddingLeft: 8 }}>• {m}</div>
+                ))}
+              </div>
+            )}
+
+            {/* Preview disclaimer ─────────────────────────────────────────── */}
+            {isPotential && (
+              <div style={{ marginTop: 8, fontSize: 9, color: T.txtMuted, fontStyle: 'italic' }}>
+                Preview only — setup developing, no order will be sent
+              </div>
+            )}
+
+            {/* ── SEND TO TRADERSPOST button (READY only) ──────────────────── */}
+            {isReady && (
+              <div style={{ marginTop: 12, paddingTop: 10,
+                            borderTop: `1px solid ${T.border}` }}>
+                {eligibility.eligible ? (
+                  <button
+                    onClick={openModal}
+                    style={{
+                      width: '100%', padding: '9px 0', borderRadius: 8,
+                      cursor: 'pointer', fontSize: 11, fontWeight: 700,
+                      background: 'rgba(56,189,248,0.10)',
+                      border:     `1px solid ${T.cyan}`,
+                      color:      T.cyan, letterSpacing: '0.06em',
+                      transition: 'background 0.15s',
+                    }}
+                    onMouseEnter={e => (e.currentTarget.style.background = 'rgba(56,189,248,0.18)')}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'rgba(56,189,248,0.10)')}
+                  >
+                    ↑ SEND TO TRADERSPOST
+                  </button>
+                ) : (
+                  <div style={{ textAlign: 'center' }}>
+                    <div style={{
+                      width: '100%', padding: '9px 0', borderRadius: 8,
+                      fontSize: 10.5, fontWeight: 700,
+                      background: 'rgba(255,255,255,0.03)',
+                      border:     `1px solid ${T.border}`,
+                      color:      T.txtMuted, letterSpacing: '0.05em',
+                      userSelect: 'none',
+                    }}>
+                      {eligibility.disabledLabel}
+                    </div>
+                    <div style={{ fontSize: 9, color: T.txtMuted, marginTop: 4,
+                                  fontStyle: 'italic' }}>
+                      Backend revalidates all conditions before any order is placed
+                    </div>
+                  </div>
+                )}
+
+                {/* Last send result (persists until next attempt or poll refresh) */}
+                {sendResult && (
+                  <div style={{
+                    marginTop: 8, padding: '6px 10px', borderRadius: 6, fontSize: 10,
+                    background: sendResult.type === 'success' ? 'rgba(34,197,94,0.08)'
+                              : sendResult.type === 'unknown' ? 'rgba(245,158,11,0.08)'
+                              :                                 'rgba(239,68,68,0.08)',
+                    border: `1px solid ${
+                      sendResult.type === 'success' ? 'rgba(34,197,94,0.20)'
+                    : sendResult.type === 'unknown' ? 'rgba(245,158,11,0.20)'
+                    :                                 'rgba(239,68,68,0.20)'}`,
+                    color: sendResult.type === 'success' ? T.green
+                         : sendResult.type === 'unknown' ? T.amber
+                         :                                 T.red,
+                    display: 'flex', justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}>
+                    <span style={{ fontWeight: 700 }}>
+                      {sendResult.type === 'success'  ? '✓ ' +
+                        (sendResult.status === 'sent'
+                          ? 'SENT TO TRADERSPOST'
+                          : sendResult.status === 'simulated'
+                          ? 'PAPER SIMULATED'
+                          : 'MANUAL PLAN RETURNED')
+                       : sendResult.type === 'unknown' ? '⚠ STATUS UNKNOWN'
+                       : '✗ NOT SENT'}
+                    </span>
+                    <span style={{ fontFamily: T.mono, fontSize: 9, color: T.txtMuted }}>
+                      {sendResult.ts
+                        ? new Date(sendResult.ts).toLocaleTimeString('en-US',
+                            { hour:'2-digit', minute:'2-digit', second:'2-digit',
+                              hour12:true, timeZone:'America/New_York' })
+                        : ''}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </Panel>
+
+      {/* Confirmation + result modal — position:fixed, outside panel scroll */}
+      {modalOpen && (
+        <MbSendModal
+          p={p}
+          onClose={() => setModalOpen(false)}
+          onConfirm={async () => {
+            const outcome = await handleMbSend();
+            setSendResult(outcome);
+            setModalOpen(false);
+            return outcome;
+          }}
+        />
       )}
-    </Panel>
+    </>
   );
 };
 
@@ -2883,6 +3381,10 @@ export default function MainBrain() {
         @keyframes mbAskSlideIn {
           from { opacity: 0; transform: translateY(14px) scale(0.97); }
           to   { opacity: 1; transform: translateY(0)    scale(1);    }
+        }
+        @keyframes mbSendSlideIn {
+          from { opacity: 0; transform: translateY(-10px) scale(0.97); }
+          to   { opacity: 1; transform: translateY(0)     scale(1);    }
         }
         @keyframes mbDot {
           0%, 100% { opacity: 0.25; transform: scale(0.8); }
