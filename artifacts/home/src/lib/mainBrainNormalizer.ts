@@ -226,6 +226,10 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
       : null;
   const main_brain: Record<string, unknown> = { voice: voiceStr };
 
+  // ── candidate_preview: pass-through (already normalized by backend) ─────────
+  // status: "READY" | "POTENTIAL" | "NO_CANDIDATE" | "UNAVAILABLE"
+  const candidate_preview = (raw.candidate_preview ?? { status: 'NO_CANDIDATE', direction: null }) as Record<string, unknown>;
+
   return {
     ...raw,
     market,
@@ -241,5 +245,6 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
     availability,
     decision_timeline,
     main_brain,
+    candidate_preview,
   };
 }

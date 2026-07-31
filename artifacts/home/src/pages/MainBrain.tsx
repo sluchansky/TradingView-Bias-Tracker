@@ -741,28 +741,95 @@ const ScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
 // ── Trade Plan Panel ──────────────────────────────────────────────────────────
 const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
-  const sc   = (p.strategy_scanner ?? {}) as Record<string, unknown>;
-  const plan = (sc.trade_plan ?? {}) as Record<string, unknown>;
-  const hasEntry = safeNum(plan.entry) != null && safeNum(plan.entry) !== 0;
+  // Source: p.candidate_preview — normalised by _mb_candidate_preview() on the backend.
+  // States: READY | POTENTIAL | NO_CANDIDATE | UNAVAILABLE
+  // Active-trade awareness: when a live position exists and a preview is also present,
+  // the preview is clearly labelled as a FUTURE CANDIDATE — never confused with the
+  // live position managed by ActiveTradesPanel.
+  const cp     = (p.candidate_preview ?? {}) as Record<string, unknown>;
+  const at     = (p.active_trades    ?? {}) as Record<string, unknown>;
+  const trades = Array.isArray(at.trades) ? at.trades as Record<string, unknown>[] : [];
+  const hasActiveTrade = trades.length > 0;
+
+  const status      = safeStr(cp.status, 'NO_CANDIDATE');
+  const direction   = cp.direction as string | null | undefined;
+  const isReady     = status === 'READY';
+  const isPotential = status === 'POTENTIAL';
+  const hasPlan     = isReady || isPotential;
+
+  const statusLabel = isReady ? 'READY' : isPotential ? 'POTENTIAL' : 'NO CANDIDATE';
+  const statusColor = isReady ? T.green  : isPotential ? T.amber    : T.txtMuted;
+
+  const missing = Array.isArray(cp.missing_confirmations)
+    ? (cp.missing_confirmations as string[])
+    : [];
 
   return (
     <Panel title="Trade Plan">
-      {!hasEntry ? (
-        <UnavailableNote msg="No actionable trade plan" />
+      {status === 'UNAVAILABLE' ? (
+        <UnavailableNote msg="Preview unavailable" />
+      ) : !hasPlan ? (
+        <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
+          No trade candidate developing
+        </div>
       ) : (
         <>
-          <div style={{ display:'flex', gap:6, marginBottom:10, flexWrap:'wrap' }}>
-            {plan.direction != null && <Pill text={String(plan.direction)} color={dirColor(plan.direction)} />}
-            {plan.setup     != null && <Badge label={String(plan.setup)} color={T.txtSec} />}
-            {plan.status    != null && <Badge label={String(plan.status)} color={readinessColor(plan.status)} />}
+          {/* Status header ─────────────────────────────────────────────────── */}
+          <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+            {direction != null && <Pill text={String(direction)} color={dirColor(direction)} />}
+            <Pill text={statusLabel} color={statusColor} />
+            {hasActiveTrade && isPotential && (
+              <span style={{ fontSize: 9, color: T.amber, marginLeft: 'auto', letterSpacing: '0.06em', fontFamily: T.mono }}>
+                FUTURE CANDIDATE
+              </span>
+            )}
           </div>
-          <KV label="Entry"    value={fmtNum(plan.entry)} mono valueColor={T.cyan} />
-          <KV label="Stop"     value={fmtNum(plan.stop)}  mono valueColor={T.red}  />
-          {plan.target_1 != null && <KV label="Target 1" value={fmtNum(plan.target_1)} mono valueColor={T.green} />}
-          {plan.target_2 != null && <KV label="Target 2" value={fmtNum(plan.target_2)} mono valueColor={T.green} />}
-          {plan.target_3 != null && <KV label="Target 3" value={fmtNum(plan.target_3)} mono valueColor={T.green} />}
-          {plan.rr != null && <KV label="Risk/Reward" value={`1 : ${fmtNum(plan.rr, 1)}`} mono />}
-          {plan.timeframe && <KV label="Timeframe"  value={String(plan.timeframe)} />}
+
+          {/* Core trade levels ──────────────────────────────────────────────── */}
+          {cp.entry_zone   != null && <KV label="Entry Zone"    value={safeStr(cp.entry_zone)}   mono valueColor={T.cyan}  />}
+          {cp.stop_loss    != null && <KV label="Stop Loss"     value={safeStr(cp.stop_loss)}    mono valueColor={T.red}   />}
+          {cp.take_profit  != null && <KV label="Take Profit"   value={safeStr(cp.take_profit)}  mono valueColor={T.green} />}
+          {cp.risk_reward  != null && <KV label="Risk / Reward" value={safeStr(cp.risk_reward)}  mono />}
+
+          {/* Risk sizing ───────────────────────────────────────────────────── */}
+          {cp.risk_points               != null && <KV label="Risk (pts)"      value={fmtNum(cp.risk_points, 2)}               mono />}
+          {cp.risk_dollars_per_contract != null && <KV label="Risk / Contract" value={`$${fmtNum(cp.risk_dollars_per_contract, 0)}`} mono />}
+
+          {/* ATR stop metadata ─────────────────────────────────────────────── */}
+          {(cp.atr != null || cp.stop_ticks != null) && (
+            <div style={{ marginTop: 7, paddingTop: 7, borderTop: `1px solid ${T.border}` }}>
+              {cp.atr != null && cp.atr_multiplier != null && (
+                <KV label="ATR Stop" value={`${fmtNum(cp.atr, 4)} pts × ${fmtNum(cp.atr_multiplier, 1)}`} mono />
+              )}
+              {cp.stop_ticks != null && (
+                <KV label="Stop Distance" value={`${String(cp.stop_ticks)} ticks`} mono />
+              )}
+              {cp.stop_valid === false && cp.stop_invalid_reason != null && (
+                <div style={{ marginTop: 4, fontSize: 10, color: T.red }}>
+                  ⚠ {safeStr(cp.stop_invalid_reason)}
+                </div>
+              )}
+            </div>
+          )}
+
+          {/* Missing confirmations (POTENTIAL only) ─────────────────────── */}
+          {isPotential && missing.length > 0 && (
+            <div style={{ marginTop: 8, paddingTop: 6, borderTop: `1px solid ${T.border}` }}>
+              <div style={{ fontSize: 9, color: T.amber, letterSpacing: '0.06em', marginBottom: 4, fontFamily: T.mono }}>
+                WAITING FOR
+              </div>
+              {missing.map((m, i) => (
+                <div key={i} style={{ fontSize: 10, color: T.txtSec, paddingLeft: 8 }}>• {m}</div>
+              ))}
+            </div>
+          )}
+
+          {/* Preview disclaimer ─────────────────────────────────────────── */}
+          {isPotential && (
+            <div style={{ marginTop: 8, fontSize: 9, color: T.txtMuted, fontStyle: 'italic' }}>
+              Preview only — setup developing, no order will be sent
+            </div>
+          )}
         </>
       )}
     </Panel>

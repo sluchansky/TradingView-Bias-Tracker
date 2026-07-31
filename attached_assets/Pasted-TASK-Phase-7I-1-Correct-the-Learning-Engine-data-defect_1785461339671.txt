@@ -1,0 +1,276 @@
+TASK: Phase 7I.1 — Correct the Learning Engine data defects and prove live weight lookup compatibility.
+
+CONTEXT
+
+The Phase 7I audit found:
+
+1. LEARNING_MIN_SAMPLE = 20, so current zero influence is expected with only six production strategy trades.
+2. strategy_trades.result stores uppercase values such as `WIN`.
+3. Learning SQL compares against `result='Win'`, causing win_rate to calculate as 0.0.
+4. The strategy key written to strategy_trades may not match the active key used by live weight lookup.
+5. The Coach diagnostics and tests are already implemented.
+
+GOAL
+
+Fix the confirmed learning-data defects without changing the learning threshold, weight formula, score caps, trading strategy logic, or execution behavior.
+
+STRICT SCOPE
+
+Allowed changes:
+
+- learning win-rate aggregation
+- canonical learning strategy-key normalization
+- learning weight lookup compatibility
+- related diagnostics and deterministic tests
+
+DO NOT modify:
+
+- LEARNING_MIN_SAMPLE
+- learning weight formula
+- weight cap or floor
+- Edge Score base calculations
+- strategy selection
+- alert thresholds
+- opposing-structure rules
+- Databento
+- TradersPost
+- execution
+- risk controls
+- active-trade management
+- polling
+- authentication
+- unrelated API contracts
+
+PART 1 — FIX THE WIN-RATE AGGREGATION
+
+Find every learning query that calculates wins or win rate from strategy_trades.result.
+
+Replace case-sensitive result comparisons with a canonical case-insensitive comparison.
+
+Preferred behavior:
+
+lower(trim(result)) = 'win'
+
+Apply this consistently to:
+
+- _recompute_learning
+- _recompute_learning_eligibility
+- any other production learning aggregation using result values
+
+Do not change stored historical rows merely to hide the query defect.
+
+The aggregation must support existing uppercase values and future case variations safely.
+
+PART 2 — VERIFY HISTORICAL RESULTS
+
+Before and after the fix, query the same production strategy_trades data and report:
+
+- strategy key
+- sample count
+- stored result values
+- computed win count
+- computed loss count
+- computed win rate
+- average R
+
+Prove that existing `WIN` rows are counted correctly after the fix.
+
+Do not recompute or apply live weights yet unless the existing production flow normally does so and the sample threshold is met.
+
+PART 3 — DEFINE ONE CANONICAL LEARNING KEY
+
+Trace all key formats used by:
+
+- trade registration
+- strategy_trades persistence
+- learning recomputation
+- strategy_weights persistence
+- _strategy_weight_for
+- compute_strategy_engine active strategy
+- live learning score influence
+- Coach diagnostics
+
+Choose one canonical learning key representation using existing canonical strategy identifiers.
+
+The canonical key must distinguish the dimensions genuinely required by the current learning model.
+
+At minimum, explicitly determine whether the key includes:
+
+- instrument
+- mode
+- strategy
+- direction
+
+Do not add dimensions without evidence that the current model requires them.
+
+Create one shared helper for producing or normalizing the learning key.
+
+Do not maintain separate ad hoc string-building logic in multiple functions.
+
+PART 4 — BACKWARD COMPATIBILITY
+
+Production already contains legacy keys such as:
+
+MGC_SCALP_CHOCH_Long
+
+Do not orphan existing learning data.
+
+Implement a safe compatibility path:
+
+1. Attempt canonical key lookup.
+2. Resolve known legacy key formats deterministically.
+3. Never apply a weight from a different:
+   - instrument
+   - mode
+   - strategy
+   - direction
+4. Expose whether the lookup matched:
+   - CANONICAL
+   - LEGACY_COMPAT
+   - NOT_FOUND
+
+Do not use fuzzy matching.
+
+Do not use substring matching that could map the wrong strategy.
+
+PART 5 — MIGRATION DECISION
+
+Determine whether persisted legacy rows should be migrated.
+
+Preferred approach:
+
+- provide an idempotent migration or canonical alias mapping
+- preserve original data
+- prevent duplicate counting
+- ensure repeated startup does not create duplicate weight rows
+
+If migration introduces unnecessary risk, retain a deterministic compatibility lookup and document why.
+
+Do not delete historical rows.
+
+PART 6 — LIVE LOOKUP PROOF
+
+Create a deterministic proof covering this complete path:
+
+trade recorded
+→ strategy_trades canonical or compatible key
+→ sample aggregation
+→ strategy weight persisted
+→ compute_strategy_engine returns active strategy
+→ _strategy_weight_for resolves the same key
+→ learning influence is applied exactly once
+
+Because the production sample count remains below 20, use isolated test fixtures with at least 20 samples for the proof.
+
+Do not lower the production threshold.
+
+PART 7 — REQUIRED TESTS
+
+Add or update tests for:
+
+CASE A
+Results stored as `WIN`, `Win`, and `win` all count as wins.
+
+CASE B
+Results stored as `LOSS`, `Loss`, and `loss` all count as losses.
+
+CASE C
+Whitespace around result values is ignored safely.
+
+CASE D
+A 20-sample winning strategy produces the expected non-neutral weight.
+
+CASE E
+Canonical persisted key is found by live lookup.
+
+CASE F
+Known legacy key is resolved through LEGACY_COMPAT.
+
+CASE G
+A legacy MGC key cannot match MNQ.
+
+CASE H
+A Long key cannot match Short.
+
+CASE I
+A SCALP key cannot match SWING.
+
+CASE J
+A similarly named strategy cannot match the wrong strategy.
+
+CASE K
+Duplicate canonical and legacy rows are not double-counted.
+
+CASE L
+Below 20 samples still produces neutral weight and zero influence.
+
+CASE M
+Learning influence is applied exactly once to the final score.
+
+CASE N
+Feature flag off still prevents live influence.
+
+CASE O
+Restart preserves the canonical/compatible weight lookup.
+
+PART 8 — COACH DIAGNOSTICS
+
+Extend the existing learning_diagnostics only as needed to show:
+
+- canonical_strategy_key
+- stored_strategy_key
+- lookup_status
+- result_normalization_status
+- aggregate_win_count
+- aggregate_loss_count
+- aggregate_win_rate
+
+Do not redesign the Coach panel again.
+
+Do not expose misleading success states.
+
+PART 9 — VALIDATION
+
+Run:
+
+- focused learning-engine tests
+- Phase 7I test_learning_engine.py
+- thesis-resolution tests
+- strategy-engine regressions
+- Main Brain regressions
+- persistence tests
+- TypeScript typecheck
+- production build
+- git diff --check
+
+Also run the known combined-order regression command that exposed the pre-existing test isolation issue.
+
+Report that issue separately and do not misclassify it as introduced by this task.
+
+PART 10 — STOP CONDITIONS
+
+Stop and report before changing code if:
+
+- the canonical key dimensions cannot be determined safely
+- fixing the key would change strategy identity semantics
+- historical rows contain ambiguous keys that cannot be mapped deterministically
+- any proposed migration could merge different strategies or directions
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Files changed
+4. Exact SQL comparisons changed
+5. Before-and-after production aggregation results
+6. Canonical learning-key format
+7. Legacy compatibility behavior
+8. Whether a migration was implemented
+9. Full live lookup proof
+10. Test results
+11. TypeScript and build results
+12. Known pre-existing failures
+13. Confirmation that LEARNING_MIN_SAMPLE remains 20
+14. Confirmation that no Databento, trading strategy, execution, risk, or alert behavior was modified

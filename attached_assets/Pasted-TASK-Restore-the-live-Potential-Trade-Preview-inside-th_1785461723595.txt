@@ -1,0 +1,382 @@
+TASK: Restore the live Potential Trade Preview inside the Main Brain Trade Plan panel.
+
+PROBLEM
+
+The legacy dashboard shows a useful developing setup preview:
+
+- Potential Long / Potential Short
+- Not yet Ready
+- Entry range
+- Stop loss
+- Take-profit level
+- Risk-to-reward ratio
+- Risk distance
+- Dollar risk per contract
+- Expected profit per contract
+- ATR value and ATR multiplier
+- Calculated stop
+- Stop distance in ticks
+- Stop validation
+- Live-price anchoring status
+- Refresh/update timing
+- Confirmation that the actual setup zone remains unchanged
+
+The Main Brain currently shows only:
+
+“No actionable trade plan”
+
+when a candidate exists but has not reached READY status.
+
+This removes important information from the operator.
+
+GOAL
+
+Display the existing live candidate trade preview inside the Main Brain TRADE PLAN panel whenever a valid developing setup exists, even if the verdict is WAIT or NOT ACTIONABLE.
+
+This is a DISPLAY AND DATA-MAPPING task.
+
+Do not create a new trade plan calculation.
+
+Reuse the exact existing backend values and canonical calculation path that power the legacy preview.
+
+STRICT SAFETY SCOPE
+
+DO NOT modify:
+
+- Databento
+- Market-data ingestion
+- Candidate generation
+- Strategy logic
+- Edge Score
+- Readiness gates
+- Opposing-structure rules
+- Entry calculations
+- Stop calculations
+- ATR logic
+- Position sizing
+- Risk calculations
+- Profit-target calculations
+- TradersPost
+- Execution
+- Active-trade management
+- Learning logic
+- Polling intervals
+- Authentication
+
+The Main Brain must be a read-only consumer of the existing trade-preview data.
+
+PART 1 — TRACE THE EXISTING PREVIEW
+
+Locate the exact backend and frontend implementation that produces the legacy preview shown in the reference screenshot.
+
+Trace:
+
+candidate setup
+→ preview calculation
+→ API response
+→ legacy dashboard renderer
+
+Document:
+
+- file paths
+- function names
+- source fields
+- API JSON paths
+- formatting logic
+- refresh behavior
+- fallback behavior
+
+Do not duplicate calculations in React.
+
+PART 2 — USE THE CANONICAL SOURCE
+
+Expose or reuse the existing preview object in `/api/main-brain`.
+
+Preferred behavior:
+
+- reuse an existing canonical trade-plan or candidate-preview object
+- add only a thin adapter if the Main Brain contract requires one
+- preserve original numeric values
+- preserve original units
+- preserve nulls and unavailable states
+- do not recalculate values in the frontend
+
+Suggested semantic fields:
+
+{
+  "status": "POTENTIAL",
+  "direction": "LONG",
+  "readiness": "NOT_READY",
+  "entry_low": 52571,
+  "entry_high": 52579,
+  "stop_loss": 52555,
+  "take_profit": 52595,
+  "risk_reward": "1:1",
+  "risk_distance_points": 20,
+  "risk_dollars_per_contract": 10,
+  "expected_profit_per_contract": 10,
+  "atr": 7.5714,
+  "atr_multiplier": 1.5,
+  "calculated_stop": 52558,
+  "stop_ticks": 20,
+  "stop_valid": true,
+  "preview_price": 52575,
+  "price_anchor_live": true,
+  "refresh_interval_seconds": 10,
+  "next_refresh_seconds": 5,
+  "setup_zone_unchanged": true
+}
+
+Use actual existing field names and values where available.
+
+Do not fabricate unavailable data.
+
+PART 3 — MAIN BRAIN TRADE PLAN STATES
+
+The TRADE PLAN panel must support these states:
+
+STATE A — NO CANDIDATE
+
+Display:
+
+NO TRADE CANDIDATE
+
+No qualified setup is currently forming.
+
+STATE B — POTENTIAL / NOT READY
+
+Display the full preview.
+
+Header example:
+
+POTENTIAL LONG — NOT YET READY
+
+or:
+
+POTENTIAL SHORT — NOT YET READY
+
+Show:
+
+Entry
+Stop Loss
+Take Profit
+R:R
+Risk Distance
+Dollar Risk / Contract
+Expected Profit / Contract
+ATR
+ATR Multiplier
+Calculated Stop
+Stop Ticks
+Stop Validation
+Preview Price
+Refresh Status
+Setup Zone Status
+
+STATE C — READY / ACTIONABLE
+
+Display:
+
+READY LONG
+
+or:
+
+READY SHORT
+
+Show the same plan values plus the existing actionable state.
+
+Do not create execution controls unless they already exist in the canonical design.
+
+STATE D — ACTIVE TRADE
+
+Do not replace active-trade management with the preview.
+
+When an active trade exists:
+
+- keep ACTIVE TRADES as the source of truth
+- either hide the candidate preview or clearly label it as a separate future candidate
+- never confuse a preview with the live position
+
+STATE E — DATA UNAVAILABLE
+
+Display:
+
+TRADE PREVIEW UNAVAILABLE
+
+Include the actual diagnostic reason when available.
+
+PART 4 — VISUAL DESIGN
+
+Use the existing Main Brain styling.
+
+Do not copy the old terminal styling literally.
+
+Within the TRADE PLAN panel:
+
+- make direction and readiness prominent
+- use clear rows or a compact grid
+- keep numeric values aligned
+- use green only for valid/confirmed states
+- use amber for potential/not-ready
+- use red only for invalid or blocked values
+- keep units visible
+- avoid tiny unreadable text
+
+Suggested layout:
+
+POTENTIAL LONG — NOT YET READY
+
+Entry Zone        52571–52579
+Stop Loss         52555
+Take Profit       52595
+Risk / Reward     1:1
+
+Risk Distance     20 pts
+Risk / Contract   $10
+Expected Profit   $10
+
+ATR               7.5714 × 1.5
+Calculated Stop   52558
+Stop Distance     20 ticks
+Stop Check        VALID
+
+Preview anchored to live price 52575
+Refreshes every 10s · next update in 5s
+Actual setup zone unchanged
+
+PART 5 — IMPORTANT SEMANTICS
+
+Clearly distinguish:
+
+- candidate preview price
+- actual entry zone
+- calculated stop
+- final stop loss
+- readiness
+- actionability
+- active trade
+
+Do not imply that a developing setup is approved for execution.
+
+The label “NOT YET READY” must remain visible whenever the setup is non-actionable.
+
+PART 6 — REFRESH BEHAVIOR
+
+Reuse the current Main Brain polling stream.
+
+Do not create another interval.
+
+If the legacy preview updates every 10 seconds independently, determine the canonical backend behavior and expose its timestamps through the existing Main Brain response.
+
+The frontend may calculate a visual countdown from timestamps, but it must not start another data-fetching loop.
+
+PART 7 — TESTS
+
+Add deterministic tests for:
+
+CASE A
+No candidate exists.
+Expected:
+NO TRADE CANDIDATE
+
+CASE B
+Potential Long exists but is not ready.
+Expected:
+full preview with NOT YET READY
+
+CASE C
+Potential Short exists but is not ready.
+Expected:
+correct direction and values
+
+CASE D
+Candidate is READY.
+Expected:
+READY state and complete plan
+
+CASE E
+Stop validation is false.
+Expected:
+invalid state clearly shown without changing the plan
+
+CASE F
+One or more preview fields are unavailable.
+Expected:
+safe placeholder, no fabricated zero
+
+CASE G
+Active trade exists.
+Expected:
+preview does not replace active-trade state
+
+CASE H
+Main Brain refreshes repeatedly.
+Expected:
+no duplicate polling or duplicate preview intervals
+
+CASE I
+Legacy preview and Main Brain preview receive the same source fixture.
+Expected:
+all core numeric values match exactly
+
+CASE J
+Candidate is blocked by opposing structure.
+Expected:
+preview remains visible, but readiness remains NOT READY and the blocker is shown elsewhere in the verdict diagnostics
+
+PART 8 — SCREENSHOT EVIDENCE
+
+Capture Main Brain screenshots for:
+
+1. No candidate
+2. Potential Long / Not Ready
+3. Potential Short / Not Ready
+4. Ready setup
+5. Invalid stop or unavailable-data state
+
+At minimum, provide a screenshot matching the reference scenario:
+
+POTENTIAL LONG — NOT YET READY
+
+with the full entry, stop, target, risk, ATR, and live-preview information visible.
+
+PART 9 — VALIDATION
+
+Run:
+
+- focused trade-preview tests
+- Main Brain regression tests
+- strategy regression tests
+- risk/sizing tests
+- TypeScript typecheck
+- production build
+- git diff --check
+
+Do not fix unrelated failures.
+
+STOP CONDITIONS
+
+Stop and report if:
+
+- the legacy preview calculations are duplicated in multiple places
+- the canonical source cannot be identified
+- exposing the preview would require changing calculation behavior
+- values shown by the legacy dashboard do not match backend canonical values
+- the task would require changes to trading or execution logic
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Files changed
+4. Canonical preview source
+5. Main Brain API fields reused or added
+6. Trade Plan panel states implemented
+7. Proof that Main Brain and legacy preview values match
+8. Test results
+9. TypeScript result
+10. Production build result
+11. Screenshot locations
+12. Confirmation that no trade calculation, Databento, risk, execution, or polling logic was changed

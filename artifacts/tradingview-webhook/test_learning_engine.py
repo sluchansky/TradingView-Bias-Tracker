@@ -154,7 +154,7 @@ with _app.LEARNING_LOCK:
     _app.LEARNING_SAMPLE_BY_KEY["SCALP::CHOCH_LONG"] = 25
     _app.LEARNING_ANALYTICS["updated_at"] = "2026-07-31T01:00:00"
 
-w_e, n_e = _app._strategy_weight_for("CHOCH_LONG", mode="SCALP")
+w_e, n_e, _st_e = _app._strategy_weight_for("CHOCH_LONG", mode="SCALP")
 check("Case E: weight is readable from STRATEGY_WEIGHTS at n=25",
       w_e == 1.18)
 check("Case E: sample_count is readable from LEARNING_SAMPLE_BY_KEY at n=25",
@@ -208,20 +208,26 @@ with _app.LEARNING_LOCK:
     _app.LEARNING_SAMPLE_BY_KEY["SCALP::MGC_SCALP_CHOCH_Long"] = 25
     _app.LEARNING_ANALYTICS["updated_at"] = "2026-07-31T01:00:00"
 
-# Live lookup uses bare strategy name (e.g., "CHOCH_LONG" from strategy engine)
-w_miss, n_miss = _app._strategy_weight_for("CHOCH_LONG", mode="SCALP")
-check("Case G: lookup with 'CHOCH_LONG' → MISSES 'MGC_SCALP_CHOCH_Long' → neutral 1.0",
+# Live lookup uses bare strategy name (e.g., "CHOCH_LONG" from strategy engine).
+# "CHOCH_LONG" is NOT in STRATEGY_DEFS so _canonical_learning_key returns NOT_FOUND;
+# legacy compat also fails (CHOCH not in _LEGACY_STRATEGY_KEY_MAP with a mapping).
+w_miss, n_miss, st_miss = _app._strategy_weight_for("CHOCH_LONG", mode="SCALP")
+check("Case G: lookup with 'CHOCH_LONG' → MISSES → neutral 1.0",
       w_miss == 1.0,
-      "DOCUMENTED KEY MISMATCH: instrument-prefixed store key ≠ bare engine active_key")
+      "instrument-prefixed store key ≠ bare engine active_key")
 check("Case G: sample_count from mismatched key → 0",
       n_miss == 0,
       "n=0 → _resolve_learning_score_influence returns None even though 25 samples exist")
+check("Case G: lookup_status = NOT_FOUND (no legacy compat for CHOCH)",
+      st_miss == "NOT_FOUND")
 
-# Direct key lookup succeeds with exact stored key
-w_hit, n_hit = _app._strategy_weight_for("MGC_SCALP_CHOCH_Long", mode="SCALP")
+# Direct key lookup with exact stored key still returns CANONICAL since it hits the cache
+w_hit, n_hit, st_hit = _app._strategy_weight_for("MGC_SCALP_CHOCH_Long", mode="SCALP")
 check("Case G: lookup with exact stored key → succeeds (weight=1.22, n=25)",
       w_hit == 1.22 and n_hit == 25,
       f"weight={w_hit}, n={n_hit}")
+check("Case G: lookup with exact stored key → status CANONICAL",
+      st_hit == "CANONICAL")
 print("   FINDING: The engine's active_key format and strategy_trades.strategy_key")
 print("   format may differ. Verify these match in production trade registrations.")
 

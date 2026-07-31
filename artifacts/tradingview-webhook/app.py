@@ -10373,7 +10373,7 @@ def compute_strategy_engine(ticker, current_price, vwap_value, vwap_status, vola
         # Capped to ±LEARNING_CONF_ADJ_CAP so history nudges, never dominates. The
         # engine stays DISPLAY-ONLY in Phase 1 — this only moves what's shown, never
         # the strict gate / verdict / money path. FAIL-OPEN: default weight 1.0.
-        hist_weight, hist_n = _strategy_weight_for(active_key)
+        hist_weight, hist_n, _ = _strategy_weight_for(active_key, instrument=inst)
         hist_adj = 0
         if hist_n >= LEARNING_MIN_SAMPLE:
             hist_adj = int(max(-LEARNING_CONF_ADJ_CAP,
@@ -11186,16 +11186,116 @@ def _ns_learning_key(base_key, mode):
     return base_key
 
 
-def _strategy_weight_for(key, mode=None):
-    """(weight, sample_size) for a strategy_key — mode-namespaced key tried first,
-    bare key as warm-up fallback. Neutral (1.0, 0) when missing; NEVER 0."""
+# ── Canonical learning-key helpers (Phase 7I.1) ──────────────────────────────
+#
+# Canonical key = one of the five STRATEGY_PRIORITY identifiers, e.g.
+#   LIQUIDITY_SWEEP_REVERSAL, VWAP_TREND_CONTINUATION, …
+# Namespaced key stored in STRATEGY_WEIGHTS:
+#   "{mode}::{canonical_key}"  e.g.  "SCALP::LIQUIDITY_SWEEP_REVERSAL"
+#
+# Legacy key format (older code snapshot):
+#   "{instrument}_{mode}_{strategy_type}_{direction}"
+#   e.g. "MGC_SCALP_CHOCH_Long"
+# These were produced when active_key was instrument-prefixed. They are
+# preserved in strategy_trades for historical accuracy but cannot be safely
+# applied to the current lookup because the strategy-type segment (CHOCH, BOS,
+# etc.) has no deterministic mapping to a current STRATEGY_PRIORITY key.
+# → LEGACY_COMPAT always resolves to NOT_FOUND for current production data.
+# This is correct: legacy weights are retained in storage, never applied.
+
+_KNOWN_INSTRUMENTS_LS = frozenset(
+    {"MGC", "MNQ", "MES", "MYM", "GC", "NQ", "SI", "ZC", "MBT", "MCL", "M6E"})
+_KNOWN_MODES_LS       = frozenset({"SCALP", "SWING", "MICRO_SCALP"})
+_KNOWN_DIRECTIONS_LS  = frozenset({"Long", "Short", "LONG", "SHORT"})
+
+# Explicit mapping: legacy strategy-type string → current STRATEGY_PRIORITY key.
+# None = no safe deterministic equivalent (must NOT be applied).
+# Only add an entry here when the semantic equivalence is unambiguous.
+_LEGACY_STRATEGY_KEY_MAP: dict = {
+    "CHOCH": None,   # older breakout label — no current equivalent
+    "BOS":   None,   # older breakout label — no current equivalent
+    # Potential future entries (uncomment only when verified equivalent):
+    # "SWEEP": "LIQUIDITY_SWEEP_REVERSAL",
+    # "VWAP":  "VWAP_TREND_CONTINUATION",
+}
+
+
+def _canonical_learning_key(raw_key):
+    """(canonical_key, lookup_status) for any stored or live strategy key.
+
+    canonical_key: a STRATEGY_PRIORITY identifier string, or None.
+    lookup_status: "CANONICAL" | "LEGACY_COMPAT" | "NOT_FOUND"
+
+    - Already a STRATEGY_PRIORITY key → ("key", "CANONICAL").
+    - Parses as legacy "{inst}_{mode}_{type(s)}_{direction}" and strategy-type
+      maps to a non-None canonical key → ("canonical", "LEGACY_COMPAT").
+    - Anything else, including unmappable types (CHOCH, BOS) → (None, "NOT_FOUND").
+    """
+    if not raw_key:
+        return (None, "NOT_FOUND")
+    if raw_key in STRATEGY_DEFS:
+        return (raw_key, "CANONICAL")
+    # Attempt legacy-format parse: {inst}_{mode}_{type(s)}_{direction}
+    parts = raw_key.split("_")
+    if len(parts) < 4:
+        return (None, "NOT_FOUND")
+    direction = parts[-1]
+    if direction not in _KNOWN_DIRECTIONS_LS:
+        return (None, "NOT_FOUND")
+    if parts[0] not in _KNOWN_INSTRUMENTS_LS:
+        return (None, "NOT_FOUND")
+    if parts[1] not in _KNOWN_MODES_LS:
+        return (None, "NOT_FOUND")
+    strategy_type = "_".join(parts[2:-1])
+    canonical = _LEGACY_STRATEGY_KEY_MAP.get(strategy_type)
+    if canonical and canonical in STRATEGY_DEFS:
+        return (canonical, "LEGACY_COMPAT")
+    return (None, "NOT_FOUND")
+
+
+def _strategy_weight_for(key, mode=None, instrument=None):
+    """(weight, sample_size, lookup_status) for a strategy key.
+
+    Lookup order:
+      1. CANONICAL  — "{mode}::{key}" then bare key (key must already be a
+                      STRATEGY_PRIORITY identifier or an exact cache match).
+      2. LEGACY_COMPAT — scan STRATEGY_WEIGHTS for stored legacy-format keys
+                      that map deterministically to this canonical key.
+                      Instrument guard: when `instrument` is provided, a legacy
+                      key whose stored instrument differs is skipped so a MGC
+                      weight is never applied to MNQ.
+      3. NOT_FOUND  — returns neutral (1.0, 0, "NOT_FOUND").
+
+    Callers that only need (weight, sample) can unpack with:
+        w, n, _ = _strategy_weight_for(key, mode)
+    """
     if not key:
-        return (1.0, 0)
+        return (1.0, 0, "NOT_FOUND")
     ns = _ns_learning_key(key, mode)
     with LEARNING_LOCK:
-        w = STRATEGY_WEIGHTS.get(ns, STRATEGY_WEIGHTS.get(key, 1.0))
-        n = LEARNING_SAMPLE_BY_KEY.get(ns, LEARNING_SAMPLE_BY_KEY.get(key, 0))
-    return (w, n)
+        if ns in STRATEGY_WEIGHTS or key in STRATEGY_WEIGHTS:
+            w = STRATEGY_WEIGHTS.get(ns, STRATEGY_WEIGHTS.get(key, 1.0))
+            n = LEARNING_SAMPLE_BY_KEY.get(ns, LEARNING_SAMPLE_BY_KEY.get(key, 0))
+            return (float(w), int(n), "CANONICAL")
+        # Legacy-compat scan: find a stored namespaced key whose legacy
+        # strategy_type maps to the same canonical key as `key`.
+        if mode:
+            mode_prefix = "%s::" % mode
+            for stored_ns, stored_w in list(STRATEGY_WEIGHTS.items()):
+                if not stored_ns.startswith(mode_prefix):
+                    continue
+                raw = stored_ns[len(mode_prefix):]
+                canon, status = _canonical_learning_key(raw)
+                if status != "LEGACY_COMPAT" or canon != key:
+                    continue
+                # Instrument guard: legacy key has inst as first underscore token.
+                if instrument:
+                    legacy_parts = raw.split("_")
+                    if legacy_parts and legacy_parts[0] != str(instrument).upper():
+                        continue
+                n = LEARNING_SAMPLE_BY_KEY.get(stored_ns, 0)
+                return (float(stored_w), int(n), "LEGACY_COMPAT")
+    return (1.0, 0, "NOT_FOUND")
 
 
 def _compute_score_source_attribution(inst, alert_history_snapshot, now_dt):
@@ -11824,7 +11924,8 @@ def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_st
         direction = engine.get("direction")
         if not key or direction not in ("Long", "Short"):
             return None
-        weight, sample = _strategy_weight_for(key, mode=TRADING_MODE)
+        _inst = instrument_of(ticker) if ticker else None
+        weight, sample, _wlookup = _strategy_weight_for(key, mode=TRADING_MODE, instrument=_inst)
         if sample < LEARNING_MIN_SAMPLE:
             return None
         infl = {"Long":  {"weight": None, "strategy_key": None, "sample": 0},
@@ -11832,7 +11933,8 @@ def _resolve_learning_score_influence(ticker, current_price, vwap_value, vwap_st
         infl[direction] = {"weight": float(weight), "strategy_key": key, "sample": int(sample)}
         infl["meta"] = {"active_strategy": engine.get("active_strategy"),
                         "active_key": key, "direction": direction,
-                        "weight": round(float(weight), 3), "sample": int(sample)}
+                        "weight": round(float(weight), 3), "sample": int(sample),
+                        "lookup_status": _wlookup}
         return infl
     except Exception as exc:   # FAIL-OPEN — never let learning resolution crash the gate.
         logger.warning("learning-score influence resolve failed (fail-open): %s", exc)
@@ -12310,7 +12412,7 @@ def _recompute_learning_eligibility(conn):
                 COALESCE(trading_mode, 'SWING') AS trading_mode,
                 count(*) AS n,
                 avg(r_multiple) AS expectancy,
-                avg((result='Win')::int::float) AS win_rate,
+                avg((lower(trim(result))='win')::int::float) AS win_rate,
                 avg((r_multiple >= 0.9)::int::float) AS tp1_hit_rate
             FROM strategy_trades
             WHERE symbol IS NOT NULL AND result IS NOT NULL
@@ -12339,7 +12441,7 @@ def _recompute_learning_eligibility(conn):
         cur.execute("""
             SELECT symbol, COALESCE(trading_mode, 'SWING') AS trading_mode, strategy_key,
                    count(*) AS n,
-                   avg((result='Win')::int::float) AS win_rate,
+                   avg((lower(trim(result))='win')::int::float) AS win_rate,
                    avg(r_multiple) AS expectancy
             FROM strategy_trades
             WHERE symbol IS NOT NULL AND strategy_key IS NOT NULL AND result IS NOT NULL
@@ -12527,7 +12629,7 @@ def _recompute_learning():
                    strategy_key,
                    max(strategy)                                            AS strategy,
                    count(*)                                                 AS n,
-                   avg((result='Win')::int::float)                          AS win_rate,
+                   avg((lower(trim(result))='win')::int::float)              AS win_rate,
                    avg(r_multiple)                                          AS avg_r,
                    avg(hold_minutes)                                        AS avg_hold,
                    sum(CASE WHEN r_multiple > 0 THEN r_multiple ELSE 0 END) AS gross_win,
@@ -12540,7 +12642,7 @@ def _recompute_learning():
         cur.execute("""
             SELECT EXTRACT(HOUR FROM opened_at AT TIME ZONE 'America/New_York')::int AS hour_et,
                    count(*) AS n,
-                   avg((result='Win')::int::float) AS win_rate,
+                   avg((lower(trim(result))='win')::int::float) AS win_rate,
                    avg(r_multiple) AS avg_r
             FROM strategy_trades
             WHERE opened_at IS NOT NULL
@@ -12551,7 +12653,7 @@ def _recompute_learning():
         cur.execute("""
             SELECT market_regime AS regime,
                    count(*) AS n,
-                   avg((result='Win')::int::float) AS win_rate,
+                   avg((lower(trim(result))='win')::int::float) AS win_rate,
                    avg(r_multiple) AS avg_r
             FROM strategy_trades
             WHERE market_regime IS NOT NULL
@@ -12576,14 +12678,14 @@ def _recompute_learning():
         # rest of recompute. by-session uses the persisted ET 'session' label.
         cur.execute("""
             SELECT count(*) AS n,
-                   avg((result='Win')::int::float) AS win_rate
+                   avg((lower(trim(result))='win')::int::float) AS win_rate
             FROM strategy_trades WHERE result IS NOT NULL
         """)
         overall_row = cur.fetchone() or {}
         cur.execute("""
             SELECT session,
                    count(*) AS n,
-                   avg((result='Win')::int::float) AS win_rate,
+                   avg((lower(trim(result))='win')::int::float) AS win_rate,
                    avg(r_multiple) AS avg_r
             FROM strategy_trades
             WHERE session IS NOT NULL AND result IS NOT NULL
@@ -12869,7 +12971,7 @@ def _generate_learning_report(trade_count):
 
         cur.execute("""
             SELECT count(*) n,
-                   avg((result='Win')::int::float) win_rate,
+                   avg((lower(trim(result))='win')::int::float) win_rate,
                    avg(r_multiple) avg_r,
                    sum(CASE WHEN r_multiple>0 THEN r_multiple ELSE 0 END)  gw,
                    sum(CASE WHEN r_multiple<0 THEN -r_multiple ELSE 0 END) gl
@@ -12888,7 +12990,7 @@ def _generate_learning_report(trade_count):
         def _dim(col):
             # `col` is a hardcoded literal (never user input) -> safe to inline.
             sql = ("SELECT {c} AS k, count(*) n, "
-                   "avg((result='Win')::int::float) win_rate, avg(r_multiple) avg_r "
+                   "avg((lower(trim(result))='win')::int::float) win_rate, avg(r_multiple) avg_r "
                    "FROM strategy_trades "
                    "WHERE {c} IS NOT NULL AND r_multiple IS NOT NULL "
                    "GROUP BY {c} ORDER BY avg_r DESC NULLS LAST").format(c=col)
@@ -12915,8 +13017,8 @@ def _generate_learning_report(trade_count):
 
         cur.execute("""
             SELECT avg(hold_minutes)                                  all_h,
-                   avg(hold_minutes) FILTER (WHERE result='Win')      win_h,
-                   avg(hold_minutes) FILTER (WHERE result='Loss')     loss_h
+                   avg(hold_minutes) FILTER (WHERE lower(trim(result))='win')  win_h,
+                   avg(hold_minutes) FILTER (WHERE lower(trim(result))='loss') loss_h
             FROM strategy_trades WHERE hold_minutes IS NOT NULL
         """)
         h = cur.fetchone() or {}
@@ -12926,7 +13028,7 @@ def _generate_learning_report(trade_count):
 
         cur.execute("""
             SELECT width_bucket(entry_efficiency, 0, 100, 5) b,
-                   count(*) n, avg((result='Win')::int::float) win_rate, avg(r_multiple) avg_r
+                   count(*) n, avg((lower(trim(result))='win')::int::float) win_rate, avg(r_multiple) avg_r
             FROM strategy_trades WHERE entry_efficiency IS NOT NULL AND r_multiple IS NOT NULL
             GROUP BY b ORDER BY avg_r DESC NULLS LAST
         """)
@@ -12943,7 +13045,7 @@ def _generate_learning_report(trade_count):
 
         cur.execute("""
             SELECT outcome_tag, count(*) n FROM strategy_trades
-            WHERE result='Loss' AND outcome_tag IS NOT NULL
+            WHERE lower(trim(result))='loss' AND outcome_tag IS NOT NULL
             GROUP BY outcome_tag ORDER BY n DESC LIMIT 1
         """)
         cmrow = cur.fetchone()
@@ -12954,8 +13056,8 @@ def _generate_learning_report(trade_count):
                               "n": int(cmrow["n"])}
 
         cur.execute("""
-            SELECT avg(edge_score) FILTER (WHERE result='Win')  ws,
-                   avg(edge_score) FILTER (WHERE result='Loss') ls
+            SELECT avg(edge_score) FILTER (WHERE lower(trim(result))='win')  ws,
+                   avg(edge_score) FILTER (WHERE lower(trim(result))='loss') ls
             FROM strategy_trades WHERE edge_score IS NOT NULL
         """)
         sc = cur.fetchone() or {}
@@ -23060,72 +23162,86 @@ def build_coach_interface(result, instrument=None, mode=None):
         _elig_status, _ = _check_learning_eligibility(inst, mode=_mode)
         rule_engine_eligibility = _elig_status  # "GHOST_ONLY" | "LIVE_ELIGIBLE"
 
-        # ── Learning diagnostics (Part 6 of learning-engine audit) — READ-ONLY ────
-        # Exposes the full pipeline state so the Coach panel can show a precise
-        # status (COLLECTING_DATA / ACTIVE / INSUFFICIENT_SAMPLES / DISABLED) instead
-        # of the ambiguous "Weight Updated: YES/NO".  No DB call, no recompute, no
-        # write.  Reads the same in-memory caches that the live scoring engine uses so
-        # the diagnostic always reflects the exact evidence available at gate time.
+        # ── Learning diagnostics (Phase 7I.1 — canonical key + win-rate fix) ───────
+        # Exposes full pipeline state including lookup_status (CANONICAL | LEGACY_COMPAT
+        # | NOT_FOUND), canonical key, aggregate win/loss counts, and win-rate after the
+        # lower(trim(result))='win' fix. No DB call, no recompute, no write.
         try:
-            # active_key: the key the live scoring engine would look up RIGHT NOW.
-            # Source is result["strategy_engine"]["active_key"] which is already
-            # computed; calling compute_strategy_engine again would be redundant.
             _se         = (result.get("strategy_engine") or {}) if result else {}
-            _active_key = _se.get("active_key")   # e.g. "CHOCH_LONG", may be None
-            _ns_key     = _ns_learning_key(_active_key, _mode) if _active_key else None
+            _active_key = _se.get("active_key")          # STRATEGY_PRIORITY key or None
+            _canon_key, _canon_status = (_canonical_learning_key(_active_key)
+                                         if _active_key else (None, "NOT_FOUND"))
 
             with LEARNING_LOCK:
-                _la      = dict(LEARNING_ANALYTICS)
-                if _active_key:
-                    _dw, _dn = (STRATEGY_WEIGHTS.get(_ns_key,
-                                    STRATEGY_WEIGHTS.get(_active_key, 1.0)),
-                                LEARNING_SAMPLE_BY_KEY.get(_ns_key,
-                                    LEARNING_SAMPLE_BY_KEY.get(_active_key, 0)))
-                else:
-                    # No active strategy — report the highest-sample key for this mode
-                    _prefix  = "%s::" % _mode
-                    _keys    = {k: v for k, v in LEARNING_SAMPLE_BY_KEY.items()
-                                if k.startswith(_prefix)}
-                    _best_k  = max(_keys, key=lambda k: _keys[k]) if _keys else None
-                    _dn      = _keys.get(_best_k, 0)
-                    _dw      = STRATEGY_WEIGHTS.get(_best_k, 1.0) if _best_k else 1.0
-                    _ns_key  = _best_k
+                _la = dict(LEARNING_ANALYTICS)
 
-            _score_enabled  = _learning_score_gate_enabled()
-            _recompute_ran  = bool(_la.get("updated_at"))
-            _total_trades   = int(_la.get("total_trades") or 0)
-
-            # Precise weight_status that replaces the ambiguous boolean
-            if not _score_enabled:
-                _weight_status = "DISABLED"
-                _blocked       = "DISABLED"
-                _applied       = False
-            elif not LEARNING_DB_ENABLED:
-                _weight_status = "DISABLED"
-                _blocked       = "DB_DISABLED"
-                _applied       = False
-            elif not _recompute_ran:
-                _weight_status = "NOT_ELIGIBLE"
-                _blocked       = "NOT_ELIGIBLE"
-                _applied       = False
-            elif _dn < LEARNING_MIN_SAMPLE:
-                _weight_status = "INSUFFICIENT_SAMPLES"
-                _blocked       = "INSUFFICIENT_SAMPLES"
-                _applied       = False
-            elif _active_key and _ns_key not in STRATEGY_WEIGHTS and _active_key not in STRATEGY_WEIGHTS:
-                _weight_status = "KEY_NOT_FOUND"
-                _blocked       = "KEY_NOT_FOUND"
-                _applied       = False
+            # Use the updated _strategy_weight_for (now returns 3-tuple + legacy compat).
+            # No LEARNING_LOCK held here — _strategy_weight_for acquires it internally.
+            if _active_key:
+                _dw, _dn, _lookup_status = _strategy_weight_for(
+                    _active_key, mode=_mode, instrument=inst)
             else:
-                _applied       = learning_influence != 0.0
-                if abs(float(_dw) - 1.0) < 0.001:
-                    _weight_status = "NO_CHANGE"
-                    _blocked       = None
-                else:
-                    _weight_status = "UPDATED"
-                    _blocked       = None
+                # No active strategy: find the highest-sample key for this mode
+                with LEARNING_LOCK:
+                    _prefix  = "%s::" % _mode
+                    _mkeys   = {k: v for k, v in LEARNING_SAMPLE_BY_KEY.items()
+                                if k.startswith(_prefix)}
+                    _best_k  = max(_mkeys, key=lambda k: _mkeys[k]) if _mkeys else None
+                    _dn      = int(_mkeys.get(_best_k, 0))
+                    _dw      = float(STRATEGY_WEIGHTS.get(_best_k, 1.0)) if _best_k else 1.0
+                _lookup_status = "NOT_FOUND"
 
+            _score_enabled = _learning_score_gate_enabled()
+            _recompute_ran = bool(_la.get("updated_at"))
+            _total_trades  = int(_la.get("total_trades") or 0)
+
+            # Derive per-strategy aggregate counts from LEARNING_ANALYTICS ranking
+            # (populated by _recompute_learning after the win-rate SQL fix).
+            _ranking     = _la.get("ranking") or []
+            _strat_entry = next((r for r in _ranking
+                                 if r.get("strategy_key") == _active_key
+                                 and r.get("trading_mode") == _mode), None)
+            if _strat_entry:
+                _n_strat    = int(_strat_entry.get("n") or 0)
+                _wr_strat   = float(_strat_entry.get("win_rate") or 0) / 100.0
+                _agg_wins   = round(_n_strat * _wr_strat)
+                _agg_losses = _n_strat - _agg_wins
+                _agg_wr     = round(_wr_strat, 4)
+            else:
+                _n_strat = _agg_wins = _agg_losses = 0
+                _agg_wr  = None
+
+            # Precise weight_status label.
+            # KEY_NOT_FOUND is only meaningful when there IS an active canonical key to
+            # look up. When _active_key is None (no current strategy) we fall through to
+            # the INSUFFICIENT_SAMPLES / NO_CHANGE / UPDATED paths using the best-sample
+            # fallback key so the panel still shows useful information.
+            if not _score_enabled:
+                _weight_status, _blocked = "DISABLED",             "DISABLED"
+                _applied = False
+            elif not LEARNING_DB_ENABLED:
+                _weight_status, _blocked = "DISABLED",             "DB_DISABLED"
+                _applied = False
+            elif not _recompute_ran:
+                _weight_status, _blocked = "NOT_ELIGIBLE",         "NOT_ELIGIBLE"
+                _applied = False
+            elif _active_key and _lookup_status == "NOT_FOUND":
+                # We know what key to look for but it isn't in the cache.
+                _weight_status, _blocked = "KEY_NOT_FOUND",        "KEY_NOT_FOUND"
+                _applied = False
+            elif _dn < LEARNING_MIN_SAMPLE:
+                _weight_status, _blocked = "INSUFFICIENT_SAMPLES", "INSUFFICIENT_SAMPLES"
+                _applied = False
+            elif abs(float(_dw) - 1.0) < 0.001:
+                _weight_status, _blocked = "NO_CHANGE",            None
+                _applied = learning_influence != 0.0
+            else:
+                _weight_status, _blocked = "UPDATED",              None
+                _applied = learning_influence != 0.0
+
+            _ns_key = _ns_learning_key(_active_key, _mode) if _active_key else None
             learning_diagnostics = {
+                # Existing fields (preserved for CoachPanel back-compat)
                 "enabled":               LEARNING_DB_ENABLED,
                 "influence_enabled":     _score_enabled,
                 "mode":                  _mode,
@@ -23135,15 +23251,23 @@ def build_coach_interface(result, instrument=None, mode=None):
                 "minimum_samples":       LEARNING_MIN_SAMPLE,
                 "closed_trade_count":    _total_trades,
                 "current_weight":        round(float(_dw), 4),
-                "previous_weight":       None,   # no previous-weight tracking exists yet
+                "previous_weight":       None,
                 "weight_delta":          round(float(_dw) - 1.0, 4),
                 "influence_points":      float(learning_influence),
-                "last_sample_at":        None,   # no per-sample timestamp cache yet
+                "last_sample_at":        None,
                 "last_weight_update_at": _la.get("updated_at"),
                 "applied_to_live_score": _applied,
                 "blocked_reason":        _blocked,
                 "weight_status":         _weight_status,
                 "source":                "learning_db",
+                # New fields (Phase 7I.1)
+                "canonical_strategy_key":    _canon_key,
+                "stored_strategy_key":       _active_key,
+                "lookup_status":             _lookup_status,
+                "result_normalization_status": "FIXED",   # lower(trim(result))='win'
+                "aggregate_win_count":       int(_agg_wins),
+                "aggregate_loss_count":      int(_agg_losses),
+                "aggregate_win_rate":        _agg_wr,
             }
         except Exception as _ld_exc:
             logger.debug("build_coach_interface diagnostics fail-open: %s", _ld_exc)
@@ -23155,6 +23279,8 @@ def build_coach_interface(result, instrument=None, mode=None):
                 "blocked_reason":    "DIAGNOSTIC_BUILD_FAILED",
                 "weight_status":     "DISABLED",
                 "source":            "learning_db",
+                "lookup_status":     "NOT_FOUND",
+                "result_normalization_status": "FIXED",
             }
 
         return {
@@ -23471,6 +23597,106 @@ def _mb_strategy_scanner(inst, result, errors):
             "targets": [], "risk_reward": None, "reason": None,
             "learning_influence": None, "ranked_strategies": [], "market_regime": None,
             "sample_count": None, "historical_expectancy": None,
+        }
+
+
+def _mb_preview_from_plan(plan, status, direction):
+    """Extract canonical display fields from a build_strict_trade_plan dict.
+
+    Read-only — never re-calculates values, never modifies plan.
+    Called by _mb_candidate_preview for both READY and POTENTIAL states.
+    """
+    mgmt    = plan.get("management") if isinstance(plan.get("management"), dict) else {}
+    missing = plan.get("missing") if isinstance(plan.get("missing"), (list, tuple)) else []
+    return {
+        "status":                    status,
+        "direction":                 direction,
+        "readiness":                 "READY" if status == "READY" else "NOT_READY",
+        # ── Core levels (string-formatted, same as build_strict_trade_plan output) ──
+        "entry_zone":                plan.get("entry_zone"),
+        "stop_loss":                 plan.get("stop_loss"),
+        "take_profit":               plan.get("target1"),
+        "risk_reward":               plan.get("rr"),
+        # ── Risk sizing ───────────────────────────────────────────────────────
+        "risk_points":               plan.get("risk_points"),
+        "risk_dollars_per_contract": plan.get("risk_dollars_per_contract"),
+        # ── ATR stop metadata ─────────────────────────────────────────────────
+        "atr":                       plan.get("atr_pts"),
+        "atr_multiplier":            plan.get("atr_multiplier"),
+        "calculated_stop":           plan.get("calculated_stop"),
+        "stop_ticks":                plan.get("stop_distance_ticks"),
+        "stop_valid":                plan.get("stop_valid"),
+        "stop_invalid_reason":       plan.get("stop_invalid_reason"),
+        # ── Live-price anchor (numeric entry from management block) ───────────
+        "preview_price":             mgmt.get("entry"),
+        # ── Missing confirmations (caller fills for POTENTIAL) ────────────────
+        "missing_confirmations":     [str(m) for m in missing if m],
+        # ── Instrument identity ───────────────────────────────────────────────
+        "instrument":                plan.get("instrument"),
+        "point_value":               plan.get("point_value"),
+    }
+
+
+def _mb_candidate_preview(result, errors):
+    """Read-only candidate trade preview for the Main Brain Trade Plan panel.
+
+    Priority order:
+      1. READY    : result["trade_plan"]["trade_plan"] is True AND "READY" in strict_label
+      2. POTENTIAL: result["directions"][dir]["potential_plan"]["trade_plan"] is True
+                   (Long checked first, then Short)
+      3. NO_CANDIDATE: neither condition met
+
+    Never calls full_analysis(), never calls build_strict_trade_plan(), never
+    writes to any shared state. Fail-open: any exception → UNAVAILABLE stub.
+    """
+    try:
+        r = result or {}
+
+        # ── READY path ────────────────────────────────────────────────────────
+        strict_label    = str(r.get("strict_label") or r.get("verdict_label") or "WAIT")
+        is_ready_verdict = "READY" in strict_label
+        tp = r.get("trade_plan") if isinstance(r.get("trade_plan"), dict) else {}
+        if is_ready_verdict and tp.get("trade_plan"):
+            direction = tp.get("direction") or r.get("strict_direction")
+            preview   = _mb_preview_from_plan(tp, "READY", direction)
+            preview["generated_at"] = (r.get("last_updated")
+                                       or r.get("generated_at"))
+            return preview
+
+        # ── POTENTIAL path ────────────────────────────────────────────────────
+        directions = (r.get("directions")
+                      if isinstance(r.get("directions"), dict) else {})
+        for direction in ("Long", "Short"):
+            blk = (directions.get(direction)
+                   if isinstance(directions.get(direction), dict) else {})
+            pp  = (blk.get("potential_plan")
+                   if isinstance(blk.get("potential_plan"), dict) else {})
+            if not pp.get("trade_plan"):
+                continue
+            # Per-direction missing confirmations from the gate block
+            missing_raw = blk.get("missing") or blk.get("strict_missing") or []
+            missing = ([str(m) for m in missing_raw if m]
+                       if isinstance(missing_raw, (list, tuple)) else [])
+            preview = _mb_preview_from_plan(pp, "POTENTIAL", direction)
+            preview["missing_confirmations"] = missing
+            preview["generated_at"] = (r.get("last_updated")
+                                       or r.get("generated_at"))
+            return preview
+
+        # ── No candidate ──────────────────────────────────────────────────────
+        return {
+            "status":       "NO_CANDIDATE",
+            "direction":    None,
+            "generated_at": (r.get("last_updated") or r.get("generated_at")),
+        }
+
+    except Exception as _exc:
+        logger.debug("_mb_candidate_preview: %s", _exc)
+        _mb_err(errors, "candidate_preview", "preview_unavailable")
+        return {
+            "status":    "UNAVAILABLE",
+            "direction": None,
+            "reason":    "preview_unavailable",
         }
 
 
@@ -23938,6 +24164,7 @@ def build_main_brain_payload(result, instrument=None):
     decision_timeline = _mb_decision_timeline(inst, errors)
     alerts            = _mb_alerts_section(errors)
     system_status     = _mb_system_status(result, errors)
+    candidate_preview = _mb_candidate_preview(result, errors)
 
     # ── availability ──────────────────────────────────────────────────────────
     error_codes = {e["code"] for e in errors}
@@ -23959,6 +24186,7 @@ def build_main_brain_payload(result, instrument=None):
         "timeline":         {"available": True, "partial": True},
         "alerts":           {"available": "alerts_unavailable"       not in error_codes},
         "system_status":    {"available": "system_status_unavailable" not in error_codes},
+        "candidate_preview":{"available": "preview_unavailable"      not in error_codes},
     }
 
     # ── voice: read-only from result (display-only, fail-open) ─────────────────
@@ -23988,6 +24216,7 @@ def build_main_brain_payload(result, instrument=None):
         "decision_timeline": decision_timeline,
         "alerts":            alerts,
         "system_status":     system_status,
+        "candidate_preview": candidate_preview,
         "availability":      availability,
         "errors":            errors,
     }
