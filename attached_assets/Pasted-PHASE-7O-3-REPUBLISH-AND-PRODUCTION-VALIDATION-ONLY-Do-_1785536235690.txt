@@ -1,0 +1,135 @@
+PHASE 7O.3 — REPUBLISH AND PRODUCTION VALIDATION ONLY
+
+Do not add features, refactor unrelated code, or change trading logic.
+
+The implementation for Phase 7O.3 is complete. Now perform the deployment and production validation.
+
+1. Pre-deployment verification
+
+Confirm and report:
+
+* Current branch
+* Current HEAD commit
+* Git working-tree status
+* Whether any files are modified or untracked
+* The exact files changed for Phase 7O.3
+* git diff --check result
+
+Do not stop merely because Replit created a new automatic checkpoint commit. Inspect the commit and continue if it contains only the completed Phase 7O.3 work or platform-generated metadata.
+
+2. Run the targeted validation
+
+Run:
+
+* test_journal_coaching_correlations_7o3.py
+* The Phase 7O.2 journal coaching regression tests
+* Journal API parity tests
+* Scalp golden tests
+* TypeScript typecheck
+
+Report separately:
+
+* Phase 7O.3 targeted test count and result
+* Any pre-existing failures
+* Whether any failure originates from the Phase 7O.3 changed files
+* Whether MainBrain.tsx produces any TypeScript errors
+
+The six previously identified failures in test_phase6_journal_coach.py and the existing TypeScript errors in MobileHome.tsx and Sentinel.tsx are not Phase 7O.3 blockers unless their behavior has changed.
+
+3. Restart and republish
+
+Restart the webhook/application server and republish the production deployment.
+
+Do not change:
+
+* Databento ingestion
+* Strategy scoring
+* Edge scores
+* Trade gates
+* Learning influence
+* Execution logic
+* TradersPost routing
+* Risk controls
+* Journal write behavior
+
+4. Production endpoint validation
+
+After publishing, validate the production endpoint:
+
+GET /journal/coaching/correlations
+
+Confirm:
+
+* HTTP response is successful
+* Response is valid JSON
+* All expected correlation sections are present
+* Empty-data cases return safe defaults rather than errors
+* No authentication loop occurs
+* No repeated failing polling requests occur
+* The Express proxy successfully forwards the endpoint
+* No Flask direct-port exposure or proxy-whitelist issue was introduced
+
+Record the endpoint response shape, but do not expose private trade data in the report.
+
+5. Production UI validation
+
+Open the Main Brain Journal Coaching page in the published application.
+
+Validate:
+
+* The page loads without a blank screen
+* The existing coaching sections still render
+* The new CORRELATIONS section renders
+* The four summary cards render
+* The setup × execution heatmap renders
+* The discipline outcomes table renders
+* The rating-field selector works
+* Rating × mistake drill-through works
+* Rating × emotion drill-through works
+* High-quality-loss drill-through works
+* Low-quality-win drill-through works
+* Expensive-combination ranking renders
+* Insight sentences render
+* The Apply button refreshes all three coaching datasets
+* Clearing one rating drill removes both rating_min and rating_max
+* Existing journal filters still work after using a correlations drill
+
+Use authenticated production screenshots as evidence.
+
+Capture at least:
+
+1. Full CORRELATIONS section
+2. Rating × mistake drill selected
+3. Setup × execution heatmap
+4. Discipline outcomes and summary cards
+5. Existing coaching section after correlations was loaded
+
+6. Browser and network checks
+
+While testing the production page, confirm:
+
+* No new console errors from MainBrain.tsx
+* No failed request to /journal/coaching/correlations
+* No uncontrolled request loop
+* No React render loop
+* No stale drill-filter state after clearing filters
+* No horizontal layout break on the normal desktop viewport
+* Mobile behavior is unchanged unless Phase 7O.3 explicitly modified it
+
+7. Final report
+
+Return a concise final validation report containing:
+
+* Published deployment status
+* Branch and HEAD
+* Phase 7O.3 targeted test result
+* Production endpoint result
+* Production UI result
+* Screenshots captured
+* Any pre-existing failures
+* Any new defects found
+* Final verdict: PASS, PASS WITH PRE-EXISTING ISSUES, or FAIL
+
+If a genuine Phase 7O.3 defect is found, fix only that defect, rerun the targeted validations, republish, and repeat the affected production checks.
+
+Do not begin Phase 7O.4 or any unrelated cleanup.
