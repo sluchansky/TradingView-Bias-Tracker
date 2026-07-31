@@ -1,5 +1,7 @@
 # Memory Index
 
+- [Opposing-structure conflict rule audit (Phase 7H)](opposing-structure-audit.md) — 10-min gap is between the TWO sides' timestamps (not absolute age); no invalidation/supersession; duplicates refresh timer; server ingestion timestamps only.
+
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
 - [Main Brain Operator Console (Phase 7C)](main-brain-ui-p7c.md) — React page at /main-brain; read-only, 7s poll, Basic Auth from localStorage brain_auth; unknown && JSX needs != null &&; Sentinel/MobileHome pre-existing TS errors not regressions.
 - [Main Brain population wiring](main-brain-population-wiring.md) — normalizeMainBrainPayload() is the single bridge; 29 schema mismatches; voice=dict extract narration; active_trades/alerts are bare lists; coach.weight_updated is boolean.
