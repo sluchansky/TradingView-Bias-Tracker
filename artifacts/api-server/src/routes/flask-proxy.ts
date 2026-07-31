@@ -162,6 +162,8 @@ export const BOT1_ROUTES = [
   // Both are pure SELECT aggregations — never touch learning weights or gate.
   "/journal/learning-eligibility",
   "/journal/review-analytics",
+  // Phase 7O: Journal Coaching Dashboard (display-only analytics, SELECT only).
+  "/journal/coaching",
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",

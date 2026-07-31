@@ -45471,6 +45471,525 @@ def journal_review_analytics():
 
 
 # ---------------------------------------------------------------------------
+# Phase 7O — Journal Coaching Dashboard (DISPLAY-ONLY analytics)
+# ---------------------------------------------------------------------------
+# Reads reviewed-trade data from journal_reviews + strategy_trades +
+# tradezella_trades and converts it into actionable coaching insights.
+#
+# INVARIANTS:
+#  • Never modifies learning weights, gate logic, or any execution path.
+#  • All writes to journal_reviews happen only in the review PATCH route.
+#  • No DDL.  SELECT only.
+#
+# CONFIDENCE THRESHOLDS (documented, not invented):
+#  Aligned with the 50-sample learning-engine threshold.
+#  INSUFFICIENT_DATA    < 5  — do not draw conclusions
+#  EARLY_SIGNAL         5–19 — directional hint only
+#  MODERATE_CONFIDENCE  20–49
+#  STRONG_EVIDENCE      ≥ 50
+#
+# COACHING PRIORITY FORMULA (display-only, never feeds money path):
+#  priority = (|net_R| × 2.0  +  frequency × 1.0) × min(1.0, n / 20.0)
+#  Weights: net_R × 2 penalises costly mistakes; frequency × 1 penalises
+#  recurring ones; sample weight scales down small-n results.
+# ---------------------------------------------------------------------------
+
+_COACHING_WIN_RESULTS_SQL = "('win','scratch','be','breakeven','b/e')"
+
+_COACHING_CONFIDENCE_THRESHOLDS = [(50, "STRONG_EVIDENCE"),
+                                   (20, "MODERATE_CONFIDENCE"),
+                                   (5,  "EARLY_SIGNAL"),
+                                   (0,  "INSUFFICIENT_DATA")]
+
+
+def _coaching_confidence(n: int) -> str:
+    for threshold, label in _COACHING_CONFIDENCE_THRESHOLDS:
+        if n >= threshold:
+            return label
+    return "INSUFFICIENT_DATA"
+
+
+def _coaching_pf(sum_pos: float, sum_neg_abs: float):
+    """Profit factor; None when no losers."""
+    if not sum_neg_abs:
+        return None
+    return round(sum_pos / sum_neg_abs, 2) if sum_pos else 0.0
+
+
+# Base CTE — unified view of all closed trades that have a review row.
+# Each section query prepends this string.
+_COACHING_BASE_CTE = """\
+WITH base AS (
+  SELECT 'system'::text AS source, st.id AS trade_id,
+    COALESCE(st.opened_at, st.created_at)
+        AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York' AS trade_date,
+    COALESCE(st.symbol,'')                                  AS instrument,
+    LOWER(COALESCE(st.direction,''))                        AS direction,
+    COALESCE(st.session,'')                                 AS session,
+    EXTRACT(DOW FROM COALESCE(st.opened_at, st.created_at)
+        AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::int AS dow,
+    LOWER(COALESCE(st.result,''))                           AS result,
+    st.r_multiple,
+    NULL::float                                             AS pnl,
+    COALESCE(st.strategy_key, st.strategy,'')              AS strategy_name,
+    COALESCE(st.trading_mode,'')                            AS mode,
+    jr.review_status, jr.followed_plan,
+    jr.mistake_tags,  jr.positive_tags, jr.emotion_tags,
+    jr.setup_quality, jr.execution_quality,
+    jr.discipline_quality, jr.overall_quality, jr.reviewed_at
+  FROM strategy_trades   st
+  JOIN journal_reviews   jr ON jr.source = 'system'    AND jr.trade_id = st.id
+  WHERE st.closed_at IS NOT NULL
+  UNION ALL
+  SELECT 'tradzella'::text, tt.id,
+    COALESCE(tt.entry_time, tt.exit_time)
+        AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York',
+    COALESCE(tt.symbol,''), LOWER(COALESCE(tt.side,'')),
+    COALESCE(tt.session_bucket,''),
+    EXTRACT(DOW FROM COALESCE(tt.entry_time, tt.exit_time)
+        AT TIME ZONE 'UTC' AT TIME ZONE 'America/New_York')::int,
+    LOWER(COALESCE(tt.outcome,'')), tt.r_multiple, tt.pnl::float,
+    COALESCE(tt.setup,''), COALESCE(tt.mode,''),
+    jr.review_status, jr.followed_plan,
+    jr.mistake_tags,  jr.positive_tags, jr.emotion_tags,
+    jr.setup_quality, jr.execution_quality,
+    jr.discipline_quality, jr.overall_quality, jr.reviewed_at
+  FROM tradezella_trades tt
+  JOIN journal_reviews   jr ON jr.source = 'tradzella' AND jr.trade_id = tt.id
+  WHERE tt.exit_time IS NOT NULL
+)"""
+
+WIN_SQL  = _COACHING_WIN_RESULTS_SQL  # shorthand
+
+
+@app.route("/journal/coaching", methods=["GET"])
+def journal_coaching():
+    """Journal Coaching Dashboard — DISPLAY-ONLY.
+
+    Query params:
+      date_from, date_to  YYYY-MM-DD (inclusive, America/New_York dates)
+      instrument           partial match (ILIKE)
+      mode                 exact (SCALP | SWING | MICRO_SCALP)
+      source               system | tradzella | '' = all
+    """
+    conn, err = _journal_db_guard()
+    if err:
+        return err
+
+    date_from    = (request.args.get("date_from") or "").strip()
+    date_to      = (request.args.get("date_to")   or "").strip()
+    f_instrument = (request.args.get("instrument") or "").strip()
+    f_mode       = (request.args.get("mode")       or "").strip().upper()
+    f_source     = (request.args.get("source")     or "").strip().lower()
+
+    # Build filter clauses applied after the CTE (no user data in SQL text)
+    f_clauses: list = []
+    f_params:  list = []
+    if date_from:
+        f_clauses.append("trade_date::date >= %s")
+        f_params.append(date_from)
+    if date_to:
+        f_clauses.append("trade_date::date <= %s")
+        f_params.append(date_to)
+    if f_instrument:
+        f_clauses.append("instrument ILIKE %s")
+        f_params.append(f"%{f_instrument}%")
+    if f_mode:
+        f_clauses.append("UPPER(mode) = %s")
+        f_params.append(f_mode)
+    if f_source in ("system", "tradzella"):
+        f_clauses.append("source = %s")
+        f_params.append(f_source)
+
+    fa = (" AND " + " AND ".join(f_clauses)) if f_clauses else ""   # filter AND
+    CTE = _COACHING_BASE_CTE
+
+    def _run(cur, sql, extra_params=()):
+        p = list(f_params) + list(extra_params)
+        cur.execute(sql, p)
+        cols = [d[0] for d in cur.description]
+        return [dict(zip(cols, r)) for r in cur.fetchall()]
+
+    def _run_one(cur, sql, extra_params=()):
+        p = list(f_params) + list(extra_params)
+        cur.execute(sql, p)
+        r = cur.fetchone()
+        return r[0] if r else 0
+
+    try:
+        with conn.cursor() as cur:
+
+            # ── 1. Data coverage ─────────────────────────────────────────
+            cur.execute(
+                CTE + f"""
+                SELECT
+                  COUNT(*) FILTER (WHERE TRUE)                                AS total,
+                  COUNT(*) FILTER (WHERE review_status = 'REVIEWED')          AS reviewed,
+                  COUNT(*) FILTER (WHERE review_status = 'EXCLUDED')          AS excluded,
+                  COUNT(*) FILTER (WHERE review_status IN ('IN_PROGRESS','NEEDS_DATA')) AS incomplete,
+                  COUNT(*) FILTER (WHERE review_status = 'UNREVIEWED')        AS unreviewed,
+                  COUNT(DISTINCT instrument)                                   AS instruments,
+                  COUNT(DISTINCT source)                                       AS sources,
+                  COUNT(DISTINCT mode)                                         AS modes
+                FROM base WHERE TRUE {fa}""", f_params
+            )
+            cov_row = cur.fetchone()
+            cov_cols = [d[0] for d in cur.description]
+            cov = dict(zip(cov_cols, cov_row)) if cov_row else {}
+
+            # ── 2. Costliest mistakes ────────────────────────────────────
+            mistake_rows = _run(cur, CTE + f"""
+                SELECT tag,
+                  COUNT(*)::int                                                AS n,
+                  SUM(CASE WHEN result IN {WIN_SQL} THEN 1 ELSE 0 END)::int   AS wins,
+                  SUM(CASE WHEN result='loss' THEN 1 ELSE 0 END)::int         AS losses,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float       AS net_r,
+                  ROUND(AVG(r_multiple)::numeric, 3)::float                   AS avg_r,
+                  ROUND(SUM(COALESCE(pnl,0))::numeric, 2)::float             AS net_pnl,
+                  ROUND(ABS(AVG(CASE WHEN result='loss' THEN r_multiple END))::numeric,3)::float
+                                                                               AS avg_loss_r,
+                  ROUND(SUM(CASE WHEN r_multiple>0 THEN r_multiple ELSE 0 END)::numeric,3)::float
+                                                                               AS sum_pos_r,
+                  ROUND(ABS(SUM(CASE WHEN r_multiple<0 THEN r_multiple ELSE 0 END))::numeric,3)::float
+                                                                               AS sum_neg_r,
+                  STRING_AGG(DISTINCT instrument, ', ' ORDER BY instrument)   AS instruments,
+                  STRING_AGG(DISTINCT session,    ', ' ORDER BY session)       AS sessions
+                FROM base,
+                     jsonb_array_elements_text(mistake_tags) AS tag
+                WHERE review_status='REVIEWED'
+                  AND mistake_tags IS NOT NULL
+                  AND jsonb_typeof(mistake_tags)='array' {fa}
+                GROUP BY tag ORDER BY net_r ASC
+            """)
+
+            # ── 3. Best behaviors (positive tags) ────────────────────────
+            behavior_rows = _run(cur, CTE + f"""
+                SELECT tag,
+                  COUNT(*)::int                                                AS n,
+                  SUM(CASE WHEN result IN {WIN_SQL} THEN 1 ELSE 0 END)::int   AS wins,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float       AS net_r,
+                  ROUND(AVG(r_multiple)::numeric, 3)::float                   AS avg_r,
+                  ROUND(SUM(CASE WHEN r_multiple>0 THEN r_multiple ELSE 0 END)::numeric,3)::float
+                                                                               AS sum_pos_r,
+                  ROUND(ABS(SUM(CASE WHEN r_multiple<0 THEN r_multiple ELSE 0 END))::numeric,3)::float
+                                                                               AS sum_neg_r,
+                  ROUND(100.0 * SUM(CASE WHEN followed_plan='YES' THEN 1 ELSE 0 END)::numeric
+                        / NULLIF(COUNT(*),0), 1)::float                        AS plan_follow_pct
+                FROM base,
+                     jsonb_array_elements_text(positive_tags) AS tag
+                WHERE review_status='REVIEWED'
+                  AND positive_tags IS NOT NULL
+                  AND jsonb_typeof(positive_tags)='array' {fa}
+                GROUP BY tag ORDER BY avg_r DESC NULLS LAST
+            """)
+
+            # ── 4. Followed-plan analytics ───────────────────────────────
+            plan_rows = _run(cur, CTE + f"""
+                SELECT followed_plan,
+                  COUNT(*)::int                                                AS n,
+                  SUM(CASE WHEN result IN {WIN_SQL} THEN 1 ELSE 0 END)::int   AS wins,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float       AS net_r,
+                  ROUND(AVG(r_multiple)::numeric, 3)::float                   AS avg_r,
+                  ROUND(SUM(CASE WHEN r_multiple>0 THEN r_multiple ELSE 0 END)::numeric,3)::float
+                                                                               AS sum_pos_r,
+                  ROUND(ABS(SUM(CASE WHEN r_multiple<0 THEN r_multiple ELSE 0 END))::numeric,3)::float
+                                                                               AS sum_neg_r,
+                  ROUND(AVG(setup_quality)::numeric, 2)::float                AS avg_setup,
+                  ROUND(AVG(execution_quality)::numeric, 2)::float            AS avg_execution,
+                  ROUND(AVG(discipline_quality)::numeric, 2)::float           AS avg_discipline
+                FROM base
+                WHERE review_status='REVIEWED'
+                  AND followed_plan IS NOT NULL {fa}
+                GROUP BY followed_plan
+                ORDER BY CASE followed_plan WHEN 'YES' THEN 1 WHEN 'PARTIALLY' THEN 2
+                                             WHEN 'NO' THEN 3 ELSE 4 END
+            """)
+
+            # ── 5. Emotion analytics ─────────────────────────────────────
+            emotion_rows = _run(cur, CTE + f"""
+                SELECT elem->>'tag'                                            AS emotion,
+                  COUNT(*)::int                                                AS n,
+                  ROUND(AVG((elem->>'intensity')::float)::numeric, 2)::float  AS avg_intensity,
+                  SUM(CASE WHEN result IN {WIN_SQL} THEN 1 ELSE 0 END)::int   AS wins,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float       AS net_r,
+                  ROUND(AVG(r_multiple)::numeric, 3)::float                   AS avg_r,
+                  ROUND(100.0 * SUM(CASE WHEN followed_plan='YES' THEN 1 ELSE 0 END)::numeric
+                        / NULLIF(COUNT(*),0), 1)::float                        AS plan_follow_pct,
+                  STRING_AGG(DISTINCT session, ', ' ORDER BY session)         AS sessions
+                FROM base,
+                     jsonb_array_elements(emotion_tags) AS elem
+                WHERE review_status='REVIEWED'
+                  AND emotion_tags IS NOT NULL
+                  AND jsonb_typeof(emotion_tags)='array' {fa}
+                GROUP BY elem->>'tag'
+                ORDER BY net_r ASC
+            """)
+
+            # ── 6. Rating analytics (4 quality fields) ───────────────────
+            rating_analytics: dict = {}
+            for field in ("setup_quality", "execution_quality",
+                          "discipline_quality", "overall_quality"):
+                rows = _run(cur, CTE + f"""
+                    SELECT {field}::int                                        AS rating,
+                      COUNT(*)::int                                            AS n,
+                      SUM(CASE WHEN result IN {WIN_SQL} THEN 1 ELSE 0 END)::int AS wins,
+                      ROUND(AVG(r_multiple)::numeric, 3)::float               AS avg_r,
+                      ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float   AS net_r
+                    FROM base
+                    WHERE review_status='REVIEWED'
+                      AND {field} IS NOT NULL {fa}
+                    GROUP BY {field} ORDER BY {field}
+                """)
+                rating_analytics[field] = rows
+
+            # ── 7. Strategy coaching ─────────────────────────────────────
+            strategy_rows = _run(cur, CTE + f"""
+                SELECT strategy_name,
+                  COUNT(*)::int                                                AS n,
+                  SUM(CASE WHEN result IN {WIN_SQL} THEN 1 ELSE 0 END)::int   AS wins,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float       AS net_r,
+                  ROUND(AVG(r_multiple)::numeric, 3)::float                   AS avg_r,
+                  ROUND(SUM(CASE WHEN r_multiple>0 THEN r_multiple ELSE 0 END)::numeric,3)::float
+                                                                               AS sum_pos_r,
+                  ROUND(ABS(SUM(CASE WHEN r_multiple<0 THEN r_multiple ELSE 0 END))::numeric,3)::float
+                                                                               AS sum_neg_r,
+                  ROUND(100.0 * SUM(CASE WHEN followed_plan='YES' THEN 1 ELSE 0 END)::numeric
+                        / NULLIF(COUNT(*),0), 1)::float                        AS plan_follow_pct,
+                  STRING_AGG(DISTINCT session, ', ' ORDER BY session)         AS sessions
+                FROM base
+                WHERE review_status='REVIEWED' {fa}
+                GROUP BY strategy_name ORDER BY avg_r DESC NULLS LAST
+            """)
+
+            # ── 8. Session analytics ─────────────────────────────────────
+            session_rows = _run(cur, CTE + f"""
+                SELECT COALESCE(NULLIF(session,''), 'unknown')                 AS session,
+                  dow,
+                  COUNT(*)::int                                                AS n,
+                  SUM(CASE WHEN result IN {WIN_SQL} THEN 1 ELSE 0 END)::int   AS wins,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float       AS net_r,
+                  ROUND(AVG(r_multiple)::numeric, 3)::float                   AS avg_r,
+                  ROUND(100.0 * SUM(CASE WHEN followed_plan='YES' THEN 1 ELSE 0 END)::numeric
+                        / NULLIF(COUNT(*),0), 1)::float                        AS plan_follow_pct
+                FROM base
+                WHERE review_status='REVIEWED' {fa}
+                GROUP BY session, dow ORDER BY session, dow
+            """)
+
+            # ── 9. Discipline trend (weekly) ─────────────────────────────
+            trend_rows = _run(cur, CTE + f"""
+                SELECT DATE_TRUNC('week', trade_date)::date                   AS week_start,
+                  COUNT(*)::int                                                AS n,
+                  ROUND(AVG(discipline_quality)::numeric, 2)::float           AS avg_discipline,
+                  ROUND(AVG(execution_quality)::numeric, 2)::float            AS avg_execution,
+                  ROUND(AVG(overall_quality)::numeric, 2)::float              AS avg_overall,
+                  ROUND(SUM(COALESCE(r_multiple,0))::numeric, 3)::float       AS net_r,
+                  ROUND(100.0 * SUM(CASE WHEN followed_plan='YES' THEN 1 ELSE 0 END)::numeric
+                        / NULLIF(COUNT(*),0), 1)::float                        AS followed_plan_pct,
+                  ROUND(100.0 * COUNT(*) FILTER (WHERE mistake_tags IS NOT NULL
+                        AND jsonb_typeof(mistake_tags)='array'
+                        AND jsonb_array_length(mistake_tags)>0)::numeric
+                        / NULLIF(COUNT(*),0), 1)::float                        AS mistake_rate_pct
+                FROM base
+                WHERE review_status='REVIEWED' {fa}
+                GROUP BY week_start ORDER BY week_start ASC
+            """)
+
+        # ── Post-process: convert SQL rows to dicts with computed fields ──
+
+        def _augment_tag_row(r, total_key="n"):
+            n = r.get(total_key) or 0
+            wins = r.get("wins") or 0
+            r["win_rate"]   = round(wins / n * 100, 1) if n else None
+            r["confidence"] = _coaching_confidence(n)
+            r["profit_factor"] = _coaching_pf(r.get("sum_pos_r") or 0,
+                                               r.get("sum_neg_r") or 0)
+            return r
+
+        costliest_mistakes = [_augment_tag_row(r) for r in mistake_rows]
+        best_behaviors     = [_augment_tag_row(r) for r in behavior_rows]
+
+        followed_plan_analytics = []
+        for r in plan_rows:
+            n = r.get("n") or 0
+            _augment_tag_row(r)
+            r["plan_label"] = r.get("followed_plan", "")
+            followed_plan_analytics.append(r)
+
+        emotion_analytics = []
+        for r in emotion_rows:
+            n = r.get("n") or 0
+            wins = r.get("wins") or 0
+            r["win_rate"]   = round(wins / n * 100, 1) if n else None
+            r["confidence"] = _coaching_confidence(n)
+            emotion_analytics.append(r)
+
+        for fld, rows in rating_analytics.items():
+            for r in rows:
+                n = r.get("n") or 0
+                wins = r.get("wins") or 0
+                r["win_rate"] = round(wins / n * 100, 1) if n else None
+
+        strategy_coaching = []
+        for r in strategy_rows:
+            _augment_tag_row(r)
+            strategy_coaching.append(r)
+
+        session_analytics = []
+        for r in session_rows:
+            n = r.get("n") or 0
+            wins = r.get("wins") or 0
+            r["win_rate"]   = round(wins / n * 100, 1) if n else None
+            r["confidence"] = _coaching_confidence(n)
+            session_analytics.append(r)
+
+        # ── Discipline trend label ───────────────────────────────────────
+        disc_trend_label = "INSUFFICIENT_DATA"
+        weeks_with_discipline = [w for w in trend_rows
+                                  if w.get("avg_discipline") is not None]
+        if len(weeks_with_discipline) >= 4:
+            mid = len(weeks_with_discipline) // 2
+            avg_first  = sum(w["avg_discipline"] for w in weeks_with_discipline[:mid]) / mid
+            avg_second = sum(w["avg_discipline"] for w in weeks_with_discipline[mid:]) / (
+                len(weeks_with_discipline) - mid)
+            diff = avg_second - avg_first
+            disc_trend_label = ("IMPROVING"  if diff >  0.2 else
+                                "DECLINING"  if diff < -0.2 else
+                                "STABLE")
+        elif weeks_with_discipline:
+            disc_trend_label = "INSUFFICIENT_DATA"
+
+        # Serialise trend rows
+        for row in trend_rows:
+            if row.get("week_start"):
+                row["week_start"] = str(row["week_start"])
+
+        # ── Coaching summary (deterministic from section results) ─────────
+        coaching_summary: dict = {}
+
+        if costliest_mistakes:
+            worst = costliest_mistakes[0]
+            coaching_summary["biggest_leak"] = {
+                "tag":   worst.get("tag"),
+                "net_r": worst.get("net_r"),
+                "count": worst.get("n"),
+                "text":  (
+                    f"{(worst.get('tag') or '').replace('_',' ').title()} "
+                    f"cost {abs(worst.get('net_r') or 0):.1f}R across "
+                    f"{worst.get('n')} reviewed trades."
+                ),
+            }
+
+        if best_behaviors:
+            best = best_behaviors[0]
+            coaching_summary["best_habit"] = {
+                "tag":   best.get("tag"),
+                "avg_r": best.get("avg_r"),
+                "count": best.get("n"),
+                "text":  (
+                    f"{(best.get('tag') or '').replace('_',' ').title()} "
+                    f"produced {'+' if (best.get('avg_r') or 0) >= 0 else ''}"
+                    f"{best.get('avg_r'):.2f}R average across {best.get('n')} trades."
+                ),
+            }
+
+        eligible_strategies = [s for s in strategy_coaching
+                                if (s.get("n") or 0) >= 5]
+        if eligible_strategies:
+            best_strat = max(eligible_strategies,
+                             key=lambda s: s.get("avg_r") or 0)
+            coaching_summary["best_setup"] = {
+                "strategy": best_strat.get("strategy_name"),
+                "avg_r":    best_strat.get("avg_r"),
+                "count":    best_strat.get("n"),
+            }
+
+        eligible_sessions = [s for s in session_analytics
+                              if (s.get("n") or 0) >= 3]
+        if eligible_sessions:
+            worst_s = min(eligible_sessions,
+                          key=lambda s: s.get("avg_r") or 0)
+            coaching_summary["worst_condition"] = {
+                "session": worst_s.get("session"),
+                "avg_r":   worst_s.get("avg_r"),
+                "count":   worst_s.get("n"),
+            }
+
+        coaching_summary["discipline_trend"] = disc_trend_label
+
+        # ── Priority list ────────────────────────────────────────────────
+        # Formula: (|net_R|×2 + frequency×1) × min(1, n/20)   [display-only]
+        priority_items = []
+        for m in costliest_mistakes[:20]:
+            n         = m.get("n") or 0
+            net_r_abs = abs(m.get("net_r") or 0)
+            freq      = n
+            score     = (net_r_abs * 2.0 + freq * 1.0) * min(1.0, n / 20.0)
+            priority_items.append({
+                "type":        "mistake",
+                "tag":         m.get("tag"),
+                "score":       round(score, 2),
+                "net_r":       m.get("net_r"),
+                "count":       n,
+                "confidence":  m.get("confidence"),
+                "description": (
+                    f"Tagged in {n} trade(s), "
+                    f"{abs(m.get('net_r') or 0):.1f}R total cost."
+                ),
+            })
+
+        priority_items.sort(key=lambda x: x["score"], reverse=True)
+
+        if priority_items:
+            coaching_summary["next_focus"] = {
+                "type": priority_items[0]["type"],
+                "tag":  priority_items[0]["tag"],
+                "text": priority_items[0]["description"],
+            }
+
+        # ── Coverage object ──────────────────────────────────────────────
+        reviewed_n = int(cov.get("reviewed") or 0)
+        data_coverage = {
+            "total":           int(cov.get("total") or 0),
+            "reviewed":        reviewed_n,
+            "excluded":        int(cov.get("excluded") or 0),
+            "incomplete":      int(cov.get("incomplete") or 0),
+            "unreviewed":      int(cov.get("unreviewed") or 0),
+            "instrument_count": int(cov.get("instruments") or 0),
+            "source_count":    int(cov.get("sources") or 0),
+            "mode_count":      int(cov.get("modes") or 0),
+            "confidence":      _coaching_confidence(reviewed_n),
+        }
+
+        return jsonify({
+            "ok":                     True,
+            "data_coverage":          data_coverage,
+            "costliest_mistakes":     costliest_mistakes,
+            "best_behaviors":         best_behaviors,
+            "followed_plan_analytics": followed_plan_analytics,
+            "emotion_analytics":      emotion_analytics,
+            "rating_analytics":       rating_analytics,
+            "strategy_coaching":      strategy_coaching,
+            "session_analytics":      session_analytics,
+            "discipline_trend":       {
+                "label":   disc_trend_label,
+                "weekly":  trend_rows,
+            },
+            "coaching_summary":       coaching_summary,
+            "coaching_priority":      priority_items,
+        })
+
+    except Exception as exc:
+        logger.warning("journal_coaching failed: %s", exc)
+        return jsonify({"ok": False, "error": "coaching query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------------------
 # Phase 7M — Directional Balance (READ-ONLY audit panel, owner-only)
 # ---------------------------------------------------------------------------
 # Aggregates Long vs Short signal counts from three in-memory sources:

@@ -2407,7 +2407,7 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 // Used ONLY for the /main-brain/journal route. The overview-grid card below is the
 // compact version that still reads from the main-brain payload.
 
-type JTab = 'trades' | 'import' | 'analytics' | 'playbook' | 'learning' | 'directional' | 'queue';
+type JTab = 'trades' | 'import' | 'analytics' | 'playbook' | 'learning' | 'directional' | 'queue' | 'coaching';
 
 interface JTrade {
   id: number; source: string; date: string; instrument: string; direction: string;
@@ -3394,6 +3394,7 @@ const JTabBar: React.FC<{ active: JTab; onChange: (t: JTab) => void; queueBadge?
     { id: 'playbook',    label: 'Playbook' },
     { id: 'learning',    label: 'Learning' },
     { id: 'directional', label: 'Direction ↕' },
+    { id: 'coaching',    label: '🧠 Coaching' },
   ];
   return (
     <div style={{ display: 'flex', gap: 2, marginBottom: 14, borderBottom: `1px solid ${T.border}`, paddingBottom: 0, overflowX: 'auto' }}>
@@ -4982,6 +4983,537 @@ const JDirectionalTab: React.FC = () => {
   );
 };
 
+// ── Phase 7O: Journal Coaching Dashboard ─────────────────────────────────────
+// Read-only coaching analytics — never modifies trading logic or learning formulas.
+
+interface JCoachCoverage {
+  total: number; reviewed: number; excluded: number; incomplete: number;
+  unreviewed: number; instrument_count: number; confidence: string;
+}
+interface JCoachMistake {
+  tag: string; n: number; wins: number; net_r: number | null; avg_r: number | null;
+  win_rate: number | null; confidence: string; profit_factor: number | null;
+  instruments: string; sessions: string;
+}
+interface JCoachBehavior {
+  tag: string; n: number; wins: number; net_r: number | null; avg_r: number | null;
+  win_rate: number | null; plan_follow_pct: number | null; confidence: string;
+  profit_factor: number | null;
+}
+interface JCoachPlan {
+  followed_plan: string; n: number; wins: number; net_r: number | null;
+  avg_r: number | null; win_rate: number | null;
+  avg_setup: number | null; avg_execution: number | null; avg_discipline: number | null;
+}
+interface JCoachEmotion {
+  emotion: string; n: number; avg_intensity: number | null; wins: number;
+  net_r: number | null; avg_r: number | null; win_rate: number | null;
+  plan_follow_pct: number | null; confidence: string;
+}
+interface JCoachStrategy {
+  strategy_name: string; n: number; wins: number; net_r: number | null;
+  avg_r: number | null; win_rate: number | null; plan_follow_pct: number | null;
+  confidence: string; profit_factor: number | null;
+}
+interface JCoachSession {
+  session: string; dow: number; n: number; wins: number;
+  net_r: number | null; avg_r: number | null; win_rate: number | null;
+  plan_follow_pct: number | null; confidence: string;
+}
+interface JCoachTrendWeek {
+  week_start: string; n: number; avg_discipline: number | null;
+  net_r: number | null; followed_plan_pct: number | null; mistake_rate_pct: number | null;
+}
+interface JCoachPriority {
+  type: string; tag: string; score: number; net_r: number | null;
+  count: number; confidence: string; description: string;
+}
+interface JCoachData {
+  ok: boolean;
+  data_coverage: JCoachCoverage;
+  costliest_mistakes: JCoachMistake[];
+  best_behaviors: JCoachBehavior[];
+  followed_plan_analytics: JCoachPlan[];
+  emotion_analytics: JCoachEmotion[];
+  rating_analytics: Record<string, { rating: number; n: number; avg_r: number | null; win_rate: number | null }[]>;
+  strategy_coaching: JCoachStrategy[];
+  session_analytics: JCoachSession[];
+  discipline_trend: { label: string; weekly: JCoachTrendWeek[] };
+  coaching_summary: {
+    biggest_leak?: { tag: string; net_r: number; count: number; text: string };
+    best_habit?: { tag: string; avg_r: number; count: number; text: string };
+    best_setup?: { strategy: string; avg_r: number; count: number };
+    worst_condition?: { session: string; avg_r: number; count: number };
+    discipline_trend: string;
+    next_focus?: { type: string; tag: string; text: string };
+  };
+  coaching_priority: JCoachPriority[];
+}
+
+const _CONFIDENCE_COLOR: Record<string, string> = {
+  STRONG_EVIDENCE:    '#00ff88',
+  MODERATE_CONFIDENCE: '#f5a623',
+  EARLY_SIGNAL:       '#a0a0b0',
+  INSUFFICIENT_DATA:  '#666688',
+};
+const _TREND_COLOR: Record<string, string> = {
+  IMPROVING:         '#00ff88',
+  STABLE:            '#f5a623',
+  DECLINING:         '#ff4560',
+  INSUFFICIENT_DATA: '#666688',
+};
+const _PLAN_COLOR: Record<string, string> = {
+  YES: '#00ff88', PARTIALLY: '#f5a623', NO: '#ff4560', NOT_APPLICABLE: '#666688',
+};
+const _DOW_LABEL = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+
+function _confBadge(confidence: string) {
+  const col = _CONFIDENCE_COLOR[confidence] ?? T.txtMuted;
+  const short: Record<string, string> = {
+    STRONG_EVIDENCE: 'STRONG', MODERATE_CONFIDENCE: 'MODERATE',
+    EARLY_SIGNAL: 'EARLY', INSUFFICIENT_DATA: 'INSUFF',
+  };
+  return (
+    <span style={{ background: col + '22', color: col, fontSize: 7, fontWeight: 700,
+      borderRadius: 3, padding: '0 4px', whiteSpace: 'nowrap' }}>
+      {short[confidence] ?? confidence}
+    </span>
+  );
+}
+
+const JCoachingTab: React.FC = () => {
+  const [data,    setData]    = useState<JCoachData | null>(null);
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState<string | null>(null);
+
+  // Filters
+  const [dateFrom,    setDateFrom]    = useState('');
+  const [dateTo,      setDateTo]      = useState('');
+  const [fSource,     setFSource]     = useState('');
+  const [fInstrument, setFInstrument] = useState('');
+  const [fMode,       setFMode]       = useState('');
+
+  const fetchCoaching = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const p = new URLSearchParams();
+      if (dateFrom)    p.set('date_from',   dateFrom);
+      if (dateTo)      p.set('date_to',     dateTo);
+      if (fSource)     p.set('source',      fSource);
+      if (fInstrument) p.set('instrument',  fInstrument);
+      if (fMode)       p.set('mode',        fMode);
+      const r = await fetch(`/api/journal/coaching?${p}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'failed');
+      setData(d as JCoachData);
+    } catch (e) { setError(String(e)); }
+    setLoading(false);
+  }, [dateFrom, dateTo, fSource, fInstrument, fMode]);
+
+  useEffect(() => { fetchCoaching(); }, [fetchCoaching]);
+
+  const inp = (label: string, val: string, set: (v: string) => void, type = 'text', placeholder = '') => (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <span style={{ fontSize: 8, color: T.txtMuted, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
+      <input type={type} value={val} placeholder={placeholder}
+        onChange={e => set(e.target.value)}
+        style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+          color: T.txtSec, padding: '4px 7px', fontSize: 11, width: 110 }} />
+    </label>
+  );
+
+  const sel = (label: string, val: string, set: (v: string) => void, opts: string[][]) => (
+    <label style={{ display: 'flex', flexDirection: 'column', gap: 2 }}>
+      <span style={{ fontSize: 8, color: T.txtMuted, textTransform: 'uppercase', letterSpacing: '0.06em' }}>{label}</span>
+      <select value={val} onChange={e => set(e.target.value)}
+        style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+          color: T.txtSec, padding: '4px 7px', fontSize: 11 }}>
+        {opts.map(([v, l]) => <option key={v} value={v}>{l}</option>)}
+      </select>
+    </label>
+  );
+
+  const rC = (r: number | null) => r != null ? (r >= 0 ? T.green : T.red) : T.txtMuted;
+  const rFmt = (r: number | null) =>
+    r != null ? `${r >= 0 ? '+' : ''}${r.toFixed(2)}R` : '—';
+
+  const SummaryCard: React.FC<{ title: string; value: React.ReactNode; sub?: string; col?: string }> =
+    ({ title, value, sub, col }) => (
+    <div style={{ flex: 1, background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
+      border: `1px solid ${T.border}` }}>
+      <div style={{ fontSize: 8, color: T.txtMuted, letterSpacing: '0.06em', fontWeight: 700,
+        marginBottom: 4, textTransform: 'uppercase' }}>{title}</div>
+      <div style={{ fontSize: 16, fontWeight: 800, fontFamily: T.mono, color: col ?? T.txtPri }}>
+        {value}
+      </div>
+      {sub && <div style={{ fontSize: 9, color: T.txtMuted, marginTop: 3 }}>{sub}</div>}
+    </div>
+  );
+
+  const TableHead: React.FC<{ cols: string[] }> = ({ cols }) => (
+    <thead>
+      <tr>
+        {cols.map(c => (
+          <th key={c} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+            paddingBottom: 5, fontSize: 8, paddingRight: 10, whiteSpace: 'nowrap' }}>
+            {c}
+          </th>
+        ))}
+      </tr>
+    </thead>
+  );
+
+  const noData = (msg: string) => (
+    <div style={{ fontSize: 9, color: T.txtMuted, padding: '8px 0' }}>{msg}</div>
+  );
+
+  if (loading && !data) return (
+    <div style={{ color: T.txtMuted, fontSize: 11, padding: 12 }}>Loading coaching analytics…</div>
+  );
+  if (error) return (
+    <div style={{ color: T.red, fontSize: 11, padding: 12 }}>Error: {error}</div>
+  );
+
+  const cov = data?.data_coverage;
+  const sm  = data?.coaching_summary;
+
+  return (
+    <div style={{ padding: '4px 0' }}>
+      {/* Filter bar */}
+      <div style={{ display: 'flex', gap: 10, flexWrap: 'wrap', marginBottom: 14,
+        background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
+        border: `1px solid ${T.border}` }}>
+        {inp('From', dateFrom, setDateFrom, 'date')}
+        {inp('To',   dateTo,   setDateTo,   'date')}
+        {sel('Source', fSource, setFSource, [['', 'All'], ['system', 'System'], ['tradzella', 'Tradzella']])}
+        {inp('Instrument', fInstrument, setFInstrument, 'text', 'MGC, MNQ…')}
+        {sel('Mode', fMode, setFMode, [['', 'All'], ['SCALP', 'SCALP'], ['SWING', 'SWING'], ['MICRO_SCALP', 'MICRO']])}
+        <div style={{ display: 'flex', alignItems: 'flex-end' }}>
+          <button onClick={fetchCoaching} disabled={loading}
+            style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}`, borderRadius: 5,
+              color: T.cyan, padding: '5px 12px', fontSize: 11, cursor: 'pointer', fontWeight: 700 }}>
+            {loading ? '…' : 'Apply'}
+          </button>
+        </div>
+      </div>
+
+      {data && (
+        <>
+          {/* TOP ROW — summary cards */}
+          <div style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+            <SummaryCard
+              title="Biggest Leak"
+              value={sm?.biggest_leak
+                ? rFmt(sm.biggest_leak.net_r)
+                : '—'}
+              sub={sm?.biggest_leak
+                ? `${sm.biggest_leak.tag.replace(/_/g, ' ').toUpperCase()} · ${sm.biggest_leak.count} trades`
+                : 'No reviewed mistakes yet'}
+              col={sm?.biggest_leak ? T.red : T.txtMuted}
+            />
+            <SummaryCard
+              title="Best Habit"
+              value={sm?.best_habit ? rFmt(sm.best_habit.avg_r) : '—'}
+              sub={sm?.best_habit
+                ? `${sm.best_habit.tag.replace(/_/g, ' ').toUpperCase()} · ${sm.best_habit.count} trades`
+                : 'No positive tags yet'}
+              col={sm?.best_habit ? T.green : T.txtMuted}
+            />
+            <SummaryCard
+              title="Discipline Trend"
+              value={sm?.discipline_trend ?? 'INSUFFICIENT DATA'}
+              col={_TREND_COLOR[sm?.discipline_trend ?? ''] ?? T.txtMuted}
+            />
+            <SummaryCard
+              title="Review Coverage"
+              value={cov ? `${cov.reviewed}/${cov.total}` : '—'}
+              sub={cov ? `${cov.excluded} excluded · ${cov.unreviewed} pending — ${cov.confidence.replace(/_/g, ' ')}` : ''}
+              col={cov ? (_CONFIDENCE_COLOR[cov.confidence] ?? T.txtMuted) : T.txtMuted}
+            />
+          </div>
+
+          {/* SECOND ROW — Mistakes + Behaviors */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+            {/* Costliest Mistakes */}
+            <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+              border: `1px solid ${T.border}` }}>
+              <div style={{ fontSize: 9, color: T.red, fontWeight: 700, letterSpacing: '0.06em',
+                marginBottom: 8 }}>COSTLIEST MISTAKES</div>
+              {!data.costliest_mistakes.length ? noData('No mistake tags on reviewed trades yet') : (
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <TableHead cols={['Mistake', 'N', 'Net R', 'Avg R', 'Win%', '']} />
+                  <tbody>
+                    {data.costliest_mistakes.slice(0, 8).map((m, i) => (
+                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtSec }}>
+                          {m.tag.replace(/_/g, ' ').toLowerCase()}
+                        </td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>{m.n}</td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(m.net_r), fontWeight: 700 }}>
+                          {rFmt(m.net_r)}
+                        </td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(m.avg_r) }}>
+                          {rFmt(m.avg_r)}
+                        </td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>
+                          {m.win_rate != null ? m.win_rate.toFixed(0) + '%' : '—'}
+                        </td>
+                        <td style={{ padding: '3px 0' }}>{_confBadge(m.confidence)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+              <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 6, fontStyle: 'italic' }}>
+                Association only — not causal attribution.
+              </div>
+            </div>
+
+            {/* Best Behaviors */}
+            <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+              border: `1px solid ${T.border}` }}>
+              <div style={{ fontSize: 9, color: T.green, fontWeight: 700, letterSpacing: '0.06em',
+                marginBottom: 8 }}>BEST BEHAVIORS</div>
+              {!data.best_behaviors.length ? noData('No positive tags on reviewed trades yet') : (
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <TableHead cols={['Behavior', 'N', 'Avg R', 'Win%', 'Plan%', '']} />
+                  <tbody>
+                    {data.best_behaviors.slice(0, 8).map((b, i) => (
+                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtSec }}>
+                          {b.tag.replace(/_/g, ' ').toLowerCase()}
+                        </td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>{b.n}</td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(b.avg_r), fontWeight: 700 }}>
+                          {rFmt(b.avg_r)}
+                        </td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>
+                          {b.win_rate != null ? b.win_rate.toFixed(0) + '%' : '—'}
+                        </td>
+                        <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>
+                          {b.plan_follow_pct != null ? b.plan_follow_pct.toFixed(0) + '%' : '—'}
+                        </td>
+                        <td style={{ padding: '3px 0' }}>{_confBadge(b.confidence)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+
+          {/* Followed Plan comparison */}
+          <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+            border: `1px solid ${T.border}`, marginBottom: 12 }}>
+            <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.06em',
+              marginBottom: 8 }}>FOLLOWED PLAN COMPARISON</div>
+            {!data.followed_plan_analytics.length ? noData('No reviewed trades with plan status yet') : (
+              <>
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <TableHead cols={['Plan', 'N', 'Net R', 'Avg R', 'Win%', 'Setup', 'Exec', 'Disc']} />
+                  <tbody>
+                    {data.followed_plan_analytics.map((p, i) => {
+                      const col = _PLAN_COLOR[p.followed_plan ?? ''] ?? T.txtMuted;
+                      return (
+                        <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                          <td style={{ padding: '4px 10px 4px 0', fontSize: 10, color: col, fontWeight: 700 }}>
+                            {(p.followed_plan || 'N/A').replace(/_/g, ' ')}
+                          </td>
+                          <td style={{ padding: '4px 10px 4px 0', fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>{p.n}</td>
+                          <td style={{ padding: '4px 10px 4px 0', fontSize: 9, fontFamily: T.mono, color: rC(p.net_r), fontWeight: 700 }}>{rFmt(p.net_r)}</td>
+                          <td style={{ padding: '4px 10px 4px 0', fontSize: 9, fontFamily: T.mono, color: rC(p.avg_r) }}>{rFmt(p.avg_r)}</td>
+                          <td style={{ padding: '4px 10px 4px 0', fontSize: 9, color: T.txtMuted }}>{p.win_rate != null ? p.win_rate.toFixed(0) + '%' : '—'}</td>
+                          <td style={{ padding: '4px 10px 4px 0', fontSize: 9, color: T.txtMuted }}>{p.avg_setup?.toFixed(1) ?? '—'}</td>
+                          <td style={{ padding: '4px 10px 4px 0', fontSize: 9, color: T.txtMuted }}>{p.avg_execution?.toFixed(1) ?? '—'}</td>
+                          <td style={{ padding: '4px 0',           fontSize: 9, color: T.txtMuted }}>{p.avg_discipline?.toFixed(1) ?? '—'}</td>
+                        </tr>
+                      );
+                    })}
+                  </tbody>
+                </table>
+                <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 6, fontStyle: 'italic' }}>
+                  Association only — not causal attribution.
+                </div>
+              </>
+            )}
+          </div>
+
+          {/* THIRD ROW — Strategy + Session */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
+            {/* Strategy coaching */}
+            <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+              border: `1px solid ${T.border}` }}>
+              <div style={{ fontSize: 9, color: T.cyan, fontWeight: 700, letterSpacing: '0.06em',
+                marginBottom: 8 }}>STRATEGY COACHING</div>
+              {!data.strategy_coaching.length ? noData('No reviewed trades yet') : (
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <TableHead cols={['Strategy', 'N', 'Avg R', 'Win%', 'Plan%', '']} />
+                  <tbody>
+                    {data.strategy_coaching.slice(0, 8).map((s, i) => (
+                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 8, color: T.txtSec,
+                          maxWidth: 90, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                          {s.strategy_name || '—'}
+                        </td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>{s.n}</td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(s.avg_r), fontWeight: 700 }}>{rFmt(s.avg_r)}</td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{s.win_rate != null ? s.win_rate.toFixed(0) + '%' : '—'}</td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{s.plan_follow_pct != null ? s.plan_follow_pct.toFixed(0) + '%' : '—'}</td>
+                        <td style={{ padding: '3px 0' }}>{_confBadge(s.confidence)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+
+            {/* Session analytics */}
+            <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+              border: `1px solid ${T.border}` }}>
+              <div style={{ fontSize: 9, color: T.amber, fontWeight: 700, letterSpacing: '0.06em',
+                marginBottom: 8 }}>SESSION ANALYTICS</div>
+              {!data.session_analytics.length ? noData('No reviewed trades yet') : (
+                <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                  <TableHead cols={['Session', 'DOW', 'N', 'Net R', 'Win%', '']} />
+                  <tbody>
+                    {data.session_analytics.slice(0, 10).map((s, i) => (
+                      <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtSec }}>{s.session}</td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{_DOW_LABEL[s.dow] ?? s.dow}</td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>{s.n}</td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(s.net_r), fontWeight: 700 }}>{rFmt(s.net_r)}</td>
+                        <td style={{ padding: '3px 8px 3px 0', fontSize: 9, color: T.txtMuted }}>{s.win_rate != null ? s.win_rate.toFixed(0) + '%' : '—'}</td>
+                        <td style={{ padding: '3px 0' }}>{_confBadge(s.confidence)}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </div>
+          </div>
+
+          {/* Emotion analytics */}
+          {data.emotion_analytics.length > 0 && (
+            <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+              border: `1px solid ${T.border}`, marginBottom: 12 }}>
+              <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.06em',
+                marginBottom: 8 }}>EMOTION ANALYTICS</div>
+              <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+                <TableHead cols={['Emotion', 'N', 'Avg Intensity', 'Net R', 'Win%', 'Plan%', '']} />
+                <tbody>
+                  {data.emotion_analytics.slice(0, 8).map((e, i) => (
+                    <tr key={i} style={{ borderTop: `1px solid ${T.border}` }}>
+                      <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtSec }}>
+                        {e.emotion.replace(/_/g, ' ').toLowerCase()}
+                      </td>
+                      <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: T.txtMuted }}>{e.n}</td>
+                      <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>
+                        {e.avg_intensity != null ? e.avg_intensity.toFixed(1) : '—'}
+                      </td>
+                      <td style={{ padding: '3px 10px 3px 0', fontSize: 9, fontFamily: T.mono, color: rC(e.net_r), fontWeight: 700 }}>{rFmt(e.net_r)}</td>
+                      <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>{e.win_rate != null ? e.win_rate.toFixed(0) + '%' : '—'}</td>
+                      <td style={{ padding: '3px 10px 3px 0', fontSize: 9, color: T.txtMuted }}>{e.plan_follow_pct != null ? e.plan_follow_pct.toFixed(0) + '%' : '—'}</td>
+                      <td style={{ padding: '3px 0' }}>{_confBadge(e.confidence)}</td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+          )}
+
+          {/* Discipline trend */}
+          <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+            border: `1px solid ${T.border}`, marginBottom: 12 }}>
+            <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 8 }}>
+              <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.06em' }}>
+                DISCIPLINE TREND
+              </div>
+              <span style={{ fontSize: 9, fontWeight: 700,
+                color: _TREND_COLOR[data.discipline_trend.label] ?? T.txtMuted }}>
+                {data.discipline_trend.label.replace(/_/g, ' ')}
+              </span>
+            </div>
+            {data.discipline_trend.weekly.length === 0 ? noData('Insufficient reviewed trades for trend') : (
+              <div style={{ display: 'flex', gap: 8, overflowX: 'auto', paddingBottom: 4 }}>
+                {data.discipline_trend.weekly.map((w, i) => (
+                  <div key={i} style={{ minWidth: 72, textAlign: 'center',
+                    background: T.panel, borderRadius: 6, padding: '6px 8px',
+                    border: `1px solid ${T.border}` }}>
+                    <div style={{ fontSize: 7, color: T.txtMuted, marginBottom: 3 }}>
+                      {w.week_start?.slice(5) ?? '—'}
+                    </div>
+                    <div style={{ fontSize: 12, fontWeight: 800, fontFamily: T.mono,
+                      color: w.avg_discipline != null
+                        ? (w.avg_discipline >= 4 ? T.green : w.avg_discipline >= 3 ? T.amber : T.red)
+                        : T.txtMuted }}>
+                      {w.avg_discipline?.toFixed(1) ?? '—'}
+                    </div>
+                    <div style={{ fontSize: 7, color: rC(w.net_r), fontFamily: T.mono }}>
+                      {rFmt(w.net_r)}
+                    </div>
+                    <div style={{ fontSize: 7, color: T.txtMuted }}>
+                      {w.followed_plan_pct != null ? w.followed_plan_pct.toFixed(0) + '%' : '—'} plan
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Priority Focus List */}
+          {data.coaching_priority.length > 0 && (
+            <div style={{ background: T.panelAlt, borderRadius: 8, padding: '12px 14px',
+              border: `1px solid ${T.border}`, marginBottom: 12 }}>
+              <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700,
+                letterSpacing: '0.06em', marginBottom: 8 }}>
+                PRIORITISED NEXT-FOCUS LIST
+                <span style={{ marginLeft: 8, fontSize: 7, fontWeight: 400, fontStyle: 'italic' }}>
+                  priority = (|net R|×2 + count×1) × min(1, n/20)
+                </span>
+              </div>
+              {data.coaching_priority.slice(0, 10).map((p, i) => (
+                <div key={i} style={{ display: 'flex', gap: 10, alignItems: 'center',
+                  padding: '5px 0', borderTop: i === 0 ? 'none' : `1px solid ${T.border}` }}>
+                  <span style={{ fontSize: 10, color: T.txtMuted, fontFamily: T.mono,
+                    minWidth: 18, textAlign: 'right' }}>{i + 1}.</span>
+                  <span style={{ fontSize: 9, color: T.red, fontWeight: 700, minWidth: 50, textAlign: 'center',
+                    fontFamily: T.mono }}>
+                    {p.score.toFixed(1)}
+                  </span>
+                  <span style={{ fontSize: 9, color: T.txtSec, flex: 1 }}>
+                    {p.tag.replace(/_/g, ' ').toUpperCase()}
+                    <span style={{ color: T.txtMuted, fontWeight: 400 }}> — {p.description}</span>
+                  </span>
+                  {_confBadge(p.confidence)}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Next Focus coaching summary card */}
+          {sm?.next_focus && (
+            <div style={{ background: T.cyan + '11', borderRadius: 8, padding: '10px 14px',
+              border: `1px solid ${T.cyan}44`, marginBottom: 12 }}>
+              <div style={{ fontSize: 9, color: T.cyan, fontWeight: 700, letterSpacing: '0.06em',
+                marginBottom: 4 }}>NEXT FOCUS</div>
+              <div style={{ fontSize: 11, color: T.txtSec }}>
+                {sm.next_focus.text}
+              </div>
+              <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 4, fontStyle: 'italic' }}>
+                Based on current reviewed data only.
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {!data && !loading && !error && (
+        <div style={{ color: T.txtMuted, fontSize: 11 }}>No coaching data loaded.</div>
+      )}
+    </div>
+  );
+};
+
 // ── Journal Full Page (outer shell) ──────────────────────────────────────────
 const JournalFullPage: React.FC = () => {
   const [tab,        setTab]        = useState<JTab>('trades');
@@ -5022,6 +5554,7 @@ const JournalFullPage: React.FC = () => {
       {tab === 'playbook'    && <JPlaybookTab />}
       {tab === 'learning'    && <JLearningTab />}
       {tab === 'directional' && <JDirectionalTab />}
+      {tab === 'coaching'    && <JCoachingTab />}
     </div>
   );
 };
