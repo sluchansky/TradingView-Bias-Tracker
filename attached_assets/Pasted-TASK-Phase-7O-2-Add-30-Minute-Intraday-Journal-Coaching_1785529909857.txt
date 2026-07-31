@@ -1,0 +1,442 @@
+TASK: Phase 7O.2 — Add 30-Minute Intraday Journal Coaching Analysis.
+
+CONTEXT
+
+Phase 7O delivered Journal Coaching analytics.
+
+Phase 7O.1 added drill-down from coaching insights into the exact supporting trades.
+
+The next goal is to analyze performance and behavior by 30-minute trading block.
+
+PRIMARY QUESTIONS
+
+The system should answer:
+
+- Which 30-minute periods produce the most profit and R?
+- Which periods produce the largest losses?
+- When is plan adherence strongest?
+- When do mistakes and emotional trading increase?
+- Which strategies perform best at specific times?
+- Are there time periods the operator should avoid or approach cautiously?
+
+This is analytics, filtering, and display only.
+
+STRICT SCOPE
+
+DO NOT modify:
+
+- Databento
+- strategy calculations
+- Edge Score
+- readiness
+- alert behavior
+- opposing-structure logic
+- learning formulas
+- learning thresholds
+- risk rules
+- TradersPost
+- execution
+- active-trade management
+- Main Brain polling
+- authentication
+
+PART 1 — DEFINE THE CANONICAL TRADE TIME
+
+Determine which timestamp should assign a trade to a 30-minute block.
+
+Preferred source:
+
+- actual entry or first-fill timestamp
+
+Fallback only when unavailable:
+
+- trade open timestamp
+
+Do not use:
+
+- close time
+- import time
+- review time
+- database insertion time
+
+Document the timestamp source for each trade source:
+
+- strategy_trades
+- tradezella_trades
+- journal_entries
+
+PART 2 — TIMEZONE
+
+Use one consistent operator-facing timezone.
+
+Preferred:
+
+America/New_York
+
+All bucketing must happen after converting the canonical entry timestamp into the display timezone.
+
+Handle:
+
+- daylight-saving time
+- overnight futures sessions
+- trades crossing midnight
+- imported timestamps with explicit timezone
+- imported timestamps without timezone
+- malformed timestamps
+
+Do not silently assume UTC for timezone-free imported data unless that is already the importer contract.
+
+PART 3 — 30-MINUTE BUCKETS
+
+Create deterministic blocks such as:
+
+00:00–00:29
+00:30–00:59
+01:00–01:29
+...
+09:00–09:29
+09:30–09:59
+10:00–10:29
+...
+23:30–23:59
+
+Use half-open intervals:
+
+[start, end)
+
+Examples:
+
+09:30:00 belongs to 09:30–09:59
+09:59:59 belongs to 09:30–09:59
+10:00:00 belongs to 10:00–10:29
+
+PART 4 — BACKEND ENDPOINT
+
+Add or extend a read-only coaching endpoint for intraday blocks.
+
+Suggested route:
+
+GET /journal/coaching/intraday
+
+Support existing filters:
+
+- date_from
+- date_to
+- instrument
+- strategy
+- mode
+- session
+- source
+- account
+- review_status
+
+Return one row per 30-minute block.
+
+Suggested shape:
+
+{
+  "block_start": "09:30",
+  "block_end": "10:00",
+  "label": "09:30–09:59",
+  "trade_count": 14,
+  "reviewed_count": 12,
+  "wins": 7,
+  "losses": 5,
+  "win_rate": 58.3,
+  "net_pnl": 420.00,
+  "net_r": 4.2,
+  "average_r": 0.35,
+  "expectancy_r": 0.35,
+  "profit_factor": 1.72,
+  "followed_plan_rate": 75.0,
+  "average_setup_quality": 3.8,
+  "average_execution_quality": 3.4,
+  "average_discipline_quality": 3.1,
+  "mistakes_per_trade": 0.67,
+  "top_mistake": "ENTERED EARLY",
+  "top_emotion": "FOMO",
+  "top_strategy": "OPENING_DRIVE",
+  "confidence": "EARLY"
+}
+
+Use actual project field names.
+
+Do not fabricate unavailable fields.
+
+PART 5 — PERFORMANCE METRICS
+
+For each block calculate:
+
+- trade count
+- reviewed trade count
+- wins
+- losses
+- breakeven
+- win rate
+- gross P&L
+- net P&L
+- net R
+- average R
+- average win R
+- average loss R
+- expectancy
+- profit factor
+- largest win
+- largest loss
+
+Exclude open trades from closed-trade performance metrics.
+
+PART 6 — REVIEW AND DISCIPLINE METRICS
+
+For each block calculate:
+
+- followed-plan YES count
+- PARTIALLY count
+- NO count
+- followed-plan rate
+- average setup-quality rating
+- average execution-quality rating
+- average discipline-quality rating
+- average overall-quality rating
+- mistake-tag count
+- mistakes per trade
+- positive-tag count
+- positive behaviors per trade
+- unreviewed trade count
+
+PART 7 — MISTAKE AND EMOTION CONCENTRATION
+
+For each block identify:
+
+- top mistake tag
+- top positive behavior
+- top emotion
+- average emotion intensity
+- most common mistake/emotion overlap
+
+Do not imply causation.
+
+Label these as observed associations.
+
+PART 8 — STRATEGY AND INSTRUMENT BREAKDOWN
+
+For each 30-minute block, expose:
+
+- top strategy by net R
+- worst strategy by net R
+- top instrument
+- worst instrument
+- Long count
+- Short count
+- Long net R
+- Short net R
+
+This should help identify whether a weak time block is caused by one strategy or instrument.
+
+PART 9 — CONFIDENCE STATES
+
+Apply the existing Journal Coaching sample thresholds:
+
+- fewer than 5 reviewed trades: INSUFFICIENT
+- 5–19: EARLY
+- 20–49: MODERATE
+- 50 or more: STRONG
+
+Show the reviewed sample count clearly.
+
+Do not recommend avoiding a time block based on one or two trades.
+
+PART 10 — UI
+
+Add an INTRADAY section inside the Journal Coaching tab.
+
+Recommended layout:
+
+A. Heatmap
+
+Rows:
+- performance
+- net R
+- followed-plan rate
+- discipline rating
+- mistakes per trade
+
+Columns:
+- 30-minute blocks
+
+B. Best and Worst Blocks
+
+Show:
+
+BEST PERFORMANCE BLOCK
+BEST DISCIPLINE BLOCK
+WORST PERFORMANCE BLOCK
+HIGHEST MISTAKE BLOCK
+
+C. Detailed Table
+
+Columns:
+
+Time Block
+Trades
+Reviewed
+Win %
+Net R
+Avg R
+Profit Factor
+Followed Plan %
+Discipline
+Top Mistake
+Confidence
+
+PART 11 — COLOR SEMANTICS
+
+Use consistent colors:
+
+- positive net R: green
+- negative net R: red
+- mixed/near zero: neutral
+- low confidence: muted or hatched
+- strong discipline: green
+- weak discipline: amber/red
+
+Do not make a low-sample positive block look strongly favorable.
+
+PART 12 — DRILL-DOWN
+
+Every block must be clickable.
+
+Example:
+
+Click 09:30–09:59
+→ open Trade Log filtered by entry-time block
+
+Preserve:
+
+- date range
+- instrument
+- strategy
+- mode
+- source
+- review status
+
+Extend the existing Phase 7O.1 drill-down contract with:
+
+- entry_block_start
+- entry_block_end
+- display_timezone
+
+The filtered Trade Log count must match the block count.
+
+PART 13 — COACHING SUMMARY
+
+Add deterministic time-based summaries.
+
+Examples:
+
+BEST WINDOW
+09:30–09:59
++4.2R across 12 reviewed trades
+
+BIGGEST TIME-BASED LEAK
+10:30–10:59
+Early entries appeared in 7 of 11 reviewed trades and were associated with -3.4R.
+
+DISCIPLINE PEAK
+08:30–08:59
+83% followed-plan rate
+
+Only render statements supported by sufficient samples.
+
+PART 14 — SESSION BOUNDARIES
+
+Clearly distinguish time block from session.
+
+Examples:
+
+09:30–09:59 may belong to New York Open.
+20:00–20:29 may belong to Asia/overnight.
+
+Do not derive session solely from the block label if the system already stores canonical session.
+
+PART 15 — TESTS
+
+TIME BUCKETS
+- exact block start
+- exact block end
+- 09:59:59
+- 10:00:00
+- midnight
+- DST transition
+- timezone-aware import
+- timezone-missing import
+
+PERFORMANCE
+- wins/losses/breakeven
+- open trades excluded
+- net R
+- profit factor
+- zero-loss denominator
+
+DISCIPLINE
+- followed-plan rate
+- ratings
+- mistake frequency
+- positive behavior frequency
+- unreviewed counts
+
+BREAKDOWN
+- Long vs Short
+- strategy
+- instrument
+- top/worst calculation
+
+CONFIDENCE
+- insufficient
+- early
+- moderate
+- strong
+
+DRILL-DOWN
+- block count equals filtered log count
+- date and source filters preserved
+- browser history preserved
+
+SAFETY
+- no learning updates
+- no trading changes
+- no additional polling stream
+
+PART 16 — VALIDATION
+
+Run:
+
+- intraday analytics tests
+- coaching analytics tests
+- drill-down tests
+- journal trade-log tests
+- review workflow tests
+- Main Brain navigation tests
+- TypeScript typecheck
+- production build
+- parity
+- scalp golden
+- git diff --check
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Files changed
+4. Canonical timestamp source
+5. Timezone handling
+6. Bucket formula
+7. Metrics delivered
+8. Confidence behavior
+9. Drill-down behavior
+10. Tests
+11. TypeScript/build results
+12. Screenshots
+13. Confirmation that no Databento, scoring, readiness, risk, alerts, TradersPost, execution, or learning behavior changed
