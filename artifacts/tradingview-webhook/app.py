@@ -548,6 +548,19 @@ DATABENTO_ENABLED = os.environ.get(
 ).strip().lower() in ("1", "true", "yes", "on")
 _DATABENTO_BRAIN  = None   # populated in __main__ when DATABENTO_ENABLED is True
 
+# ── HIGH-2: Databento execution-health gate thresholds ────────────────────────
+# These are the HARD thresholds used by _check_databento_execution_health().
+# They are intentionally tighter than the 30-min display/staleness window because
+# an intraday execution decision must be grounded in fresh data.  All values are
+# in seconds unless the key ends in _min (minutes).
+_DB_EXEC_THRESHOLDS = {
+    "tick_age_max_sec":       300,   # 5 min: last trade tick must be ≤5 min old
+    "bar_age_max_sec":        300,   # 5 min: last completed 1-min bar must be ≤5 min
+    "vwap_age_max_min":        10,   # 10 min: VWAP must be fresher than 10 min
+    "candidate_age_max_sec":  120,   # 2 min: READY setup must have been evaluated ≤2 min ago
+    "future_skew_max_sec":     30,   # 30 s: timestamps >30 s in the future are rejected
+}
+
 # When DATABENTO_ENABLED, Databento BOS/CHOCH/CONFIRMATION events automatically
 # enqueue a scored webhook analysis (Discord + auto-trade) without needing a TV hit.
 # Set DATABENTO_SIGNALS=0 to disable signal triggering while keeping the feed alive
@@ -3212,8 +3225,13 @@ EXECUTION_WEBHOOK_URL = os.environ.get("EXECUTION_WEBHOOK_URL", "").strip()
 EXECUTION_ACCOUNT_ID  = os.environ.get("EXECUTION_ACCOUNT_ID", "").strip()
 EXECUTION_TOKEN       = os.environ.get("EXECUTION_TOKEN", "").strip()   # PickMyTrade body token
 _EXECUTION_MODE_RAW   = os.environ.get("EXECUTION_MODE", "").strip().lower()
-_VALID_EXECUTION_MODES = {"manual_only", "paper", "traderspost", "pickmytrade"}
+# ── HIGH-1 SAFETY FIX: fail-closed execution mode ─────────────────────────────
+# "disabled" added as a first-class mode. Missing / blank / invalid values resolve
+# to "paper" (never live). The presence of a webhook URL NEVER enables live mode.
+# Live providers (traderspost, pickmytrade) require an EXPLICIT env setting.
+_VALID_EXECUTION_MODES = {"disabled", "manual_only", "paper", "traderspost", "pickmytrade"}
 _EXECUTION_PROVIDER_LABELS = {
+    "disabled":    "Disabled (no execution)",
     "manual_only": "Manual (no auto-send)",
     "paper":       "Paper (simulated)",
     "traderspost": "TradersPost → Tradovate",
@@ -3221,25 +3239,36 @@ _EXECUTION_PROVIDER_LABELS = {
 }
 
 def resolve_execution_mode():
-    """Resolve the active execution mode per request (so a secret change takes
-    effect on the next restart predictably). An explicit, valid EXECUTION_MODE wins;
-    otherwise default to a LIVE provider only when its URL is set, else manual_only."""
+    """Resolve the active execution mode (fail-closed).
+
+    FAIL-CLOSED invariant: if EXECUTION_MODE is missing, blank, or unrecognised,
+    the resolved mode is 'paper' — never a live provider.  The presence of a
+    TradersPost or PickMyTrade webhook URL NEVER enables live execution.
+    Live execution requires an explicit EXECUTION_MODE=traderspost setting.
+    'disabled' blocks all execution (gateway returns 409 immediately).
+    """
     if _EXECUTION_MODE_RAW in _VALID_EXECUTION_MODES:
         return _EXECUTION_MODE_RAW
-    if TRADERSPOST_WEBHOOK_URL:
-        return "traderspost"
-    if EXECUTION_WEBHOOK_URL:
-        return "pickmytrade"
-    return "manual_only"
+    # Missing / blank / unknown → paper (fail-closed; never live).
+    return "paper"
+
+def _configured_execution_mode():
+    """Return the explicitly configured raw value, or None if unset / invalid.
+    Used for audit/status reporting; callers must use resolve_execution_mode() for
+    actual execution decisions."""
+    return _EXECUTION_MODE_RAW if _EXECUTION_MODE_RAW in _VALID_EXECUTION_MODES else None
 
 def execution_is_live(mode=None):
-    """True for provider modes that POST to a real broker bridge."""
+    """True ONLY for provider modes that POST to a real broker bridge.
+    'disabled' and the safe defaults never return True."""
     return (mode or resolve_execution_mode()) in ("traderspost", "pickmytrade")
 
 def execution_configured(mode=None):
-    """True when the resolved mode can act. manual_only / paper need no URL; live
-    providers need their destination configured."""
+    """True when the resolved mode is ready to act. manual_only / paper need no URL;
+    live providers need their destination configured; disabled is never configured."""
     mode = mode or resolve_execution_mode()
+    if mode == "disabled":
+        return False
     if mode == "traderspost":
         return bool(TRADERSPOST_WEBHOOK_URL)
     if mode == "pickmytrade":
@@ -9401,6 +9430,35 @@ LEARNING_SETUP_DISABLE_MAX_WR = 0.25  # win-rate ceiling for "repeatedly failing
 LEARNING_SETUP_DISABLE_MAX_EXP = -0.5  # expectancy ceiling for "repeatedly failing" detection
 LEARNING_ELIGIBILITY          = {}    # instrument -> Rule Engine verdict (in-memory; DB-backed after recompute)
 LEARNING_ELIGIBILITY_LOCK     = threading.Lock()
+
+# ── HIGH-3: LRE error counter ─────────────────────────────────────────────────
+# Counts every LRE exception across both check points in _execute_trade_gateway_inner().
+# Exposed via /status (lre_error_count) so the operator can detect a stuck engine.
+_LRE_ERROR_COUNT      = 0
+_LRE_ERROR_COUNT_LOCK = threading.Lock()
+
+def _increment_lre_error_count():
+    global _LRE_ERROR_COUNT
+    with _LRE_ERROR_COUNT_LOCK:
+        _LRE_ERROR_COUNT += 1
+
+def _get_lre_error_count():
+    with _LRE_ERROR_COUNT_LOCK:
+        return _LRE_ERROR_COUNT
+
+# ── Execution-attempt audit deque ─────────────────────────────────────────────
+# Every _maybe_auto_execute() decision writes a structured record here (MEDIUM-7/8).
+# Blocked attempts are recorded but never as strategy_trades / journal entries.
+_EXEC_ATTEMPTS      = deque(maxlen=200)
+_EXEC_ATTEMPTS_LOCK = threading.Lock()
+
+def _record_exec_attempt(record: dict):
+    """Append a structured execution-attempt audit record (fail-open, never raises)."""
+    try:
+        with _EXEC_ATTEMPTS_LOCK:
+            _EXEC_ATTEMPTS.append({**record, "recorded_at": now_utc().isoformat()})
+    except Exception:
+        pass
 # ── Shared Trade Memory weighting (display-only; governor + analyst single source).
 # STRATEGY_VERSION is bumped MANUALLY whenever the trade LOGIC (filters / indicators
 # / rules) changes; prior-version closed trades are then heavily down-weighted so
@@ -51327,10 +51385,17 @@ def _build_status_payload(_tk):
         "discord_configured":      bool(DISCORD_WEBHOOK_URL),
         "mnq_discord_configured":  bool(DISCORD_MNQ_WEBHOOK_URL),
         "traderspost_configured":  bool(TRADERSPOST_WEBHOOK_URL),
+        # HIGH-1: expose both the configured value and the fail-closed effective value.
+        # "configured_mode" is the raw EXECUTION_MODE env value (None = unset/invalid).
+        # "execution_mode" (effective_mode) is what the gateway actually uses.
+        "configured_mode":          _configured_execution_mode(),
         "execution_mode":           resolve_execution_mode(),
+        "effective_mode":           resolve_execution_mode(),
         "execution_live":           execution_is_live() and execution_configured(),
         "execution_enabled":        execution_configured(),
         "execution_provider_label": _EXECUTION_PROVIDER_LABELS.get(resolve_execution_mode(), resolve_execution_mode()),
+        # HIGH-3: LRE error counter for monitoring.
+        "lre_error_count":          _get_lre_error_count(),
         # Manual pre-READY "TAKE THIS TRADE" preview path — gates the dashboard button
         # (default OFF => key is False => button hidden => today's UI byte-identical).
         "user_preview_enabled":     _user_preview_take_enabled(),
@@ -54601,6 +54666,14 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
     logger.debug("execute_trade_gateway: source=%s instrument=%s mode=%s", source, instrument, mode)
 
+    # ── HIGH-1: disabled mode blocks all execution immediately ──────────────────
+    if mode == "disabled":
+        return {"status": "error",
+                "configured_mode": _configured_execution_mode(),
+                "effective_mode":  mode,
+                "reason": "Execution is disabled (EXECUTION_MODE=disabled). "
+                          "Set EXECUTION_MODE=paper or EXECUTION_MODE=traderspost to enable."}, 409
+
     # Live providers require their destination URL; manual_only / paper never do.
     if execution_is_live(mode) and not execution_configured(mode):
         miss = "TRADERSPOST_WEBHOOK_URL" if mode == "traderspost" else "EXECUTION_WEBHOOK_URL"
@@ -54685,6 +54758,32 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     # direction come from the authoritative full_analysis() for the instrument.
     a = full_analysis(ticker_override=instrument)
     verdict = str(a.get("verdict", ""))
+
+    # ── Candidate timestamp validation (HIGH-2 / MEDIUM-2) ───────────────────
+    # Validate that the READY setup was evaluated recently.  A stale candidate
+    # (analysis generated before the current market state) must not drive execution.
+    # Only applies when a candidate_preview block is present; absence is allowed
+    # (not all setups generate a preview).  Fail-closed on malformed timestamps.
+    _cp_preview = a.get("candidate_preview") or {}
+    _cp_gen_ts  = _cp_preview.get("generated_at") or _cp_preview.get("ts")
+    if _cp_gen_ts:
+        try:
+            _cp_dt  = datetime.fromisoformat(str(_cp_gen_ts))
+            _cp_age = (now_utc() - _cp_dt).total_seconds()
+            if _cp_age < -_DB_EXEC_THRESHOLDS["future_skew_max_sec"]:
+                return {"status": "error",
+                        "reason": "Candidate timestamp is in the future — "
+                                  "refusing execution on a clock-skewed setup."}, 409
+            if _cp_age > _DB_EXEC_THRESHOLDS["candidate_age_max_sec"]:
+                return {"status": "error",
+                        "reason": f"Candidate setup is stale ({int(_cp_age)}s old, "
+                                  f"max {_DB_EXEC_THRESHOLDS['candidate_age_max_sec']}s) — "
+                                  "re-evaluate before sending."}, 409
+        except (ValueError, TypeError) as _cp_exc:
+            # Malformed timestamp in candidate_preview → fail-closed.
+            return {"status": "error",
+                    "reason": f"Candidate timestamp is malformed — refusing execution "
+                              f"({type(_cp_exc).__name__})."}, 409
 
     # Authoritative READY gate — mirrors EXACTLY what makes the dashboard button
     # appear, so an authenticated POST can't bypass the UI. Market-closed can leave
@@ -55026,30 +55125,63 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
                         "Wait for higher-conviction setup or the London/NY session."
                     )}, 409
 
-    # ── Learning Rule Engine gate (FAIL-OPEN: no data = no effect) ───────────────────────
+    # ── Learning Rule Engine gate (HIGH-3 FIX: exceptions now FAIL-CLOSED) ─────────
     # Check per-instrument eligibility from the in-memory LEARNING_ELIGIBILITY cache
-    # (warmed by _recompute_learning every Nth close + boot). DISABLED = hard 409.
-    # GHOST_ONLY = demote live order to paper so the trade still fires + builds data.
-    # No data yet (DB off / under-sampled) = FAIL-OPEN (pass through, unchanged).
+    # (warmed by _recompute_learning every Nth close + boot).
+    # States handled explicitly — no exception is interpreted as "no influence":
+    #   LIVE_ELIGIBLE  → pass through
+    #   GHOST_ONLY     → demote live to paper (trade fires, builds evidence)
+    #   DISABLED       → hard 409 block
+    #   INSUFFICIENT_SAMPLES (n=0 bootstrap or under-sample) → pass (fail-open by design)
+    #   Exception / malformed → FAIL-CLOSED (block + increment error counter)
+    _lre_diag = {"check": "instrument_eligibility", "instrument": instrument}
     try:
         _lre_status, _lre_rule = _check_learning_eligibility(instrument, mode=TRADING_MODE)
+        _sample_count = None
+        try:
+            _ns = _ns_learning_key(instrument, TRADING_MODE)
+            with LEARNING_ELIGIBILITY_LOCK:
+                _lre_entry = LEARNING_ELIGIBILITY.get(_ns) or LEARNING_ELIGIBILITY.get(instrument) or {}
+            _sample_count = _lre_entry.get("sample_size")
+        except Exception:
+            pass
+        _lre_diag.update({"status": _lre_status, "rule": _lre_rule,
+                           "sample_count": _sample_count, "blocked": False})
         if _lre_status == "DISABLED":
+            _lre_diag["blocked"] = True
             logger.warning("LearningRuleGate: %s DISABLED (%s) → blocking", instrument, _lre_rule)
             return {"status": "error",
+                    "lre_diagnostics": _lre_diag,
                     "reason": "Learning Rule Engine: %s is blocked (%s). "
                               "This setup repeatedly fails — pausing live orders." % (instrument, _lre_rule)}, 409
         if _lre_status == "GHOST_ONLY" and execution_is_live(mode):
             logger.info("LearningRuleGate: %s GHOST_ONLY (%s) → demoting to paper ghost trade",
                         instrument, _lre_rule)
             mode = "paper"
+        # LIVE_ELIGIBLE / INSUFFICIENT_SAMPLES / no-data → continue (no influence applied)
     except Exception as _lre_exc:
-        logger.debug("LearningRuleGate check failed (fail-open): %s", _lre_exc)
+        # HIGH-3: exceptions in the LRE are a safety-engine failure and must NEVER
+        # be silently treated as approval.  Block the trade and record the error.
+        _lre_error_type = type(_lre_exc).__name__
+        _lre_diag.update({"status": "EXCEPTION", "exc_type": _lre_error_type,
+                           "blocked": True})
+        _increment_lre_error_count()
+        logger.error("LearningRuleGate check 1 EXCEPTION — blocking (fail-closed): %s: %s",
+                     _lre_error_type, _lre_exc)
+        return {"status": "error",
+                "lre_diagnostics": _lre_diag,
+                "reason": "Learning Rule Engine internal error — blocking to protect the account "
+                          "(exception type: %s)." % _lre_error_type}, 409
+
     # Per-setup rule: if THIS specific strategy pattern has been flagged as repeatedly
     # failing for this instrument, demote to ghost so evidence keeps accumulating but
-    # live orders pause until the pattern turns around. FAIL-OPEN.
+    # live orders pause until the pattern turns around.
+    # HIGH-3 FIX: exceptions here also FAIL-CLOSED.
+    _lre_sk_diag = {"check": "setup_key_disabled", "instrument": instrument}
     try:
         _lre_sk = ((a.get("learning_score_influence") or {}).get("meta") or {}).get("active_key") or \
                   (a.get("strategy_engine") or {}).get("active_key")
+        _lre_sk_diag["strategy_key"] = _lre_sk
         if _lre_sk and execution_is_live(mode):
             _lre_ns_key = _ns_learning_key(instrument, TRADING_MODE)
             with LEARNING_ELIGIBILITY_LOCK:
@@ -55061,7 +55193,17 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
                                instrument, _lre_sk)
                 mode = "paper"
     except Exception as _lre_sk_exc:
-        logger.debug("LearningRuleGate setup check failed (fail-open): %s", _lre_sk_exc)
+        # HIGH-3: setup-key check exception → fail-closed.
+        _lre_sk_error_type = type(_lre_sk_exc).__name__
+        _lre_sk_diag.update({"status": "EXCEPTION", "exc_type": _lre_sk_error_type,
+                              "blocked": True})
+        _increment_lre_error_count()
+        logger.error("LearningRuleGate check 2 EXCEPTION — blocking (fail-closed): %s: %s",
+                     _lre_sk_error_type, _lre_sk_exc)
+        return {"status": "error",
+                "lre_diagnostics": _lre_sk_diag,
+                "reason": "Learning Rule Engine (setup check) internal error — blocking to protect "
+                          "the account (exception type: %s)." % _lre_sk_error_type}, 409
 
     try:
         zone = str(tp["entry_zone"])
@@ -55385,6 +55527,114 @@ def execute_trade_gateway(instrument, contracts, source="manual", direction=None
     return result, code
 
 
+def _check_databento_execution_health(inst):
+    """HIGH-2: Hard pre-execution health gate for the Databento feed.
+
+    Returns (healthy: bool, reason_code: str, diagnostics: dict).
+
+    Called from _maybe_auto_execute() BEFORE the _AUTO_EXEC_LOCK / gateway call.
+    If DATABENTO_ENABLED is False the gate is a no-op (pass-through) so the system
+    stays byte-identical when running on TradingView alerts only.
+
+    Thresholds are defined in _DB_EXEC_THRESHOLDS (centrally, near the declaration
+    of DATABENTO_ENABLED).  All fail-closed: unknown state = block.
+
+    Required invariant: a candidate approved before a feed disconnect is still blocked
+    if the feed is unhealthy at transmission time (this function is called at the last
+    moment before the lock, not at signal-arrival time).
+    """
+    diag = {
+        "instrument":        inst,
+        "databento_enabled": DATABENTO_ENABLED,
+        "checked_at":        now_utc().isoformat(),
+    }
+    # Gate is N/A when Databento is disabled — TV-alert-only path is unaffected.
+    if not DATABENTO_ENABLED or _DATABENTO_BRAIN is None:
+        diag["result"] = "gate_not_applicable"
+        return True, "databento_disabled", diag
+
+    now  = now_utc()
+    thr  = _DB_EXEC_THRESHOLDS
+
+    # ── 1. Connection state (lazy import from databento_brain) ─────────────
+    try:
+        from databento_brain import DATABENTO_STATUS as _DB_STATUS  # noqa: PLC0415
+    except ImportError:
+        _DB_STATUS = {}
+    connected = bool(_DB_STATUS.get("connected", False))
+    diag["connected"] = connected
+    if not connected:
+        diag["result"] = "disconnected"
+        return False, "databento_disconnected", diag
+
+    # ── 2. Instrument subscribed (id→inst map populated) ───────────────────
+    try:
+        id_map = getattr(_DATABENTO_BRAIN, "_id_to_inst", {}) or {}
+        subscribed = inst in id_map.values()
+    except Exception:
+        subscribed = False
+    diag["subscribed"] = subscribed
+    if not subscribed:
+        diag["result"] = "instrument_not_subscribed"
+        return False, "databento_instrument_not_subscribed", diag
+
+    # ── 3. Tick freshness (from app-level CURRENT_PRICE_TS_BY_TICKER) ─────────
+    tick_ts_raw = (CURRENT_PRICE_TS_BY_TICKER or {}).get(inst)
+    diag["tick_ts"] = tick_ts_raw
+    if not tick_ts_raw:
+        diag["result"] = "tick_timestamp_missing"
+        return False, "databento_tick_timestamp_missing", diag
+    try:
+        tick_dt    = datetime.fromisoformat(tick_ts_raw)
+        tick_age_s = (now - tick_dt).total_seconds()
+        diag["tick_age_sec"] = round(tick_age_s, 1)
+        if tick_age_s < -thr["future_skew_max_sec"]:
+            diag["result"] = "tick_timestamp_future"
+            return False, "databento_tick_timestamp_future", diag
+        if tick_age_s > thr["tick_age_max_sec"]:
+            diag["result"] = "tick_stale"
+            return False, "databento_tick_stale", diag
+    except (ValueError, TypeError) as _exc:
+        diag.update({"result": "tick_timestamp_malformed", "exc": type(_exc).__name__})
+        return False, "databento_tick_timestamp_malformed", diag
+
+    # ── 4. Completed bar freshness (lazy import from databento_brain) ──────
+    try:
+        from databento_brain import DATABENTO_BARS_BY_INST as _DB_BARS  # noqa: PLC0415
+    except ImportError:
+        _DB_BARS = {}
+    bars = _DB_BARS.get(inst)
+    diag["bars_available"] = bool(bars)
+    if bars:
+        last_bar    = bars[-1]
+        bar_ts_raw  = last_bar.get("ts") or last_bar.get("ts_close")
+        diag["bar_ts"] = bar_ts_raw
+        if bar_ts_raw:
+            try:
+                # Bar timestamps may be Unix epoch integers (seconds) OR isoformat strings
+                if isinstance(bar_ts_raw, (int, float)):
+                    bar_dt = datetime.fromtimestamp(bar_ts_raw, tz=timezone.utc)
+                else:
+                    bar_dt = datetime.fromisoformat(str(bar_ts_raw))
+                bar_age_s = (now - bar_dt).total_seconds()
+                diag["bar_age_sec"] = round(bar_age_s, 1)
+                if bar_age_s > thr["bar_age_max_sec"]:
+                    diag["result"] = "bar_stale"
+                    return False, "databento_bar_stale", diag
+            except (ValueError, TypeError, OSError):
+                diag["bar_ts_malformed"] = True  # warn-only; tick freshness already verified
+
+    # ── 5. VWAP freshness (tighter threshold than display) ─────────────────
+    _, vwap_status = get_vwap(inst, max_age_min=thr["vwap_age_max_min"])
+    diag["vwap_status"] = vwap_status
+    if vwap_status != "ok":
+        diag["result"] = "vwap_" + vwap_status
+        return False, "databento_vwap_" + vwap_status, diag
+
+    diag["result"] = "healthy"
+    return True, "healthy", diag
+
+
 def _advisor_blocks_auto_trade(inst):
     """Advisor (Analyst Reasoning) review of an about-to-fire AUTO-trade.
 
@@ -55506,6 +55756,27 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
                 return False
     except Exception as _pex_exc:
         logger.debug("Pre-execution direction checks failed (fail-open): %s", _pex_exc)
+
+    # ── HIGH-2: Databento feed health gate ────────────────────────────────────
+    # Evaluated at execution time (not at signal arrival) so a disconnect between
+    # signal and execution still blocks.  Fail-open when Databento is disabled.
+    _db_healthy, _db_reason, _db_diag = _check_databento_execution_health(inst)
+    if not _db_healthy:
+        logger.warning(
+            "Auto-trade skipped for %s — Databento health gate: %s %s",
+            inst, _db_reason, _db_diag)
+        _record_exec_attempt({
+            "instrument":     inst,
+            "source":         source,
+            "setup_key":      str(setup_key),
+            "configured_mode": _configured_execution_mode(),
+            "effective_mode": resolve_execution_mode(),
+            "databento_health": _db_diag,
+            "final_action":   "blocked",
+            "reason_code":    _db_reason,
+        })
+        return False
+
     with _AUTO_EXEC_LOCK:
         # A still-open USER-APPROVED PREVIEW take holds this instrument's slot by the
         # operator's own hand — never let a bot-AUTO entry stack on top of it, even in

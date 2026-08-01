@@ -629,11 +629,148 @@ dedup key composition) were confirmed as correctly implemented.
 
 ## 20. Exact Files Changed
 
+### Initial Audit (no production code modified)
+
 | File | Change |
 |---|---|
 | `artifacts/tradingview-webhook/test_auto_trading_audit.py` | **NEW** — 97-test audit suite |
 
-No production code was modified during this audit.
+### Remediation Pass (HIGH findings resolved)
+
+| File | Change |
+|---|---|
+| `artifacts/tradingview-webhook/app.py` | HIGH-1: `resolve_execution_mode()` fails closed to `"paper"` — removed URL fallback; added `"disabled"` mode; new `_configured_execution_mode()` helper |
+| `artifacts/tradingview-webhook/app.py` | HIGH-2: new `_check_databento_execution_health(inst)` gate + `_DB_EXEC_THRESHOLDS` constants; called from `_maybe_auto_execute()` before the `_AUTO_EXEC_LOCK` block |
+| `artifacts/tradingview-webhook/app.py` | HIGH-3: both LRE `try/except` blocks changed from `logger.debug("fail-open")` to `logger.error` + return 409; new `_LRE_ERROR_COUNT` / `_LRE_ERROR_COUNT_LOCK` + `_increment_lre_error_count()` / `_get_lre_error_count()` |
+| `artifacts/tradingview-webhook/app.py` | MEDIUM-2: candidate timestamp validation in `_execute_trade_gateway_inner()` — fail-closed on stale, future-skew, or malformed `generated_at` |
+| `artifacts/tradingview-webhook/app.py` | MEDIUM-7/8: `_EXEC_ATTEMPTS` deque + `_EXEC_ATTEMPTS_LOCK` + `_record_exec_attempt()` — structured blocked-attempt audit trail |
+| `artifacts/tradingview-webhook/app.py` | `/status` endpoint: exposes `configured_mode`, `effective_mode`, `lre_error_count` |
+| `artifacts/tradingview-webhook/test_auto_trading_audit.py` | Updated 2 tests whose expected values documented the old HIGH-1 URL-fallback defect; renamed to reflect the fixed behavior |
+| `artifacts/tradingview-webhook/test_auto_trading_high_findings_remediation.py` | **NEW** — 57-test remediation regression suite (7 sections covering all 5 spec invariants) |
+
+---
+
+## 22. Remediation Outcomes (HIGH Findings Resolved)
+
+> **Status: COMPLETE** — All three HIGH findings and two MEDIUM findings resolved.
+> Original 97 tests updated and still pass. 57 new regression tests added, all pass.
+> Scalp golden byte-identical before and after.
+
+### HIGH-1 — Execution-Mode Fail-Closed
+
+**Previous behaviour:** `resolve_execution_mode()` fell back to `"traderspost"` (live) when
+`EXECUTION_MODE` was unset but `TRADERSPOST_WEBHOOK_URL` was configured.
+
+**New behaviour:**
+- `resolve_execution_mode()` always returns `"paper"` for any missing, blank, or unrecognised
+  `EXECUTION_MODE` value. The URL-fallback path has been deleted entirely.
+- A new `"disabled"` mode is now a valid mode; the gateway returns 409 immediately without
+  calling `full_analysis`.
+- `_configured_execution_mode()` returns the raw env value (or `None`) for audit/display,
+  keeping it separate from the safe effective value.
+- `/status` now exposes both `configured_mode` (raw) and `effective_mode` (resolved).
+
+**Functions changed:** `resolve_execution_mode`, `_configured_execution_mode` (new),
+`execution_is_live`, `execution_configured`, `_execute_trade_gateway_inner`
+
+**Effective mode default:** `"paper"` (never live when unconfigured)
+
+---
+
+### HIGH-2 — Databento Health Gate
+
+**Previous behaviour:** `_maybe_auto_execute()` fired without checking whether the live feed
+was connected, subscribed, or fresh. A disconnected or stale Databento feed could not block
+an auto-execution.
+
+**New behaviour:** `_check_databento_execution_health(inst)` is called in `_maybe_auto_execute()`
+before acquiring `_AUTO_EXEC_LOCK`. It evaluates:
+
+| Check | Threshold |
+|---|---|
+| Feed connected | `DATABENTO_STATUS.connected == True` |
+| Instrument subscribed | `inst` in `_DATABENTO_BRAIN._id_to_inst.values()` |
+| Tick age | ≤ 300 s |
+| Completed bar age | ≤ 300 s |
+| VWAP freshness | `get_vwap()` must return a non-stale value (≤ 600 s) |
+| Candidate preview age | ≤ 120 s (MEDIUM-2, in gateway) |
+| Future-skew limit | ≤ 30 s ahead |
+
+All checks fail-closed (block on exception, missing key, or malformed timestamp).
+When `DATABENTO_ENABLED=False` the gate is a no-op pass-through.
+
+**New constants:** `_DB_EXEC_THRESHOLDS` dict near the `DATABENTO_ENABLED` declaration.
+**New function:** `_check_databento_execution_health(inst) → (ok, reason, diag)`
+
+---
+
+### HIGH-3 — LRE Exceptions Fail-Closed
+
+**Previous behaviour:** Both LRE `try/except` blocks in `_execute_trade_gateway_inner()` used
+`logger.debug("... fail-open")` and silently allowed execution to proceed on any exception.
+
+**New behaviour:**
+- Both blocks now `logger.error(...)` and return 409 with a structured `lre_diagnostics` dict.
+- `_LRE_ERROR_COUNT` (int, thread-safe via `_LRE_ERROR_COUNT_LOCK`) tracks runtime LRE
+  exceptions. Exposed in `/status` as `lre_error_count`.
+- Helper functions: `_increment_lre_error_count()`, `_get_lre_error_count()`.
+
+---
+
+### MEDIUM-2 — Candidate Timestamp Validation
+
+Added in `_execute_trade_gateway_inner()` after the `market_open` check:
+- Validates `candidate_preview.generated_at` against `_DB_EXEC_THRESHOLDS["candidate_age_max_sec"]`
+  (120 s) and the future-skew limit.
+- Absent `candidate_preview` or absent `generated_at` → pass-through (gate only fires when
+  the key is present with a value).
+- Malformed timestamp → 409 + `"malformed_candidate_timestamp"` reason code.
+- Stale → 409 + `"stale_candidate"`.
+- Future → 409 + `"candidate_timestamp_future"`.
+
+---
+
+### MEDIUM-7/8 — Structured Execution-Attempt Audit
+
+- `_EXEC_ATTEMPTS = deque(maxlen=200)` with `_EXEC_ATTEMPTS_LOCK` — in-memory ring buffer.
+- `_record_exec_attempt(record: dict)` — fail-open helper that appends with a `recorded_at`
+  ISO timestamp. Called by `_maybe_auto_execute()` on every health-gate block.
+- Required fields per record: `instrument`, `final_action`, `reason_code`, `recorded_at`.
+
+---
+
+### Flask Port Exposure (MEDIUM-6)
+
+Confirmed: In the production Reserved VM topology, only the api-server port (Express) is
+publicly reachable. Flask binds on `host="0.0.0.0"` at the configured `PORT` but that port
+is never added to the proxy's public routing table — it is only reachable via
+the Express `/api` proxy from inside the same VM. No change required.
+
+---
+
+### Test Results After Remediation
+
+| Suite | Tests | Pass | Fail |
+|---|---|---|---|
+| `test_auto_trading_audit.py` (original) | 97 | 97 | 0 |
+| `test_auto_trading_high_findings_remediation.py` (new) | 57 | 57 | 0 |
+| **Total** | **154** | **154** | **0** |
+
+Subtests: 29 pass. Scalp golden: byte-identical ✅. Live broker calls during suite: **0**.
+
+---
+
+### Remaining Open Findings
+
+| ID | Severity | Summary | Status |
+|---|---|---|---|
+| MEDIUM-1 | MEDIUM | Bar-age gate not independent — see HIGH-2 `bar_age` check | ✅ Addressed in health gate |
+| MEDIUM-3 | MEDIUM | Prop drawdown not tracked in-app | Deferred — requires broker integration |
+| MEDIUM-4 | MEDIUM | Pre-send audit lacks payload hash | Deferred — cosmetic audit hardening |
+| MEDIUM-5 | MEDIUM | Paper / live path divergence | Acceptable — documented |
+| MEDIUM-6 | MEDIUM | Flask port reachable externally? | ✅ Confirmed not reachable |
+
+All CRITICAL and HIGH findings are resolved. No outstanding blockers for live use.
 
 ---
 
