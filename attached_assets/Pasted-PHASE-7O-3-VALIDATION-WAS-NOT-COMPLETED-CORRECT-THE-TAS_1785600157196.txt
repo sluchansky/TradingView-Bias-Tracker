@@ -1,0 +1,159 @@
+PHASE 7O.3 VALIDATION WAS NOT COMPLETED — CORRECT THE TASK
+
+The report you returned is for Phase 7M, the Databento Live Candlestick Chart. That is not the requested Phase 7O.3 Journal Coaching correlations validation.
+
+Do not repeat the chart validation. Do not add, modify, or recommit chart code.
+
+Now complete the original Phase 7O.3 task only.
+
+Required scope
+
+Validate the implementation containing:
+
+* GET /journal/coaching/correlations
+* Journal Coaching CORRELATIONS UI
+* Correlation drill-through filters
+* Phase 7O.3 regression tests
+
+1. Identify the Phase 7O.3 implementation
+
+Report:
+
+* Current branch
+* Current HEAD
+* Commit or checkpoint containing Phase 7O.3
+* Exact Phase 7O.3 changed files
+* Whether those files are present in the current deployed revision
+* Clean or dirty working-tree status
+* git diff --check result
+
+Do not report Phase 7M chart files as the Phase 7O.3 file list.
+
+2. Run the actual Phase 7O.3 tests
+
+Run the correct file:
+
+test_journal_coaching_correlations_7o3.py
+
+Report:
+
+* Exact collection result
+* Exact number of tests executed
+* Passed, failed, skipped, or collection errors
+* Full reason for any collection error
+* Whether the previously reported 87 tests still pass
+
+If the test cannot collect, diagnose and fix only the Phase 7O.3 test or implementation issue causing that failure. Do not label a collection error “pre-existing” without proving it against the commit immediately before Phase 7O.3.
+
+Also run:
+
+* Phase 7O.2 journal coaching regression tests
+* Journal coaching drill-down tests
+* Journal API parity tests
+* Scalp golden tests
+* TypeScript typecheck
+
+Report whether MainBrain.tsx has any errors related to the CORRELATIONS implementation.
+
+3. Restart and republish the current application
+
+Restart the webhook/application server and publish the revision containing Phase 7O.3.
+
+Confirm the published revision or deployment corresponds to the current HEAD.
+
+Do not change:
+
+* Databento ingestion
+* Chart code
+* Strategy scoring
+* Edge scores
+* Trade gates
+* Learning influence
+* Execution
+* TradersPost
+* Risk controls
+* Journal write behavior
+
+4. Validate the correct production endpoint
+
+Using authenticated production access, call:
+
+GET /journal/coaching/correlations
+
+Confirm:
+
+* Successful HTTP status
+* Valid JSON
+* ok or equivalent success state
+* Coverage counts
+* Rating × mistake matrices
+* Rating × emotion matrices
+* Setup × execution matrix
+* Discipline outcomes
+* High-quality losses
+* Low-quality wins
+* Expensive combinations
+* Coaching summary or insight sentences
+* Safe empty-data behavior
+
+Record field names and data types without exposing private trade values.
+
+Also confirm:
+
+* The Express proxy forwards the endpoint
+* No authentication loop
+* No repeated failing polling
+* No direct Flask-port exposure was introduced
+
+5. Validate the Journal Coaching production UI
+
+Open the authenticated published Main Brain Journal Coaching page.
+
+Verify:
+
+* Existing Journal Coaching content renders
+* CORRELATIONS section renders
+* Four summary cards render
+* Setup × execution heatmap renders
+* Discipline outcomes table renders
+* Rating-field selector works
+* Rating × mistake drill-through works
+* Rating × emotion drill-through works
+* High-quality-loss drill-through works
+* Low-quality-win drill-through works
+* Expensive-combination ranking renders
+* Insight sentences render
+* Apply refreshes all three coaching datasets
+* Clearing a rating drill removes both rating_min and rating_max
+* Existing journal filters still work afterward
+
+Capture authenticated screenshots of:
+
+1. Full CORRELATIONS section
+2. Summary cards and discipline outcomes
+3. Setup × execution heatmap
+4. Active rating × mistake drill
+5. Active rating × emotion drill
+6. Existing coaching content after correlations loads
+
+An unauthenticated “Connecting” screenshot is not sufficient.
+
+6. Final Phase 7O.3 report
+
+Return only the Phase 7O.3 validation report containing:
+
+* Deployment status
+* Published revision
+* Branch and HEAD
+* Phase 7O.3 test result
+* Regression result
+* Production correlations endpoint result
+* Production Journal Coaching UI result
+* Screenshot locations
+* New Phase 7O.3 defects found
+* Proven pre-existing issues
+* Final verdict: PASS, PASS WITH PRE-EXISTING ISSUES, or FAIL
+
+Do not include another Phase 7M chart report.
+
+Do not begin Phase 7O.4.
