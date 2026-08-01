@@ -193,6 +193,71 @@ class DatabentoBrain:
         Called from the data-feed thread — fn must return quickly."""
         self._structure_signal_callbacks.append(fn)
 
+    # ── HTTP symbology pre-fetch ──────────────────────────────────────────────
+
+    def _prefetch_id_map_http(self, db_module: Any, api_key: str) -> None:
+        """
+        Pre-populate _id_to_inst via Databento's REST symbology.resolve endpoint.
+
+        The live feed for continuous-contract subscriptions (stype_in="continuous")
+        never sends SymbolMappingMsg records, so client.symbology_map stays empty
+        for the entire session. TradeMsg also has no `symbol` field, so every
+        symbol-string fallback in _on_trade resolves to "". This method resolves
+        instrument_id values up-front from the HTTP API so the map is ready before
+        the first tick arrives. Fail-open: any exception is logged and the live
+        feed continues — the add_callback path handles any rollover mid-session.
+        """
+        try:
+            hist = db_module.Historical(key=api_key)
+            today = datetime.now(timezone.utc).date().isoformat()
+            result = hist.symbology.resolve(
+                dataset=DB_DATASET,
+                symbols=list(DB_SYMBOLS.values()),
+                stype_in="continuous",
+                stype_out="instrument_id",
+                start_date=today,
+            )
+            # Response shape: {"result": {"MGC.c.0": [{"d0":…,"d1":…,"s":"12345"}], …}}
+            mappings: dict = result.get("result", {})
+            found = 0
+            for cont_sym, intervals in mappings.items():
+                inst = self._sym_to_inst.get(cont_sym)
+                if inst is None:
+                    continue
+                for interval in (intervals or []):
+                    iid_str = (
+                        interval.get("s") if isinstance(interval, dict) else str(interval)
+                    )
+                    if not iid_str or iid_str in ("0", "None", ""):
+                        continue
+                    try:
+                        iid = int(iid_str)
+                        self._id_to_inst[iid] = inst
+                        found += 1
+                        logger.info(
+                            "DatabentoBrain: pre-fetched id→inst %s → %s (sym=%s)",
+                            iid, inst, cont_sym,
+                        )
+                    except (ValueError, TypeError):
+                        pass
+            if found:
+                logger.info(
+                    "DatabentoBrain: symbology pre-fetch complete — %d id(s) mapped: %s",
+                    found, self._id_to_inst,
+                )
+            else:
+                logger.warning(
+                    "DatabentoBrain: symbology pre-fetch returned no mappings "
+                    "(raw result=%s); instrument resolution will rely on add_callback",
+                    mappings,
+                )
+        except Exception as exc:
+            logger.warning(
+                "DatabentoBrain: symbology pre-fetch failed (%s); "
+                "instrument resolution will rely on add_callback",
+                exc,
+            )
+
     # ── Reconnect loop ────────────────────────────────────────────────────────
 
     def _reconnect_loop(self) -> None:
@@ -251,46 +316,37 @@ class DatabentoBrain:
             "DatabentoBrain: connected ✓  streaming %s", list(DB_SYMBOLS.values())
         )
 
-        # ── Background thread: poll client.symbology_map until populated ─────────
-        # The SDK processes SymbolMappingMsg internally (via its own _map_symbol
-        # callback) and populates client.symbology_map within ~1s of start().
-        # add_callback is unreliable for this — we poll from a side thread.
-        DATABENTO_STATUS["_symmap_debug"] = {"polls": 0, "smap": {}, "err": None}
+        # ── Pre-fetch instrument_id map via HTTP API ──────────────────────────
+        # The Databento live feed for continuous-contract subscriptions does NOT
+        # send SymbolMappingMsg records, so client.symbology_map stays permanently
+        # empty. TradeMsg also has no `symbol` field. We resolve instrument_id
+        # values up-front via the REST symbology.resolve endpoint instead.
+        self._prefetch_id_map_http(db, api_key)
 
-        def _build_id_map() -> None:
-            for i in range(100):          # up to 10s; typically < 1s
-                try:
-                    smap: dict = client.symbology_map
-                    DATABENTO_STATUS["_symmap_debug"]["polls"] = i + 1
-                    DATABENTO_STATUS["_symmap_debug"]["smap"] = dict(smap)
-                    if smap:
-                        for iid, native_sym in smap.items():
-                            native_str = str(native_sym)
-                            for root in DB_SYMBOLS:
-                                if native_str.startswith(root):
-                                    self._id_to_inst[iid] = root
-                                    logger.info(
-                                        "DatabentoBrain: id→inst %s → %s"
-                                        " (native=%s)", iid, root, native_str,
-                                    )
-                                    break
-                        logger.info(
-                            "DatabentoBrain: symbology map ready — %s",
-                            self._id_to_inst,
-                        )
-                        return
-                except Exception as _e:
-                    DATABENTO_STATUS["_symmap_debug"]["err"] = str(_e)
-                    logger.warning("DatabentoBrain: symbology poll error: %s", _e)
-                time.sleep(0.1)
-            logger.warning(
-                "DatabentoBrain: symbology_map empty after 10s — "
-                "will fall back to symbol-prefix matching"
-            )
+        # ── add_callback: catch any SymbolMappingMsg that arrives at runtime ──
+        # Handles contract rollovers mid-session where instrument_ids change.
+        def _symmap_callback(rec) -> None:
+            try:
+                import databento_dbn as _dbn  # noqa: PLC0415
+                if not isinstance(rec, _dbn.SymbolMappingMsg):
+                    return
+                iid    = rec.instrument_id
+                native = getattr(rec, "stype_out_symbol", "") or ""
+                if not native:
+                    native = getattr(rec, "stype_in_symbol", "") or ""
+                for root in DB_SYMBOLS:
+                    if native.startswith(root):
+                        if self._id_to_inst.get(iid) != root:
+                            self._id_to_inst[iid] = root
+                            logger.info(
+                                "DatabentoBrain: live id→inst %s → %s (native=%s)",
+                                iid, root, native,
+                            )
+                        break
+            except Exception:
+                pass
 
-        threading.Thread(
-            target=_build_id_map, daemon=True, name="db-symmap"
-        ).start()
+        client.add_callback(_symmap_callback)
 
         # ── Periodic stale-partial flush (low-volume bar-close fix) ─────────
         # Closes bars that accumulated real trades but whose minute has already
@@ -315,7 +371,8 @@ class DatabentoBrain:
     def _on_trade(self, rec) -> None:
         try:
             # ── Instrument resolution ─────────────────────────────────────────
-            # Primary: instrument_id → inst via the map built from SymbolMappingMsg
+            # Primary: instrument_id → inst via the map pre-fetched by HTTP API
+            # (_prefetch_id_map_http) and kept current by add_callback rollover handler.
             iid  = getattr(rec, "instrument_id", None)
             inst = self._id_to_inst.get(iid) if iid is not None else None
 
