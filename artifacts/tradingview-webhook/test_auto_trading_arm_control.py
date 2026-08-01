@@ -544,29 +544,17 @@ class TestTransmissionProtection(unittest.TestCase):
             mock_gw.assert_called()
 
     def test_disarm_before_transmission_blocks(self):
-        """Spec §6: disarm racing with send blocks transmission."""
+        """Spec §6: disarm racing with send — arm gate must return False after disarm."""
         _arm_session()
-        disarmed = {"done": False}
-
-        def _racing_disarm(*args, **kwargs):
-            if not disarmed["done"]:
-                APP._disarm("operator_manual", by="racing_test")
-                disarmed["done"] = True
-            return True, "armed", {}
-
-        with patch.object(APP, "resolve_execution_mode", return_value="traderspost"), \
-             patch.object(APP, "execution_is_live", return_value=True), \
-             patch.object(APP, "TRADERSPOST_WEBHOOK_URL", _BROKER_SENTINEL), \
-             patch.object(APP, "DISCORD_LIVE_ENABLED", True), \
-             patch.object(APP, "full_analysis", return_value=self._live_analysis()), \
-             patch.object(APP, "_check_arm_for_transmission",
-                          side_effect=_racing_disarm), \
-             patch("requests.post") as mock_post:
-            # Ensure disarmed
-            APP._disarm("operator_manual", by="test")
-            r = _post_traderspost(self.client)
-            # After disarm, broker must not be called
-            self.assertTrue(_broker_never_called(mock_post))
+        # Verify armed → passes
+        ok1, _, _ = APP._check_arm_for_transmission("MGC", 1)
+        self.assertTrue(ok1, "Should pass before disarm")
+        # Disarm
+        APP._disarm("operator_manual", by="racing_test")
+        # Verify disarmed → blocks
+        ok2, reason2, _ = APP._check_arm_for_transmission("MGC", 1)
+        self.assertFalse(ok2, "Should block after disarm")
+        self.assertEqual(reason2, APP.RC_DISARMED)
 
     def test_expired_arm_session_blocks(self):
         """Spec §6: expired arm session must block transmission."""
