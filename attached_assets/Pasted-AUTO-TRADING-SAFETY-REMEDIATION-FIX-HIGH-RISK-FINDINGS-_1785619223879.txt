@@ -1,0 +1,401 @@
+AUTO-TRADING SAFETY REMEDIATION — FIX HIGH-RISK FINDINGS ONLY
+
+Do not add strategies, change scoring formulas, loosen gates, redesign the UI, or refactor unrelated code.
+
+Keep execution in paper mode throughout this task.
+
+Do not transmit any live TradersPost orders.
+
+Goal
+
+Resolve the three HIGH findings from AUTO_TRADING_SYSTEM_AUDIT.md:
+
+1. Missing EXECUTION_MODE can default to live TradersPost
+2. Databento connectivity is not a hard pre-execution gate
+3. Learning Rule Engine exceptions fail open
+
+Also fix the directly related candidate-freshness and blocked-attempt audit gaps.
+
+1. Baseline
+
+Report:
+
+* Current branch
+* Starting HEAD
+* Working-tree status
+* Published revision
+* Configured execution mode
+* Effective execution mode
+* Whether a TradersPost webhook is configured, without exposing it
+* git diff --check
+
+Before making changes, confirm effective execution mode is paper or disabled.
+
+If it is anything else, stop outbound execution immediately by setting the effective mode to paper or disabled before continuing.
+
+2. Fix execution-mode resolution
+
+Find resolve_execution_mode() and every other place that resolves or infers execution mode.
+
+Change the rules to:
+
+* Missing EXECUTION_MODE → disabled
+* Blank EXECUTION_MODE → disabled
+* Invalid value → disabled
+* paper → paper only
+* disabled → no execution
+* traderspost → live routing only when explicitly configured
+* A configured webhook must never enable live execution by itself
+* Legacy variables must not override an explicit disabled or paper value
+* Mode comparisons must be case-insensitive
+* Backend status must expose both configured mode and effective mode
+* The frontend must display the backend effective mode rather than infer it
+
+Required invariant:
+
+No explicit live authorization = no outbound order
+
+Add tests for:
+
+* Missing mode
+* Blank mode
+* Invalid mode
+* Mixed-case values
+* Explicit paper
+* Explicit disabled
+* Explicit traderspost
+* Webhook present with missing mode
+* Webhook present with disabled mode
+* Conflicting legacy/current settings
+* Restart or config reload
+
+Every non-explicit-live case must assert that the outbound transport was not called.
+
+3. Add a mandatory Databento health gate
+
+Add a hard backend gate immediately before candidate claiming and again immediately before transmission.
+
+The gate must verify:
+
+* Databento is enabled
+* Connection state is healthy
+* The requested instrument is subscribed
+* Latest canonical tick is fresh
+* Latest completed bar is fresh
+* VWAP is fresh
+* Candidate is fresh
+* Market state is not empty
+* No required timestamp is missing or malformed
+* No timestamp is materially in the future
+* Freshness data belongs to the same instrument
+* The system is not treating a maintenance halt or closed market as tradable
+* Unknown health state blocks execution
+
+Define freshness thresholds centrally.
+
+Do not use the existing 30-minute VWAP window as sufficient approval for intraday execution.
+
+Use strategy/timeframe-aware thresholds where practical. If the current architecture cannot support that cleanly, use conservative centralized thresholds and document them.
+
+Required invariant:
+
+Disconnected, stale, missing, conflicting, or invalid market data = NO TRADE
+
+Add tests for:
+
+* Healthy feed
+* Disconnected feed
+* Unknown connection state
+* Databento disabled
+* Unsubscribed instrument
+* Stale tick
+* Stale completed bar
+* Stale VWAP
+* Stale candidate
+* Missing timestamp
+* Malformed timestamp
+* Future timestamp
+* Wrong-instrument timestamp
+* Empty market state
+* Maintenance halt
+* Feed disconnect after initial approval but before transmission
+* Reconnect before fresh data arrives
+
+For every blocked case, assert zero outbound webhook calls.
+
+4. Fix Learning Rule Engine exception handling
+
+Audit both Learning Rule Engine checks in the execution path.
+
+Represent these states explicitly:
+
+* pass
+* block
+* disabled
+* insufficient samples
+* no optional learning data
+* exception
+* timeout
+* malformed result
+* contradictory result
+* strategy-key mismatch
+
+Safe behavior:
+
+* Disabled → no influence
+* Insufficient samples → no influence
+* Missing optional learning data → no influence
+* Explicit block → block execution
+* Exception → block auto-execution
+* Timeout → block auto-execution
+* Malformed result → block auto-execution
+* Contradictory result → block auto-execution
+* Strategy-key mismatch → block auto-execution
+
+Do not treat engine failure as equivalent to “no learning influence.”
+
+Add structured diagnostics with:
+
+* State
+* Strategy key
+* Rule key
+* Sample count when available
+* Exception class
+* Whether execution was blocked
+* Error counter
+
+Do not log secrets or full stack traces containing credentials.
+
+Required invariant:
+
+A safety-engine error can never become approval
+
+Add tests at both LRE checkpoints for every state above.
+
+5. Enforce final candidate freshness
+
+Validate the final execution candidate’s:
+
+* Candidate ID
+* Creation timestamp
+* Market-data timestamp
+* Strategy-evaluation timestamp
+* Expiration timestamp, if present
+* Market-state generation or cycle ID, if present
+
+Block when:
+
+* Timestamp is absent
+* Timestamp is malformed
+* Candidate is too old
+* Timestamp is materially in the future
+* Candidate belongs to an older market-state cycle
+* Setup was invalidated after candidate creation
+* Candidate instrument differs from execution instrument
+
+Include the candidate timestamp or generation ID in the deterministic idempotency key.
+
+6. Add structured blocked-attempt auditing
+
+For each automatic execution evaluation, write a structured audit event containing:
+
+* Timestamp
+* Candidate ID
+* Instrument
+* Strategy
+* Direction
+* Configured execution mode
+* Effective execution mode
+* Databento health result
+* Tick age
+* Bar age
+* VWAP age
+* Candidate age
+* LRE state
+* Mandatory gate result
+* Duplicate-guard result
+* Final action
+* Machine-readable reason codes
+
+Allowed final actions:
+
+* blocked
+* paper_simulated
+* claimed
+* transmitted
+* transmission_unknown
+* rejected
+
+Use reason codes such as:
+
+* EXECUTION_MODE_DISABLED
+* EXECUTION_MODE_NOT_EXPLICIT
+* DATABENTO_DISCONNECTED
+* DATABENTO_STATE_UNKNOWN
+* STALE_TICK
+* STALE_BAR
+* STALE_VWAP
+* STALE_CANDIDATE
+* INVALID_TIMESTAMP
+* FUTURE_TIMESTAMP
+* WRONG_INSTRUMENT_STATE
+* LRE_BLOCK
+* LRE_EXCEPTION
+* LRE_TIMEOUT
+* LRE_INVALID_RESULT
+* DUPLICATE_SIGNAL
+
+Blocked attempts must not be recorded as filled or executed trades.
+
+7. Verify execution-route security
+
+Investigate whether Flask port 8000 or any direct backend route is reachable without Express authentication in production.
+
+Check:
+
+* /traderspost
+* Manual execution routes
+* Execution-mode controls
+* Order-management routes
+* Configuration routes
+* Any route capable of changing state or causing an order
+
+Confirm:
+
+* GET requests cannot place orders
+* Direct Flask access cannot bypass authentication
+* Production port 8000 is not publicly exposed
+* State-changing routes require backend authorization
+* Secrets are not exposed by status routes
+
+If a production authentication bypass exists, classify it as CRITICAL and fix it immediately.
+
+Acceptable fixes include:
+
+* Bind Flask internally only
+* Add backend authentication to execution routes
+* Remove public exposure
+* Require an internal proxy secret in addition to operator authentication
+
+Do not rely solely on the frontend UI.
+
+8. Required test file
+
+Create:
+
+test_auto_trading_high_findings_remediation.py
+
+The file must cover:
+
+* Fail-closed execution-mode resolution
+* Webhook presence cannot enable live mode
+* Databento connection gate
+* Tick freshness
+* Bar freshness
+* VWAP freshness
+* Candidate freshness
+* Instrument-state matching
+* LRE exception handling
+* LRE timeout handling
+* Invalid LRE responses
+* Structured reason codes
+* No outbound webhook for every blocked condition
+* Feed disconnect between approval and send
+
+9. Regression and concurrency testing
+
+Run:
+
+* Existing 97-test audit suite
+* New remediation suite
+* Existing execution safety tests
+* Existing duplicate-guard tests
+* Existing TradersPost payload tests
+* Existing prop-guard tests
+* Parity checks
+* Scalp golden tests
+
+Also run:
+
+* 2 simultaneous execution calls
+* 10 simultaneous execution calls
+* Timeout followed by retry
+* Server restart with mode missing
+* Feed disconnect between approval and send
+* LRE exception at first checkpoint
+* LRE exception at final checkpoint
+* Paper dry runs for MGC, MNQ, MES, and MYM
+* Long and Short for all four instruments
+
+Confirm:
+
+* Zero live outbound transmissions
+* No duplicate transmission
+* Missing mode cannot transmit
+* Disconnected feed cannot transmit
+* Stale data cannot transmit
+* LRE exception cannot transmit
+
+10. Update the audit report
+
+Update:
+
+AUTO_TRADING_SYSTEM_AUDIT.md
+
+Add a remediation section containing:
+
+* Original finding
+* Previous behavior
+* New behavior
+* Functions changed
+* Files changed
+* Tests added
+* Test results
+* Effective default execution mode
+* Freshness thresholds
+* LRE error behavior
+* Direct Flask exposure result
+* Remaining CRITICAL findings
+* Remaining HIGH findings
+* Remaining MEDIUM findings
+
+11. Final report
+
+Return:
+
+* Branch
+* Starting HEAD
+* Final HEAD
+* Published revision
+* Configured execution mode
+* Effective execution mode
+* Files changed
+* Original audit tests passed
+* New remediation tests passed
+* Concurrency tests passed
+* Dry-run scenarios passed
+* Live outbound attempts
+* CRITICAL findings remaining
+* HIGH findings remaining
+* MEDIUM findings remaining
+* Any defects fixed
+* Any unresolved blockers
+
+Use one verdict:
+
+* SAFE FOR CONTROLLED PAPER TRADING
+* SAFE FOR LIMITED LIVE PILOT
+* NOT SAFE FOR LIVE AUTO-TRADING
+
+Do not use SAFE FOR LIMITED LIVE PILOT unless:
+
+* Missing mode defaults to disabled
+* Webhook presence cannot enable live execution
+* Databento health and freshness gates are mandatory
+* Candidate freshness is enforced
+* LRE errors fail closed
+* No production authentication bypass exists
+* All remediation tests pass
+* No unresolved CRITICAL or HIGH execution-safety findings remain
+
+Do not enable live auto-trading during this task.
