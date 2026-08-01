@@ -69,31 +69,31 @@ class TestExecutionModeResolution(unittest.TestCase):
         with patch.object(APP, "_EXECUTION_MODE_RAW", "traderspost"):
             self.assertEqual(APP.resolve_execution_mode(), "traderspost")
 
-    def test_missing_env_no_url_defaults_paper(self):
-        """HIGH-1 FIX: when EXECUTION_MODE is unset AND no provider URL is configured,
-        resolve_execution_mode() must return paper (fail-closed, never live)."""
+    def test_missing_env_no_url_defaults_disabled(self):
+        """HIGH-1 FIX v2: when EXECUTION_MODE is unset AND no provider URL is configured,
+        resolve_execution_mode() must return 'disabled' (strongest fail-closed default)."""
         with patch.object(APP, "_EXECUTION_MODE_RAW", ""), \
              patch.object(APP, "TRADERSPOST_WEBHOOK_URL", ""), \
              patch.object(APP, "EXECUTION_WEBHOOK_URL", ""):
             mode = APP.resolve_execution_mode()
-            self.assertEqual(mode, "paper",
-                             "Missing EXECUTION_MODE must default to paper, not live")
+            self.assertEqual(mode, "disabled",
+                             "Missing EXECUTION_MODE must default to disabled (strongest safe default)")
             self.assertFalse(APP.execution_is_live(mode))
+            self.assertFalse(APP.execution_configured(mode))
 
-    def test_missing_env_with_traderspost_url_still_paper(self):
-        """HIGH-1 FIX: URL presence must NOT enable live mode when EXECUTION_MODE is unset.
-        This is the primary defect fixed by HIGH-1: before the fix, this returned live
-        traderspost. After the fix, only an explicit EXECUTION_MODE=traderspost activates
-        live execution."""
+    def test_missing_env_with_traderspost_url_still_disabled(self):
+        """HIGH-1 FIX v2: URL presence must NOT enable any execution when EXECUTION_MODE is unset.
+        The fix defaults to disabled (no execution at all), not paper. Only an explicit
+        EXECUTION_MODE=traderspost activates live execution."""
         with patch.object(APP, "_EXECUTION_MODE_RAW", ""), \
              patch.object(APP, "TRADERSPOST_WEBHOOK_URL", "https://traderspost.io/hook/x"), \
              patch.object(APP, "EXECUTION_WEBHOOK_URL", ""):
             mode = APP.resolve_execution_mode()
-            self.assertNotEqual(mode, "traderspost",
-                                "HIGH-1 FIX: URL present without explicit EXECUTION_MODE "
-                                "must NOT resolve to live traderspost")
+            self.assertEqual(mode, "disabled",
+                             "Missing EXECUTION_MODE + URL must resolve to disabled")
             self.assertFalse(APP.execution_is_live(mode),
                              "Missing EXECUTION_MODE + URL configured must never be live")
+            self.assertFalse(APP.execution_configured(mode))
 
     def test_paper_is_never_live(self):
         self.assertFalse(APP.execution_is_live("paper"))

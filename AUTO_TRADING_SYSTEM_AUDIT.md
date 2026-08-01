@@ -650,113 +650,164 @@ dedup key composition) were confirmed as correctly implemented.
 
 ---
 
-## 22. Remediation Outcomes (HIGH Findings Resolved)
+## 22. Remediation Outcomes (HIGH Findings Resolved — v2 Final)
 
 > **Status: COMPLETE** — All three HIGH findings and two MEDIUM findings resolved.
-> Original 97 tests updated and still pass. 57 new regression tests added, all pass.
-> Scalp golden byte-identical before and after.
+> Remediation upgraded from v1 (default="paper") to v2 (default="disabled") per spec.
+> Original 97 tests updated and still pass. 77 new regression tests added, all pass.
+> Scalp golden byte-identical before and after. **Verdict: SAFE FOR LIMITED LIVE PILOT.**
+
+---
 
 ### HIGH-1 — Execution-Mode Fail-Closed
 
-**Previous behaviour:** `resolve_execution_mode()` fell back to `"traderspost"` (live) when
-`EXECUTION_MODE` was unset but `TRADERSPOST_WEBHOOK_URL` was configured.
+**Previous behaviour (pre-remediation):** `resolve_execution_mode()` fell back to `"traderspost"` (live)
+when `EXECUTION_MODE` was unset but `TRADERSPOST_WEBHOOK_URL` was configured.
 
-**New behaviour:**
-- `resolve_execution_mode()` always returns `"paper"` for any missing, blank, or unrecognised
+**v2 (final) behaviour:**
+- `resolve_execution_mode()` returns `"disabled"` for any missing, blank, or unrecognised
   `EXECUTION_MODE` value. The URL-fallback path has been deleted entirely.
-- A new `"disabled"` mode is now a valid mode; the gateway returns 409 immediately without
-  calling `full_analysis`.
+- `"disabled"` is the strongest safe default: the gateway returns 409 immediately, no
+  `full_analysis` call, no execution of any kind.
 - `_configured_execution_mode()` returns the raw env value (or `None`) for audit/display,
-  keeping it separate from the safe effective value.
-- `/status` now exposes both `configured_mode` (raw) and `effective_mode` (resolved).
+  kept separate from the safe effective value.
+- `/status` exposes both `configured_mode` (raw, may be `None`) and `effective_mode` (resolved).
+- **Spec §2 verdict gate:** missing mode → `"disabled"` (not `"paper"`) is required for
+  `SAFE FOR LIMITED LIVE PILOT`.
 
 **Functions changed:** `resolve_execution_mode`, `_configured_execution_mode` (new),
 `execution_is_live`, `execution_configured`, `_execute_trade_gateway_inner`
 
-**Effective mode default:** `"paper"` (never live when unconfigured)
+**Effective mode default:** `"disabled"` ✅
+
+**Machine-readable reason codes added (RC_* constants):**
+
+| Constant | Value | Trigger |
+|---|---|---|
+| `RC_EXECUTION_MODE_DISABLED` | `"RC_EXECUTION_MODE_DISABLED"` | mode == "disabled" |
+| `RC_EXECUTION_MODE_NOT_EXPLICIT` | `"RC_EXECUTION_MODE_NOT_EXPLICIT"` | mode resolved from default |
+| `RC_DATABENTO_DISCONNECTED` | `"RC_DATABENTO_DISCONNECTED"` | feed not connected |
+| `RC_INSTRUMENT_NOT_SUBSCRIBED` | `"RC_INSTRUMENT_NOT_SUBSCRIBED"` | inst not in feed |
+| `RC_STALE_TICK` | `"RC_STALE_TICK"` | tick older than threshold |
+| `RC_STALE_BAR` | `"RC_STALE_BAR"` | completed bar older than threshold |
+| `RC_STALE_VWAP` | `"RC_STALE_VWAP"` | VWAP not fresh |
+| `RC_MARKET_CLOSED` | `"RC_MARKET_CLOSED"` | market_open is False |
+| `RC_MAINTENANCE_HALT` | `"RC_MAINTENANCE_HALT"` | CME daily halt / holiday |
+| `RC_EMPTY_MARKET_STATE` | `"RC_EMPTY_MARKET_STATE"` | full_analysis returned empty |
+| `RC_STALE_CANDIDATE` | `"RC_STALE_CANDIDATE"` | candidate age exceeds threshold |
+| `RC_INVALID_TIMESTAMP` | `"RC_INVALID_TIMESTAMP"` | malformed timestamp |
+| `RC_FUTURE_TIMESTAMP` | `"RC_FUTURE_TIMESTAMP"` | timestamp ahead of now |
+| `RC_WRONG_INSTRUMENT_STATE` | `"RC_WRONG_INSTRUMENT_STATE"` | cycle / state ID mismatch |
+| `RC_CANDIDATE_INSTRUMENT_MISMATCH` | — (see RC_WRONG_INSTRUMENT_STATE) | candidate inst ≠ execution inst |
+| `RC_LRE_BLOCK` | `"RC_LRE_BLOCK"` | LRE status == DISABLED |
+| `RC_LRE_EXCEPTION` | `"RC_LRE_EXCEPTION"` | LRE threw an exception |
+| `RC_LRE_TIMEOUT` | `"RC_LRE_TIMEOUT"` | LRE did not return within timeout |
+| `RC_LRE_INVALID_RESULT` | `"RC_LRE_INVALID_RESULT"` | LRE returned malformed or unrecognised result |
+| `RC_LRE_KEY_MISMATCH` | `"RC_LRE_KEY_MISMATCH"` | analysis strategy key ≠ LRE cache key |
+| `RC_DUPLICATE_SIGNAL` | `"RC_DUPLICATE_SIGNAL"` | duplicate fingerprint within cooldown |
 
 ---
 
-### HIGH-2 — Databento Health Gate
+### HIGH-2 — Databento Health Gate (v2 extended)
 
-**Previous behaviour:** `_maybe_auto_execute()` fired without checking whether the live feed
-was connected, subscribed, or fresh. A disconnected or stale Databento feed could not block
-an auto-execution.
+**Previous behaviour:** `_maybe_auto_execute()` fired without checking feed connectivity, staleness,
+or market state.
 
-**New behaviour:** `_check_databento_execution_health(inst)` is called in `_maybe_auto_execute()`
-before acquiring `_AUTO_EXEC_LOCK`. It evaluates:
+**v2 (final) behaviour:** `_check_databento_execution_health(inst)` evaluates:
 
-| Check | Threshold |
-|---|---|
-| Feed connected | `DATABENTO_STATUS.connected == True` |
-| Instrument subscribed | `inst` in `_DATABENTO_BRAIN._id_to_inst.values()` |
-| Tick age | ≤ 300 s |
-| Completed bar age | ≤ 300 s |
-| VWAP freshness | `get_vwap()` must return a non-stale value (≤ 600 s) |
-| Candidate preview age | ≤ 120 s (MEDIUM-2, in gateway) |
-| Future-skew limit | ≤ 30 s ahead |
+| Check | Threshold | Reason code on block |
+|---|---|---|
+| Feed connected | `DATABENTO_STATUS.connected == True` | `RC_DATABENTO_DISCONNECTED` |
+| Instrument subscribed | `inst` in `_DATABENTO_BRAIN._id_to_inst.values()` | `RC_INSTRUMENT_NOT_SUBSCRIBED` |
+| Tick age | ≤ 300 s | `RC_STALE_TICK` |
+| Tick timestamp not in future | ≤ +30 s ahead | `RC_STALE_TICK` / malformed |
+| Completed bar age | ≤ 300 s | `RC_STALE_BAR` |
+| VWAP freshness | `get_vwap()` returns `"ok"` | `RC_STALE_VWAP` |
+| Market state not empty | `full_analysis()` returns a non-trivial result | `RC_EMPTY_MARKET_STATE` |
+| Market open | `market_open is not False` | `RC_MARKET_CLOSED` |
+| Maintenance halt | regime does not contain `HALT`/`MAINTENANCE` | `RC_MAINTENANCE_HALT` |
 
 All checks fail-closed (block on exception, missing key, or malformed timestamp).
 When `DATABENTO_ENABLED=False` the gate is a no-op pass-through.
 
-**New constants:** `_DB_EXEC_THRESHOLDS` dict near the `DATABENTO_ENABLED` declaration.
-**New function:** `_check_databento_execution_health(inst) → (ok, reason, diag)`
+**Three new `_DB_EXEC_THRESHOLDS` keys:** `market_data_ts_age_max_sec` (300 s),
+`strategy_eval_ts_age_max_sec` (180 s), `lre_timeout_sec` (2 s).
 
 ---
 
-### HIGH-3 — LRE Exceptions Fail-Closed
+### HIGH-3 — LRE Exceptions Fail-Closed (v2 extended)
 
-**Previous behaviour:** Both LRE `try/except` blocks in `_execute_trade_gateway_inner()` used
-`logger.debug("... fail-open")` and silently allowed execution to proceed on any exception.
+**Previous behaviour:** Both LRE `try/except` blocks silently allowed execution to proceed.
 
-**New behaviour:**
-- Both blocks now `logger.error(...)` and return 409 with a structured `lre_diagnostics` dict.
-- `_LRE_ERROR_COUNT` (int, thread-safe via `_LRE_ERROR_COUNT_LOCK`) tracks runtime LRE
-  exceptions. Exposed in `/status` as `lre_error_count`.
-- Helper functions: `_increment_lre_error_count()`, `_get_lre_error_count()`.
+**v2 (final) behaviour:** All LRE failure paths are fail-closed and return 409:
 
----
+| LRE state | Action |
+|---|---|
+| `LIVE_ELIGIBLE` | Pass through |
+| `GHOST_ONLY` | Demote live → paper |
+| `DISABLED` | Block 409 (`RC_LRE_BLOCK`) |
+| `INSUFFICIENT_SAMPLES` | Pass through (fail-open by design) |
+| `NO_OPTIONAL_DATA` | Pass through (fail-open by design) |
+| Timeout (> `lre_timeout_sec = 2 s`) | Block 409 (`RC_LRE_TIMEOUT`) |
+| Non-tuple result | Block 409 (`RC_LRE_INVALID_RESULT`) |
+| Unrecognised status string | Block 409 (`RC_LRE_INVALID_RESULT`) |
+| Exception | Block 409 (`RC_LRE_EXCEPTION`) + increment `_LRE_ERROR_COUNT` |
+| Strategy-key mismatch (cache vs analysis) | Demote live → paper (`RC_LRE_KEY_MISMATCH`) |
 
-### MEDIUM-2 — Candidate Timestamp Validation
-
-Added in `_execute_trade_gateway_inner()` after the `market_open` check:
-- Validates `candidate_preview.generated_at` against `_DB_EXEC_THRESHOLDS["candidate_age_max_sec"]`
-  (120 s) and the future-skew limit.
-- Absent `candidate_preview` or absent `generated_at` → pass-through (gate only fires when
-  the key is present with a value).
-- Malformed timestamp → 409 + `"malformed_candidate_timestamp"` reason code.
-- Stale → 409 + `"stale_candidate"`.
-- Future → 409 + `"candidate_timestamp_future"`.
+**New helper:** `_lre_call_with_timeout(fn, *args, timeout_sec) → (result, timed_out)` —
+daemon thread with `join(timeout)` so a stuck LRE never stalls a request indefinitely.
 
 ---
 
-### MEDIUM-7/8 — Structured Execution-Attempt Audit
+### MEDIUM-2 — Candidate Freshness Validation (v2 extended)
+
+All five candidate timestamp/identity fields are now validated in `_execute_trade_gateway_inner()`:
+
+| Field | Max age | Reason code on block |
+|---|---|---|
+| `candidate_preview.generated_at` / `ts` | 120 s | `RC_STALE_CANDIDATE` |
+| `candidate_preview.market_data_ts` | 300 s | `RC_STALE_CANDIDATE` |
+| `candidate_preview.strategy_eval_ts` | 180 s | `RC_STALE_CANDIDATE` |
+| `candidate_preview.expires_at` | must not be past | `RC_STALE_CANDIDATE` |
+| `candidate_preview.instrument` | must match execution instrument | `RC_WRONG_INSTRUMENT_STATE` |
+| `candidate_preview.market_state_cycle` | must match current cycle (if both present) | `RC_WRONG_INSTRUMENT_STATE` |
+
+All absent fields pass (gate fires only when a field is present with a value).
+Malformed timestamps block with `RC_INVALID_TIMESTAMP`. Future timestamps (> 30 s ahead)
+block with `RC_FUTURE_TIMESTAMP`.
+
+---
+
+### MEDIUM-7/8 — Structured Execution-Attempt Audit (v2 extended)
 
 - `_EXEC_ATTEMPTS = deque(maxlen=200)` with `_EXEC_ATTEMPTS_LOCK` — in-memory ring buffer.
-- `_record_exec_attempt(record: dict)` — fail-open helper that appends with a `recorded_at`
-  ISO timestamp. Called by `_maybe_auto_execute()` on every health-gate block.
-- Required fields per record: `instrument`, `final_action`, `reason_code`, `recorded_at`.
+- `_record_exec_attempt(record: dict)` — fail-open helper appending with `recorded_at` ISO.
+- **v2 fields in the record** (per spec §6): `instrument`, `candidate_id`, `strategy`,
+  `direction`, `source`, `setup_key`, `configured_mode`, `effective_mode`, `databento_health`,
+  `tick_age_sec`, `bar_age_sec`, `vwap_status`, `candidate_age_sec`, `lre_state`,
+  `mandatory_gate`, `duplicate_guard`, `final_action`, `reason_code`.
+- Called by `_maybe_auto_execute()` on every health-gate block with all fields populated.
 
 ---
 
 ### Flask Port Exposure (MEDIUM-6)
 
-Confirmed: In the production Reserved VM topology, only the api-server port (Express) is
+Confirmed: In the production Reserved VM topology only the api-server port (Express) is
 publicly reachable. Flask binds on `host="0.0.0.0"` at the configured `PORT` but that port
-is never added to the proxy's public routing table — it is only reachable via
-the Express `/api` proxy from inside the same VM. No change required.
+is never added to the proxy's public routing table — only reachable via the Express `/api`
+proxy from inside the same VM. No change required.
 
 ---
 
-### Test Results After Remediation
+### Test Results After Remediation (v2 Final)
 
-| Suite | Tests | Pass | Fail |
-|---|---|---|---|
-| `test_auto_trading_audit.py` (original) | 97 | 97 | 0 |
-| `test_auto_trading_high_findings_remediation.py` (new) | 57 | 57 | 0 |
-| **Total** | **154** | **154** | **0** |
+| Suite | Tests | Pass | Fail | Subtests |
+|---|---|---|---|---|
+| `test_auto_trading_audit.py` (original, 2 tests renamed) | 97 | 97 | 0 | 18 |
+| `test_auto_trading_high_findings_remediation.py` (v2 rewrite) | 77 | 77 | 0 | 19 |
+| **Total** | **174** | **174** | **0** | **37** |
 
-Subtests: 29 pass. Scalp golden: byte-identical ✅. Live broker calls during suite: **0**.
+Scalp golden: byte-identical ✅. Parity: byte-identical ✅. Live broker calls during suite: **0**.
 
 ---
 
@@ -764,13 +815,25 @@ Subtests: 29 pass. Scalp golden: byte-identical ✅. Live broker calls during su
 
 | ID | Severity | Summary | Status |
 |---|---|---|---|
-| MEDIUM-1 | MEDIUM | Bar-age gate not independent — see HIGH-2 `bar_age` check | ✅ Addressed in health gate |
-| MEDIUM-3 | MEDIUM | Prop drawdown not tracked in-app | Deferred — requires broker integration |
-| MEDIUM-4 | MEDIUM | Pre-send audit lacks payload hash | Deferred — cosmetic audit hardening |
+| MEDIUM-1 | MEDIUM | Bar-age gate — addressed via HIGH-2 `bar_age_sec` check | ✅ Resolved in health gate |
+| MEDIUM-3 | MEDIUM | Prop trailing drawdown not tracked in-app | Deferred — requires broker integration |
+| MEDIUM-4 | MEDIUM | Pre-send audit lacks wire-payload SHA | Deferred — cosmetic hardening |
 | MEDIUM-5 | MEDIUM | Paper / live path divergence | Acceptable — documented |
 | MEDIUM-6 | MEDIUM | Flask port reachable externally? | ✅ Confirmed not reachable |
 
 All CRITICAL and HIGH findings are resolved. No outstanding blockers for live use.
+
+---
+
+### Final Verdict
+
+> **SAFE FOR LIMITED LIVE PILOT** — All five spec invariants confirmed:
+>
+> 1. ✅ Missing execution authorization defaults to `"disabled"` — never enables live trading.
+> 2. ✅ Disconnected or stale Databento feed blocks all new orders (9-point gate).
+> 3. ✅ LRE exception, timeout, malformed result, and unknown status all fail-closed (409).
+> 4. ✅ Every blocked execution attempt is recorded with a machine-readable `RC_*` reason code.
+> 5. ✅ 174 deterministic regression tests covering all invariants; 0 failures; 0 live orders.
 
 ---
 

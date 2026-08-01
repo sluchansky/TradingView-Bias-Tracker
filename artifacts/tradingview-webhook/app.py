@@ -554,12 +554,40 @@ _DATABENTO_BRAIN  = None   # populated in __main__ when DATABENTO_ENABLED is Tru
 # an intraday execution decision must be grounded in fresh data.  All values are
 # in seconds unless the key ends in _min (minutes).
 _DB_EXEC_THRESHOLDS = {
-    "tick_age_max_sec":       300,   # 5 min: last trade tick must be ≤5 min old
-    "bar_age_max_sec":        300,   # 5 min: last completed 1-min bar must be ≤5 min
-    "vwap_age_max_min":        10,   # 10 min: VWAP must be fresher than 10 min
-    "candidate_age_max_sec":  120,   # 2 min: READY setup must have been evaluated ≤2 min ago
-    "future_skew_max_sec":     30,   # 30 s: timestamps >30 s in the future are rejected
+    "tick_age_max_sec":              300,   # 5 min: last trade tick must be ≤5 min old
+    "bar_age_max_sec":               300,   # 5 min: last completed 1-min bar must be ≤5 min
+    "vwap_age_max_min":               10,   # 10 min: VWAP must be fresher than 10 min
+    "candidate_age_max_sec":         120,   # 2 min: READY setup must have been evaluated ≤2 min ago
+    "market_data_ts_age_max_sec":    300,   # 5 min: market-data timestamp in candidate
+    "strategy_eval_ts_age_max_sec":  180,   # 3 min: strategy-evaluation timestamp in candidate
+    "future_skew_max_sec":            30,   # 30 s: timestamps >30 s in the future are rejected
+    "lre_timeout_sec":                 2,   # 2 s: LRE check times out and blocks
 }
+
+# ── Execution-attempt reason codes (machine-readable; used in audit records) ──
+# Use these constants everywhere rather than bare strings so refactors stay safe.
+RC_EXECUTION_MODE_DISABLED      = "EXECUTION_MODE_DISABLED"
+RC_EXECUTION_MODE_NOT_EXPLICIT  = "EXECUTION_MODE_NOT_EXPLICIT"
+RC_DATABENTO_DISCONNECTED       = "DATABENTO_DISCONNECTED"
+RC_DATABENTO_STATE_UNKNOWN      = "DATABENTO_STATE_UNKNOWN"
+RC_DATABENTO_NOT_SUBSCRIBED     = "DATABENTO_NOT_SUBSCRIBED"
+RC_STALE_TICK                   = "STALE_TICK"
+RC_STALE_BAR                    = "STALE_BAR"
+RC_STALE_VWAP                   = "STALE_VWAP"
+RC_STALE_CANDIDATE              = "STALE_CANDIDATE"
+RC_INVALID_TIMESTAMP            = "INVALID_TIMESTAMP"
+RC_FUTURE_TIMESTAMP             = "FUTURE_TIMESTAMP"
+RC_WRONG_INSTRUMENT_STATE       = "WRONG_INSTRUMENT_STATE"
+RC_MARKET_CLOSED                = "MARKET_CLOSED"
+RC_MAINTENANCE_HALT             = "MAINTENANCE_HALT"
+RC_EMPTY_MARKET_STATE           = "EMPTY_MARKET_STATE"
+RC_LRE_BLOCK                    = "LRE_BLOCK"
+RC_LRE_EXCEPTION                = "LRE_EXCEPTION"
+RC_LRE_TIMEOUT                  = "LRE_TIMEOUT"
+RC_LRE_INVALID_RESULT           = "LRE_INVALID_RESULT"
+RC_LRE_KEY_MISMATCH             = "LRE_KEY_MISMATCH"
+RC_DUPLICATE_SIGNAL             = "DUPLICATE_SIGNAL"
+RC_CANDIDATE_INSTRUMENT_MISMATCH = "CANDIDATE_INSTRUMENT_MISMATCH"
 
 # When DATABENTO_ENABLED, Databento BOS/CHOCH/CONFIRMATION events automatically
 # enqueue a scored webhook analysis (Discord + auto-trade) without needing a TV hit.
@@ -3242,15 +3270,16 @@ def resolve_execution_mode():
     """Resolve the active execution mode (fail-closed).
 
     FAIL-CLOSED invariant: if EXECUTION_MODE is missing, blank, or unrecognised,
-    the resolved mode is 'paper' — never a live provider.  The presence of a
-    TradersPost or PickMyTrade webhook URL NEVER enables live execution.
-    Live execution requires an explicit EXECUTION_MODE=traderspost setting.
-    'disabled' blocks all execution (gateway returns 409 immediately).
+    the resolved mode is 'disabled' — no execution is authorised at all.
+    The presence of a webhook URL NEVER enables live execution; only an explicit
+    EXECUTION_MODE=traderspost (or =pickmytrade) activates live routing.
+    'paper' simulates execution; 'disabled' blocks all execution (gateway 409).
+    Mode comparisons are case-insensitive (raw value is lowercased at load time).
     """
     if _EXECUTION_MODE_RAW in _VALID_EXECUTION_MODES:
         return _EXECUTION_MODE_RAW
-    # Missing / blank / unknown → paper (fail-closed; never live).
-    return "paper"
+    # Missing / blank / unknown → disabled (strongest safe default; never live).
+    return "disabled"
 
 def _configured_execution_mode():
     """Return the explicitly configured raw value, or None if unset / invalid.
@@ -9445,6 +9474,32 @@ def _increment_lre_error_count():
 def _get_lre_error_count():
     with _LRE_ERROR_COUNT_LOCK:
         return _LRE_ERROR_COUNT
+
+def _lre_call_with_timeout(fn, *args, timeout_sec=None, **kwargs):
+    """Run fn(*args, **kwargs) with a wall-clock timeout.
+
+    Returns (result, timed_out).  When timed_out=True the result is None and
+    the caller must treat the LRE as failed-closed (RC_LRE_TIMEOUT).
+    Uses a daemon thread so a stuck LRE never stalls the request indefinitely.
+    """
+    timeout_sec = timeout_sec or _DB_EXEC_THRESHOLDS.get("lre_timeout_sec", 2)
+    _result  = [None]
+    _exc     = [None]
+
+    def _run():
+        try:
+            _result[0] = fn(*args, **kwargs)
+        except Exception as _e:
+            _exc[0] = _e
+
+    t = threading.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout_sec)
+    if t.is_alive():
+        return None, True           # timed out
+    if _exc[0] is not None:
+        raise _exc[0]               # re-raise for caller to handle as LRE_EXCEPTION
+    return _result[0], False
 
 # ── Execution-attempt audit deque ─────────────────────────────────────────────
 # Every _maybe_auto_execute() decision writes a structured record here (MEDIUM-7/8).
@@ -54759,31 +54814,96 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     a = full_analysis(ticker_override=instrument)
     verdict = str(a.get("verdict", ""))
 
-    # ── Candidate timestamp validation (HIGH-2 / MEDIUM-2) ───────────────────
-    # Validate that the READY setup was evaluated recently.  A stale candidate
-    # (analysis generated before the current market state) must not drive execution.
-    # Only applies when a candidate_preview block is present; absence is allowed
-    # (not all setups generate a preview).  Fail-closed on malformed timestamps.
+    # ── Candidate freshness validation (spec §5) ─────────────────────────────
+    # Validate the final execution candidate's timestamps and identity fields.
+    # Fields checked (all fail-closed when present):
+    #   generated_at / ts     — creation timestamp (primary, ≤2 min)
+    #   market_data_ts        — age of the market data that produced this candidate (≤5 min)
+    #   strategy_eval_ts      — when the strategy scored this setup (≤3 min)
+    #   expires_at            — explicit expiry timestamp (if present, must not be past)
+    #   market_state_cycle    — cycle/generation ID (if mismatch with current → stale)
+    #   instrument            — candidate must belong to the instrument being executed
+    # Absent block OR absent individual field → pass (not all setups populate every field).
+    _cp_now     = now_utc()
     _cp_preview = a.get("candidate_preview") or {}
-    _cp_gen_ts  = _cp_preview.get("generated_at") or _cp_preview.get("ts")
-    if _cp_gen_ts:
+
+    # Instrument mismatch: if the candidate records an instrument, it must match.
+    _cp_inst = _cp_preview.get("instrument") or _cp_preview.get("ticker")
+    if _cp_inst and _cp_inst != instrument:
+        return {"status": "error",
+                "reason": f"Candidate instrument '{_cp_inst}' does not match "
+                          f"execution instrument '{instrument}' — refusing."}, 409
+
+    def _validate_cp_ts(ts_raw, max_age_sec, label):
+        """Validate a single candidate timestamp. Returns (ok, error_response, code)."""
+        if not ts_raw:
+            return True, None, None  # absent → pass
         try:
-            _cp_dt  = datetime.fromisoformat(str(_cp_gen_ts))
-            _cp_age = (now_utc() - _cp_dt).total_seconds()
-            if _cp_age < -_DB_EXEC_THRESHOLDS["future_skew_max_sec"]:
+            dt    = datetime.fromisoformat(str(ts_raw))
+            age_s = (_cp_now - dt).total_seconds()
+            if age_s < -_DB_EXEC_THRESHOLDS["future_skew_max_sec"]:
+                return False, {"status": "error",
+                               "reason": f"Candidate {label} is in the future — "
+                                         "refusing execution on a clock-skewed setup.",
+                               "reason_code": RC_FUTURE_TIMESTAMP}, 409
+            if age_s > max_age_sec:
+                return False, {"status": "error",
+                               "reason": f"Candidate {label} is stale ({int(age_s)}s old, "
+                                         f"max {max_age_sec}s) — re-evaluate before sending.",
+                               "reason_code": RC_STALE_CANDIDATE}, 409
+            return True, None, None
+        except (ValueError, TypeError) as _vex:
+            return False, {"status": "error",
+                           "reason": f"Candidate {label} is malformed — refusing execution "
+                                     f"({type(_vex).__name__}).",
+                           "reason_code": RC_INVALID_TIMESTAMP}, 409
+
+    # 1. Creation timestamp (primary — required when block is present)
+    _cp_gen_ts = _cp_preview.get("generated_at") or _cp_preview.get("ts")
+    if _cp_gen_ts:
+        _ok, _err, _code = _validate_cp_ts(
+            _cp_gen_ts, _DB_EXEC_THRESHOLDS["candidate_age_max_sec"], "creation timestamp")
+        if not _ok:
+            return _err, _code
+
+    # 2. Market-data timestamp (freshness of the underlying bars/ticks)
+    _ok, _err, _code = _validate_cp_ts(
+        _cp_preview.get("market_data_ts"),
+        _DB_EXEC_THRESHOLDS["market_data_ts_age_max_sec"], "market-data timestamp")
+    if not _ok:
+        return _err, _code
+
+    # 3. Strategy-evaluation timestamp
+    _ok, _err, _code = _validate_cp_ts(
+        _cp_preview.get("strategy_eval_ts"),
+        _DB_EXEC_THRESHOLDS["strategy_eval_ts_age_max_sec"], "strategy-eval timestamp")
+    if not _ok:
+        return _err, _code
+
+    # 4. Expiration timestamp (explicit TTL on the candidate, if present)
+    _cp_expires = _cp_preview.get("expires_at")
+    if _cp_expires:
+        try:
+            _exp_dt  = datetime.fromisoformat(str(_cp_expires))
+            _exp_age = (_cp_now - _exp_dt).total_seconds()
+            if _exp_age > 0:
                 return {"status": "error",
-                        "reason": "Candidate timestamp is in the future — "
-                                  "refusing execution on a clock-skewed setup."}, 409
-            if _cp_age > _DB_EXEC_THRESHOLDS["candidate_age_max_sec"]:
-                return {"status": "error",
-                        "reason": f"Candidate setup is stale ({int(_cp_age)}s old, "
-                                  f"max {_DB_EXEC_THRESHOLDS['candidate_age_max_sec']}s) — "
-                                  "re-evaluate before sending."}, 409
-        except (ValueError, TypeError) as _cp_exc:
-            # Malformed timestamp in candidate_preview → fail-closed.
+                        "reason": f"Candidate has expired ({int(_exp_age)}s past expiry) — "
+                                  "re-evaluate before sending.",
+                        "reason_code": RC_STALE_CANDIDATE}, 409
+        except (ValueError, TypeError) as _exp_exc:
             return {"status": "error",
-                    "reason": f"Candidate timestamp is malformed — refusing execution "
-                              f"({type(_cp_exc).__name__})."}, 409
+                    "reason": f"Candidate expiry timestamp is malformed ({type(_exp_exc).__name__}).",
+                    "reason_code": RC_INVALID_TIMESTAMP}, 409
+
+    # 5. Market-state cycle / generation ID mismatch (if both sides publish one)
+    _cp_cycle = _cp_preview.get("market_state_cycle") or _cp_preview.get("cycle_id")
+    _cur_cycle = (a.get("market_state") or {}).get("cycle") or (a.get("market_regime_meta") or {}).get("cycle")
+    if _cp_cycle is not None and _cur_cycle is not None and _cp_cycle != _cur_cycle:
+        return {"status": "error",
+                "reason": f"Candidate market-state cycle {_cp_cycle!r} does not match "
+                          f"current cycle {_cur_cycle!r} — analysis is stale.",
+                "reason_code": RC_WRONG_INSTRUMENT_STATE}, 409
 
     # Authoritative READY gate — mirrors EXACTLY what makes the dashboard button
     # appear, so an authenticated POST can't bypass the UI. Market-closed can leave
@@ -55125,28 +55245,88 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
                         "Wait for higher-conviction setup or the London/NY session."
                     )}, 409
 
-    # ── Learning Rule Engine gate (HIGH-3 FIX: exceptions now FAIL-CLOSED) ─────────
+    # ── Learning Rule Engine gate ─────────────────────────────────────────────
     # Check per-instrument eligibility from the in-memory LEARNING_ELIGIBILITY cache
     # (warmed by _recompute_learning every Nth close + boot).
-    # States handled explicitly — no exception is interpreted as "no influence":
-    #   LIVE_ELIGIBLE  → pass through
-    #   GHOST_ONLY     → demote live to paper (trade fires, builds evidence)
-    #   DISABLED       → hard 409 block
-    #   INSUFFICIENT_SAMPLES (n=0 bootstrap or under-sample) → pass (fail-open by design)
-    #   Exception / malformed → FAIL-CLOSED (block + increment error counter)
-    _lre_diag = {"check": "instrument_eligibility", "instrument": instrument}
+    #
+    # Explicit state table (no exception is interpreted as "no influence"):
+    #   LIVE_ELIGIBLE          → pass through
+    #   GHOST_ONLY             → demote live to paper (trade fires, builds evidence)
+    #   DISABLED               → hard 409 block (RC_LRE_BLOCK)
+    #   INSUFFICIENT_SAMPLES   → no influence (n=0 bootstrap / under-sample, fail-open)
+    #   NO_OPTIONAL_DATA       → no influence (learning DB off / not warmed)
+    #   Exception              → FAIL-CLOSED  (RC_LRE_EXCEPTION)
+    #   Timeout                → FAIL-CLOSED  (RC_LRE_TIMEOUT)
+    #   Malformed result       → FAIL-CLOSED  (RC_LRE_INVALID_RESULT)
+    #   Contradictory result   → FAIL-CLOSED  (RC_LRE_INVALID_RESULT)
+    #   Strategy-key mismatch  → demote live to paper (RC_LRE_KEY_MISMATCH)
+    _lre_diag = {
+        "check":           "instrument_eligibility",
+        "instrument":      instrument,
+        "strategy_key":    None,
+        "rule_key":        None,
+        "sample_count":    None,
+        "exc_type":        None,
+        "blocked":         False,
+        "error_counter":   _get_lre_error_count(),
+    }
     try:
-        _lre_status, _lre_rule = _check_learning_eligibility(instrument, mode=TRADING_MODE)
-        _sample_count = None
+        _lre_raw, _lre_timed_out = _lre_call_with_timeout(
+            _check_learning_eligibility, instrument,
+            mode=TRADING_MODE,
+            timeout_sec=_DB_EXEC_THRESHOLDS["lre_timeout_sec"])
+
+        if _lre_timed_out:
+            _lre_diag.update({"status": RC_LRE_TIMEOUT, "blocked": True})
+            _increment_lre_error_count()
+            _lre_diag["error_counter"] = _get_lre_error_count()
+            logger.error("LearningRuleGate check 1 TIMEOUT — blocking (fail-closed): %s", instrument)
+            return {"status": "error",
+                    "lre_diagnostics": _lre_diag,
+                    "reason": "Learning Rule Engine timed out — blocking to protect the account."}, 409
+
+        # Validate result shape (malformed / contradictory result check)
+        if not isinstance(_lre_raw, (tuple, list)) or len(_lre_raw) < 2:
+            _lre_diag.update({"status": RC_LRE_INVALID_RESULT,
+                              "blocked": True, "raw_result": repr(_lre_raw)[:80]})
+            _increment_lre_error_count()
+            _lre_diag["error_counter"] = _get_lre_error_count()
+            logger.error("LearningRuleGate check 1 INVALID RESULT — blocking (fail-closed): %r",
+                         _lre_raw)
+            return {"status": "error",
+                    "lre_diagnostics": _lre_diag,
+                    "reason": "Learning Rule Engine returned an invalid result — blocking."}, 409
+
+        _lre_status, _lre_rule = _lre_raw[0], _lre_raw[1]
+
+        # Contradictory result: both DISABLED and LIVE_ELIGIBLE at same time is impossible
+        # but a corrupt cache could emit both.  Any unrecognised status → block.
+        _KNOWN_LRE_STATUSES = {
+            "LIVE_ELIGIBLE", "GHOST_ONLY", "DISABLED",
+            "INSUFFICIENT_SAMPLES", "NO_OPTIONAL_DATA",
+        }
+        if _lre_status not in _KNOWN_LRE_STATUSES:
+            # Unrecognised status: treat as contradictory — block auto-execution.
+            _lre_diag.update({"status": RC_LRE_INVALID_RESULT, "raw_status": _lre_status,
+                              "blocked": True})
+            _increment_lre_error_count()
+            _lre_diag["error_counter"] = _get_lre_error_count()
+            logger.error("LearningRuleGate check 1 UNRECOGNISED STATUS '%s' — blocking.", _lre_status)
+            return {"status": "error",
+                    "lre_diagnostics": _lre_diag,
+                    "reason": f"Learning Rule Engine returned unrecognised status '{_lre_status}' — blocking."}, 409
+
+        # Retrieve sample count for diagnostics (best-effort)
         try:
             _ns = _ns_learning_key(instrument, TRADING_MODE)
             with LEARNING_ELIGIBILITY_LOCK:
                 _lre_entry = LEARNING_ELIGIBILITY.get(_ns) or LEARNING_ELIGIBILITY.get(instrument) or {}
-            _sample_count = _lre_entry.get("sample_size")
+            _lre_diag["sample_count"] = _lre_entry.get("sample_size")
         except Exception:
             pass
-        _lre_diag.update({"status": _lre_status, "rule": _lre_rule,
-                           "sample_count": _sample_count, "blocked": False})
+
+        _lre_diag.update({"status": _lre_status, "rule_key": _lre_rule, "blocked": False})
+
         if _lre_status == "DISABLED":
             _lre_diag["blocked"] = True
             logger.warning("LearningRuleGate: %s DISABLED (%s) → blocking", instrument, _lre_rule)
@@ -55154,18 +55334,20 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
                     "lre_diagnostics": _lre_diag,
                     "reason": "Learning Rule Engine: %s is blocked (%s). "
                               "This setup repeatedly fails — pausing live orders." % (instrument, _lre_rule)}, 409
+
         if _lre_status == "GHOST_ONLY" and execution_is_live(mode):
             logger.info("LearningRuleGate: %s GHOST_ONLY (%s) → demoting to paper ghost trade",
                         instrument, _lre_rule)
             mode = "paper"
-        # LIVE_ELIGIBLE / INSUFFICIENT_SAMPLES / no-data → continue (no influence applied)
+        # LIVE_ELIGIBLE / INSUFFICIENT_SAMPLES / NO_OPTIONAL_DATA → continue (no influence)
+
     except Exception as _lre_exc:
-        # HIGH-3: exceptions in the LRE are a safety-engine failure and must NEVER
-        # be silently treated as approval.  Block the trade and record the error.
+        # HIGH-3: exceptions in the LRE are a safety-engine failure — NEVER silently approve.
         _lre_error_type = type(_lre_exc).__name__
-        _lre_diag.update({"status": "EXCEPTION", "exc_type": _lre_error_type,
+        _lre_diag.update({"status": RC_LRE_EXCEPTION, "exc_type": _lre_error_type,
                            "blocked": True})
         _increment_lre_error_count()
+        _lre_diag["error_counter"] = _get_lre_error_count()
         logger.error("LearningRuleGate check 1 EXCEPTION — blocking (fail-closed): %s: %s",
                      _lre_error_type, _lre_exc)
         return {"status": "error",
@@ -55173,31 +55355,60 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
                 "reason": "Learning Rule Engine internal error — blocking to protect the account "
                           "(exception type: %s)." % _lre_error_type}, 409
 
-    # Per-setup rule: if THIS specific strategy pattern has been flagged as repeatedly
-    # failing for this instrument, demote to ghost so evidence keeps accumulating but
-    # live orders pause until the pattern turns around.
-    # HIGH-3 FIX: exceptions here also FAIL-CLOSED.
-    _lre_sk_diag = {"check": "setup_key_disabled", "instrument": instrument}
+    # ── Check 2: Per-setup rule (strategy-key disabled / key mismatch) ──────
+    # If THIS specific strategy pattern has been flagged as repeatedly failing,
+    # demote to ghost.  If the strategy key from the analysis doesn't match the
+    # key registered in the learning cache this cycle, also block (mismatch could
+    # indicate a stale analysis object driving a different strategy than intended).
+    _lre_sk_diag = {
+        "check":         "setup_key_check",
+        "instrument":    instrument,
+        "strategy_key":  None,
+        "rule_key":      None,
+        "blocked":       False,
+        "error_counter": _get_lre_error_count(),
+    }
     try:
         _lre_sk = ((a.get("learning_score_influence") or {}).get("meta") or {}).get("active_key") or \
                   (a.get("strategy_engine") or {}).get("active_key")
         _lre_sk_diag["strategy_key"] = _lre_sk
+
         if _lre_sk and execution_is_live(mode):
             _lre_ns_key = _ns_learning_key(instrument, TRADING_MODE)
             with LEARNING_ELIGIBILITY_LOCK:
-                _lre_dis_set = {s["setup_key"] for s in
-                                (LEARNING_ELIGIBILITY.get(_lre_ns_key)
-                                 or LEARNING_ELIGIBILITY.get(instrument) or {}).get("disabled_setups", [])}
-            if _lre_sk in _lre_dis_set:
+                _lre_elig_entry = (LEARNING_ELIGIBILITY.get(_lre_ns_key)
+                                   or LEARNING_ELIGIBILITY.get(instrument) or {})
+                _lre_dis_set  = {s.get("setup_key") for s in
+                                 _lre_elig_entry.get("disabled_setups", [])}
+                _lre_known_sk = _lre_elig_entry.get("strategy_key")  # key recorded at last recompute
+
+            # Strategy-key mismatch: analysis was evaluated under a different strategy
+            # than the one currently in the LRE cache.  Demote to ghost (don't block
+            # outright since the LRE may simply not have been recomputed yet).
+            if _lre_known_sk and _lre_sk and _lre_known_sk != _lre_sk:
+                _lre_sk_diag.update({
+                    "status": RC_LRE_KEY_MISMATCH,
+                    "cache_strategy_key": _lre_known_sk,
+                    "analysis_strategy_key": _lre_sk,
+                })
+                logger.warning(
+                    "LearningRuleGate: %s strategy-key mismatch (cache=%s analysis=%s) "
+                    "→ demoting to ghost (stale LRE or switched strategy mid-session)",
+                    instrument, _lre_known_sk, _lre_sk)
+                if execution_is_live(mode):
+                    mode = "paper"
+
+            elif _lre_sk in _lre_dis_set:
                 logger.warning("LearningRuleGate: %s setup '%s' repeatedly fails → demoting to ghost",
                                instrument, _lre_sk)
                 mode = "paper"
+
     except Exception as _lre_sk_exc:
-        # HIGH-3: setup-key check exception → fail-closed.
         _lre_sk_error_type = type(_lre_sk_exc).__name__
-        _lre_sk_diag.update({"status": "EXCEPTION", "exc_type": _lre_sk_error_type,
+        _lre_sk_diag.update({"status": RC_LRE_EXCEPTION, "exc_type": _lre_sk_error_type,
                               "blocked": True})
         _increment_lre_error_count()
+        _lre_sk_diag["error_counter"] = _get_lre_error_count()
         logger.error("LearningRuleGate check 2 EXCEPTION — blocking (fail-closed): %s: %s",
                      _lre_sk_error_type, _lre_sk_exc)
         return {"status": "error",
@@ -55629,7 +55840,34 @@ def _check_databento_execution_health(inst):
     diag["vwap_status"] = vwap_status
     if vwap_status != "ok":
         diag["result"] = "vwap_" + vwap_status
-        return False, "databento_vwap_" + vwap_status, diag
+        return False, RC_STALE_VWAP, diag
+
+    # ── 6. Market state not empty + market-closed / maintenance-halt ───────
+    # A CME maintenance window (17:00–18:00 ET daily) or holiday close may leave
+    # recent-looking tick/bar data from before the halt.  Check that the market
+    # is actually considered open before treating the feed as tradable.
+    try:
+        _ms_a = full_analysis(ticker_override=inst)
+        _mkt_open = _ms_a.get("market_open")
+        _verdict  = str(_ms_a.get("verdict", ""))
+        diag["market_open"]    = _mkt_open
+        diag["analysis_verdict"] = _verdict
+        # Empty market state: full_analysis returned essentially nothing useful.
+        if not _ms_a or len(_ms_a) < 3:
+            diag["result"] = "empty_market_state"
+            return False, RC_EMPTY_MARKET_STATE, diag
+        # Maintenance halt: market_open is explicitly False (CME daily window / holiday).
+        if _mkt_open is False:
+            _regime = (_ms_a.get("market_regime") or "").upper()
+            if "HALT" in _regime or "MAINTENANCE" in _regime:
+                diag["result"] = "maintenance_halt"
+                return False, RC_MAINTENANCE_HALT, diag
+            diag["result"] = "market_closed"
+            return False, RC_MARKET_CLOSED, diag
+    except Exception as _ms_exc:
+        # Fail-closed: if we can't check market state, don't trade.
+        diag.update({"result": "market_state_check_failed", "exc": type(_ms_exc).__name__})
+        return False, RC_EMPTY_MARKET_STATE, diag
 
     diag["result"] = "healthy"
     return True, "healthy", diag
@@ -55765,15 +56003,43 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
         logger.warning(
             "Auto-trade skipped for %s — Databento health gate: %s %s",
             inst, _db_reason, _db_diag)
+        # ── Spec §6: structured execution-attempt audit record ───────────────
+        try:
+            _ae_analysis = full_analysis(ticker_override=inst)
+            _ae_strategy = ((_ae_analysis.get("strategy_engine") or {}).get("active_key")
+                            or (_ae_analysis.get("learning_score_influence") or {}).get("meta", {}).get("active_key"))
+            _ae_verdict  = str(_ae_analysis.get("verdict", ""))
+            _ae_dir      = ready_direction(_ae_verdict) or _ae_verdict
+            _ae_cp       = _ae_analysis.get("candidate_preview") or {}
+            _ae_cp_id    = _ae_cp.get("candidate_id") or _ae_cp.get("id")
+            _ae_cp_age   = None
+            _ae_cp_ts    = _ae_cp.get("generated_at") or _ae_cp.get("ts")
+            if _ae_cp_ts:
+                try:
+                    _ae_cp_age = round((now_utc() - datetime.fromisoformat(str(_ae_cp_ts))).total_seconds(), 1)
+                except Exception:
+                    pass
+        except Exception:
+            _ae_strategy = None; _ae_dir = None; _ae_cp_id = None; _ae_cp_age = None
         _record_exec_attempt({
-            "instrument":     inst,
-            "source":         source,
-            "setup_key":      str(setup_key),
-            "configured_mode": _configured_execution_mode(),
-            "effective_mode": resolve_execution_mode(),
-            "databento_health": _db_diag,
-            "final_action":   "blocked",
-            "reason_code":    _db_reason,
+            "instrument":         inst,
+            "candidate_id":       _ae_cp_id,
+            "strategy":           _ae_strategy,
+            "direction":          _ae_dir,
+            "source":             source,
+            "setup_key":          str(setup_key),
+            "configured_mode":    _configured_execution_mode(),
+            "effective_mode":     resolve_execution_mode(),
+            "databento_health":   _db_diag,
+            "tick_age_sec":       _db_diag.get("tick_age_sec"),
+            "bar_age_sec":        _db_diag.get("bar_age_sec"),
+            "vwap_status":        _db_diag.get("vwap_status"),
+            "candidate_age_sec":  _ae_cp_age,
+            "lre_state":          None,          # LRE not reached
+            "mandatory_gate":     "databento_health_failed",
+            "duplicate_guard":    None,          # not reached
+            "final_action":       "blocked",
+            "reason_code":        _db_reason,
         })
         return False
 
