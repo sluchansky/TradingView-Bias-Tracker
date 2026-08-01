@@ -52,6 +52,15 @@ DATABENTO_BARS_BY_INST: dict[str, deque] = {
     inst: deque(maxlen=200) for inst in DB_SYMBOLS
 }
 
+# Current in-progress (partial) 1m bar per instrument.
+# Snapshot updated after every tick inside _partial_lock so Flask routes
+# can read a consistent copy without acquiring the lock themselves.
+# Each entry: {ts, open, high, low, close, volume} or None when no bar is open.
+# Display-only — never read by full_analysis or the gate.
+DATABENTO_PARTIAL_BY_INST: dict[str, Any] = {
+    inst: None for inst in DB_SYMBOLS
+}
+
 DATABENTO_STATUS: dict[str, Any] = {
     "connected":   False,
     "reconnects":  0,
@@ -403,6 +412,12 @@ class DatabentoBrain:
                 if price < p["low"]:  p["low"]  = price
                 p["close"]   = price
                 p["volume"] += size
+            # Publish a display snapshot so Flask routes can read the partial
+            # bar without acquiring this lock.  dict() creates a frozen copy
+            # while we're still inside the lock — consistent and lock-free for readers.
+            DATABENTO_PARTIAL_BY_INST[inst] = (
+                dict(self._partial[inst]) if self._partial[inst] is not None else None
+            )
         # Call _on_bar_close OUTSIDE the lock — it runs detectors and callbacks
         # that take meaningful time and must not block the flush thread.
         if to_close is not None:

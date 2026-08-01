@@ -197,6 +197,8 @@ export const BOT1_ROUTES = [
   "/tradezella/trades",
   "/tradezella/reset",
   "/tradezella/reseed-reviews",
+  "/tradezella/rematch",
+  "/tradezella/review-queue",
   "/trade-snapshots",
   // Manual Trade Manager (ADVISORY / DISPLAY-ONLY; owner-only; NOT in dashboard-auth
   // OPEN_PATHS). Never sends a broker order — monitors a manually-entered position.
@@ -266,10 +268,13 @@ export const BOT1_ROUTES = [
   // Databento live feed — display-only market data endpoints.
   // /databento-bars: 1-minute OHLCV bars for the dashboard live chart.
   // /databento-status: connection health + per-instrument telemetry.
-  // Both return {"ok":false,"enabled":false} when DATABENTO_ENABLED=0 so the
+  // /main-brain/chart: unified chart endpoint — OHLCV + VWAP + structure events
+  //   + active-trade overlay, with optional timeframe aggregation (1m/5m/15m).
+  // All return {"ok":false,"enabled":false} when DATABENTO_ENABLED=0 so the
   // UI can distinguish "feed off" from "route missing".
   "/databento-bars",
   "/databento-status",
+  "/main-brain/chart",
   // Right Brain status — training log, PF, mode, last per-instrument eval.
   // DISPLAY/READ-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
   "/right-brain",

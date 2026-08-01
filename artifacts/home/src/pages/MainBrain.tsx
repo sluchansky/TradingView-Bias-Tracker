@@ -9,6 +9,7 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { Link, useLocation, useParams } from 'wouter';
+import { LiveMarketChart } from '../components/LiveMarketChart';
 import { normalizeMainBrainPayload } from '../lib/mainBrainNormalizer';
 import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
 import { audioManager, SoundEvent } from '../lib/audioManager';
@@ -2415,6 +2416,10 @@ interface JTrade {
   r_multiple: number | null; pnl: number | null; review_status: string;
   edge_score: number | null; duration_min: number | null; trading_mode: string;
   session?: string;
+  // Task 83 — snapshot attribution columns (TZ trades only)
+  strategy_source?: string | null;
+  match_confidence?: string | null;
+  learning_status?: string | null;
 }
 
 interface JTradeDetail extends JTrade {
@@ -2428,6 +2433,19 @@ interface JTradeDetail extends JTrade {
   strategy?: string; strategy_key?: string;
   entry_time?: string; exit_time?: string; fees?: number | null;
   mistakes?: string; notes?: string; screenshots?: string;
+  // Task 83 — snapshot-derived planned fields (TZ trades only)
+  system_strategy?: string | null;
+  system_strategy_key?: string | null;
+  system_thesis_direction?: string | null;
+  system_thesis_strength?: string | null;
+  system_edge_score?: number | null;
+  system_grade?: string | null;
+  system_planned_entry?: number | null;
+  system_planned_stop?: number | null;
+  system_planned_risk?: number | null;
+  system_planned_targets?: Record<string, unknown> | null;
+  snap_thesis_alignment?: string | null;
+  is_external_manual?: boolean | null;
 }
 
 /** Phase 7O.1 — Canonical drill-down filter contract.
@@ -3882,6 +3900,10 @@ const JTradesTab: React.FC<{
                   <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
                     paddingBottom: 6, fontSize: 9 }}>Review</th>
                   <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                    paddingBottom: 6, fontSize: 9 }}>Src Type</th>
+                  <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                    paddingBottom: 6, fontSize: 9 }}>Match</th>
+                  <th style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
                     paddingBottom: 6, fontSize: 9 }}>Eligibility</th>
                 </tr>
               </thead>
@@ -4007,8 +4029,30 @@ const JTradesTab: React.FC<{
           {detail && (
             <>
               <div style={{ marginBottom: 16 }}>
-                <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 4 }}>
-                  {detail.source === 'system' ? 'SYSTEM TRADE' : 'TRADZELLA IMPORT'}
+                <div style={{ fontSize: 9, color: T.txtMuted, marginBottom: 4, display: 'flex', gap: 8, alignItems: 'center' }}>
+                  <span>{detail.source === 'system' ? 'SYSTEM TRADE' : 'TRADZELLA IMPORT'}</span>
+                  {detail.source === 'tradzella' && detail.match_confidence && (
+                    <span style={{ padding: '1px 6px', borderRadius: 4, fontSize: 8, fontWeight: 700,
+                      background: detail.match_confidence === 'EXACT'     ? T.green + '22' :
+                                  detail.match_confidence === 'HIGH'      ? T.cyan  + '22' :
+                                  detail.match_confidence === 'UNMATCHED' ? T.red   + '22' :
+                                  detail.match_confidence === 'AMBIGUOUS' ? T.red   + '22' : T.panelAlt,
+                      color:      detail.match_confidence === 'EXACT'     ? T.green :
+                                  detail.match_confidence === 'HIGH'      ? T.cyan  :
+                                  detail.match_confidence === 'UNMATCHED' ? T.red   :
+                                  detail.match_confidence === 'AMBIGUOUS' ? T.red   : T.txtMuted }}>
+                      {detail.match_confidence}
+                    </span>
+                  )}
+                  {detail.source === 'tradzella' && detail.strategy_source && (
+                    <span style={{ padding: '1px 6px', borderRadius: 4, fontSize: 8, fontWeight: 700,
+                      background: detail.strategy_source === 'SYSTEM' ? T.cyan  + '22' :
+                                  detail.strategy_source === 'MANUAL' ? T.amber + '22' : T.panelAlt,
+                      color:      detail.strategy_source === 'SYSTEM' ? T.cyan  :
+                                  detail.strategy_source === 'MANUAL' ? T.amber : T.txtMuted }}>
+                      {detail.strategy_source}
+                    </span>
+                  )}
                 </div>
                 <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexWrap: 'wrap' }}>
                   <span style={{ fontSize: 16, fontWeight: 800, color: T.cyan, fontFamily: T.mono }}>
@@ -4020,6 +4064,47 @@ const JTradesTab: React.FC<{
                   {jResultBadge(detail.result || '')}
                 </div>
               </div>
+
+              {/* Task 83: PLANNED BY SYSTEM block — shown for matched TZ trades */}
+              {detail.source === 'tradzella' && (detail.system_strategy || detail.system_strategy_key || detail.system_edge_score != null || detail.system_planned_entry != null) && (
+                <div style={{ marginBottom: 14, background: T.cyan + '0a', border: `1px solid ${T.cyan}33`,
+                  borderRadius: 6, padding: '8px 10px' }}>
+                  <div style={{ fontSize: 8, fontWeight: 800, color: T.cyan, letterSpacing: '0.08em',
+                    textTransform: 'uppercase', marginBottom: 6 }}>📋 Planned by System</div>
+                  <div style={{ fontSize: 10 }}>
+                    {([
+                      ['Strategy', detail.system_strategy],
+                      ['Strategy Key', detail.system_strategy_key],
+                      ['Thesis', detail.system_thesis_direction && detail.system_thesis_strength
+                        ? `${detail.system_thesis_direction} (${detail.system_thesis_strength})` : null],
+                      ['Alignment', detail.snap_thesis_alignment],
+                      ['Edge Score', detail.system_edge_score != null ? `${detail.system_edge_score}/110` : null],
+                      ['Grade', detail.system_grade],
+                      ['Planned Entry', detail.system_planned_entry != null ? detail.system_planned_entry.toFixed(2) : null],
+                      ['Planned Stop', detail.system_planned_stop != null ? detail.system_planned_stop.toFixed(2) : null],
+                      ['Planned Risk', detail.system_planned_risk != null ? `$${detail.system_planned_risk.toFixed(0)}` : null],
+                    ] as [string, string | null | undefined][]).map(([lbl, val]) => val != null && (
+                      <div key={lbl} style={{ display: 'flex', justifyContent: 'space-between',
+                        padding: '2px 0', borderBottom: `1px solid ${T.border}22` }}>
+                        <span style={{ color: T.txtMuted, fontSize: 9 }}>{lbl}</span>
+                        <span style={{ color: T.txtSec }}>{String(val)}</span>
+                      </div>
+                    ))}
+                  </div>
+                </div>
+              )}
+              {/* Unmatched banner for TZ trades without a snapshot match */}
+              {detail.source === 'tradzella' && !detail.system_strategy && !detail.system_strategy_key && detail.system_edge_score == null && (
+                <div style={{ marginBottom: 14, background: T.amber + '11', border: `1px solid ${T.amber}44`,
+                  borderRadius: 6, padding: '8px 10px' }}>
+                  <div style={{ fontSize: 9, fontWeight: 700, color: T.amber, marginBottom: 2 }}>
+                    ⚠ No system snapshot — {detail.match_confidence ?? 'not yet matched'}
+                  </div>
+                  <div style={{ fontSize: 8, color: T.txtMuted }}>
+                    Use the Review Queue tab to assign strategy attribution and unlock learning eligibility.
+                  </div>
+                </div>
+              )}
 
               {/* Entry / Exit / R */}
               <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8, marginBottom: 14 }}>
@@ -7855,6 +7940,13 @@ export default function MainBrain() {
               <div style={{ marginBottom:12 }}>
                 <MarketStrip p={p} />
               </div>
+
+              {/* ── Databento Live Market Chart ─────────────────────────────── */}
+              <LiveMarketChart
+                ticker={ticker}
+                onInstrumentChange={handleSetTicker}
+                authHeader={getAuthHeader()['Authorization']}
+              />
 
               {/* ── Cleanest Trade Available button strip ──────────────────── */}
               <CleanestTradeButton

@@ -38610,6 +38610,277 @@ def get_databento_status():
     })
 
 
+def _aggregate_bars_tf(bars_1m: list, tf: str) -> list:
+    """Aggregate completed 1m bars into 5m or 15m bars.
+
+    Only combines fully-completed bars — the partial bar is handled
+    separately by the caller.  Returns bars sorted ascending by ts.
+    """
+    tf_sec = 5 * 60 if tf == "5m" else 15 * 60
+    buckets: dict = {}
+    for bar in bars_1m:
+        bucket_ts = (bar["ts"] // tf_sec) * tf_sec
+        if bucket_ts not in buckets:
+            buckets[bucket_ts] = {
+                "ts":       bucket_ts,
+                "open":     bar["open"],
+                "high":     bar["high"],
+                "low":      bar["low"],
+                "close":    bar["close"],
+                "volume":   float(bar.get("volume") or 0),
+                "complete": True,
+            }
+        else:
+            b = buckets[bucket_ts]
+            if bar["high"] > b["high"]:  b["high"]   = bar["high"]
+            if bar["low"]  < b["low"]:   b["low"]    = bar["low"]
+            b["close"]   = bar["close"]
+            b["volume"] += float(bar.get("volume") or 0)
+    return sorted(buckets.values(), key=lambda x: x["ts"])
+
+
+def _chart_connection_status(inst: str) -> str:
+    """Derive a display status label from DATABENTO_STATUS.
+
+    Labels (per spec):
+      LIVE          — connected, data arriving < 30s ago
+      DELAYED       — connected but last tick 30–120s ago
+      STALE         — connected but last tick > 120s ago, or bar data present
+      NO DATA       — connected but no bars at all for this instrument
+      RECONNECTING  — not connected, at least one reconnect attempt made
+      DISCONNECTED  — not connected, no reconnect attempt yet
+    """
+    try:
+        from databento_brain import DATABENTO_BARS_BY_INST, DATABENTO_STATUS  # noqa: PLC0415
+    except ImportError:
+        return "DISCONNECTED"
+
+    connected  = DATABENTO_STATUS.get("connected", False)
+    reconnects = int(DATABENTO_STATUS.get("reconnects") or 0)
+    last_ts_str = DATABENTO_STATUS.get("last_ts")
+
+    if not connected:
+        return "RECONNECTING" if reconnects > 0 else "DISCONNECTED"
+
+    if last_ts_str:
+        try:
+            age_s = (now_utc() - datetime.fromisoformat(last_ts_str)).total_seconds()
+            if age_s < 30:
+                return "LIVE"
+            if age_s < 120:
+                return "DELAYED"
+            return "STALE"
+        except Exception:
+            pass
+
+    bars = DATABENTO_BARS_BY_INST.get(inst)
+    return "STALE" if bars else "NO DATA"
+
+
+@app.route("/main-brain/chart", methods=["GET"])
+def get_main_brain_chart():
+    """
+    GET /main-brain/chart?instrument=MGC&timeframe=1m&limit=300
+
+    Unified read-only chart endpoint for the Main Brain live candlestick chart.
+    Returns canonical Databento-derived OHLCV bars plus display overlays
+    (VWAP, structure events, active trade plan).
+
+    Timeframe aggregation (1m → 5m / 15m) is performed here on completed bars
+    only.  The partial in-progress bar is always returned separately.
+
+    DISPLAY ONLY — never reads from or writes to any gate, scoring, risk,
+    execution, or learning state.  Uses existing canonical data stores.
+    Returns {"ok":false,"enabled":false} when Databento is disabled.
+    """
+    if not DATABENTO_ENABLED or _DATABENTO_BRAIN is None:
+        return jsonify({
+            "ok":          False,
+            "enabled":     False,
+            "reason":      "Databento feed is not enabled (set DATABENTO_ENABLED=1)",
+            "bars":        [],
+            "partial_bar": None,
+            "connection":  {
+                "status": "DISCONNECTED", "connected": False,
+                "reconnects": 0, "last_ts": None, "error": None,
+            },
+        }), 200
+
+    from databento_brain import (  # noqa: PLC0415
+        DATABENTO_BARS_BY_INST,
+        DATABENTO_PARTIAL_BY_INST,
+        DATABENTO_STATUS,
+        DB_SYMBOLS,
+    )
+
+    # ── Instrument ────────────────────────────────────────────────────────────
+    raw_inst = request.args.get("instrument", "MNQ").upper()
+    inst = instrument_of(raw_inst) if raw_inst not in DB_SYMBOLS else raw_inst
+    if inst not in DB_SYMBOLS:
+        return jsonify({"ok": False, "error": f"Unknown instrument: {raw_inst}"}), 400
+
+    # ── Timeframe ─────────────────────────────────────────────────────────────
+    tf = request.args.get("timeframe", "1m").lower()
+    if tf not in ("1m", "5m", "15m"):
+        return jsonify({
+            "ok":    False,
+            "error": f"Invalid timeframe: {tf!r} — use 1m, 5m, or 15m",
+        }), 400
+
+    # ── Limit ─────────────────────────────────────────────────────────────────
+    try:
+        limit = max(1, min(500, int(request.args.get("limit", 300))))
+    except (TypeError, ValueError):
+        limit = 300
+
+    # ── Completed bars ────────────────────────────────────────────────────────
+    bars_1m = list(DATABENTO_BARS_BY_INST.get(inst, []))   # thread-safe copy
+
+    if tf == "1m":
+        agg_bars = [dict(b, complete=True) for b in bars_1m]
+    else:
+        agg_bars = _aggregate_bars_tf(bars_1m, tf)
+
+    agg_bars = agg_bars[-limit:]
+
+    # ── Partial bar (current in-progress 1m candle) ───────────────────────────
+    raw_partial = DATABENTO_PARTIAL_BY_INST.get(inst)  # already a dict copy
+    partial_bar = None
+    if raw_partial is not None:
+        if tf == "1m":
+            partial_bar = dict(raw_partial, complete=False)
+        else:
+            tf_sec = 5 * 60 if tf == "5m" else 15 * 60
+            bucket_ts = (raw_partial["ts"] // tf_sec) * tf_sec
+            if agg_bars and agg_bars[-1]["ts"] == bucket_ts:
+                # Merge partial into the last completed aggregate bucket
+                last = agg_bars[-1]
+                partial_bar = {
+                    "ts":       bucket_ts,
+                    "open":     last["open"],
+                    "high":     max(last["high"], raw_partial["high"]),
+                    "low":      min(last["low"],  raw_partial["low"]),
+                    "close":    raw_partial["close"],
+                    "volume":   float(last.get("volume") or 0) + float(raw_partial.get("volume") or 0),
+                    "complete": False,
+                }
+            else:
+                partial_bar = dict(raw_partial, ts=bucket_ts, complete=False)
+
+    # ── Connection status ──────────────────────────────────────────────────────
+    conn_status = _chart_connection_status(inst)
+    native_contract = None
+    try:
+        # Resolve native contract from Databento symbol map (best-effort)
+        from databento_brain import DB_SYMBOLS as _DBS  # noqa: PLC0415
+        native_contract = _DBS.get(inst)                # e.g. "MGC.c.0"
+        # Override with resolved native symbol from status if available
+        inst_telemetry  = DATABENTO_STATUS.get("instruments", {}).get(inst, {})
+        native_override = inst_telemetry.get("native_contract")
+        if native_override:
+            native_contract = native_override
+    except Exception:
+        pass
+
+    # ── VWAP ──────────────────────────────────────────────────────────────────
+    vwap_rec = VWAP_BY_TICKER.get(inst) or {}
+    vwap_data = None
+    if vwap_rec.get("value") is not None:
+        try:
+            vwap_data = {
+                "value":  round(float(vwap_rec["value"]), 4),
+                "ts":     vwap_rec.get("ts"),
+                "source": vwap_rec.get("source", "unknown"),
+            }
+        except Exception:
+            pass
+
+    # ── Structure events ──────────────────────────────────────────────────────
+    # Collect from ALERT_HISTORY.  Includes BOS/CHOCH, sweep, and HH/HL/LH/LL
+    # pivot labels injected by DatabentoBrain._inject_alert().
+    _STRUCT_TYPES = frozenset({
+        "BOS DEMAND", "BOS SUPPLY", "CHOCH DEMAND", "CHOCH SUPPLY",
+        "HH", "HL", "LH", "LL",
+    })
+    _sweep_types  = frozenset({f"{inst} BULLISH SWEEP", f"{inst} BEARISH SWEEP"})
+    _vwap_types   = frozenset({f"{inst} VWAP_RECLAIM", f"{inst} VWAP_REJECTION"})
+    _allowed_types = _STRUCT_TYPES | _sweep_types | _vwap_types
+
+    chart_start_ts = agg_bars[0]["ts"] if agg_bars else 0
+
+    structure_events = []
+    for ah in list(ALERT_HISTORY):       # list() snapshot — atomic under GIL
+        if ah.get("instrument") != inst:
+            continue
+        a_type = str(ah.get("alert_type", ""))
+        if a_type not in _allowed_types:
+            continue
+        ts_str = ah.get("timestamp")
+        try:
+            ts_epoch = int(datetime.fromisoformat(ts_str).timestamp())
+        except Exception:
+            continue
+        if ts_epoch < chart_start_ts:
+            continue
+        structure_events.append({
+            "ts":     ts_epoch,
+            "type":   a_type,
+            "price":  ah.get("price"),
+            "source": ah.get("instrument_source", "webhook"),
+        })
+
+    structure_events = structure_events[-200:]   # bounded
+
+    # ── Active trade overlay ───────────────────────────────────────────────────
+    at = active_trade_for(inst)
+    active_trade_data = None
+    if at:
+        active_trade_data = {
+            "direction": at.get("direction"),
+            "entry":     at.get("entry"),
+            "stop":      at.get("stop"),
+            "target1":   at.get("target1"),
+            "target2":   at.get("target2"),
+            "opened_at": at.get("opened_at"),
+        }
+
+    # ── Left Brain meta (thesis age, last calc) ───────────────────────────────
+    lb_meta = None
+    try:
+        from left_brain_mi import _LB_THESIS_BY_INST  # noqa: PLC0415
+        lb_rec = _LB_THESIS_BY_INST.get(inst) or {}
+        lb_meta = {
+            "last_updated_at": lb_rec.get("last_updated_at"),
+            "direction":       lb_rec.get("direction"),
+        }
+    except Exception:
+        pass
+
+    return jsonify({
+        "ok":             True,
+        "enabled":        True,
+        "instrument":     inst,
+        "native_contract": native_contract,
+        "timeframe":      tf,
+        "generated_at":   now_utc().isoformat(),
+        "connection": {
+            "status":     conn_status,
+            "connected":  bool(DATABENTO_STATUS.get("connected", False)),
+            "reconnects": int(DATABENTO_STATUS.get("reconnects") or 0),
+            "last_ts":    DATABENTO_STATUS.get("last_ts"),
+            "error":      DATABENTO_STATUS.get("error"),
+        },
+        "bars":            agg_bars,
+        "bar_count_1m":    len(bars_1m),
+        "partial_bar":     partial_bar,
+        "vwap":            vwap_data,
+        "structure_events": structure_events,
+        "active_trade":    active_trade_data,
+        "left_brain":      lb_meta,
+        "telemetry":       DATABENTO_STATUS.get("instruments", {}).get(inst, {}),
+    })
+
+
 def _update_setup_state(inst, a, dispatched_ready=False, is_duplicate=False):
     """Derive a per-instrument setup lifecycle state AFTER an evaluation. Pure
     display/diagnostics — it is NEVER read by full_analysis or the gate, so it can
@@ -43482,6 +43753,8 @@ def _persist_tradezella_trades(trades, filename=None):
                             auto_reviewed += 1
                     except Exception:
                         pass  # fail-open: review row is not critical
+                    # Task 83: run snapshot matching at import time (fail-open wrapper inside)
+                    _run_match_at_import(conn, new_trade_id, t)
             skipped_dupes = len(trades) - imported
             cur.execute(
                 "INSERT INTO tradezella_import_batches "
@@ -43501,6 +43774,143 @@ def _persist_tradezella_trades(trades, filename=None):
             conn.close()
         except Exception:
             pass
+
+
+def _run_match_at_import(conn, trade_id, tz_row):
+    """Run snapshot matching for a newly-inserted TZ trade row.
+
+    Queries internal_trade_snapshots in a ±30-min window around entry_time,
+    runs the five-priority matching algorithm, and UPDATEs the trade row with
+    match_confidence, matched_snapshot_id, strategy_source, learning_status,
+    is_external_manual, and the snapshot-mirror fields.
+
+    Convention: FAIL-OPEN.  Any error is caught + logged; the trade row is left
+    with NULL match columns rather than aborting the import.  This function may
+    open additional cursors on `conn` while the caller's own cursor is still open —
+    this is safe in psycopg2 (multiple cursors share one transaction).
+    """
+    if not SNAPSHOTS_DB_READY:
+        return
+    try:
+        import tradezella_matching as _tzm
+    except ImportError:
+        logger.warning("tradezella_matching module unavailable — skipping match")
+        return
+    try:
+        from datetime import datetime as _dt2, timezone as _tz2, timedelta as _td2
+
+        # ── Parse entry_time ─────────────────────────────────────────────────
+        entry_raw = tz_row.get("entry_time")
+        entry_dt = None
+        if entry_raw is not None:
+            if isinstance(entry_raw, str):
+                try:
+                    entry_dt = _dt2.fromisoformat(entry_raw.replace("Z", "+00:00"))
+                    if entry_dt.tzinfo is None:
+                        entry_dt = entry_dt.replace(tzinfo=_tz2.utc)
+                except Exception:
+                    entry_dt = None
+            elif hasattr(entry_raw, "tzinfo"):
+                entry_dt = entry_raw
+                if entry_dt.tzinfo is None:
+                    entry_dt = entry_dt.replace(tzinfo=_tz2.utc)
+
+        # ── Fetch candidate snapshots (±30-min window) ───────────────────────
+        # 30 min covers the 5-min time-match tiers AND the 30-min external-manual check.
+        snaps: list = []
+        if entry_dt is not None:
+            lo = entry_dt - _td2(minutes=30)
+            hi = entry_dt + _td2(minutes=30)
+            with conn.cursor() as _qcur:
+                _qcur.execute(
+                    "SELECT id, canonical_strategy_key, strategy_display_name,"
+                    " thesis_direction, thesis_strength, thesis_alignment,"
+                    " edge_score, grade, planned_entry, planned_stop, planned_risk,"
+                    " planned_targets, planned_contracts, instrument, direction,"
+                    " broker_order_id, execution_fingerprint, sent_at, created_at"
+                    " FROM internal_trade_snapshots"
+                    " WHERE (sent_at BETWEEN %s AND %s)"
+                    "    OR (sent_at IS NULL AND created_at BETWEEN %s AND %s)"
+                    " LIMIT 50",
+                    (lo, hi, lo, hi),
+                )
+                _snap_cols = [d[0] for d in _qcur.description]
+                for _r in _qcur.fetchall():
+                    _sd = dict(zip(_snap_cols, _r))
+                    for _k, _v in _sd.items():
+                        if hasattr(_v, "isoformat"):
+                            _sd[_k] = _v.isoformat()
+                        elif _v is not None and type(_v).__name__ == "UUID":
+                            _sd[_k] = str(_v)
+                    snaps.append(_sd)
+
+        # ── Run matching + external-manual detection ──────────────────────────
+        match = _tzm.match_tradezella_trade(tz_row, snaps)
+        is_ext = _tzm.is_external_manual(tz_row, snaps)
+
+        # ── Determine strategy_source ────────────────────────────────────────
+        if match.confidence in (_tzm.CONFIDENCE_EXACT, _tzm.CONFIDENCE_HIGH):
+            _ss = _tzm.STRATEGY_SOURCE_SYSTEM
+        elif is_ext:
+            _ss = _tzm.STRATEGY_SOURCE_IMPORTED
+        else:
+            _ss = _tzm.STRATEGY_SOURCE_UNMATCHED
+
+        # ── Compute learning_status ──────────────────────────────────────────
+        _tz_ctx = dict(tz_row)
+        _tz_ctx["strategy_source"] = _ss
+        _ls = _tzm.compute_learning_status(match, _tz_ctx)
+
+        # ── Write match results back to tradezella_trades ────────────────────
+        with conn.cursor() as _ucur:
+            _ucur.execute(
+                "UPDATE tradezella_trades SET"
+                "  matched_snapshot_id  = %s,"
+                "  match_method         = %s,"
+                "  match_confidence     = %s,"
+                "  candidate_count      = %s,"
+                "  match_notes          = %s,"
+                "  strategy_source      = %s,"
+                "  learning_status      = %s,"
+                "  is_external_manual   = %s,"
+                "  snap_strategy_key    = %s,"
+                "  snap_strategy        = %s,"
+                "  snap_thesis_direction = %s,"
+                "  snap_thesis_strength  = %s,"
+                "  snap_thesis_alignment = %s,"
+                "  snap_edge_score      = %s,"
+                "  snap_grade           = %s,"
+                "  snap_planned_entry   = %s,"
+                "  snap_planned_stop    = %s,"
+                "  snap_planned_risk    = %s,"
+                "  snap_planned_targets = %s"
+                " WHERE id = %s",
+                (
+                    match.snapshot_id,
+                    match.method,
+                    match.confidence,
+                    match.candidate_count,
+                    (match.notes or "")[:500] or None,
+                    _ss,
+                    _ls,
+                    is_ext,
+                    match.snap_strategy_key,
+                    match.snap_strategy,
+                    match.snap_thesis_direction,
+                    match.snap_thesis_strength,
+                    match.snap_thesis_alignment,
+                    match.snap_edge_score,
+                    match.snap_grade,
+                    match.snap_planned_entry,
+                    match.snap_planned_stop,
+                    match.snap_planned_risk,
+                    psycopg2.extras.Json(match.snap_planned_targets)
+                    if match.snap_planned_targets else None,
+                    trade_id,
+                ),
+            )
+    except Exception as _me:
+        logger.warning("_run_match_at_import trade_id=%s: %s", trade_id, _me)
 
 
 def _reset_tradezella_trades():
@@ -44041,6 +44451,232 @@ def tradezella_reseed_reviews():
             pass
 
 
+# ── Task 83: TradeZella snapshot matching management endpoints ────────────────
+
+@app.route("/tradezella/rematch", methods=["POST"])
+def tradezella_rematch():
+    """Owner-only.  Re-run the five-priority snapshot matching algorithm across
+    all UNMATCHED, AMBIGUOUS, or NULL-confidence TradeZella rows (or all rows
+    when ?full=1 is passed).  Useful after a bot restart when snapshots may have
+    arrived after the original import.
+
+    Returns { ok, scanned, improved, errors }.
+    """
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return jsonify({"ok": False, "error": "database not ready"}), 503
+    if not SNAPSHOTS_DB_READY:
+        return jsonify({"ok": False, "error": "snapshots table not ready — "
+                                              "cannot rematch without internal_trade_snapshots"}), 503
+    full_rescan = request.args.get("full", "0") == "1"
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    scanned = improved = errors = 0
+    try:
+        with conn.cursor() as cur:
+            if full_rescan:
+                cur.execute(
+                    "SELECT id, symbol, side, entry_time, exit_time,"
+                    " entry_price, exit_price, quantity, outcome, mode,"
+                    " broker_order_id, execution_fingerprint"
+                    " FROM tradezella_trades ORDER BY id"
+                )
+            else:
+                cur.execute(
+                    "SELECT id, symbol, side, entry_time, exit_time,"
+                    " entry_price, exit_price, quantity, outcome, mode,"
+                    " broker_order_id, execution_fingerprint"
+                    " FROM tradezella_trades"
+                    " WHERE match_confidence IS NULL"
+                    "    OR match_confidence IN ('UNMATCHED','AMBIGUOUS')"
+                    " ORDER BY id"
+                )
+            _cols = [d[0] for d in cur.description]
+            rows = [dict(zip(_cols, r)) for r in cur.fetchall()]
+
+        for row in rows:
+            scanned += 1
+            prev_conf = row.get("match_confidence")
+            trade_id = row["id"]
+            # Normalise datetime fields so matching helpers can parse them
+            for tk in ("entry_time", "exit_time"):
+                v = row.get(tk)
+                if v is not None and hasattr(v, "isoformat"):
+                    row[tk] = v.isoformat()
+            try:
+                _run_match_at_import(conn, trade_id, row)
+                # Check if the result improved (only possible with new confidence)
+                with conn.cursor() as chk:
+                    chk.execute("SELECT match_confidence FROM tradezella_trades WHERE id = %s",
+                                (trade_id,))
+                    new_row = chk.fetchone()
+                    new_conf = new_row[0] if new_row else None
+                if new_conf != prev_conf:
+                    improved += 1
+            except Exception as _re:
+                logger.warning("rematch trade_id=%s: %s", trade_id, _re)
+                errors += 1
+        conn.commit()
+        return jsonify({"ok": True, "scanned": scanned, "improved": improved, "errors": errors})
+    except Exception as exc:
+        logger.warning("tradezella_rematch failed: %s", exc)
+        return jsonify({"ok": False, "error": "rematch failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/tradezella/review-queue", methods=["GET"])
+def tradezella_review_queue():
+    """Owner-only.  Returns all UNMATCHED and AMBIGUOUS TradeZella trades so the
+    operator can manually assign strategy attribution.
+
+    Query params:
+        limit=100   — row cap (max 500)
+        offset=0    — pagination offset
+
+    Each row includes the trade fields plus candidate snapshot summaries.
+    """
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return jsonify({"ok": False, "error": "database not ready"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        try:
+            limit  = min(int(request.args.get("limit", 100)), 500)
+            offset = max(0, int(request.args.get("offset", 0)))
+        except (ValueError, TypeError):
+            limit, offset = 100, 0
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, symbol, side, entry_time, exit_time, entry_price,"
+                " exit_price, quantity, pnl, r_multiple, outcome, mode,"
+                " match_confidence, match_method, match_notes, candidate_count,"
+                " strategy_source, learning_status, is_external_manual,"
+                " snap_strategy, snap_strategy_key, setup"
+                " FROM tradezella_trades"
+                " WHERE match_confidence IS NULL"
+                "    OR match_confidence IN ('UNMATCHED','AMBIGUOUS')"
+                " ORDER BY entry_time DESC NULLS LAST, id DESC"
+                " LIMIT %s OFFSET %s",
+                (limit, offset),
+            )
+            _cols = [d[0] for d in cur.description]
+            trades = []
+            for r in cur.fetchall():
+                row = dict(zip(_cols, r))
+                for k in ("entry_time", "exit_time"):
+                    if row.get(k) and hasattr(row[k], "isoformat"):
+                        row[k] = row[k].isoformat()
+                trades.append(row)
+            # Total count for pagination
+            cur.execute(
+                "SELECT COUNT(*) FROM tradezella_trades"
+                " WHERE match_confidence IS NULL"
+                "    OR match_confidence IN ('UNMATCHED','AMBIGUOUS')"
+            )
+            total = int(cur.fetchone()[0] or 0)
+        return jsonify({"ok": True, "trades": trades, "total": total,
+                        "limit": limit, "offset": offset})
+    except Exception as exc:
+        logger.warning("tradezella_review_queue GET failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/tradezella/review-queue/<int:trade_id>", methods=["PATCH"])
+def tradezella_review_queue_assign(trade_id):
+    """Owner-only.  Manually assign strategy attribution to an UNMATCHED or
+    AMBIGUOUS TradeZella trade.
+
+    Body (JSON, all optional):
+        strategy_key   — e.g. "CHOCH_DEMAND_PULLBACK"
+        strategy_name  — human display name
+        setup_name     — CSV-style setup label
+        playbook       — free-text note
+        mode           — SCALP | SWING | MICRO_SCALP
+        direction      — Long | Short
+        is_external    — true/false
+        learning_eligible — true/false (operator override)
+
+    On success: sets strategy_source = 'MANUAL', updates snap_strategy fields,
+    recomputes learning_status, returns updated match fields.
+    Never feeds the gate, scoring, sizing, or broker path.
+    """
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return jsonify({"ok": False, "error": "database not ready"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+        strategy_key  = (data.get("strategy_key")  or "").strip() or None
+        strategy_name = (data.get("strategy_name") or "").strip() or None
+        setup_name    = (data.get("setup_name")    or "").strip() or None
+        is_external   = bool(data.get("is_external", False))
+        learning_elig = data.get("learning_eligible")  # explicit bool override
+
+        # Derive learning_status
+        if learning_elig is False:
+            learning_st = "INELIGIBLE"
+        elif learning_elig is True:
+            learning_st = "ELIGIBLE"
+        else:
+            learning_st = "REVIEW_REQUIRED"   # manual assignment always needs review
+
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE tradezella_trades SET"
+                "  strategy_source    = 'MANUAL',"
+                "  snap_strategy_key  = COALESCE(%s, snap_strategy_key),"
+                "  snap_strategy      = COALESCE(%s, snap_strategy),"
+                "  learning_status    = %s,"
+                "  is_external_manual = %s,"
+                "  match_notes        = COALESCE(match_notes,'') || ' [MANUAL ASSIGNMENT]'"
+                " WHERE id = %s"
+                " RETURNING id, strategy_source, snap_strategy_key, snap_strategy,"
+                "   learning_status, is_external_manual, match_confidence",
+                (strategy_key, strategy_name, learning_st, is_external, trade_id),
+            )
+            row = cur.fetchone()
+            conn.commit()
+        if row is None:
+            return jsonify({"ok": False, "error": "trade not found"}), 404
+        rkeys = ("id", "strategy_source", "snap_strategy_key", "snap_strategy",
+                 "learning_status", "is_external_manual", "match_confidence")
+        return jsonify({"ok": True, "updated": dict(zip(rkeys, row))})
+    except Exception as exc:
+        logger.warning("tradezella_review_queue_assign trade_id=%s: %s", trade_id, exc)
+        return jsonify({"ok": False, "error": "update failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 # ── Journal Phase 7K: unified trade-review endpoints ──────────────────────────
 # All routes are owner-only (dashboard password via Express proxy).
 # DISPLAY/READ-ONLY except import/rollback, which mutate ONLY the private journal
@@ -44207,7 +44843,11 @@ def journal_trades_list():
             " jr.setup_quality,"
             " jr.execution_quality,"
             " jr.discipline_quality,"
-            " jr.overall_quality"
+            " jr.overall_quality,"
+            # Task 83: match attribution columns (NULL for system trades)
+            " NULL AS strategy_source,"
+            " NULL AS match_confidence,"
+            " NULL AS learning_status"
             " FROM strategy_trades st"
             " LEFT JOIN journal_reviews jr"
             "   ON jr.source = 'system' AND jr.trade_id = st.id"
@@ -44219,13 +44859,15 @@ def journal_trades_list():
             "SELECT tt.id, 'tradzella' AS source,"
             " tt.entry_time AS date,"
             " tt.symbol AS instrument, tt.side AS direction,"
-            " COALESCE(tt.setup, '') AS strategy_name,"
+            # Task 83: prefer snap_strategy (from matched snapshot) over raw CSV setup
+            " COALESCE(tt.snap_strategy, tt.setup, '') AS strategy_name,"
             " tt.entry_price AS entry, tt.exit_price AS exit,"
             " COALESCE(tt.outcome, '') AS result,"
             " COALESCE(tt.r_multiple, 0) AS r_multiple,"
             " COALESCE(tt.pnl, 0) AS pnl,"
             " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
-            " NULL::double precision AS edge_score,"
+            # Task 83: use snap_edge_score for matched TZ trades
+            " COALESCE(CAST(tt.snap_edge_score AS double precision), NULL) AS edge_score,"
             " CASE WHEN tt.entry_time IS NOT NULL AND tt.exit_time IS NOT NULL"
             "      THEN EXTRACT(EPOCH FROM (tt.exit_time - tt.entry_time))/60.0"
             "      ELSE NULL END AS duration_min,"
@@ -44239,7 +44881,11 @@ def journal_trades_list():
             " jr.setup_quality,"
             " jr.execution_quality,"
             " jr.discipline_quality,"
-            " jr.overall_quality"
+            " jr.overall_quality,"
+            # Task 83: match attribution columns for TZ trades
+            " tt.strategy_source,"
+            " tt.match_confidence,"
+            " tt.learning_status"
             " FROM tradezella_trades tt"
             " LEFT JOIN journal_reviews jr"
             "   ON jr.source = 'tradzella' AND jr.trade_id = tt.id"
@@ -44723,7 +45369,15 @@ def journal_trade_detail(source, trade_id):
                 cur.execute(
                     "SELECT id, entry_time, exit_time, symbol, side, setup,"
                     " entry_price, exit_price, outcome, r_multiple, pnl, fees,"
-                    " mfe, mae, notes, mistake, screenshots, mode, session_bucket"
+                    " mfe, mae, notes, mistake, screenshots, mode, session_bucket,"
+                    # Task 83: snapshot-derived and match attribution fields
+                    " snap_strategy_key, snap_strategy, snap_thesis_direction,"
+                    " snap_thesis_strength, snap_thesis_alignment,"
+                    " snap_edge_score, snap_grade,"
+                    " snap_planned_entry, snap_planned_stop, snap_planned_risk,"
+                    " snap_planned_targets,"
+                    " match_confidence, strategy_source, learning_status,"
+                    " is_external_manual"
                     " FROM tradezella_trades WHERE id = %s",
                     (trade_id,)
                 )
@@ -44733,11 +45387,29 @@ def journal_trade_detail(source, trade_id):
             keys = ("id", "entry_time", "exit_time", "symbol", "direction",
                     "strategy_name", "entry", "exit", "result", "r_multiple", "pnl",
                     "fees", "mfe_r", "mae_r", "notes", "mistakes", "screenshots",
-                    "trading_mode", "session")
+                    "trading_mode", "session",
+                    "snap_strategy_key", "snap_strategy", "snap_thesis_direction",
+                    "snap_thesis_strength", "snap_thesis_alignment",
+                    "snap_edge_score", "snap_grade",
+                    "snap_planned_entry", "snap_planned_stop", "snap_planned_risk",
+                    "snap_planned_targets",
+                    "match_confidence", "strategy_source", "learning_status",
+                    "is_external_manual")
             d = dict(zip(keys, row))
             for k in ("entry_time", "exit_time"):
                 if d.get(k) and hasattr(d[k], "isoformat"):
                     d[k] = d[k].isoformat()
+            # Expose snap fields under ui-friendly names
+            d["system_strategy"]      = d.get("snap_strategy") or d.get("strategy_name")
+            d["system_strategy_key"]  = d.get("snap_strategy_key")
+            d["system_thesis_direction"] = d.get("snap_thesis_direction")
+            d["system_thesis_strength"]  = d.get("snap_thesis_strength")
+            d["system_edge_score"]    = float(d["snap_edge_score"]) if d.get("snap_edge_score") is not None else None
+            d["system_grade"]         = d.get("snap_grade")
+            d["system_planned_entry"] = float(d["snap_planned_entry"]) if d.get("snap_planned_entry") is not None else None
+            d["system_planned_stop"]  = float(d["snap_planned_stop"])  if d.get("snap_planned_stop")  is not None else None
+            d["system_planned_risk"]  = float(d["snap_planned_risk"])  if d.get("snap_planned_risk")  is not None else None
+            d["system_planned_targets"] = d.get("snap_planned_targets")
             d["source"] = "tradzella"
 
         else:
@@ -45824,10 +46496,13 @@ def journal_learning_eligibility():
             sys_rows = cur.fetchall()
 
             # ── Tradezella trades ─────────────────────────────────────────
+            # Task 83: include match_confidence + learning_status for attribution gate
             cur.execute(
                 "SELECT tt.id,"
                 " tt.outcome AS result,"
-                " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status"
+                " COALESCE(jr.review_status, 'UNREVIEWED') AS review_status,"
+                " tt.match_confidence,"
+                " tt.learning_status"
                 " FROM tradezella_trades tt"
                 " LEFT JOIN journal_reviews jr"
                 "   ON jr.source = 'tradzella' AND jr.trade_id = tt.id"
@@ -45875,10 +46550,20 @@ def journal_learning_eligibility():
             d = dict(zip(tz_cols, row))
             result        = (d.get("result") or "").strip().lower()
             review_status = d.get("review_status", "UNREVIEWED")
+            match_conf    = d.get("match_confidence")
+            db_learning   = d.get("learning_status")
 
             if review_status == "EXCLUDED":
                 status = "EXCLUDED_BY_OPERATOR"
                 reason = "Manually excluded by operator"
+            elif match_conf in ("UNMATCHED", "AMBIGUOUS"):
+                # Task 83: unmatched/ambiguous TZ trades cannot be learning-eligible
+                status = "UNMATCHED"
+                reason = (f"Not matched to an internal system snapshot "
+                          f"({match_conf or 'no match data'}) — assign strategy manually")
+            elif db_learning == "INELIGIBLE":
+                status = "INELIGIBLE"
+                reason = "Ineligible per match result (external trade or unresolved strategy)"
             elif result not in _ELIG_VALID_OUTCOMES:
                 status = "INVALID_OUTCOME"
                 reason = "Outcome not recorded or unrecognised"
@@ -45890,10 +46575,11 @@ def journal_learning_eligibility():
                 reason = ""
 
             records.append({
-                "source":   "tradzella",
-                "trade_id": int(d["id"]),
-                "status":   status,
-                "reason":   reason,
+                "source":        "tradzella",
+                "trade_id":      int(d["id"]),
+                "status":        status,
+                "reason":        reason,
+                "match_confidence": match_conf,
             })
 
         counts: dict = {}
