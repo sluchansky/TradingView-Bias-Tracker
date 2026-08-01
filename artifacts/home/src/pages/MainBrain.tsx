@@ -5105,7 +5105,7 @@ const JDirectionalTab: React.FC = () => {
 
   useEffect(() => {
     setLoading(true);
-    fetch('/api/directional-balance', { headers: { Authorization: `Basic ${btoa(localStorage.getItem('mb_auth') ?? ':')}` } })
+    fetch('/api/directional-balance', { headers: getAuthHeader() })
       .then(r => r.json())
       .then(j => { setData(j); setError(null); })
       .catch(e => setError(String(e)))
@@ -5558,6 +5558,22 @@ const JCoachingTab: React.FC<{
               col={cov ? (_CONFIDENCE_COLOR[cov.confidence] ?? T.txtMuted) : T.txtMuted}
             />
           </div>
+
+          {/* Imported-trades callout — shown whenever source is All or Tradzella */}
+          {(!fSource || fSource === 'tradzella') && (
+            <div style={{ display: 'flex', alignItems: 'flex-start', gap: 8,
+              background: '#f5a62318', border: `1px solid #f5a62355`,
+              borderRadius: 7, padding: '8px 12px', marginBottom: 12, fontSize: 11 }}>
+              <span style={{ fontSize: 14, lineHeight: 1 }}>📥</span>
+              <div>
+                <span style={{ color: '#f5a623', fontWeight: 700 }}>Imported trades require a review to appear here. </span>
+                <span style={{ color: T.txtMuted }}>
+                  Go to <strong style={{ color: T.txtPri }}>Trade Log</strong>, filter Source → <strong style={{ color: T.txtPri }}>Tradzella</strong>,
+                  open each trade, fill in quality ratings + tags, and save. Only trades with status <strong style={{ color: T.txtPri }}>REVIEWED</strong> feed coaching insights.
+                </span>
+              </div>
+            </div>
+          )}
 
           {/* SECOND ROW — Mistakes + Behaviors */}
           <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, marginBottom: 12 }}>
