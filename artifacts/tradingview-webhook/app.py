@@ -38715,9 +38715,16 @@ def get_main_brain_chart():
 
     # ── Instrument ────────────────────────────────────────────────────────────
     raw_inst = request.args.get("instrument", "MNQ").upper()
-    inst = instrument_of(raw_inst) if raw_inst not in DB_SYMBOLS else raw_inst
-    if inst not in DB_SYMBOLS:
-        return jsonify({"ok": False, "error": f"Unknown instrument: {raw_inst}"}), 400
+    # Strict allowlist: only accept instrument names that are directly in DB_SYMBOLS.
+    # instrument_of() maps any unknown ticker to the first enabled instrument, which
+    # would silently serve data for a different instrument than requested — not safe
+    # for a chart that displays a labelled instrument.
+    if raw_inst not in DB_SYMBOLS:
+        return jsonify({
+            "ok":    False,
+            "error": f"Unknown instrument: {raw_inst!r} — use one of {sorted(DB_SYMBOLS)}",
+        }), 400
+    inst = raw_inst
 
     # ── Timeframe ─────────────────────────────────────────────────────────────
     tf = request.args.get("timeframe", "1m").lower()
