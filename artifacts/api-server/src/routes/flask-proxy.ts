@@ -197,6 +197,7 @@ export const BOT1_ROUTES = [
   "/tradezella/trades",
   "/tradezella/reset",
   "/tradezella/reseed-reviews",
+  "/trade-snapshots",
   // Manual Trade Manager (ADVISORY / DISPLAY-ONLY; owner-only; NOT in dashboard-auth
   // OPEN_PATHS). Never sends a broker order — monitors a manually-entered position.
   "/manual-trade",

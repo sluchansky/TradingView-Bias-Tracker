@@ -132,6 +132,7 @@ PENDING_TFA_BY_INST = {}                 # inst → ready_id, links READY verdic
 LAST_TFA_BY_INST    = {}                 # inst → {ready_id, direction, ts}, dedup repeated READY webhooks
 LIVE_TFA_BY_INST    = {}                 # inst → ready_id of the most recently triggered trade
 DQ_DB_READY              = False   # set by _check_dq_db_ready at boot
+SNAPSHOTS_DB_READY       = False   # set by _boot_snapshots_table at boot — internal_trade_snapshots
 _DQ_PENDING_BY_SETUP: dict = {}   # fp → {snapshot_key, inst, direction, mode, created_at}  (Phase 5F.1)
 _DQ_SETUP_TTL_MIN        = 240    # expire *untraded* candidates older than 4 hours; active trades are exempt
 _DQ_MAX_PENDING          = 100    # hard cap — prevents unbounded growth
@@ -34298,6 +34299,137 @@ def _check_dq_db_ready():
         logger.warning("decision_snapshots table NOT ready: %s — Decision Quality disabled", exc)
 
 
+def _boot_snapshots_table():
+    """Probe internal_trade_snapshots (no DDL) and set SNAPSHOTS_DB_READY.
+
+    FAIL-OPEN: a missing table / unavailable DB silently disables snapshot
+    capture everywhere.  The table is created out-of-band via the database
+    tool (dev) and a publish schema-diff (prod) — never by app code."""
+    global SNAPSHOTS_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM internal_trade_snapshots LIMIT 0")
+        cur.close()
+        conn.close()
+        SNAPSHOTS_DB_READY = True
+        logger.info("internal_trade_snapshots table ready — send-time snapshot capture enabled")
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        logger.warning("internal_trade_snapshots table NOT ready: %s — snapshot capture disabled", exc)
+
+
+def _persist_trade_snapshot(snapshot):
+    """INSERT one immutable send-time snapshot into internal_trade_snapshots.
+
+    FAIL-OPEN: any error is logged at DEBUG level and swallowed — this must
+    NEVER block, delay, or alter the trade path.  No UPDATE path exists;
+    snapshots are write-once (ON CONFLICT DO NOTHING)."""
+    if not SNAPSHOTS_DB_READY or not isinstance(snapshot, dict):
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO internal_trade_snapshots
+               (internal_trade_id, signal_id, execution_fingerprint,
+                instrument, contract, account, mode, direction,
+                canonical_strategy_key, strategy_display_name, setup_name,
+                playbook, thesis_direction, thesis_strength, thesis_alignment,
+                edge_score, grade, readiness, actionable,
+                confirmations, blockers, opposing_structure, risk_state,
+                planned_entry, planned_stop, planned_targets, planned_risk,
+                planned_contracts, source,
+                broker_order_id, broker_signal_id, broker_metadata,
+                created_at, sent_at)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (internal_trade_id) DO NOTHING""",
+            (
+                snapshot.get("internal_trade_id"),
+                snapshot.get("signal_id"),
+                snapshot.get("execution_fingerprint"),
+                snapshot.get("instrument"),
+                snapshot.get("contract"),
+                snapshot.get("account"),
+                snapshot.get("mode"),
+                snapshot.get("direction"),
+                snapshot.get("canonical_strategy_key"),
+                snapshot.get("strategy_display_name"),
+                snapshot.get("setup_name"),
+                snapshot.get("playbook"),
+                snapshot.get("thesis_direction"),
+                snapshot.get("thesis_strength"),
+                snapshot.get("thesis_alignment"),
+                snapshot.get("edge_score"),
+                snapshot.get("grade"),
+                snapshot.get("readiness"),
+                snapshot.get("actionable"),
+                psycopg2.extras.Json(snapshot.get("confirmations")),
+                psycopg2.extras.Json(snapshot.get("blockers")),
+                snapshot.get("opposing_structure"),
+                snapshot.get("risk_state"),
+                snapshot.get("planned_entry"),
+                snapshot.get("planned_stop"),
+                psycopg2.extras.Json(snapshot.get("planned_targets")),
+                snapshot.get("planned_risk"),
+                snapshot.get("planned_contracts"),
+                snapshot.get("source"),
+                snapshot.get("broker_order_id"),
+                snapshot.get("broker_signal_id"),
+                psycopg2.extras.Json(snapshot.get("broker_metadata")),
+                snapshot.get("created_at"),
+                snapshot.get("sent_at"),
+            ),
+        )
+        conn.commit()
+        cur.close()
+        logger.debug(
+            "Trade snapshot persisted: %s %s %s (fingerprint=%s)",
+            snapshot.get("instrument"),
+            snapshot.get("direction"),
+            snapshot.get("source"),
+            (snapshot.get("execution_fingerprint") or "")[:12],
+        )
+    except Exception as exc:
+        logger.debug("_persist_trade_snapshot fail-open: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _capture_send_time_snapshot(a, instrument, mode, source, contracts,
+                                 direction, entry, stop, t1, t2,
+                                 broker_out=None):
+    """Fail-open wrapper: build + persist an immutable send-time snapshot.
+
+    Called from execute_trade_gateway after paper-simulate or live-send 2xx.
+    NEVER raises — any error is logged at DEBUG and swallowed.  Must never
+    appear in any code path that affects the trade result, response, or timing.
+    """
+    try:
+        import trade_snapshot as _ts
+        snap = _ts.build_trade_snapshot(
+            a, instrument, mode, source, contracts,
+            direction=direction, entry=entry, stop=stop, t1=t1, t2=t2,
+            broker_out=broker_out or {},
+        )
+        _persist_trade_snapshot(snap)
+    except Exception as exc:
+        logger.debug("_capture_send_time_snapshot fail-open: %s", exc)
+
+
 def _dq_has_active_trade(inst, direction):
     """Return True if an active trade for `inst` matches `direction`.
 
@@ -43742,6 +43874,73 @@ def tradezella_reset():
     return jsonify(result)
 
 
+@app.route("/trade-snapshots", methods=["GET"])
+def trade_snapshots_list():
+    """Owner-only debug view of internal_trade_snapshots.
+
+    Query params:
+        instrument=MGC       — filter to one instrument (optional)
+        since=<ISO datetime> — earliest created_at (optional)
+        limit=50             — row cap (max 200)
+
+    Returns rows newest-first.  DISPLAY-ONLY — no mutations."""
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not SNAPSHOTS_DB_READY:
+        return jsonify({"ok": False, "error": "internal_trade_snapshots table not ready"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        instrument = request.args.get("instrument")
+        since      = request.args.get("since")
+        try:
+            limit = min(int(request.args.get("limit", 50)), 200)
+        except (ValueError, TypeError):
+            limit = 50
+        conditions = []
+        params: list = []
+        if instrument:
+            conditions.append("instrument = %s")
+            params.append(instrument.upper())
+        if since:
+            conditions.append("created_at >= %s")
+            params.append(since)
+        where = ("WHERE " + " AND ".join(conditions)) if conditions else ""
+        params.append(limit)
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT id, internal_trade_id, instrument, direction, mode, source,
+                           canonical_strategy_key, strategy_display_name, setup_name,
+                           edge_score, grade, readiness, actionable,
+                           planned_entry, planned_stop, planned_risk, planned_contracts,
+                           execution_fingerprint, broker_order_id, broker_signal_id,
+                           created_at, sent_at
+                    FROM internal_trade_snapshots
+                    {where}
+                    ORDER BY created_at DESC LIMIT %s""",
+                params,
+            )
+            cols = [d[0] for d in cur.description]
+            rows = [dict(zip(cols, r)) for r in cur.fetchall()]
+        for row in rows:
+            for k, v in row.items():
+                if hasattr(v, "isoformat"):
+                    row[k] = v.isoformat()
+                elif hasattr(v, "__class__") and v.__class__.__name__ == "UUID":
+                    row[k] = str(v)
+        return jsonify({"ok": True, "snapshots": rows, "count": len(rows)})
+    except Exception as exc:
+        logger.warning("trade_snapshots_list error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 @app.route("/tradezella/reseed-reviews", methods=["POST"])
 def tradezella_reseed_reviews():
     """Owner-only.  Re-run auto-seed on every UNREVIEWED tradzella trade.
@@ -51887,7 +52086,7 @@ def _apply_opposite_side_buffer(instrument, mode, payload):
 
 
 def _send_broker_order(mode, provider_label, instrument, payload, send_url,
-                       *, release_slot=None, order_kind="entry"):
+                       *, release_slot=None, order_kind="entry", broker_out=None):
     """Audited broker-send sink shared by the single-order gateway AND the LIVE
     2-contract runner (entry legs + runner reduce). Owns ONLY the money-path SEND
     discipline: the redacted pre-send audit log (the destination URL is NEVER
@@ -51967,6 +52166,13 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
 
     if 200 <= resp.status_code < 300:
         _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
+        # Populate broker_out with any order/signal IDs from the response (fail-open).
+        if broker_out is not None:
+            try:
+                import trade_snapshot as _ts
+                broker_out.update(_ts.audit_broker_response(resp.text))
+            except Exception:
+                pass
         return None, None  # success -- caller continues to its own confirmation path
     elif 400 <= resp.status_code < 500:
         _release()
@@ -54312,6 +54518,9 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     if mode == "paper":
         logger.info("PAPER order simulated: %s %s x%d @ market (stop %.1f, t1 %.1f)",
                     tp_symbol, action, contracts, stop, t1)
+        # ── Immutable send-time snapshot (fail-open; never blocks the paper path) ──
+        _capture_send_time_snapshot(a, instrument, mode, source, contracts,
+                                    direction, entry, stop, t1, t2)
         try:
             _url = _discord_url(instrument)
             if _url:
@@ -54365,10 +54574,25 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     # condition is false, _live_runner_eligible returns False and we fall through to
     # the byte-identical single-order send below.
     if _live_runner_eligible(mode, instrument, contracts):
-        return _execute_live_two_leg_entry(
+        _runner_res, _runner_code = _execute_live_two_leg_entry(
             mode, provider_label, instrument, intent, plan_public, tp,
             direction, action, tp_symbol, entry, stop, t1, t2,
             contracts, source, _release_slot, fingerprint, now)
+        # Capture an immutable send-time snapshot when the primary was confirmed
+        # (status="sent"). The runner leg's metadata is stored in broker_metadata.
+        # Fail-open: never alters the returned result or code.
+        if isinstance(_runner_res, dict) and _runner_res.get("status") == "sent":
+            _runner_broker_meta = {
+                "runner_status":          _runner_res.get("runner_status"),
+                "runner_qty":             _runner_res.get("runner_qty"),
+                "partial_fill":           _runner_res.get("partial_fill"),
+                "broker_verify_required": _runner_res.get("broker_verify_required"),
+                "path":                   "two_leg_runner",
+            }
+            _capture_send_time_snapshot(a, instrument, mode, source, contracts,
+                                        direction, entry, stop, t1, t2,
+                                        broker_out=_runner_broker_meta)
+        return _runner_res, _runner_code
 
     # Audited send sink (shared with the LIVE 2-contract runner legs / reduce in
     # Phase 3b). Byte-identical for the single-order path: it logs the redacted
@@ -54376,11 +54600,17 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     # result fail-closed. (None, None) => 2xx landed -- fall through to the Discord
     # confirmation + success response below. _release_slot frees the duplicate-guard
     # cooldown ONLY on a local validation block or a definite broker 4xx.
+    _broker_out = {}
     _send_res, _send_code = _send_broker_order(
         mode, provider_label, instrument, payload, send_url,
-        release_slot=_release_slot, order_kind="entry")
+        release_slot=_release_slot, order_kind="entry", broker_out=_broker_out)
     if _send_res is not None:
         return _send_res, _send_code
+
+    # ── Immutable send-time snapshot (fail-open; broker 2xx confirmed) ──────
+    _capture_send_time_snapshot(a, instrument, mode, source, contracts,
+                                direction, entry, stop, t1, t2,
+                                broker_out=_broker_out)
 
     content = (
         f"🚀 **ORDER SENT → {provider_label} — {direction.upper()}**\n"
@@ -72821,6 +73051,7 @@ if __name__ == "__main__":
         _check_tfa_db_ready()                      # probe trade_failure_analysis (no DDL; created via DB tool/publish diff) — READY decision + failure mode recording (DISPLAY-ONLY)
         _check_market_state_cache_db_ready()       # probe market_state_cache (no DDL; created via DB tool/publish diff) — in-memory market-state persistence (CVD, vol-spike, TP dedup, AUTO_FIRED_KEYS, alert history)
         _check_dq_db_ready()                       # probe decision_snapshots (no DDL; created via DB tool/publish diff) — decision quality & signal calibration (Phase 5F — DISPLAY-ONLY)
+        _boot_snapshots_table()                    # probe internal_trade_snapshots (no DDL; created via DB tool/publish diff) — immutable send-time context for TradeZella matching
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     if LEARNING_DB_ENABLED:
