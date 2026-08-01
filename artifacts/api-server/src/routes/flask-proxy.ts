@@ -307,6 +307,20 @@ export const BOT1_ROUTES = [
   // NOT in dashboard-auth OPEN_PATHS). Assembles the versioned Main Brain
   // payload from canonical V1 interfaces. Never mutates trading state.
   "/main-brain",
+  // ── Execution Arm / Disarm Control ──────────────────────────────────────────
+  // Owner-only; NOT in dashboard-auth OPEN_PATHS (Basic Auth + CSRF apply).
+  // /execution/state   — GET  current arm state (sanitized, no secrets)
+  // /execution/arm     — POST arm the system (requires exact confirmation phrase)
+  // /execution/disarm  — POST disarm immediately (blocks new entries)
+  // /execution/kill-switch — POST safety-lock (requires separate reset)
+  // /execution/reset-safety-lock — POST reset the kill-switch lock
+  // /execution/audit-log — GET recent arm-state-change audit records
+  "/execution/state",
+  "/execution/arm",
+  "/execution/disarm",
+  "/execution/kill-switch",
+  "/execution/reset-safety-lock",
+  "/execution/audit-log",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

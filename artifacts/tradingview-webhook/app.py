@@ -9514,6 +9514,480 @@ def _record_exec_attempt(record: dict):
             _EXEC_ATTEMPTS.append({**record, "recorded_at": now_utc().isoformat()})
     except Exception:
         pass
+
+# ── Execution Arm / Disarm Control ────────────────────────────────────────────
+# Backend-owned arm state.  ALWAYS resets to DISARMED on restart, deployment,
+# crash, configuration reload, or any unknown execution state.  Per spec §1.
+#
+# Effective execution state (5 values):
+#   "disabled"              — EXECUTION_MODE=disabled
+#   "paper"                 — EXECUTION_MODE=paper (or manual_only)
+#   "live_available_disarmed" — live-capable mode, not yet armed
+#   "live_armed"            — live-capable mode + valid active arm session
+#   "safety_locked"         — kill-switch / hard lockout engaged
+#
+# Live orders require BOTH: EXECUTION_MODE=traderspost AND live_armed state.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ARM_CONFIRM_PHRASE       = "ARM LIVE AUTO TRADING"   # exact, case-sensitive
+ARM_DEFAULT_DURATION_MIN = 30
+ARM_MAX_DURATION_MIN     = 120
+ARM_DEFAULT_MAX_TRADES   = 3
+ARM_DEFAULT_MAX_CONTRACTS = 1
+
+_ARM_STATE: dict = {
+    "armed":                  False,
+    "armed_at":               None,
+    "expires_at":             None,
+    "armed_by":               None,
+    "arm_session_id":         None,
+    "configured_mode":        None,
+    "effective_mode":         "disabled",
+    "disarm_reason":          "deployment_restart",
+    "last_changed_at":        None,
+    "last_changed_by":        "system",
+    # Session limits
+    "allowed_instruments":    [],
+    "max_contracts":          {},      # {inst: n}
+    "max_trades":             ARM_DEFAULT_MAX_TRADES,
+    "trades_used":            0,
+    "session_pnl":            0.0,
+    "max_session_loss":       None,    # None = unlimited
+    "allowed_strategies":     None,    # None = all allowed
+    "direction_restriction":  None,    # None = both; "long" or "short"
+    "single_position_only":   True,
+    # Safety lock (separate from armed)
+    "safety_locked":          False,
+    "safety_lock_reason":     None,
+    "safety_lock_at":         None,
+}
+_ARM_STATE_LOCK   = threading.RLock()
+_ARM_AUDIT_LOG    = deque(maxlen=500)
+_ARM_AUDIT_LOCK   = threading.Lock()
+_ARM_RATE_LIMIT: dict = {}       # {ip: [epoch_ts, ...]}
+_ARM_RATE_LIMIT_LOCK = threading.Lock()
+
+# Reason code constants for arm/disarm audit
+RC_DISARMED                  = "RC_DISARMED"
+RC_ARM_EXPIRED               = "RC_ARM_EXPIRED"
+RC_ARM_SESSION_MISMATCH      = "RC_ARM_SESSION_MISMATCH"
+RC_ARM_INSTRUMENT_NOT_ALLOWED = "RC_ARM_INSTRUMENT_NOT_ALLOWED"
+RC_ARM_CONTRACTS_EXCEEDED    = "RC_ARM_CONTRACTS_EXCEEDED"
+RC_ARM_STRATEGY_NOT_ALLOWED  = "RC_ARM_STRATEGY_NOT_ALLOWED"
+RC_ARM_TRADE_LIMIT           = "RC_ARM_TRADE_LIMIT"
+RC_ARM_SESSION_LOSS_LIMIT    = "RC_ARM_SESSION_LOSS_LIMIT"
+RC_ARM_DIRECTION_RESTRICTED  = "RC_ARM_DIRECTION_RESTRICTED"
+RC_SAFETY_LOCKED             = "RC_SAFETY_LOCKED"
+
+
+def _effective_execution_state(arm_state=None):
+    """Return the 5-value effective execution state string.
+
+    Order of precedence (most severe first):
+      1. safety_locked — always reported regardless of execution mode
+      2. mode check    — disabled / paper short-circuits the arm state
+      3. arm state     — live_armed / live_available_disarmed
+    """
+    st = arm_state
+    if st is None:
+        with _ARM_STATE_LOCK:
+            st = dict(_ARM_STATE)
+
+    # Safety lock always wins, regardless of execution mode
+    if st.get("safety_locked"):
+        return "safety_locked"
+
+    mode = resolve_execution_mode()
+    if mode == "disabled":
+        return "disabled"
+    if not execution_is_live(mode):
+        return "paper"
+
+    # Live-capable mode (traderspost / pickmytrade)
+    if not st.get("armed"):
+        return "live_available_disarmed"
+    exp = st.get("expires_at")
+    if exp:
+        try:
+            if now_utc() > datetime.fromisoformat(exp):
+                return "live_available_disarmed"
+        except Exception:
+            return "live_available_disarmed"
+    return "live_armed"
+
+
+def _record_arm_audit(action, prev_state, new_state, **kwargs):
+    """Append an arm-state-change audit record (fail-open, never raises)."""
+    try:
+        record = {
+            "ts":             now_utc().isoformat(),
+            "action":         action,
+            "prev_armed":     (prev_state or {}).get("armed"),
+            "new_armed":      (new_state or {}).get("armed"),
+            "prev_effective": _effective_execution_state(prev_state),
+            "new_effective":  _effective_execution_state(new_state),
+            "session_id":     (new_state or {}).get("arm_session_id"),
+            "expires_at":     (new_state or {}).get("expires_at"),
+            "limits": {
+                "instruments":    (new_state or {}).get("allowed_instruments"),
+                "max_contracts":  (new_state or {}).get("max_contracts"),
+                "max_trades":     (new_state or {}).get("max_trades"),
+                "max_session_loss": (new_state or {}).get("max_session_loss"),
+            },
+            "configured_mode": _configured_execution_mode(),
+        }
+        record.update({k: v for k, v in kwargs.items()
+                       if k not in ("password", "token", "webhook_url", "secret")})
+        with _ARM_AUDIT_LOCK:
+            _ARM_AUDIT_LOG.append(record)
+    except Exception:
+        pass
+
+
+def _disarm(reason="operator_manual", by="system"):
+    """Thread-safe disarm. Always succeeds. Returns previous state snapshot."""
+    with _ARM_STATE_LOCK:
+        prev = dict(_ARM_STATE)
+        _ARM_STATE["armed"]           = False
+        _ARM_STATE["arm_session_id"]  = None
+        _ARM_STATE["armed_by"]        = None
+        _ARM_STATE["armed_at"]        = None
+        _ARM_STATE["expires_at"]      = None
+        _ARM_STATE["disarm_reason"]   = reason
+        _ARM_STATE["last_changed_at"] = now_utc().isoformat()
+        _ARM_STATE["last_changed_by"] = by
+        new = dict(_ARM_STATE)
+    _record_arm_audit("disarm", prev, new, reason=reason, by=by)
+    logger.info("Execution DISARMED by %s — reason: %s", by, reason)
+    return prev
+
+
+def _safety_lock(reason="emergency_kill_switch", by="system"):
+    """Thread-safe safety lock. Sets safety_locked=True + disarms immediately."""
+    with _ARM_STATE_LOCK:
+        prev = dict(_ARM_STATE)
+        _ARM_STATE["armed"]            = False
+        _ARM_STATE["arm_session_id"]   = None
+        _ARM_STATE["armed_by"]         = None
+        _ARM_STATE["armed_at"]         = None
+        _ARM_STATE["expires_at"]       = None
+        _ARM_STATE["disarm_reason"]    = reason
+        _ARM_STATE["safety_locked"]    = True
+        _ARM_STATE["safety_lock_reason"] = reason
+        _ARM_STATE["safety_lock_at"]   = now_utc().isoformat()
+        _ARM_STATE["last_changed_at"]  = now_utc().isoformat()
+        _ARM_STATE["last_changed_by"]  = by
+        new = dict(_ARM_STATE)
+    _record_arm_audit("safety_lock", prev, new, reason=reason, by=by)
+    logger.critical("Execution SAFETY LOCKED by %s — reason: %s", by, reason)
+    return prev
+
+
+def _reset_safety_lock(by="operator"):
+    """Reset the safety lock so arming is possible again.
+    Requires no open positions with unknown protective-order state.
+    Returns (ok, error_message).
+    """
+    # Check for unknown protective-order state
+    try:
+        for inst_c in list(ASSETS.keys()):
+            at = active_trade_for(inst_c)
+            if at and at.get("protective_order_state") == "unknown":
+                return False, (f"{inst_c} has an open position with unknown protective-order "
+                               "state. Reconcile before resetting the safety lock.")
+    except Exception as _e:
+        logger.warning("Safety-lock reset: active-trade check failed (%s) — proceeding", _e)
+    with _ARM_STATE_LOCK:
+        if not _ARM_STATE.get("safety_locked"):
+            return True, "Not locked"
+        prev = dict(_ARM_STATE)
+        _ARM_STATE["safety_locked"]     = False
+        _ARM_STATE["safety_lock_reason"] = None
+        _ARM_STATE["safety_lock_at"]    = None
+        _ARM_STATE["last_changed_at"]   = now_utc().isoformat()
+        _ARM_STATE["last_changed_by"]   = by
+        new = dict(_ARM_STATE)
+    _record_arm_audit("reset_safety_lock", prev, new, by=by)
+    logger.info("Safety lock RESET by %s", by)
+    return True, "ok"
+
+
+def _arm_preflight_check(data):
+    """Run all pre-arm checks. Returns (ok: bool, errors: list[str]).
+    FAIL-CLOSED: any uncaught exception is treated as a failed check.
+    """
+    errors = []
+
+    # 1. EXECUTION_MODE must be live-capable
+    mode = resolve_execution_mode()
+    if not execution_is_live(mode):
+        errors.append(f"EXECUTION_MODE must be live-capable (traderspost/pickmytrade); "
+                      f"current effective mode is {mode!r}.")
+
+    # 2. Not safety-locked
+    with _ARM_STATE_LOCK:
+        if _ARM_STATE.get("safety_locked"):
+            errors.append(f"System is safety-locked ({_ARM_STATE.get('safety_lock_reason')}). "
+                          "Reset the safety lock before arming.")
+
+    # 3. TradersPost URL configured
+    if mode == "traderspost":
+        if not (TRADERSPOST_WEBHOOK_URL or "").strip():
+            errors.append("TradersPost webhook URL not configured "
+                          "(TRADERSPOST_WEBHOOK_URL env var missing).")
+
+    # 4. Databento health (if enabled; fail-closed on exception)
+    if DATABENTO_ENABLED:
+        instruments = data.get("instruments") or list(ASSETS.keys())
+        _probe_inst = instruments[0] if instruments else None
+        if _probe_inst and _probe_inst in ASSETS:
+            try:
+                db_ok, db_reason, _ = _check_databento_execution_health(_probe_inst)
+                if not db_ok:
+                    errors.append(f"Databento feed unhealthy: {db_reason}")
+            except Exception as _db_e:
+                errors.append(f"Databento health check failed: {type(_db_e).__name__}")
+
+    # 5. Daily loss lockout
+    try:
+        instruments = data.get("instruments") or list(ASSETS.keys())
+        for inst_c in instruments:
+            if inst_c not in ASSETS:
+                continue
+            _loss_cap = max_losses_per_day(inst_c)
+            if _loss_cap is not None:
+                _losses = _losses_today(inst_c)
+                if _losses >= _loss_cap:
+                    errors.append(f"{inst_c} has hit its daily loss limit "
+                                  f"({_losses}/{_loss_cap} losing trades today).")
+    except Exception as _dl_e:
+        errors.append(f"Daily loss limit check failed: {type(_dl_e).__name__}")
+
+    # 6. No unprotected active positions
+    try:
+        for inst_c in list(ASSETS.keys()):
+            at = active_trade_for(inst_c)
+            if at:
+                if not at.get("stop_loss") and not at.get("target1"):
+                    errors.append(f"{inst_c} has an open position with no protective stop — "
+                                  "cannot arm until the position is protected or closed.")
+                if at.get("protective_order_state") == "unknown":
+                    errors.append(f"{inst_c} has an open position with unknown protective-order "
+                                  "state — cannot arm until reconciliation completes.")
+    except Exception as _at_e:
+        logger.debug("Preflight active-trade check failed (fail-open): %s", _at_e)
+
+    # 7. Requested instruments are in the approved registry
+    for inst_c in (data.get("instruments") or []):
+        if inst_c not in ASSETS:
+            errors.append(f"Unknown instrument: {inst_c!r}. Allowed: {list(ASSETS.keys())}")
+
+    # 8. Contract limits within hard backend limits
+    for inst_c, req_c in (data.get("max_contracts") or {}).items():
+        if inst_c not in ASSETS:
+            continue
+        hard_limit = max_contracts(inst_c)
+        try:
+            if int(req_c) > hard_limit:
+                errors.append(f"{inst_c}: requested {req_c} contracts exceeds hard limit "
+                              f"({hard_limit}).")
+        except (ValueError, TypeError):
+            errors.append(f"{inst_c}: max_contracts must be an integer.")
+
+    return len(errors) == 0, errors
+
+
+def _check_arm_for_transmission(instrument, contracts, strategy=None, arm_session_id=None,
+                                direction=None):
+    """Final arm gate immediately before any live broker transmission.
+
+    Returns (ok: bool, reason_code: str, diagnostics: dict).
+    FAIL-CLOSED: any exception returns (False, RC_DISARMED, {...}).
+    Must be called with the execution lock ALREADY HELD when applicable.
+
+    Checks the raw arm state dict directly so it is testable without patching
+    resolve_execution_mode().  Callers are already gated on execution_is_live(mode)
+    so we do not re-derive the effective execution state here.
+    """
+    try:
+        with _ARM_STATE_LOCK:
+            st = dict(_ARM_STATE)   # snapshot under lock
+
+        diag = {
+            "instrument":        instrument,
+            "contracts":         contracts,
+            "strategy":          strategy,
+            "direction":         direction,
+            "check_session_id":  arm_session_id,
+            "active_session_id": st.get("arm_session_id"),
+            "armed":             st.get("armed"),
+            "safety_locked":     st.get("safety_locked"),
+            "trades_used":       st.get("trades_used", 0),
+            "max_trades":        st.get("max_trades"),
+            "session_pnl":       st.get("session_pnl", 0.0),
+            "max_session_loss":  st.get("max_session_loss"),
+            "time_remaining_sec": None,
+        }
+
+        # Check 1: safety lock (highest priority — blocks even if armed)
+        if st.get("safety_locked"):
+            return False, RC_SAFETY_LOCKED, {**diag, "reason": "system is safety-locked",
+                                              "effective_state": "safety_locked"}
+
+        # Check 2: must be actively armed
+        if not st.get("armed"):
+            return False, RC_DISARMED, {**diag, "reason": "system is not armed",
+                                         "effective_state": "disarmed"}
+
+        # Check 3: session not expired
+        exp_raw = st.get("expires_at")
+        if exp_raw:
+            try:
+                exp_dt = datetime.fromisoformat(exp_raw)
+                remaining = (exp_dt - now_utc()).total_seconds()
+                diag["time_remaining_sec"] = round(remaining, 1)
+                if remaining <= 0:
+                    return False, RC_ARM_EXPIRED, {**diag, "reason": "arm session expired",
+                                                    "effective_state": "live_available_disarmed"}
+            except Exception:
+                return False, RC_ARM_EXPIRED, {**diag, "reason": "expires_at malformed"}
+
+        # Check 3: arm-session ID match (if candidate was approved under a session)
+        if arm_session_id is not None and st.get("arm_session_id") != arm_session_id:
+            return False, RC_ARM_SESSION_MISMATCH, {
+                **diag, "reason": "arm-session ID mismatch — system was re-armed since approval"}
+
+        # Check 4: instrument allowed
+        allowed_insts = st.get("allowed_instruments") or []
+        if allowed_insts and instrument not in allowed_insts:
+            return False, RC_ARM_INSTRUMENT_NOT_ALLOWED, {
+                **diag, "reason": f"{instrument} not in allowed instruments {allowed_insts}"}
+
+        # Check 5: contracts within session limit
+        max_c_map = st.get("max_contracts") or {}
+        max_c = max_c_map.get(instrument, ARM_DEFAULT_MAX_CONTRACTS)
+        if contracts > max_c:
+            return False, RC_ARM_CONTRACTS_EXCEEDED, {
+                **diag, "reason": f"{contracts} contracts > session limit {max_c} for {instrument}"}
+
+        # Check 6: strategy allowed (if a restriction is set)
+        allowed_strats = st.get("allowed_strategies")
+        if allowed_strats is not None and strategy and strategy not in allowed_strats:
+            return False, RC_ARM_STRATEGY_NOT_ALLOWED, {
+                **diag, "reason": f"strategy {strategy!r} not in allowed list {allowed_strats}"}
+
+        # Check 7: direction restriction
+        dir_restr = st.get("direction_restriction")
+        if dir_restr and direction:
+            if dir_restr.lower() != (direction or "").lower():
+                return False, RC_ARM_DIRECTION_RESTRICTED, {
+                    **diag, "reason": f"direction {direction!r} restricted to {dir_restr!r}"}
+
+        # Check 8: session trade count
+        trades_used = st.get("trades_used", 0)
+        max_trades  = st.get("max_trades", ARM_DEFAULT_MAX_TRADES)
+        if trades_used >= max_trades:
+            return False, RC_ARM_TRADE_LIMIT, {
+                **diag, "reason": f"session trade limit reached ({trades_used}/{max_trades})"}
+
+        # Check 9: session loss limit
+        max_loss = st.get("max_session_loss")
+        if max_loss is not None:
+            pnl = st.get("session_pnl", 0.0)
+            if pnl <= -abs(float(max_loss)):
+                return False, RC_ARM_SESSION_LOSS_LIMIT, {
+                    **diag, "reason": f"session loss limit reached (P&L ${pnl:+.2f}, limit $-{abs(max_loss):.2f})"}
+
+        return True, "armed", diag
+
+    except Exception as _arm_exc:
+        logger.error("_check_arm_for_transmission EXCEPTION (fail-closed): %s", _arm_exc)
+        return False, RC_DISARMED, {"error": type(_arm_exc).__name__, "instrument": instrument}
+
+
+def _arm_increment_trades_used():
+    """Increment the session trade counter after a confirmed send. Thread-safe."""
+    with _ARM_STATE_LOCK:
+        _ARM_STATE["trades_used"] = _ARM_STATE.get("trades_used", 0) + 1
+
+
+def _arm_update_session_pnl(pnl_delta):
+    """Update session P&L by delta (negative = loss). Thread-safe."""
+    with _ARM_STATE_LOCK:
+        _ARM_STATE["session_pnl"] = _ARM_STATE.get("session_pnl", 0.0) + pnl_delta
+
+
+def _auto_disarm_watcher():
+    """Daemon thread: auto-disarm on arm expiry, Databento disconnect, daily loss, etc.
+    Runs every 30 seconds. Fail-open: exceptions are swallowed to keep the thread alive.
+    """
+    while True:
+        try:
+            time.sleep(30)
+            with _ARM_STATE_LOCK:
+                armed     = _ARM_STATE.get("armed", False)
+                exp_raw   = _ARM_STATE.get("expires_at")
+                insts     = list(_ARM_STATE.get("allowed_instruments") or ASSETS.keys())
+                max_loss  = _ARM_STATE.get("max_session_loss")
+                sess_pnl  = _ARM_STATE.get("session_pnl", 0.0)
+                safety_locked = _ARM_STATE.get("safety_locked", False)
+            if not armed:
+                continue
+
+            # (A) Arm expired
+            if exp_raw:
+                try:
+                    if now_utc() > datetime.fromisoformat(exp_raw):
+                        _disarm("arm_expired", by="auto_watcher")
+                        continue
+                except Exception:
+                    _disarm("arm_expired", by="auto_watcher")
+                    continue
+
+            # (B) Databento disconnected
+            if DATABENTO_ENABLED and insts:
+                try:
+                    db_ok, db_reason, _ = _check_databento_execution_health(insts[0])
+                    if not db_ok and "disabled" not in db_reason.lower():
+                        _disarm("databento_disconnected", by="auto_watcher")
+                        continue
+                except Exception:
+                    pass  # fail-open for watcher
+
+            # (C) Daily loss limit breached for any allowed instrument
+            try:
+                for inst_c in insts:
+                    if inst_c not in ASSETS:
+                        continue
+                    _loss_cap = max_losses_per_day(inst_c)
+                    if _loss_cap is not None:
+                        _losses = _losses_today(inst_c)
+                        if _losses >= _loss_cap:
+                            _disarm("daily_loss_limit", by="auto_watcher")
+                            break
+            except Exception:
+                pass
+
+            # (D) Session loss limit
+            if max_loss is not None and sess_pnl <= -abs(float(max_loss)):
+                _disarm("session_loss_limit", by="auto_watcher")
+                continue
+
+            # (E) LRE blocking error state (high error count)
+            try:
+                if _get_lre_error_count() >= 10:
+                    _disarm("lre_failure", by="auto_watcher")
+                    continue
+            except Exception:
+                pass
+
+        except Exception as _watcher_exc:
+            logger.debug("auto_disarm_watcher error (fail-open): %s", _watcher_exc)
+
+
+_arm_watcher_thread = threading.Thread(target=_auto_disarm_watcher, daemon=True, name="arm-watcher")
+_arm_watcher_thread.start()
+
 # ── Shared Trade Memory weighting (display-only; governor + analyst single source).
 # STRATEGY_VERSION is bumped MANUALLY whenever the trade LOGIC (filters / indicators
 # / rules) changes; prior-version closed trades are then heavily down-weighted so
@@ -51781,6 +52255,261 @@ def traderspost_order():
     return jsonify(result), code
 
 
+@app.route("/execution/state", methods=["GET"])
+def execution_state_route():
+    """Current arm/disarm state (sanitized — no secrets).
+    Owner-only: auth enforced at the Express /api edge (not in OPEN_PATHS).
+    """
+    with _ARM_STATE_LOCK:
+        st = dict(_ARM_STATE)
+    eff = _effective_execution_state(st)
+    exp_raw = st.get("expires_at")
+    time_remaining_sec = None
+    if exp_raw and st.get("armed"):
+        try:
+            time_remaining_sec = round(
+                (datetime.fromisoformat(exp_raw) - now_utc()).total_seconds(), 0)
+        except Exception:
+            pass
+    return jsonify({
+        "armed":                  st["armed"],
+        "effective_state":        eff,
+        "armed_at":               st.get("armed_at"),
+        "expires_at":             exp_raw,
+        "time_remaining_sec":     time_remaining_sec,
+        "arm_session_id":         st.get("arm_session_id"),
+        "disarm_reason":          st.get("disarm_reason"),
+        "last_changed_at":        st.get("last_changed_at"),
+        "configured_mode":        _configured_execution_mode(),
+        "effective_mode":         resolve_execution_mode(),
+        "safety_locked":          st.get("safety_locked", False),
+        "safety_lock_reason":     st.get("safety_lock_reason"),
+        "allowed_instruments":    st.get("allowed_instruments"),
+        "max_contracts":          st.get("max_contracts"),
+        "max_trades":             st.get("max_trades"),
+        "trades_used":            st.get("trades_used", 0),
+        "session_pnl":            st.get("session_pnl", 0.0),
+        "max_session_loss":       st.get("max_session_loss"),
+        "allowed_strategies":     st.get("allowed_strategies"),
+        "direction_restriction":  st.get("direction_restriction"),
+        "single_position_only":   st.get("single_position_only", True),
+    })
+
+
+@app.route("/execution/arm", methods=["POST"])
+def execution_arm_route():
+    """Arm the auto-execution system with a structured pre-flight check.
+    Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
+    Requires exact confirmation phrase 'ARM LIVE AUTO TRADING'.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    client_ip = (request.headers.get("X-Forwarded-For") or
+                 request.remote_addr or "unknown").split(",")[0].strip()
+
+    # Rate-limit: max 5 arm attempts per 5-minute window per IP
+    _now_ts = time.time()
+    with _ARM_RATE_LIMIT_LOCK:
+        _attempts = [t for t in _ARM_RATE_LIMIT.get(client_ip, [])
+                     if _now_ts - t < 300]
+        if len(_attempts) >= 5:
+            _record_arm_audit("arm_rate_limited", {}, {}, ip=client_ip)
+            return jsonify({"status": "error",
+                            "reason": "Too many arm attempts. Wait 5 minutes."}), 429
+        _attempts.append(_now_ts)
+        _ARM_RATE_LIMIT[client_ip] = _attempts
+
+    # Exact confirmation phrase (case-sensitive, no partial match)
+    confirm = data.get("confirm_phrase", "")
+    if confirm != ARM_CONFIRM_PHRASE:
+        _record_arm_audit("arm_failed", dict(_ARM_STATE), dict(_ARM_STATE),
+                          reason="wrong_confirmation", ip=client_ip)
+        return jsonify({
+            "status": "error",
+            "reason": (f"Exact confirmation phrase required. "
+                       f"Send: confirm_phrase: '{ARM_CONFIRM_PHRASE}'"),
+        }), 400
+
+    # Pre-arm checks
+    ok, errors = _arm_preflight_check(data)
+    if not ok:
+        _record_arm_audit("arm_failed", dict(_ARM_STATE), dict(_ARM_STATE),
+                          reason="preflight_failed", errors=errors[:10], ip=client_ip)
+        return jsonify({"status": "error",
+                        "reason": "Pre-arm checks failed",
+                        "errors": errors}), 409
+
+    # Parse and clamp parameters
+    try:
+        duration_min = int(data.get("duration_min", ARM_DEFAULT_DURATION_MIN))
+        duration_min = max(1, min(duration_min, ARM_MAX_DURATION_MIN))
+    except (ValueError, TypeError):
+        return jsonify({"status": "error",
+                        "reason": "duration_min must be an integer."}), 400
+
+    instruments = list(data.get("instruments") or ASSETS.keys())
+    # Validate all requested instruments
+    bad_insts = [i for i in instruments if i not in ASSETS]
+    if bad_insts:
+        return jsonify({"status": "error",
+                        "reason": f"Unknown instruments: {bad_insts}"}), 400
+
+    # Contract limits: clamp each to its hard global ceiling
+    raw_max_c = data.get("max_contracts") or {}
+    resolved_max_c = {}
+    for inst_c in instruments:
+        requested_c = raw_max_c.get(inst_c, ARM_DEFAULT_MAX_CONTRACTS)
+        try:
+            resolved_max_c[inst_c] = min(int(requested_c), max_contracts(inst_c))
+        except (ValueError, TypeError):
+            return jsonify({"status": "error",
+                            "reason": f"max_contracts[{inst_c}] must be an integer."}), 400
+
+    try:
+        max_trades_req = max(1, int(data.get("max_trades", ARM_DEFAULT_MAX_TRADES)))
+    except (ValueError, TypeError):
+        return jsonify({"status": "error",
+                        "reason": "max_trades must be a positive integer."}), 400
+
+    max_session_loss  = data.get("max_session_loss")    # None = unlimited
+    allowed_strategies = data.get("allowed_strategies") # None = all
+    direction_restr   = data.get("direction_restriction")
+    if direction_restr not in (None, "long", "short"):
+        return jsonify({"status": "error",
+                        "reason": "direction_restriction must be null, 'long', or 'short'."}), 400
+
+    session_id = str(uuid.uuid4())[:16]
+    armed_at   = now_utc()
+    expires_at = armed_at + timedelta(minutes=duration_min)
+
+    with _ARM_STATE_LOCK:
+        prev = dict(_ARM_STATE)
+        _ARM_STATE.update({
+            "armed":                  True,
+            "armed_at":               armed_at.isoformat(),
+            "expires_at":             expires_at.isoformat(),
+            "armed_by":               data.get("armed_by", "operator"),
+            "arm_session_id":         session_id,
+            "configured_mode":        _configured_execution_mode(),
+            "effective_mode":         resolve_execution_mode(),
+            "disarm_reason":          None,
+            "last_changed_at":        armed_at.isoformat(),
+            "last_changed_by":        data.get("armed_by", "operator"),
+            "allowed_instruments":    instruments,
+            "max_contracts":          resolved_max_c,
+            "max_trades":             max_trades_req,
+            "trades_used":            0,
+            "session_pnl":            0.0,
+            "max_session_loss":       max_session_loss,
+            "allowed_strategies":     allowed_strategies,
+            "direction_restriction":  direction_restr,
+            "single_position_only":   bool(data.get("single_position_only", True)),
+        })
+        new = dict(_ARM_STATE)
+
+    eff = _effective_execution_state(new)
+    _record_arm_audit("arm", prev, new, session_id=session_id, ip=client_ip,
+                      duration_min=duration_min)
+    logger.info("Execution ARMED by %s — session %s, %dmin, insts %s",
+                data.get("armed_by", "operator"), session_id, duration_min, instruments)
+
+    return jsonify({
+        "status":             "armed",
+        "arm_session_id":     session_id,
+        "armed_at":           armed_at.isoformat(),
+        "expires_at":         expires_at.isoformat(),
+        "effective_state":    eff,
+        "allowed_instruments": instruments,
+        "max_contracts":      resolved_max_c,
+        "max_trades":         max_trades_req,
+        "max_session_loss":   max_session_loss,
+        "allowed_strategies": allowed_strategies,
+        "direction_restriction": direction_restr,
+    })
+
+
+@app.route("/execution/disarm", methods=["POST"])
+def execution_disarm_route():
+    """Disarm the auto-execution system immediately.
+    Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
+    Blocks new entries. Existing protected positions continue normal management.
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    reason = str(data.get("reason") or "operator_manual")
+    by     = str(data.get("by")     or "operator")
+    # Validate reason code
+    _VALID_DISARM_REASONS = {
+        "operator_manual", "arm_expired", "deployment_restart", "databento_disconnected",
+        "stale_market_data", "daily_loss_limit", "drawdown_limit", "duplicate_guard_failure",
+        "lre_failure", "broker_state_unknown", "protective_order_failure",
+        "authentication_failure", "system_exception", "emergency_kill_switch",
+        "session_loss_limit",
+    }
+    if reason not in _VALID_DISARM_REASONS:
+        reason = "operator_manual"
+    prev = _disarm(reason=reason, by=by)
+    eff  = _effective_execution_state()
+    return jsonify({
+        "status":           "disarmed",
+        "effective_state":  eff,
+        "disarm_reason":    reason,
+        "was_armed":        prev.get("armed", False),
+        "arm_session_id":   prev.get("arm_session_id"),
+    })
+
+
+@app.route("/execution/kill-switch", methods=["POST"])
+def execution_kill_switch_route():
+    """Emergency kill switch — immediately disarm + safety-lock.
+    Blocks ALL new execution attempts until the lock is explicitly reset.
+    Does NOT close existing positions (a separate /execution/emergency-close route
+    is required for that, with its own confirmation).
+    Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
+    """
+    data   = request.get_json(force=True, silent=True) or {}
+    reason = str(data.get("reason") or "emergency_kill_switch")
+    by     = str(data.get("by")     or "operator")
+    _safety_lock(reason=reason, by=by)
+    eff = _effective_execution_state()
+    logger.critical("KILL SWITCH activated by %s — reason: %s", by, reason)
+    return jsonify({
+        "status":          "safety_locked",
+        "effective_state": eff,
+        "reason":          reason,
+        "message": ("System is safety-locked. All new execution is blocked. "
+                    "Use POST /execution/reset-safety-lock to re-enable arming. "
+                    "Existing protective orders are NOT affected."),
+    })
+
+
+@app.route("/execution/reset-safety-lock", methods=["POST"])
+def execution_reset_safety_lock_route():
+    """Reset the safety lock so arming is possible again.
+    Requires no open positions with unknown protective-order state.
+    Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
+    """
+    data = request.get_json(force=True, silent=True) or {}
+    by   = str(data.get("by") or "operator")
+    ok, msg = _reset_safety_lock(by=by)
+    if not ok:
+        return jsonify({"status": "error", "reason": msg}), 409
+    eff = _effective_execution_state()
+    return jsonify({
+        "status":          "ok",
+        "effective_state": eff,
+        "message":         "Safety lock cleared. You may now arm when ready.",
+    })
+
+
+@app.route("/execution/audit-log", methods=["GET"])
+def execution_audit_log_route():
+    """Return recent arm-state-change audit records (last 50).
+    Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
+    """
+    with _ARM_AUDIT_LOCK:
+        records = list(_ARM_AUDIT_LOG)[-50:]
+    return jsonify({"records": records, "total": len(records)})
+
+
 @app.route("/take-preview", methods=["POST"])
 def take_preview_trade():
     """Owner-only (dashboard auth enforced at the Express /api edge; NOT in
@@ -55640,6 +56369,24 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
                                         broker_out=_runner_broker_meta)
         return _runner_res, _runner_code
 
+    # ── Final arm check (immediately before transmission) ────────────────────────
+    # This is the third and final arm gate (§6 spec): checked at candidate evaluation,
+    # before candidate claim, and NOW — immediately before the outbound wire.
+    # Guards against a disarm that races with the send after all prior checks passed.
+    # Paper/manual_only are exempt (arm control is live-execution only).
+    if execution_is_live(mode):
+        _fa_arm_ok, _fa_arm_reason, _fa_arm_diag = _check_arm_for_transmission(
+            instrument, contracts, strategy=None, direction=direction)
+        if not _fa_arm_ok:
+            logger.warning(
+                "Execution blocked at final arm gate for %s — %s",
+                instrument, _fa_arm_reason)
+            return {"status": "error",
+                    "reason": (f"System disarmed before transmission — {_fa_arm_reason}. "
+                               "No order was sent."),
+                    "reason_code": _fa_arm_reason,
+                    "arm_diagnostics": _fa_arm_diag}, 409
+
     # Audited send sink (shared with the LIVE 2-contract runner legs / reduce in
     # Phase 3b). Byte-identical for the single-order path: it logs the redacted
     # payload, validates required fields (local 400 block), POSTs, and maps the
@@ -56042,6 +56789,48 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
             "reason_code":        _db_reason,
         })
         return False
+
+    # ── Arm/Disarm gate (live execution only) ────────────────────────────────────
+    # Paper/manual_only skip this check so paper trading is unaffected.
+    # For live execution: both EXECUTION_MODE=traderspost AND a valid arm session
+    # are required.  FAIL-CLOSED: any arm-check exception blocks.
+    if execution_is_live(mode):
+        try:
+            # Best-effort strategy key for arm strategy-restriction checks
+            _arm_sk = None
+            try:
+                _arm_a  = full_analysis(ticker_override=inst)
+                _arm_sk = ((_arm_a.get("strategy_engine") or {}).get("active_key")
+                            or (_arm_a.get("learning_score_influence") or {}).get("meta", {}).get("active_key"))
+                _arm_dir = ready_direction(str(_arm_a.get("verdict", "")))
+            except Exception:
+                _arm_sk = None; _arm_dir = None
+
+            _arm_ok, _arm_reason, _arm_diag = _check_arm_for_transmission(
+                inst, contracts_override or 1, strategy=_arm_sk, direction=_arm_dir)
+            if not _arm_ok:
+                logger.warning(
+                    "Auto-trade blocked (arm gate) for %s — %s (%s)",
+                    inst, _arm_reason, _arm_diag.get("reason", ""))
+                _record_exec_attempt({
+                    "instrument":    inst,
+                    "source":        source,
+                    "setup_key":     str(setup_key),
+                    "configured_mode": _configured_execution_mode(),
+                    "effective_mode":  resolve_execution_mode(),
+                    "arm_check":     _arm_diag,
+                    "arm_session_id": _arm_diag.get("active_session_id"),
+                    "lre_state":     None,
+                    "mandatory_gate": "arm_disarmed",
+                    "duplicate_guard": None,
+                    "final_action":  "blocked",
+                    "reason_code":   _arm_reason,
+                })
+                return False
+        except Exception as _arm_exc:
+            logger.error(
+                "Arm gate EXCEPTION for %s — blocking (fail-closed): %s", inst, _arm_exc)
+            return False
 
     with _AUTO_EXEC_LOCK:
         # A still-open USER-APPROVED PREVIEW take holds this instrument's slot by the
