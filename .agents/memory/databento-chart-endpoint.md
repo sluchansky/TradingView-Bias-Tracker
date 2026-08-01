@@ -16,6 +16,13 @@ description: GET /main-brain/chart — unified OHLCV + overlays endpoint; lightw
 - Proxy whitelist: `/main-brain/chart` is in `BOT1_ROUTES` in `flask-proxy.ts`.
 - Structure events read from `ALERT_HISTORY` via `list()` snapshot (thread-safe, no lock needed).
 
+## Instrument ID resolution (critical — do NOT rely on symbology_map)
+`Live` client subscriptions with `stype_in="continuous"` never receive SymbolMappingMsg, so `client.symbology_map` stays permanently empty. `TradeMsg` also has no `.symbol` field. All three original resolution fallbacks (id map, sym lookup, prefix match) silently returned `inst=None` on every tick — no bars were ever built.
+
+**Fix**: `_prefetch_id_map_http(db_module, api_key)` calls `db.Historical(key).symbology.resolve(dataset, symbols, stype_in="continuous", stype_out="instrument_id", start_date=today)` before the iterator starts. Populates `_id_to_inst` with current `{instrument_id: root}` pairs. `add_callback(_symmap_callback)` handles rollover mid-session. Both are fail-open.
+
+**Why:** SDK v0.82.0 never sends SymbolMappingMsg on continuous-contract subscriptions; TradeMsg has no .symbol. HTTP pre-fetch is the only reliable resolution path.
+
 ## lightweight-charts v5 API (breaking changes from v4)
 - `chart.addSeries(CandlestickSeries, opts)` not `chart.addCandlestickSeries(opts)`
 - `chart.addSeries(LineSeries, opts)` not `chart.addLineSeries(opts)`
