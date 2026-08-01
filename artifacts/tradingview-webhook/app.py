@@ -9567,6 +9567,69 @@ _ARM_AUDIT_LOCK   = threading.Lock()
 _ARM_RATE_LIMIT: dict = {}       # {ip: [epoch_ts, ...]}
 _ARM_RATE_LIMIT_LOCK = threading.Lock()
 
+# ── DB-backed arm audit persistence (critical events only; fail-open) ─────────
+# In-memory _ARM_AUDIT_LOG is always written first (fast, never raises).
+# _persist_arm_audit_critical() additionally writes CRITICAL arm events to the
+# execution_arm_audit table so they survive a restart. The table is created via
+# the database tool (no DDL in app.py); this probe just checks it is available.
+# ─────────────────────────────────────────────────────────────────────────────
+EXECUTION_ARM_AUDIT_DB_READY = False
+
+_CRITICAL_ARM_ACTIONS = frozenset({
+    "arm", "disarm", "safety_lock", "reset_safety_lock",
+    "candidate_authorized", "candidate_blocked_final",
+})
+
+
+def _probe_execution_arm_audit_table():
+    """Probe the execution_arm_audit table (no DDL). Fail-open."""
+    global EXECUTION_ARM_AUDIT_DB_READY
+    try:
+        _conn = get_db_connection()
+        if _conn is None:
+            raise RuntimeError("get_db_connection() returned None")
+        with _conn:
+            with _conn.cursor() as _cur:
+                _cur.execute("SELECT 1 FROM execution_arm_audit LIMIT 0")
+        _conn.close()
+        EXECUTION_ARM_AUDIT_DB_READY = True
+        logger.info("execution_arm_audit table ready")
+    except Exception as _exc:
+        logger.warning(
+            "execution_arm_audit table unavailable (arm audit DB persistence disabled): %s", _exc)
+
+
+def _persist_arm_audit_critical(record: dict):
+    """Write critical arm-state change events to DB (fail-open, never raises)."""
+    if not EXECUTION_ARM_AUDIT_DB_READY:
+        return
+    if record.get("action") not in _CRITICAL_ARM_ACTIONS:
+        return
+    try:
+        import json as _jj
+        _extra = {k: v for k, v in record.items()
+                  if k not in ("action", "reason", "session_id", "by",
+                               "new_effective", "ts", "arm_session_id")}
+        _conn = get_db_connection()
+        if _conn is None:
+            return
+        with _conn:
+            with _conn.cursor() as _cur:
+                _cur.execute(
+                    """INSERT INTO execution_arm_audit
+                           (action, reason, arm_session_id, by_actor, effective_state, extra)
+                       VALUES (%s, %s, %s, %s, %s, %s::jsonb)""",
+                    (record.get("action"),
+                     str(record.get("reason") or "")[:500],
+                     record.get("session_id") or record.get("arm_session_id"),
+                     str(record.get("by") or "")[:100],
+                     record.get("new_effective"),
+                     _jj.dumps(_extra, default=str))
+                )
+        _conn.close()
+    except Exception as _exc:
+        logger.debug("arm audit DB persist failed (fail-open): %s", _exc)
+
 # Reason code constants for arm/disarm audit
 RC_DISARMED                  = "RC_DISARMED"
 RC_ARM_EXPIRED               = "RC_ARM_EXPIRED"
@@ -9617,7 +9680,9 @@ def _effective_execution_state(arm_state=None):
 
 
 def _record_arm_audit(action, prev_state, new_state, **kwargs):
-    """Append an arm-state-change audit record (fail-open, never raises)."""
+    """Append an arm-state-change audit record (fail-open, never raises).
+    Critical events (arm/disarm/safety_lock/reset) are also persisted to the
+    execution_arm_audit DB table via _persist_arm_audit_critical()."""
     try:
         record = {
             "ts":             now_utc().isoformat(),
@@ -9640,6 +9705,8 @@ def _record_arm_audit(action, prev_state, new_state, **kwargs):
                        if k not in ("password", "token", "webhook_url", "secret")})
         with _ARM_AUDIT_LOCK:
             _ARM_AUDIT_LOG.append(record)
+        # Persist critical events to DB (fail-open; deque already written above)
+        _persist_arm_audit_critical(record)
     except Exception:
         pass
 
@@ -52255,10 +52322,48 @@ def traderspost_order():
     return jsonify(result), code
 
 
+# ── Flask-level auth guard for all execution-control routes ─────────────────
+# Defense-in-depth: Express /api middleware is the PRIMARY auth boundary
+# (execution routes are NOT in OPEN_PATHS).  This decorator additionally
+# validates the Basic-auth password at the Flask layer when DASHBOARD_PASSWORD
+# is set, so a direct-to-Flask request (e.g. an internal mis-route) cannot
+# bypass Express authentication.  When DASHBOARD_PASSWORD is unset (local dev
+# without a password configured), the check is skipped and Express is the only
+# guard — identical to all other owner-only endpoints in this file.
+def _arm_owner_required(f):
+    import functools as _ft
+    import base64 as _b64
+    @_ft.wraps(f)
+    def _wrapped(*args, **kwargs):
+        _pw = os.environ.get("DASHBOARD_PASSWORD", "")
+        # Defense-in-depth: only check when DASHBOARD_PASSWORD is set AND the
+        # request arrives from outside localhost.
+        # - Express always proxies from 127.0.0.1 → no check (Express already authed).
+        # - Flask test client uses 127.0.0.1 → no check (avoids breaking test suites).
+        # - A request that somehow bypasses Express (non-localhost remote_addr) DOES
+        #   get checked — this is the scenario the guard is designed to block.
+        _remote = (request.remote_addr or "")
+        _from_proxy = _remote in ("127.0.0.1", "::1", "localhost", "")
+        if _pw and not _from_proxy:
+            _auth_hdr = request.headers.get("Authorization", "")
+            _ok = False
+            if _auth_hdr.lower().startswith("basic "):
+                try:
+                    _decoded = _b64.b64decode(_auth_hdr[6:].strip()).decode("utf-8", errors="replace")
+                    _ok = _decoded.split(":", 1)[-1] == _pw
+                except Exception:
+                    pass
+            if not _ok:
+                return jsonify({"status": "error", "reason": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return _wrapped
+
+
 @app.route("/execution/state", methods=["GET"])
+@_arm_owner_required
 def execution_state_route():
     """Current arm/disarm state (sanitized — no secrets).
-    Owner-only: auth enforced at the Express /api edge (not in OPEN_PATHS).
+    Owner-only: auth enforced at Express /api edge + Flask-level _arm_owner_required.
     """
     with _ARM_STATE_LOCK:
         st = dict(_ARM_STATE)
@@ -52297,6 +52402,7 @@ def execution_state_route():
 
 
 @app.route("/execution/arm", methods=["POST"])
+@_arm_owner_required
 def execution_arm_route():
     """Arm the auto-execution system with a structured pre-flight check.
     Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
@@ -52428,6 +52534,7 @@ def execution_arm_route():
 
 
 @app.route("/execution/disarm", methods=["POST"])
+@_arm_owner_required
 def execution_disarm_route():
     """Disarm the auto-execution system immediately.
     Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
@@ -52458,6 +52565,7 @@ def execution_disarm_route():
 
 
 @app.route("/execution/kill-switch", methods=["POST"])
+@_arm_owner_required
 def execution_kill_switch_route():
     """Emergency kill switch — immediately disarm + safety-lock.
     Blocks ALL new execution attempts until the lock is explicitly reset.
@@ -52482,6 +52590,7 @@ def execution_kill_switch_route():
 
 
 @app.route("/execution/reset-safety-lock", methods=["POST"])
+@_arm_owner_required
 def execution_reset_safety_lock_route():
     """Reset the safety lock so arming is possible again.
     Requires no open positions with unknown protective-order state.
@@ -52501,6 +52610,7 @@ def execution_reset_safety_lock_route():
 
 
 @app.route("/execution/audit-log", methods=["GET"])
+@_arm_owner_required
 def execution_audit_log_route():
     """Return recent arm-state-change audit records (last 50).
     Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
@@ -75318,6 +75428,7 @@ if __name__ == "__main__":
         _check_tfa_db_ready()                      # probe trade_failure_analysis (no DDL; created via DB tool/publish diff) — READY decision + failure mode recording (DISPLAY-ONLY)
         _check_market_state_cache_db_ready()       # probe market_state_cache (no DDL; created via DB tool/publish diff) — in-memory market-state persistence (CVD, vol-spike, TP dedup, AUTO_FIRED_KEYS, alert history)
         _check_dq_db_ready()                       # probe decision_snapshots (no DDL; created via DB tool/publish diff) — decision quality & signal calibration (Phase 5F — DISPLAY-ONLY)
+        _probe_execution_arm_audit_table()          # probe execution_arm_audit (no DDL; created via DB tool/publish diff) — arm audit persistence (critical arm/disarm events; in-memory deque stays primary)
         _boot_snapshots_table()                    # probe internal_trade_snapshots (no DDL; created via DB tool/publish diff) — immutable send-time context for TradeZella matching
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)

@@ -69,7 +69,12 @@ def _make_analysis(verdict="LONG READY", market_open=True,
                    instrument=None, market_data_ts=None,
                    strategy_eval_ts=None, expires_at=None,
                    cp_instrument=None, market_state_cycle=None):
-    """Build a minimal full_analysis() return value for testing."""
+    """Build a minimal full_analysis() return value for testing.
+
+    edge_score=90 is set at the top level so the Asia-session Long floor
+    (ASIA_SESSION_LONG_MIN_EDGE=85) does not block test requests during
+    overnight hours, allowing the code under test (LRE, freshness) to run.
+    """
     tp = {"trade_plan": True, "entry_zone": "2800.0–2802.0",
           "stop_loss": "2795.0", "target1": "2815.0", "target2": "2830.0",
           "direction": direction, "rr": "1:3"}
@@ -77,7 +82,8 @@ def _make_analysis(verdict="LONG READY", market_open=True,
         "verdict":          verdict,
         "market_open":      market_open,
         "trade_plan":       tp if market_open else False,
-        "directions":       {direction: {"verdict": verdict, "edge_score": 75}},
+        "edge_score":       90,          # must be ≥ ASIA_SESSION_LONG_MIN_EDGE (85)
+        "directions":       {direction: {"verdict": verdict, "edge_score": 90}},
         "alert_diagnostics": {},
         "strategy_engine":  {"active_key": "LIQUIDITY_SWEEP_REVERSAL"},
     }

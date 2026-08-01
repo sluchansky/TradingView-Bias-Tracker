@@ -7679,6 +7679,305 @@ const ErrorScreen: React.FC<{ msg: string | null; refresh: () => void }> = ({ ms
 );
 
 // ── Main Page ─────────────────────────────────────────────────────────────────
+// ── Execution Arm Control Panel ────────────────────────────────────────────────
+// Polls GET /api/execution/state every 30 s. Backend is sole source of truth —
+// no localStorage for arm state. Action buttons call the same execution routes
+// that the legacy Flask dashboard uses.
+
+interface ArmStateData {
+  armed: boolean;
+  effective_state: string;
+  armed_at: string | null;
+  expires_at: string | null;
+  time_remaining_sec: number | null;
+  arm_session_id: string | null;
+  disarm_reason: string | null;
+  last_changed_at: string | null;
+  configured_mode: string;
+  effective_mode: string;
+  safety_locked: boolean;
+  safety_lock_reason: string | null;
+  allowed_instruments: string[] | null;
+  max_contracts: Record<string, number> | null;
+  max_trades: number | null;
+  trades_used: number;
+  session_pnl: number;
+  max_session_loss: number | null;
+  allowed_strategies: string[] | null;
+  direction_restriction: string | null;
+  single_position_only: boolean;
+}
+
+function useArmStateData() {
+  const [data, setData] = useState<ArmStateData | null>(null);
+  const [armErr, setArmErr] = useState<string | null>(null);
+
+  const fetchArm = useCallback(async () => {
+    try {
+      const r = await fetch('/api/execution/state', {
+        credentials: 'include', headers: getAuthHeader(),
+      });
+      if (r.ok) { setData(await r.json()); setArmErr(null); }
+      else setArmErr(`HTTP ${r.status}`);
+    } catch { setArmErr('Network error'); }
+  }, []);
+
+  useEffect(() => {
+    fetchArm();
+    const id = setInterval(fetchArm, 30_000);
+    return () => clearInterval(id);
+  }, [fetchArm]);
+
+  return { armData: data, armErr, refreshArm: fetchArm };
+}
+
+const _ARM_CONFIRM_PHRASE = 'ARM LIVE AUTO TRADING';
+
+const ArmControlPanel: React.FC = () => {
+  const { armData, armErr, refreshArm } = useArmStateData();
+  const [armModalOpen, setArmModalOpen] = useState(false);
+  const [confirmPhrase, setConfirmPhrase]   = useState('');
+  const [armDuration,   setArmDuration]     = useState('30');
+  const [armMaxTrades,  setArmMaxTrades]    = useState('3');
+  const [armMaxLoss,    setArmMaxLoss]      = useState('');
+  const [armInstruments,setArmInstruments]  = useState('MGC');
+  const [armMaxCt,      setArmMaxCt]        = useState('1');
+  const [pending,       setPending]         = useState(false);
+  const [actMsg,        setActMsg]          = useState<{ ok: boolean; text: string } | null>(null);
+  const expiresAtRef = useRef<string | null>(null);
+  const [countdown, setCountdown] = useState('—');
+
+  // Live countdown from expires_at timestamp (avoids stale server-side value)
+  useEffect(() => {
+    if (!armData?.expires_at || !armData.armed) { setCountdown('—'); return; }
+    expiresAtRef.current = armData.expires_at;
+    const update = () => {
+      const exp = expiresAtRef.current;
+      if (!exp) { setCountdown('—'); return; }
+      const s = Math.max(0, Math.floor((new Date(exp).getTime() - Date.now()) / 1000));
+      if (s === 0) { setCountdown('Expired'); return; }
+      const h = Math.floor(s / 3600);
+      const m = Math.floor((s % 3600) / 60);
+      const sec = s % 60;
+      setCountdown(h > 0 ? `${h}h ${m}m` : `${m}m ${sec}s`);
+    };
+    update();
+    const id = setInterval(update, 1000);
+    return () => clearInterval(id);
+  }, [armData?.expires_at, armData?.armed]);
+
+  const effState = armData?.effective_state ?? 'unknown';
+  const stateColor = effState === 'live_armed' ? T.green
+    : effState === 'safety_locked' ? T.red
+    : effState === 'live_available_disarmed' ? T.amber : T.txtMuted;
+  const stateLabel: Record<string, string> = {
+    live_armed:               '⊙ ARMED',
+    live_available_disarmed:  '◎ DISARMED',
+    safety_locked:            '⚠ SAFETY LOCKED',
+    paper:                    '● PAPER',
+    disabled:                 '○ DISABLED',
+  };
+
+  async function doAction(path: string, body?: object): Promise<boolean> {
+    setPending(true); setActMsg(null);
+    try {
+      const r = await fetch(`/api/execution/${path}`, {
+        method: 'POST', credentials: 'include',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body ?? {}),
+      });
+      const j = await r.json().catch(() => ({}));
+      setActMsg({ ok: r.ok, text: j.reason ?? j.message ?? (r.ok ? 'Done' : `Error ${r.status}`) });
+      if (r.ok) { await refreshArm(); }
+      return r.ok;
+    } catch { setActMsg({ ok: false, text: 'Network error' }); return false; }
+    finally { setPending(false); }
+  }
+
+  async function handleArm() {
+    if (confirmPhrase !== _ARM_CONFIRM_PHRASE) return;
+    const insts = armInstruments.split(',').map(s => s.trim()).filter(Boolean);
+    const mc: Record<string, number> = {};
+    for (const inst of insts) mc[inst] = parseInt(armMaxCt) || 1;
+    const ok = await doAction('arm', {
+      confirm_phrase: confirmPhrase,
+      duration_min:   parseInt(armDuration) || 30,
+      max_trades:     parseInt(armMaxTrades) || 3,
+      instruments:    insts,
+      max_contracts:  mc,
+      ...(armMaxLoss ? { max_session_loss: parseFloat(armMaxLoss) } : {}),
+    });
+    if (ok) { setArmModalOpen(false); setConfirmPhrase(''); }
+  }
+
+  const armed    = effState === 'live_armed';
+  const disarmed = effState === 'live_available_disarmed';
+  const locked   = effState === 'safety_locked';
+  const tradesOver = (armData?.trades_used ?? 0) >= (armData?.max_trades ?? 9999);
+  const lossNear   = armData?.max_session_loss != null
+    && armData?.session_pnl < 0
+    && Math.abs(armData.session_pnl) >= armData.max_session_loss * 0.8;
+
+  const btn = (color: string, label: string, onClick: () => void, disabled?: boolean) => (
+    <button onClick={onClick} disabled={pending || !!disabled}
+      style={{ background: `${color}18`, border: `1px solid ${color}55`, color,
+        borderRadius: 6, padding: '7px 14px', fontSize: 10.5, fontWeight: 700,
+        cursor: (pending || disabled) ? 'not-allowed' : 'pointer',
+        opacity: (pending || disabled) ? 0.5 : 1, letterSpacing: '0.06em' }}>
+      {label}
+    </button>
+  );
+
+  const inpStyle: React.CSSProperties = {
+    background: '#060f1e', border: `1px solid ${T.border}`, color: T.txtPri,
+    borderRadius: 5, padding: '7px 9px', fontSize: 11, outline: 'none', width: '100%',
+    boxSizing: 'border-box',
+  };
+
+  return (
+    <Panel title="Execution Arm Control" id="execution-arm-control"
+      badge={<Pill text={stateLabel[effState] ?? effState.toUpperCase()} color={stateColor} />}
+      right={
+        <button onClick={refreshArm} disabled={pending}
+          style={{ background: 'none', border: 'none', color: T.txtMuted, cursor: 'pointer', fontSize: 13 }}>
+          ↻
+        </button>
+      }>
+
+      {armErr && (
+        <div style={{ color: T.amber, fontSize: 10, marginBottom: 8, padding: '4px 8px',
+          background: `${T.amber}10`, borderRadius: 4 }}>
+          ⚠ {armErr} — auto-retry in 30 s
+        </div>
+      )}
+
+      {/* Status grid */}
+      <div style={{ marginBottom: 12 }}>
+        <KV label="Effective State"       value={stateLabel[effState] ?? effState} valueColor={stateColor} />
+        <KV label="Configured Mode"       value={armData?.configured_mode ?? '—'} mono />
+        <KV label="Session Expires"       value={armed ? countdown : '—'} valueColor={armed && countdown !== '—' && countdown.includes('m') && !countdown.includes('h') && parseInt(countdown) < 5 ? T.amber : T.txtPri} />
+        <KV label="Trades Used / Limit"   value={armData ? `${armData.trades_used} / ${armData.max_trades ?? '—'}` : '—'} valueColor={tradesOver ? T.red : T.txtPri} />
+        <KV label="Allowed Instruments"   value={armData?.allowed_instruments?.join(', ') ?? '—'} />
+        <KV label="Max Contracts"         value={armData?.max_contracts ? Object.entries(armData.max_contracts).map(([k,v]) => `${k}:${v}`).join(', ') : '—'} />
+        <KV label="Session P&L"           value={armData?.session_pnl != null ? `$${armData.session_pnl.toFixed(0)}` : '—'} valueColor={(armData?.session_pnl ?? 0) < 0 ? (lossNear ? T.red : T.amber) : T.green} />
+        <KV label="Session Loss Limit"    value={armData?.max_session_loss != null ? `$${armData.max_session_loss.toFixed(0)}` : 'None'} />
+        <KV label="Direction Restriction" value={armData?.direction_restriction ?? 'None'} />
+        <KV label="Safety Locked"         value={locked ? (armData?.safety_lock_reason ?? 'Yes') : 'No'} valueColor={locked ? T.red : T.txtMuted} />
+        <KV label="Last Disarm Reason"    value={armData?.disarm_reason ?? '—'} />
+        <KV label="Last Changed"          value={fmtTs(armData?.last_changed_at)} />
+      </div>
+
+      {/* Action buttons */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: actMsg ? 10 : 0 }}>
+        {(disarmed || armed) && !locked && btn(T.green, '⊙ ARM', () => { setArmModalOpen(true); setConfirmPhrase(''); setActMsg(null); })}
+        {armed && !locked && btn(T.amber, '◎ DISARM NEW ENTRIES', () => doAction('disarm', { reason: 'operator_manual' }))}
+        {(disarmed || armed) && !locked && btn(T.red, '⚠ KILL SWITCH', () => {
+          if (window.confirm('Activate emergency kill switch?\n\nThis will lock auto-execution and require a manual safety-lock reset.')) {
+            doAction('kill-switch', {});
+          }
+        })}
+        {locked && btn(T.purple, '↺ RESET SAFETY LOCK', () => {
+          if (window.confirm('Reset the safety lock? Ensure the system is safe before proceeding.')) {
+            doAction('reset-safety-lock', {});
+          }
+        })}
+      </div>
+
+      {/* Feedback */}
+      {actMsg && (
+        <div style={{ fontSize: 10.5, padding: '6px 10px', borderRadius: 5, marginTop: 8,
+          background: actMsg.ok ? `${T.green}15` : `${T.red}15`,
+          color: actMsg.ok ? T.green : T.red,
+          border: `1px solid ${actMsg.ok ? T.green : T.red}44` }}>
+          {actMsg.ok ? '✓' : '✗'} {actMsg.text}
+        </div>
+      )}
+
+      {/* ARM Modal */}
+      {armModalOpen && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(5,12,26,0.85)',
+          zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onClick={e => { if (e.target === e.currentTarget) setArmModalOpen(false); }}>
+          <div style={{ background: T.panel, border: `1px solid ${T.red}66`,
+            borderRadius: 12, padding: '24px 28px', width: 420, maxWidth: '95vw',
+            boxShadow: `0 0 40px ${T.red}22` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: T.red, marginBottom: 4, letterSpacing: '0.08em' }}>
+              ⚠ ARM LIVE AUTO-TRADING
+            </div>
+            <div style={{ fontSize: 10, color: T.txtSec, marginBottom: 16, lineHeight: 1.65 }}>
+              This enables automated live order transmission to the configured broker.
+              Live execution involves real financial risk. Type the exact phrase to confirm.
+            </div>
+
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 12, marginBottom: 16 }}>
+              <div>
+                <div style={{ fontSize: 9.5, color: T.red, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 4 }}>
+                  CONFIRM PHRASE (required)
+                </div>
+                <input value={confirmPhrase}
+                  onChange={e => setConfirmPhrase(e.target.value)}
+                  placeholder={_ARM_CONFIRM_PHRASE}
+                  style={{ ...inpStyle, fontFamily: T.mono, fontSize: 12,
+                    borderColor: confirmPhrase === _ARM_CONFIRM_PHRASE ? T.green
+                      : confirmPhrase.length > 0 ? T.red : T.border }} />
+              </div>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
+                <div>
+                  <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 3 }}>DURATION (min)</div>
+                  <input value={armDuration} type="number" min="5" max="480" onChange={e => setArmDuration(e.target.value)} style={inpStyle} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 3 }}>MAX TRADES</div>
+                  <input value={armMaxTrades} type="number" min="1" max="20" onChange={e => setArmMaxTrades(e.target.value)} style={inpStyle} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 3 }}>INSTRUMENTS</div>
+                  <input value={armInstruments} placeholder="MGC,MNQ" onChange={e => setArmInstruments(e.target.value)} style={inpStyle} />
+                </div>
+                <div>
+                  <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 3 }}>MAX CONTRACTS / INST</div>
+                  <input value={armMaxCt} type="number" min="1" max="10" onChange={e => setArmMaxCt(e.target.value)} style={inpStyle} />
+                </div>
+                <div style={{ gridColumn: '1 / -1' }}>
+                  <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 3 }}>MAX SESSION LOSS $ (optional)</div>
+                  <input value={armMaxLoss} type="number" min="0" placeholder="leave blank = no limit" onChange={e => setArmMaxLoss(e.target.value)} style={inpStyle} />
+                </div>
+              </div>
+            </div>
+
+            {actMsg && (
+              <div style={{ fontSize: 10.5, padding: '6px 10px', borderRadius: 5, marginBottom: 12,
+                background: actMsg.ok ? `${T.green}15` : `${T.red}15`,
+                color: actMsg.ok ? T.green : T.red,
+                border: `1px solid ${actMsg.ok ? T.green : T.red}44` }}>
+                {actMsg.ok ? '✓' : '✗'} {actMsg.text}
+              </div>
+            )}
+
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button onClick={() => { setArmModalOpen(false); setActMsg(null); }}
+                style={{ background: 'none', border: `1px solid ${T.border}`, color: T.txtSec,
+                  borderRadius: 6, padding: '7px 14px', fontSize: 10.5, cursor: 'pointer' }}>
+                Cancel
+              </button>
+              <button onClick={handleArm} disabled={pending || confirmPhrase !== _ARM_CONFIRM_PHRASE}
+                style={{ background: confirmPhrase === _ARM_CONFIRM_PHRASE ? `${T.green}20` : `${T.border}40`,
+                  border: `1px solid ${confirmPhrase === _ARM_CONFIRM_PHRASE ? T.green : T.border}`,
+                  color: confirmPhrase === _ARM_CONFIRM_PHRASE ? T.green : T.txtMuted,
+                  borderRadius: 6, padding: '7px 18px', fontSize: 10.5, fontWeight: 700,
+                  cursor: (pending || confirmPhrase !== _ARM_CONFIRM_PHRASE) ? 'not-allowed' : 'pointer',
+                  opacity: (pending || confirmPhrase !== _ARM_CONFIRM_PHRASE) ? 0.5 : 1, letterSpacing: '0.06em' }}>
+                {pending ? '…' : '⊙ CONFIRM ARM'}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </Panel>
+  );
+};
+
+
 export default function MainBrain() {
   // Section param — present when route is /main-brain/:section, absent at /main-brain
   const params = useParams<{ section?: string }>();
@@ -7870,6 +8169,18 @@ export default function MainBrain() {
         return <JournalFullPage />;
       case 'coach':
         return <CoachPanel p={p} />;
+      case 'execution':
+        return (
+          <>
+            <div style={{ marginBottom: 10 }}>
+              <ArmControlPanel />
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
+              <ExecutionPanel p={p} />
+              <SystemHealthPanel p={p} />
+            </div>
+          </>
+        );
       case 'alerts':
         return (
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10 }} className="mb-grid-3">
