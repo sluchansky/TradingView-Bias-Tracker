@@ -43271,6 +43271,7 @@ def _persist_tradezella_trades(trades, filename=None):
         return {"ok": False, "error": "database unavailable"}
     batch_id = uuid.uuid4().hex
     imported = 0
+    auto_reviewed = 0
     try:
         with conn.cursor() as cur:
             for t in trades:
@@ -43299,21 +43300,54 @@ def _persist_tradezella_trades(trades, filename=None):
                 row_result = cur.fetchone()
                 if row_result is not None:
                     imported += 1
-                    # Phase 7N: create a journal_reviews stub for each newly-inserted
-                    # trade, mapping any Tradzella notes → pre_trade_notes on first
-                    # import.  ON CONFLICT DO NOTHING preserves existing review work
-                    # on re-import (the review row stays untouched).
+                    # Auto-seed a journal_reviews row from the trade's CSV fields.
+                    # ON CONFLICT … WHERE review_status='UNREVIEWED' means existing
+                    # manual reviews are NEVER overwritten on re-import.
                     new_trade_id = row_result[0]
-                    trz_notes    = (t.get("notes") or "").strip() or None
                     try:
+                        import tradezella_auto_seed as _tas
+                        seed = _tas.auto_seed_review(t)
                         cur.execute(
                             "INSERT INTO journal_reviews"
-                            " (source, trade_id, review_status, pre_trade_notes,"
+                            " (source, trade_id, review_status, followed_plan,"
+                            "  mistake_tags, positive_tags, emotion_tags,"
+                            "  pre_trade_notes, post_trade_review,"
+                            "  discipline_quality, overall_quality,"
+                            "  execution_quality, reviewed_at,"
                             "  reviewed_by, updated_at)"
-                            " VALUES ('tradzella',%s,'UNREVIEWED',%s,'operator',NOW())"
-                            " ON CONFLICT (source, trade_id) DO NOTHING",
-                            (new_trade_id, trz_notes),
+                            " VALUES ('tradzella',%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,'auto_seed',NOW())"
+                            " ON CONFLICT (source, trade_id) DO UPDATE SET"
+                            "  review_status     = EXCLUDED.review_status,"
+                            "  followed_plan     = EXCLUDED.followed_plan,"
+                            "  mistake_tags      = EXCLUDED.mistake_tags,"
+                            "  positive_tags     = EXCLUDED.positive_tags,"
+                            "  emotion_tags      = EXCLUDED.emotion_tags,"
+                            "  pre_trade_notes   = EXCLUDED.pre_trade_notes,"
+                            "  post_trade_review = EXCLUDED.post_trade_review,"
+                            "  discipline_quality= EXCLUDED.discipline_quality,"
+                            "  overall_quality   = EXCLUDED.overall_quality,"
+                            "  execution_quality = EXCLUDED.execution_quality,"
+                            "  reviewed_at       = EXCLUDED.reviewed_at,"
+                            "  reviewed_by       = EXCLUDED.reviewed_by,"
+                            "  updated_at        = EXCLUDED.updated_at"
+                            " WHERE journal_reviews.review_status = 'UNREVIEWED'",
+                            (
+                                new_trade_id,
+                                seed["review_status"],
+                                seed["followed_plan"],
+                                psycopg2.extras.Json(seed["mistake_tags"]),
+                                psycopg2.extras.Json(seed["positive_tags"]),
+                                psycopg2.extras.Json(seed["emotion_tags"]),
+                                seed["pre_trade_notes"],
+                                seed["post_trade_review"],
+                                seed["discipline_quality"],
+                                seed["overall_quality"],
+                                seed["execution_quality"],
+                                seed["reviewed_at"],
+                            ),
                         )
+                        if seed["review_status"] == "REVIEWED":
+                            auto_reviewed += 1
                     except Exception:
                         pass  # fail-open: review row is not critical
             skipped_dupes = len(trades) - imported
@@ -43325,6 +43359,7 @@ def _persist_tradezella_trades(trades, filename=None):
                  skipped_dupes),
             )
         return {"ok": True, "import_batch_id": batch_id, "imported": imported,
+                "auto_reviewed": auto_reviewed,
                 "skipped_dupes": skipped_dupes, "submitted": len(trades)}
     except Exception as exc:
         logger.warning("tradezella persist failed: %s", exc)
@@ -43705,6 +43740,106 @@ def tradezella_reset():
     if not result.get("ok"):
         return jsonify(result), 500
     return jsonify(result)
+
+
+@app.route("/tradezella/reseed-reviews", methods=["POST"])
+def tradezella_reseed_reviews():
+    """Owner-only.  Re-run auto-seed on every UNREVIEWED tradzella trade.
+
+    Safe to call multiple times — only rows with review_status='UNREVIEWED'
+    are touched.  Manually reviewed trades are never overwritten.
+
+    Returns { ok, reseeded, skipped_already_reviewed, total_checked }.
+    """
+    guard = _tz_guard()
+    if guard:
+        return guard
+    if not TRADEZELLA_DB_READY:
+        _check_tradezella_db_ready()
+    if not TRADEZELLA_DB_READY:
+        return jsonify({"ok": False, "error": "database not ready"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        import tradezella_auto_seed as _tas
+
+        reseeded = 0
+        skipped  = 0
+
+        with conn.cursor() as cur:
+            # Load all tradezella_trades that still have UNREVIEWED review rows.
+            cur.execute(
+                "SELECT tt.id, tt.outcome, tt.r_multiple, tt.mfe, tt.mae,"
+                "       tt.mistake, tt.notes"
+                " FROM tradezella_trades tt"
+                " JOIN journal_reviews   jr"
+                "   ON jr.source = 'tradzella' AND jr.trade_id = tt.id"
+                " WHERE jr.review_status = 'UNREVIEWED'"
+            )
+            rows = cur.fetchall()
+            cols = ("id", "outcome", "r_multiple", "mfe", "mae",
+                    "mistake", "notes")
+            trades = [dict(zip(cols, r)) for r in rows]
+
+        total = len(trades)
+
+        with conn.cursor() as cur:
+            for t in trades:
+                trade_id = t["id"]
+                seed = _tas.auto_seed_review(t)
+                if seed["review_status"] != "REVIEWED":
+                    skipped += 1
+                    continue
+                cur.execute(
+                    "UPDATE journal_reviews SET"
+                    "  review_status     = %s,"
+                    "  followed_plan     = %s,"
+                    "  mistake_tags      = %s,"
+                    "  positive_tags     = %s,"
+                    "  emotion_tags      = %s,"
+                    "  pre_trade_notes   = COALESCE(pre_trade_notes, %s),"
+                    "  post_trade_review = COALESCE(post_trade_review, %s),"
+                    "  discipline_quality= %s,"
+                    "  overall_quality   = %s,"
+                    "  execution_quality = %s,"
+                    "  reviewed_at       = %s,"
+                    "  reviewed_by       = 'auto_seed',"
+                    "  updated_at        = NOW()"
+                    " WHERE source = 'tradzella' AND trade_id = %s"
+                    "   AND review_status = 'UNREVIEWED'",
+                    (
+                        seed["review_status"],
+                        seed["followed_plan"],
+                        psycopg2.extras.Json(seed["mistake_tags"]),
+                        psycopg2.extras.Json(seed["positive_tags"]),
+                        psycopg2.extras.Json(seed["emotion_tags"]),
+                        seed["pre_trade_notes"],
+                        seed["post_trade_review"],
+                        seed["discipline_quality"],
+                        seed["overall_quality"],
+                        seed["execution_quality"],
+                        seed["reviewed_at"],
+                        trade_id,
+                    ),
+                )
+                if cur.rowcount > 0:
+                    reseeded += 1
+
+        return jsonify({
+            "ok": True,
+            "reseeded": reseeded,
+            "no_data_to_seed": skipped,
+            "total_checked": total,
+        })
+    except Exception as exc:
+        logger.warning("tradezella_reseed_reviews failed: %s", exc)
+        return jsonify({"ok": False, "error": "reseed failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ── Journal Phase 7K: unified trade-review endpoints ──────────────────────────
@@ -44246,6 +44381,7 @@ def journal_import_confirm():
         "ok": True,
         "batch_id":      result["import_batch_id"],
         "imported":      result["imported"],
+        "auto_reviewed": result.get("auto_reviewed", 0),
         "skipped_dupes": result["skipped_dupes"],
         "submitted":     result["submitted"],
     })

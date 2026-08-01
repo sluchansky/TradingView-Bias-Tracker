@@ -66,6 +66,7 @@
 - [Market-session (CME/COMEX) awareness](market-session-hours.md) — MNQ/MGC pause weekend + daily 17-18 ET halt + US holidays; closed-override runs LAST in full_analysis; new override goes before it.
 - [Trade Idea Review (/review-idea)](trade-idea-review.md) — owner-only display-only grading by REUSING read-only engines; manual ticket only, NEVER a money path; goldens byte-identical.
 - [TradeZella integration](tradezella-integration.md) — imported journal feeds memory as DOWN-WEIGHTED source:"tradezella" + display-only presenter; memory DB read stays OUTSIDE LEARNING_LOCK (only swap is locked).
+- [TradeZella auto-seed reviews](tradezella-autoseed.md) — tradezella_auto_seed.py (pure, no app import); ON CONFLICT WHERE review_status='UNREVIEWED' guards manual reviews; reseed endpoint at /tradezella/reseed-reviews; auto_reviewed count in confirm response.
 - [Entry Quality location engine](entry-quality-engine.md) — 0-100 LOCATION scorer; display-first flag-gated DEMOTE-ONLY veto (score<70 & not Edge≥90), veto DEFAULT ON; ATR uses MODE-CORRECT ATR; absence-of-bad subs default 1.0.
 - [Broker payload pre-send guard](broker-payload-presend-guard.md) — every LIVE broker POST audit-logged + required-field checked; invalid → local reject (no send); fail-closed, valid payload never mutated.
 - [Manual Trade Manager bot mirror](manual-trade-monitor-bot-mirror.md) — compute_manual_trade_management MUTATES its input (min_r/max_r) so bot-trade mirror MUST pass a COPY, never ACTIVE_TRADE.

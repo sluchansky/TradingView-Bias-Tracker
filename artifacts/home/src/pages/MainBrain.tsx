@@ -4136,7 +4136,9 @@ const JImportTab: React.FC = () => {
   const [previewToken, setPreviewToken] = useState<string | null>(null);
   const [filename, setFilename] = useState('');
   const [rawCsv, setRawCsv] = useState('');
-  const [doneResult, setDoneResult] = useState<{ batch_id: string; imported: number; skipped_dupes: number } | null>(null);
+  const [doneResult, setDoneResult] = useState<{ batch_id: string; imported: number; auto_reviewed: number; skipped_dupes: number } | null>(null);
+  const [reseedResult, setReseedResult] = useState<{ reseeded: number; no_data_to_seed: number; total_checked: number } | null>(null);
+  const [reseedLoading, setReseedLoading] = useState(false);
   const [batches, setBatches] = useState<JBatch[]>([]);
   const [batchLoading, setBatchLoading] = useState(false);
   const [rollbackMsg, setRollbackMsg] = useState<string | null>(null);
@@ -4186,7 +4188,7 @@ const JImportTab: React.FC = () => {
       });
       const data = await r.json();
       if (!data.ok) throw new Error(data.error || 'confirm failed');
-      setDoneResult({ batch_id: data.batch_id, imported: data.imported, skipped_dupes: data.skipped_dupes });
+      setDoneResult({ batch_id: data.batch_id, imported: data.imported, auto_reviewed: data.auto_reviewed ?? 0, skipped_dupes: data.skipped_dupes });
       setStage('done');
       fetchBatches();
     } catch (e) { setError(String(e)); }
@@ -4309,23 +4311,82 @@ const JImportTab: React.FC = () => {
       )}
 
       {stage === 'done' && doneResult && (
-        <div style={{ textAlign: 'center', padding: '24px 0' }}>
-          <div style={{ fontSize: 32, marginBottom: 8 }}>✓</div>
-          <div style={{ fontSize: 14, color: T.green, fontWeight: 700, marginBottom: 4 }}>
-            Import Complete
+        <div style={{ padding: '20px 0' }}>
+          <div style={{ textAlign: 'center', marginBottom: 16 }}>
+            <div style={{ fontSize: 28, marginBottom: 6 }}>✓</div>
+            <div style={{ fontSize: 13, color: T.green, fontWeight: 700, marginBottom: 4 }}>
+              Import Complete
+            </div>
+            <div style={{ fontSize: 11, color: T.txtSec, marginBottom: 2 }}>
+              {doneResult.imported} trade{doneResult.imported !== 1 ? 's' : ''} imported
+              {doneResult.skipped_dupes > 0 ? ` · ${doneResult.skipped_dupes} duplicates skipped` : ''}
+            </div>
+            <div style={{ fontSize: 9, color: T.txtMuted, fontFamily: T.mono, marginBottom: 12 }}>
+              Batch ID: {doneResult.batch_id.slice(0, 12)}…
+            </div>
           </div>
-          <div style={{ fontSize: 11, color: T.txtSec, marginBottom: 2 }}>
-            {doneResult.imported} trade{doneResult.imported !== 1 ? 's' : ''} imported
-            {doneResult.skipped_dupes > 0 ? ` · ${doneResult.skipped_dupes} duplicates skipped` : ''}
+          {/* Auto-seed summary */}
+          <div style={{ background: doneResult.auto_reviewed > 0 ? T.green + '11' : T.panelAlt,
+            border: `1px solid ${doneResult.auto_reviewed > 0 ? T.green + '44' : T.border}`,
+            borderRadius: 8, padding: '10px 14px', marginBottom: 14 }}>
+            {doneResult.auto_reviewed > 0 ? (
+              <>
+                <div style={{ fontSize: 11, color: T.green, fontWeight: 700, marginBottom: 3 }}>
+                  🧠 {doneResult.auto_reviewed} trade{doneResult.auto_reviewed !== 1 ? 's' : ''} auto-reviewed from your TradeZella journal notes
+                </div>
+                <div style={{ fontSize: 10, color: T.txtMuted }}>
+                  Mistake tags, emotion tags, and quality ratings were extracted from your notes and mistake fields.
+                  {doneResult.imported - doneResult.auto_reviewed > 0
+                    ? ` ${doneResult.imported - doneResult.auto_reviewed} trade${doneResult.imported - doneResult.auto_reviewed !== 1 ? 's' : ''} had no journal data — open them in Trade Log to add a review.`
+                    : ' All imported trades are ready for coaching.'}
+                </div>
+              </>
+            ) : (
+              <>
+                <div style={{ fontSize: 11, color: T.amber, fontWeight: 700, marginBottom: 3 }}>
+                  📋 No journal notes found to auto-review
+                </div>
+                <div style={{ fontSize: 10, color: T.txtMuted }}>
+                  Your CSV didn't contain mistake or notes fields. Go to <strong style={{ color: T.txtPri }}>Trade Log</strong> → filter Tradzella → open each trade to add a review manually. Or fill in the Mistake/Notes columns in TradeZella and re-export.
+                </div>
+              </>
+            )}
           </div>
-          <div style={{ fontSize: 9, color: T.txtMuted, fontFamily: T.mono, marginBottom: 16 }}>
-            Batch ID: {doneResult.batch_id.slice(0, 12)}…
+          <div style={{ display: 'flex', gap: 8, justifyContent: 'center', flexWrap: 'wrap' }}>
+            <button onClick={() => { setStage('pick'); setPreview([]); setPreviewMeta(null); setReseedResult(null); }}
+              style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 6,
+                color: T.txtSec, padding: '6px 16px', fontSize: 11, cursor: 'pointer' }}>
+              Import Another File
+            </button>
+            <button
+              disabled={reseedLoading}
+              onClick={async () => {
+                setReseedLoading(true);
+                setReseedResult(null);
+                try {
+                  const r = await fetch('/api/tradezella/reseed-reviews', {
+                    method: 'POST',
+                    headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+                  });
+                  const d = await r.json();
+                  if (d.ok) setReseedResult({ reseeded: d.reseeded, no_data_to_seed: d.no_data_to_seed, total_checked: d.total_checked });
+                } catch { /* fail-open */ }
+                finally { setReseedLoading(false); }
+              }}
+              style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 6,
+                color: T.txtSec, padding: '6px 16px', fontSize: 11, cursor: reseedLoading ? 'wait' : 'pointer',
+                opacity: reseedLoading ? 0.6 : 1 }}>
+              {reseedLoading ? 'Re-seeding…' : '🔄 Re-seed All Unreviewed Trades'}
+            </button>
           </div>
-          <button onClick={() => { setStage('pick'); setPreview([]); setPreviewMeta(null); }}
-            style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 6,
-              color: T.txtSec, padding: '6px 16px', fontSize: 11, cursor: 'pointer' }}>
-            Import Another File
-          </button>
+          {reseedResult && (
+            <div style={{ marginTop: 10, background: T.green + '11', border: `1px solid ${T.green}44`,
+              borderRadius: 7, padding: '8px 12px', fontSize: 10, color: T.txtSec }}>
+              ✓ Re-seed complete — <strong style={{ color: T.green }}>{reseedResult.reseeded}</strong> trades upgraded to REVIEWED
+              {reseedResult.no_data_to_seed > 0 ? ` · ${reseedResult.no_data_to_seed} had no journal data to extract` : ''}
+              {' '}(checked {reseedResult.total_checked} total)
+            </div>
+          )}
         </div>
       )}
 
