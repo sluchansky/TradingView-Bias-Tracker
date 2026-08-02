@@ -7851,6 +7851,20 @@ const ArmControlPanel: React.FC = () => {
         </div>
       )}
 
+      {/* Mode notice — explain what state the gateway is in */}
+      {effState === 'disabled' && (
+        <div style={{ color: T.amber, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
+          background: `${T.amber}0e`, border: `1px solid ${T.amber}33`, borderRadius: 5, lineHeight: 1.5 }}>
+          <strong>Auto-trading is DISABLED.</strong> Set <code style={{ background: `${T.amber}18`, borderRadius: 3, padding: '1px 4px' }}>EXECUTION_MODE=traderspost</code> (or <code style={{ background: `${T.amber}18`, borderRadius: 3, padding: '1px 4px' }}>pickmytrade</code>) in Secrets, then republish to enable live execution. You can still ARM a session now — it will take effect once the mode is switched.
+        </div>
+      )}
+      {effState === 'paper' && (
+        <div style={{ color: T.txtMuted, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
+          background: '#ffffff08', border: `1px solid ${T.border}`, borderRadius: 5, lineHeight: 1.5 }}>
+          <strong>PAPER mode.</strong> No live orders will be sent. ARM controls paper-simulation auto-execution only.
+        </div>
+      )}
+
       {/* Status grid */}
       <div style={{ marginBottom: 12 }}>
         <KV label="Effective State"       value={stateLabel[effState] ?? effState} valueColor={stateColor} />
@@ -7867,9 +7881,9 @@ const ArmControlPanel: React.FC = () => {
         <KV label="Last Changed"          value={fmtTs(armData?.last_changed_at)} />
       </div>
 
-      {/* Action buttons */}
+      {/* Action buttons — ARM always visible when not safety-locked */}
       <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: actMsg ? 10 : 0 }}>
-        {(disarmed || armed) && !locked && btn(T.green, '⊙ ARM', () => { setArmModalOpen(true); setConfirmPhrase(''); setActMsg(null); })}
+        {!locked && btn(T.green, '⊙ ARM', () => { setArmModalOpen(true); setConfirmPhrase(''); setActMsg(null); })}
         {armed && !locked && btn(T.amber, '◎ DISARM NEW ENTRIES', () => doAction('disarm', { reason: 'operator_manual' }))}
         {(disarmed || armed) && !locked && btn(T.red, '⚠ KILL SWITCH', () => {
           if (window.confirm('Activate emergency kill switch?\n\nThis will lock auto-execution and require a manual safety-lock reset.')) {
@@ -8233,7 +8247,9 @@ export default function MainBrain() {
         <Header p={p} fetchState={fetchState} lastOk={lastOk} ticker={ticker} setTicker={handleSetTicker} refresh={refresh} onAskAi={() => setAskOpen(true)} />
 
         <main id="main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
-          {isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
+          {/* Execution section renders immediately — it has its own data source, no brain poll needed */}
+          {section === 'execution' ? renderSectionPanels() :
+          isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
             <>
               {/* Stale banner */}
               {fetchState === 'stale' && (
