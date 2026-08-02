@@ -1,0 +1,592 @@
+TASK: Phase 7K-C — Add native journal review workflow, notes, screenshots, and manual-override analysis.
+
+CONTEXT
+
+Native Journal Phases A, A.2, and B are complete.
+
+Current capabilities:
+
+- immutable send-time plan snapshot
+- native journal lifecycle
+- execution details
+- management-event timeline
+- final outcome
+- manual/automated event source badges
+- read-only full Trade Detail
+- native trade log
+- Tradzella and Legacy retained as secondary sources
+
+GOAL
+
+Add the operator-review layer for completed native trades.
+
+This phase should implement:
+
+1. review status
+2. followed-plan assessment
+3. mistake and emotion tags
+4. notes and lessons
+5. screenshot attachments
+6. structured manual-override review
+7. review queue
+8. learning-eligibility review boundary
+
+Do not build analytics, calendar, playbook, or Tradzella reconciliation yet.
+
+STRICT SCOPE
+
+DO NOT modify:
+
+- Databento ingestion
+- bar construction
+- strategy logic
+- Edge Score
+- readiness gates
+- risk rules
+- TradersPost payloads
+- execution-gateway decisions
+- active-trade management behavior
+- learning formulas
+- learning thresholds
+- Main Brain polling
+- authentication
+
+Review changes must never alter the historical planned trade context.
+
+==================================================
+PART 1 — REVIEW STATES
+==================================================
+
+Support canonical review statuses:
+
+- UNREVIEWED
+- IN_PROGRESS
+- REVIEWED
+- NEEDS_REVIEW
+- EXCLUDED
+
+Define exact transition rules.
+
+Examples:
+
+UNREVIEWED
+→ IN_PROGRESS
+→ REVIEWED
+
+STATUS_UNKNOWN, missing strategy, or missing execution may force:
+NEEDS_REVIEW
+
+Operator may mark:
+EXCLUDED
+
+Every review-status change must record:
+
+- timestamp
+- prior status
+- new status
+- operator
+- reason
+
+Do not use review_status to modify lifecycle_status.
+
+==================================================
+PART 2 — REVIEW DATA CONTRACT
+==================================================
+
+Use a structured review_data object.
+
+Suggested shape:
+
+{
+  "followed_plan": true,
+  "setup_quality": 4,
+  "execution_quality": 3,
+  "management_quality": 2,
+  "emotional_control": 2,
+  "mistake_tags": [],
+  "emotion_tags": [],
+  "positive_tags": [],
+  "lesson": "",
+  "what_went_well": "",
+  "what_to_improve": "",
+  "operator_exit_reason": null,
+  "reviewed_at": null,
+  "reviewed_by": null
+}
+
+Use project naming conventions.
+
+Do not store all review content in one unstructured note.
+
+==================================================
+PART 3 — FOLLOWED-PLAN ASSESSMENT
+==================================================
+
+Allow:
+
+- YES
+- PARTIALLY
+- NO
+- NOT_APPLICABLE
+
+Show the system plan beside the review:
+
+- planned entry
+- planned stop
+- planned targets
+- expected management
+- actual management events
+- actual close
+
+The review must not edit the historical plan.
+
+==================================================
+PART 4 — MISTAKE TAGS
+==================================================
+
+Support structured mistake tags such as:
+
+- ENTERED_EARLY
+- ENTERED_LATE
+- OVERTRADED
+- REVENGE_TRADE
+- EXITED_EARLY
+- MOVED_STOP_TOO_SOON
+- WIDENED_STOP
+- OVERSIZED
+- IGNORED_BLOCKER
+- TOOK_COUNTERTREND
+- MISSED_TARGET
+- MANUAL_INTERVENTION
+- BROKE_SESSION_RULE
+- OTHER
+
+Use canonical codes with readable labels.
+
+Allow multiple tags.
+
+Do not auto-assign a mistake without evidence.
+
+==================================================
+PART 5 — EMOTION TAGS
+==================================================
+
+Support:
+
+- ANXIETY
+- FEAR
+- FOMO
+- IMPATIENCE
+- FRUSTRATION
+- REVENGE
+- OVERCONFIDENCE
+- HESITATION
+- CALM
+- DISCIPLINED
+- OTHER
+
+Allow multiple tags.
+
+Keep emotion tags operator-entered unless there is explicit structured evidence from an override reason.
+
+==================================================
+PART 6 — POSITIVE TAGS
+==================================================
+
+Support:
+
+- FOLLOWED_PLAN
+- WAITED_FOR_CONFIRMATION
+- RESPECTED_STOP
+- LET_WINNER_RUN
+- GOOD_RISK_CONTROL
+- GOOD_PATIENCE
+- CLEAN_EXECUTION
+- NO_INTERVENTION
+- OTHER
+
+The journal should track good behavior, not only mistakes.
+
+==================================================
+PART 7 — NOTES AND LESSONS
+==================================================
+
+Add editable fields:
+
+- trade notes
+- what went well
+- what to improve
+- lesson learned
+
+Autosave or explicit Save is acceptable, but use one clear pattern.
+
+Show:
+
+- last saved timestamp
+- unsaved state
+- save error state
+
+Do not overwrite immutable planned context or management history.
+
+==================================================
+PART 8 — SCREENSHOT ATTACHMENTS
+==================================================
+
+Allow screenshots to be attached to the native journal trade.
+
+Support categories:
+
+- PRE_ENTRY
+- ENTRY
+- MANAGEMENT
+- EXIT
+- REVIEW
+- OTHER
+
+Store metadata:
+
+- attachment ID
+- category
+- uploaded_at
+- uploaded_by
+- caption
+- safe storage reference
+- mime type
+- file size
+
+File safety:
+
+- image formats only
+- enforce size limit
+- sanitize filenames
+- no executable content
+- no local path exposure
+- no secrets in metadata
+
+Do not store large image binaries directly in native_journal JSONB unless that is already the project’s approved attachment model.
+
+==================================================
+PART 9 — MANUAL OVERRIDE REVIEW
+==================================================
+
+When has_manual_override = true, show an explicit section:
+
+MANUAL OVERRIDE REVIEW
+
+Display:
+
+- system state before intervention
+- operator action
+- reason code
+- timestamp
+- lifecycle state
+- actual result after intervention
+- hypothetical automated result when deterministically available
+
+Require the operator to classify the intervention:
+
+- HELPFUL
+- HARMFUL
+- NEUTRAL
+- CANNOT_DETERMINE
+
+Do not fabricate the hypothetical result.
+
+If unavailable, show:
+
+AUTOMATED COMPARISON UNAVAILABLE
+
+==================================================
+PART 10 — REVIEW QUEUE
+==================================================
+
+Add a Review Queue view inside Journal.
+
+Include trades that are:
+
+- CLOSED + UNREVIEWED
+- NEEDS_REVIEW
+- STATUS_UNKNOWN
+- manual override present
+- missing outcome data
+- learning blocked by review
+- external/manual attribution unresolved
+
+Columns:
+
+- date
+- instrument
+- strategy
+- lifecycle
+- result
+- R
+- override
+- missing information
+- priority
+- review status
+
+Add:
+
+REVIEW NEXT TRADE
+
+It should open the oldest or highest-priority unresolved trade using deterministic ordering.
+
+==================================================
+PART 11 — LEARNING ELIGIBILITY BOUNDARY
+==================================================
+
+Review may unlock learning eligibility only when all existing non-review conditions already pass.
+
+Review must never override:
+
+- missing strategy
+- missing planned risk
+- duplicate
+- unresolved execution
+- ambiguous import
+- invalid outcome
+- status unknown
+
+Define review rules by source.
+
+Suggested:
+
+SYSTEM_AUTO
+- closed
+- valid outcome
+- no unresolved status
+- review may be optional or required by configured policy
+
+SYSTEM_MANUAL_CONFIRM
+- review required
+
+EXTERNAL_MANUAL
+- review and strategy attribution required
+
+TRADZELLA_IMPORT
+- match confidence and review required
+
+Do not change learning formulas.
+
+==================================================
+PART 12 — API
+==================================================
+
+Add authenticated endpoints following existing conventions.
+
+Suggested:
+
+PATCH /api/journal/native-trades/{id}/review
+
+Allow only review fields.
+
+Reject attempts to edit immutable planned fields.
+
+POST /api/journal/native-trades/{id}/screenshots
+
+DELETE /api/journal/native-trades/{id}/screenshots/{attachment_id}
+
+GET /api/journal/review-queue
+
+All writes require owner authentication.
+
+Validate enum values and field sizes.
+
+==================================================
+PART 13 — UI
+==================================================
+
+Upgrade Trade Detail with a sixth section:
+
+REVIEW
+
+Show:
+
+- status
+- followed plan
+- quality ratings
+- mistake tags
+- emotion tags
+- positive tags
+- notes
+- lesson
+- screenshots
+- save status
+- manual override assessment
+
+Keep the first five sections read-only.
+
+Add a visible divider:
+
+HISTORICAL RECORD — READ ONLY
+
+and:
+
+OPERATOR REVIEW — EDITABLE
+
+==================================================
+PART 14 — REVIEW COMPLETENESS
+==================================================
+
+Add a compact progress indicator.
+
+Example:
+
+REVIEW COMPLETION
+7 / 9 fields complete
+
+Required fields should depend on source and override state.
+
+Do not require irrelevant fields.
+
+==================================================
+PART 15 — TESTS
+==================================================
+
+REVIEW STATUS
+
+1. UNREVIEWED → IN_PROGRESS.
+2. IN_PROGRESS → REVIEWED.
+3. REVIEWED can reopen to IN_PROGRESS with audit event.
+4. Invalid status rejected.
+5. Lifecycle remains unchanged.
+
+IMMUTABILITY
+
+6. Review update cannot change strategy.
+7. Review update cannot change thesis.
+8. Review update cannot change planned stop.
+9. Review update cannot change Edge Score.
+10. Review update cannot change management events.
+
+REVIEW DATA
+
+11. Followed-plan enum validation.
+12. Ratings bounded.
+13. Multiple mistake tags.
+14. Multiple emotion tags.
+15. Positive tags.
+16. Notes persist.
+17. Lesson persists.
+18. Save preserves existing fields.
+
+OVERRIDES
+
+19. Manual override section appears.
+20. Helpful/harmful/neutral classification persists.
+21. Hypothetical unavailable state.
+22. No override section for fully automated trade.
+
+SCREENSHOTS
+
+23. Valid image upload.
+24. Invalid file type rejected.
+25. Oversized file rejected.
+26. Filename sanitized.
+27. Attachment metadata persisted.
+28. Delete attachment.
+29. No local path exposed.
+30. Auth required.
+
+REVIEW QUEUE
+
+31. Closed unreviewed included.
+32. Reviewed excluded.
+33. Needs-review included.
+34. Status-unknown included.
+35. Manual override prioritized.
+36. Review-next ordering deterministic.
+37. Missing fields displayed.
+
+LEARNING
+
+38. Review unlocks eligibility only when other criteria pass.
+39. Review cannot unlock missing strategy.
+40. Review cannot unlock status unknown.
+41. Excluded trade remains ineligible.
+42. External manual requires attribution.
+
+UI
+
+43. Historical sections remain read-only.
+44. Review section editable.
+45. Save state.
+46. Error state.
+47. Review completion indicator.
+48. Tags render.
+49. Screenshot gallery.
+50. Review Queue.
+
+REGRESSION
+
+51. Phase A tests.
+52. A.2 API/UI tests.
+53. Phase B tests.
+54. Snapshot tests.
+55. Execution tests.
+56. Tradzella tests.
+57. Learning tests.
+58. Navigation tests.
+59. TypeScript/build/diff.
+60. Parity and goldens.
+
+==================================================
+PART 16 — SCREENSHOT EVIDENCE
+==================================================
+
+Capture:
+
+1. Unreviewed closed trade
+2. Review form
+3. Mistake/emotion tags
+4. Screenshot gallery
+5. Manual override review
+6. Completed review
+7. Review Queue
+8. Learning blocked by review
+
+==================================================
+PART 17 — STOP CONDITIONS
+==================================================
+
+Stop and report if:
+
+- existing attachment storage is unsuitable
+- review writes could alter immutable context
+- learning eligibility cannot be recalculated safely
+- manual override data is not deterministic
+- screenshot handling would expose local paths or unsafe files
+- the task would alter trade management or execution behavior
+
+==================================================
+PART 18 — COMMIT BOUNDARY
+==================================================
+
+Create one clean commit:
+
+`Phase 7K-C: Add native journal review workflow and attachments`
+
+Do not begin analytics, calendar, playbook, or Tradzella migration.
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Files changed
+4. Review-status contract
+5. Editable versus immutable fields
+6. Tag sets
+7. Screenshot storage approach
+8. Manual override review
+9. Review Queue behavior
+10. Learning eligibility interaction
+11. API routes
+12. UI changes
+13. Screenshots
+14. Test results
+15. Full TypeScript/build status
+16. Known limitations
+17. Confirmation that trading, risk, execution, Databento, scoring, readiness, management, and learning formulas were unchanged
+18. Recommended Phase D instructions, but do not implement them
