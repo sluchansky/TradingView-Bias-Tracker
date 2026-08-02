@@ -40430,7 +40430,16 @@ def _databento_tick_broadcast(inst: str, ts_s: float, price: float,
     put_nowait() is used throughout — a full queue drops the tick and increments
     the subscriber's drop counter.  The Databento feed thread is never blocked.
     """
-    _side = side if side in ("A", "B") else "N"
+    # Normalize to a plain Python string.  databento's Side enum implements
+    # __eq__ against strings, so `side in ("A", "B")` can be True while side
+    # is still an enum object — which crashes json.dumps.  Use explicit
+    # equality checks and produce a literal string to avoid the trap.
+    if side == "A":
+        _side: str = "A"
+    elif side == "B":
+        _side = "B"
+    else:
+        _side = "N"
     tick_data: dict = {
         "instrument": inst,
         "ts_s":       round(ts_s, 6),
