@@ -32579,9 +32579,14 @@ def _check_journal_db_ready():
 def _persist_journal_entry(entry):
     """Upsert one journal entry by journal_key. FAIL-OPEN. The key is assigned
     SYNCHRONOUSLY (so the in-memory entry + DB row match), and a snapshot of the
-    entry is captured before the DB write is offloaded to the slow-task worker —
+    entry is captured before the DB write is dispatched on its own daemon thread
     so a DB stall never delays a trade decision, and a later mutation of the same
-    entry can't corrupt this write (the next persist call writes the new state)."""
+    entry can't corrupt this write (the next persist call writes the new state).
+
+    NOTE: uses a dedicated daemon thread per write (NOT the shared slow-task queue).
+    Journal creation is rare (~once per trade) so the per-thread overhead is
+    negligible. This avoids the SIGTERM race where os._exit(0) kills the slow
+    worker queue before pending journal writes are flushed to Postgres."""
     if not JOURNAL_DB_READY or not entry:
         return
     _ensure_journal_key(entry)
@@ -32591,6 +32596,7 @@ def _persist_journal_entry(entry):
     def _task():
         conn = _learning_conn()
         if conn is None:
+            logger.warning("journal persist skipped — DB connection unavailable (fail-open)")
             return
         try:
             with conn.cursor() as cur:
@@ -32599,17 +32605,19 @@ def _persist_journal_entry(entry):
                        VALUES (%s, %s)
                        ON CONFLICT (journal_key)
                        DO UPDATE SET entry = EXCLUDED.entry, updated_at = now()""",
-                    (key, psycopg2.extras.Json(snapshot)),
+                    (key, psycopg2.extras.Json(snapshot,
+                                               dumps=lambda v: __import__("json").dumps(v, default=str))),
                 )
+            logger.debug("journal entry persisted: key=%s", key[:8])
         except Exception as exc:
-            logger.warning("journal persist failed: %s", exc)
+            logger.warning("journal persist failed (fail-open): %s", exc)
         finally:
             try:
                 conn.close()
             except Exception:
                 pass
 
-    _enqueue_slow(_task)
+    threading.Thread(target=_task, name="journal-persist", daemon=True).start()
 
 
 def _load_journal_from_db(limit=500):
@@ -32622,6 +32630,7 @@ def _load_journal_from_db(limit=500):
         return
     conn = _learning_conn()
     if conn is None:
+        logger.warning("journal restore skipped — DB connection unavailable at boot (fail-open)")
         return
     try:
         with conn.cursor() as cur:
