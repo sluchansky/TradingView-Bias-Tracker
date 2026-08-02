@@ -30341,6 +30341,13 @@ def _update_journal_outcome(new_outcome, pnl_dollars=None, symbol=None):
                     reason=f"After {entry.get('symbol','—')} "
                            f"{entry.get('direction','—')} closed: {new_outcome}"
                 )
+                # Phase A: mirror terminal outcome to native_journal
+                _nj_close_by_instrument(
+                    instrument=instrument_of(entry.get("symbol", "")) or _want_inst or "",
+                    direction=entry.get("direction"),
+                    exit_reason=new_outcome,
+                    pnl_dollars=entry.get("pnl_dollars"),
+                )
             return entry
     return None
 
@@ -35175,8 +35182,496 @@ def _capture_send_time_snapshot(a, instrument, mode, source, contracts,
             broker_out=broker_out or {},
         )
         _persist_trade_snapshot(snap)
+        _nj_create_from_snapshot(snap)   # Phase A: create native journal record
     except Exception as exc:
         logger.debug("_capture_send_time_snapshot fail-open: %s", exc)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Native Journal — Phase A
+#
+# One canonical journal record per trade, linked to internal_trade_snapshots.
+# Created at send time (snapshot creation); updated through the trade lifecycle.
+#
+# ALL helpers are FAIL-OPEN:
+#   - any exception is caught, logged at DEBUG, and swallowed
+#   - no helper ever raises, acquires a money-path lock, or affects gateway logic
+#
+# Table provisioned out-of-band: db_native_journal_schema.sql
+# (database tool in dev; Publish schema-diff in prod — never by app code)
+# ─────────────────────────────────────────────────────────────────────────────
+
+NJ_DB_READY = False  # set by _boot_native_journal_table()
+
+_NJ_VALID_STATUSES = frozenset({
+    "PLANNED", "SUBMITTED", "ACKNOWLEDGED", "ACTIVE",
+    "PARTIALLY_CLOSED", "CLOSED", "REJECTED", "CANCELED",
+    "STATUS_UNKNOWN", "NEEDS_REVIEW",
+})
+
+_NJ_TERMINAL_OUTCOMES = frozenset({
+    "CLOSED", "REJECTED", "CANCELED", "STATUS_UNKNOWN",
+})
+
+
+def _boot_native_journal_table():
+    """Probe native_journal (no DDL). Sets NJ_DB_READY.
+
+    FAIL-OPEN: a missing table / unavailable DB silently disables all NJ
+    helpers.  The table is created out-of-band (db_native_journal_schema.sql).
+    """
+    global NJ_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM native_journal LIMIT 0")
+        cur.close()
+        conn.close()
+        NJ_DB_READY = True
+        logger.info("native_journal table ready — native journal enabled")
+    except Exception as exc:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        logger.warning("native_journal table NOT ready: %s — native journal disabled", exc)
+
+
+def _nj_create_from_snapshot(snapshot):
+    """Insert one native_journal row from an immutable snapshot dict.
+
+    Idempotent: ON CONFLICT (internal_trade_id) DO NOTHING.
+    FAIL-OPEN — never raises, never blocks the trade path.
+    """
+    if not NJ_DB_READY or not isinstance(snapshot, dict):
+        return
+    iid = snapshot.get("internal_trade_id")
+    if not iid:
+        return
+    raw_source = (snapshot.get("source") or "").lower()
+    if raw_source == "paper":
+        src_label = "PAPER"
+    elif raw_source == "simulation":
+        src_label = "SIMULATION"
+    else:
+        src_label = "SYSTEM_AUTO"
+    broker_meta = snapshot.get("broker_metadata") or {}
+    exec_block = {
+        "submission_time": str(snapshot.get("sent_at") or snapshot.get("created_at") or ""),
+        "broker_order_id": snapshot.get("broker_order_id"),
+        "traderspost_id": snapshot.get("broker_signal_id"),
+        "source": raw_source,
+    }
+    if broker_meta:
+        exec_block["broker_metadata"] = broker_meta
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """INSERT INTO native_journal
+               (internal_trade_id, signal_id, execution_fingerprint,
+                broker_order_id, traderspost_id,
+                lifecycle_status, source_label,
+                instrument, contract, mode, direction,
+                canonical_strategy_key, strategy_display_name,
+                setup_name, playbook,
+                thesis_direction, thesis_strength, thesis_alignment,
+                edge_score, grade, readiness,
+                confirmations, blockers, opposing_structure, risk_state,
+                planned_entry, planned_stop, planned_targets,
+                planned_risk, planned_contracts,
+                decision_timestamp, execution)
+               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                       %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+               ON CONFLICT (internal_trade_id) DO NOTHING""",
+            (
+                str(iid),
+                snapshot.get("signal_id"),
+                snapshot.get("execution_fingerprint"),
+                snapshot.get("broker_order_id"),
+                snapshot.get("broker_signal_id"),
+                "SUBMITTED",
+                src_label,
+                snapshot.get("instrument"),
+                snapshot.get("contract"),
+                snapshot.get("mode"),
+                snapshot.get("direction"),
+                snapshot.get("canonical_strategy_key"),
+                snapshot.get("strategy_display_name"),
+                snapshot.get("setup_name"),
+                snapshot.get("playbook"),
+                snapshot.get("thesis_direction"),
+                snapshot.get("thesis_strength"),
+                snapshot.get("thesis_alignment"),
+                snapshot.get("edge_score"),
+                snapshot.get("grade"),
+                snapshot.get("readiness"),
+                psycopg2.extras.Json(snapshot.get("confirmations")),
+                psycopg2.extras.Json(snapshot.get("blockers")),
+                snapshot.get("opposing_structure"),
+                snapshot.get("risk_state"),
+                snapshot.get("planned_entry"),
+                snapshot.get("planned_stop"),
+                psycopg2.extras.Json(snapshot.get("planned_targets")),
+                snapshot.get("planned_risk"),
+                snapshot.get("planned_contracts"),
+                snapshot.get("sent_at") or snapshot.get("created_at"),
+                psycopg2.extras.Json(exec_block),
+            ),
+        )
+        conn.commit()
+        cur.close()
+        logger.debug(
+            "native_journal created: %s %s %s (iid=%.8s)",
+            snapshot.get("instrument"),
+            snapshot.get("direction"),
+            src_label,
+            str(iid),
+        )
+    except Exception as exc:
+        logger.debug("_nj_create_from_snapshot fail-open: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_update_lifecycle(internal_trade_id, new_status,
+                          event_type=None, event_data=None, source="system_auto"):
+    """Update lifecycle_status and append a management event.
+
+    FAIL-OPEN — never raises.
+    """
+    if not NJ_DB_READY or not internal_trade_id:
+        return
+    if new_status not in _NJ_VALID_STATUSES:
+        logger.debug("_nj_update_lifecycle: unknown status %r — ignored", new_status)
+        return
+    evt = {
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "event_type": event_type or "STATUS_CHANGE",
+        "new_value": {"lifecycle_status": new_status},
+        "source": source,
+        "automated": source == "system_auto",
+        "operator_id": None,
+    }
+    if isinstance(event_data, dict):
+        evt.update(event_data)
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE native_journal
+               SET lifecycle_status  = %s,
+                   management_events = management_events || %s::jsonb,
+                   updated_at        = NOW()
+               WHERE internal_trade_id = %s""",
+            (new_status, json.dumps([evt], default=str), str(internal_trade_id)),
+        )
+        conn.commit()
+        cur.close()
+        logger.debug("native_journal %.8s → %s", str(internal_trade_id), new_status)
+    except Exception as exc:
+        logger.debug("_nj_update_lifecycle fail-open: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_update_execution(internal_trade_id, patch):
+    """Merge `patch` dict into native_journal.execution (jsonb ||).
+
+    Never replaces the entire column — only merges new keys.
+    FAIL-OPEN — never raises.
+    """
+    if not NJ_DB_READY or not internal_trade_id or not isinstance(patch, dict):
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE native_journal
+               SET execution  = COALESCE(execution, '{}'::jsonb) || %s::jsonb,
+                   updated_at = NOW()
+               WHERE internal_trade_id = %s""",
+            (json.dumps(patch, default=str), str(internal_trade_id)),
+        )
+        conn.commit()
+        cur.close()
+    except Exception as exc:
+        logger.debug("_nj_update_execution fail-open: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_append_management_event(internal_trade_id, event_type,
+                                  old_value=None, new_value=None,
+                                  source="system_auto", reason=None,
+                                  automated=True, operator_id=None):
+    """Append one management event to native_journal.management_events.
+
+    FAIL-OPEN — never raises.
+    """
+    if not NJ_DB_READY or not internal_trade_id:
+        return
+    evt = {
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "event_type": event_type,
+        "old_value": old_value,
+        "new_value": new_value,
+        "source": source,
+        "reason": reason,
+        "automated": automated,
+        "operator_id": operator_id,
+    }
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE native_journal
+               SET management_events = management_events || %s::jsonb,
+                   updated_at        = NOW()
+               WHERE internal_trade_id = %s""",
+            (json.dumps([evt], default=str), str(internal_trade_id)),
+        )
+        conn.commit()
+        cur.close()
+    except Exception as exc:
+        logger.debug("_nj_append_management_event fail-open: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_check_and_set_learning_eligible(internal_trade_id):
+    """Evaluate and persist learning eligibility for one NJ row.
+
+    Criteria (all must pass):
+      lifecycle_status == 'CLOSED'
+      canonical_strategy_key is not null
+      planned_risk is not null
+      execution is not null and has avg_entry or fill_prices
+      outcome is not null
+      review_status != 'STATUS_UNKNOWN'
+
+    FAIL-OPEN — never raises.
+    """
+    if not NJ_DB_READY or not internal_trade_id:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT lifecycle_status, canonical_strategy_key, planned_risk,
+                      execution, outcome, review_status
+               FROM native_journal WHERE internal_trade_id = %s""",
+            (str(internal_trade_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return
+        lifecycle, strategy, planned_risk, execution, outcome, review_status = row
+        blocked = None
+        if lifecycle != "CLOSED":
+            blocked = f"lifecycle={lifecycle}"
+        elif not strategy:
+            blocked = "missing_strategy"
+        elif planned_risk is None:
+            blocked = "missing_planned_risk"
+        elif not execution or (
+            not (execution or {}).get("avg_entry")
+            and not (execution or {}).get("fill_prices")
+        ):
+            blocked = "missing_execution_data"
+        elif not outcome:
+            blocked = "missing_outcome"
+        elif (review_status or "") == "STATUS_UNKNOWN":
+            blocked = "unresolved_status"
+        eligible = blocked is None
+        cur.execute(
+            """UPDATE native_journal
+               SET learning_eligible       = %s,
+                   learning_blocked_reason = %s,
+                   updated_at              = NOW()
+               WHERE internal_trade_id = %s""",
+            (eligible, blocked, str(internal_trade_id)),
+        )
+        conn.commit()
+        cur.close()
+        logger.debug(
+            "native_journal eligibility %.8s: eligible=%s reason=%s",
+            str(internal_trade_id), eligible, blocked,
+        )
+    except Exception as exc:
+        logger.debug("_nj_check_and_set_learning_eligible fail-open: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_set_outcome(internal_trade_id, outcome_data,
+                     exit_reason=None, pnl_dollars=None):
+    """Set outcome JSONB, transition to CLOSED, recheck learning eligibility.
+
+    R is computed from immutable planned_entry/planned_stop (never the moved
+    stop) so BE moves cannot inflate the R number.
+    FAIL-OPEN — never raises.
+    """
+    if not NJ_DB_READY or not internal_trade_id:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT planned_entry, planned_stop, direction
+               FROM native_journal WHERE internal_trade_id = %s""",
+            (str(internal_trade_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return
+        planned_entry, planned_stop, direction = row
+        out = dict(outcome_data) if isinstance(outcome_data, dict) else {}
+        if exit_reason:
+            out["exit_reason"] = exit_reason
+        if pnl_dollars is not None:
+            out["net_pnl"] = round(float(pnl_dollars), 2)
+        # Realized R — uses immutable planned_stop always
+        if (planned_entry is not None and planned_stop is not None
+                and planned_entry != planned_stop
+                and "actual_exit" in out):
+            try:
+                r_unit = abs(float(planned_entry) - float(planned_stop))
+                dir_sign = 1.0 if (direction or "").lower() in ("long", "buy") else -1.0
+                out["realized_r"] = round(
+                    dir_sign * (float(out["actual_exit"]) - float(planned_entry)) / r_unit, 3
+                )
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+        evt = {
+            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "event_type": "STATUS_CHANGE",
+            "new_value": {"lifecycle_status": "CLOSED"},
+            "source": "system_auto",
+            "automated": True,
+            "reason": exit_reason or "trade_closed",
+        }
+        cur.execute(
+            """UPDATE native_journal
+               SET lifecycle_status  = 'CLOSED',
+                   outcome           = %s::jsonb,
+                   management_events = management_events || %s::jsonb,
+                   updated_at        = NOW()
+               WHERE internal_trade_id = %s""",
+            (
+                json.dumps(out, default=str),
+                json.dumps([evt], default=str),
+                str(internal_trade_id),
+            ),
+        )
+        conn.commit()
+        cur.close()
+        logger.debug(
+            "native_journal outcome set: %.8s exit_reason=%s pnl=%s",
+            str(internal_trade_id), exit_reason, pnl_dollars,
+        )
+    except Exception as exc:
+        logger.debug("_nj_set_outcome fail-open: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    # Eligibility check runs outside the connection block (fail-open pattern)
+    _nj_check_and_set_learning_eligible(internal_trade_id)
+
+
+def _nj_find_open_by_instrument(instrument, direction=None):
+    """Return internal_trade_id (str) for the most recent open NJ row.
+
+    'Open' means lifecycle_status IN (SUBMITTED, ACKNOWLEDGED, ACTIVE,
+    PARTIALLY_CLOSED).  Used when a close event lacks an explicit
+    internal_trade_id.  FAIL-OPEN — returns None on any error.
+    """
+    if not NJ_DB_READY or not instrument:
+        return None
+    conn = _learning_conn()
+    if conn is None:
+        return None
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """SELECT internal_trade_id
+               FROM native_journal
+               WHERE instrument = %s
+                 AND (%s IS NULL OR LOWER(direction) = LOWER(%s))
+                 AND lifecycle_status IN
+                     ('SUBMITTED','ACKNOWLEDGED','ACTIVE','PARTIALLY_CLOSED')
+               ORDER BY created_at DESC LIMIT 1""",
+            (instrument, direction, direction),
+        )
+        row = cur.fetchone()
+        cur.close()
+        return str(row[0]) if row else None
+    except Exception as exc:
+        logger.debug("_nj_find_open_by_instrument fail-open: %s", exc)
+        return None
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_close_by_instrument(instrument, direction, exit_reason,
+                              pnl_dollars=None, actual_exit=None):
+    """Find the open NJ row for instrument and close it.
+
+    High-level helper used by _update_journal_outcome and legacy close paths.
+    FAIL-OPEN — never raises.
+    """
+    if not NJ_DB_READY or not instrument:
+        return
+    iid = _nj_find_open_by_instrument(instrument, direction)
+    if not iid:
+        return
+    outcome_data = {}
+    if actual_exit is not None:
+        outcome_data["actual_exit"] = actual_exit
+    _nj_set_outcome(iid, outcome_data, exit_reason=exit_reason, pnl_dollars=pnl_dollars)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# End Native Journal Phase A helpers
+# ─────────────────────────────────────────────────────────────────────────────
 
 
 def _dq_has_active_trade(inst, direction):
@@ -75959,6 +76454,7 @@ if __name__ == "__main__":
         _probe_execution_arm_audit_table()          # probe execution_arm_audit (no DDL; created via DB tool/publish diff) — arm audit persistence (critical arm/disarm events; in-memory deque stays primary)
         _restore_execution_enabled_from_db()       # restore execution_enabled from last enable/disable audit record (fail-open; safe default=False)
         _boot_snapshots_table()                    # probe internal_trade_snapshots (no DDL; created via DB tool/publish diff) — immutable send-time context for TradeZella matching
+        _boot_native_journal_table()               # probe native_journal (no DDL; created via DB tool/publish diff) — canonical per-trade journal record (Phase A)
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     if LEARNING_DB_ENABLED:

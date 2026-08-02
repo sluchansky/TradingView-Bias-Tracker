@@ -103,6 +103,7 @@
 - [Execution Arm / Disarm Control](arm-disarm-control.md) — in-memory arm session required for live auto-execution; 5-state model; safety_locked checked first; _check_arm_for_transmission reads raw _ARM_STATE directly (testable).
 - [Unified Learning Brain](unified-learning-brain.md) — PER_MODE_STATS global (inst,mode key) feeds compute_playbook_selector + compute_unified_learning; display-only cognitive seam; goldens byte-identical.
 - [Execution Enable/Disable control](execution-enable-disable.md) — execution_enabled + armed are independent; check 0 in gate; routes /execution/enable|disable; recorded_at column; test helpers need execution_enabled=True.
+- [Native Journal Phase A](native-journal-phase-a.md) — canonical per-trade table; NJ helpers use json.dumps NOT _jj; _nj_close_by_instrument needs own NJ_DB_READY guard; test _set_row sentinel pattern for nullable columns.
 - [Journal Coaching Drill-Down (Phase 7O.1)](journal-coaching-drilldown.md) — _RATING_FIELDS frozenset at module level; JDrillFilter 15-field contract; JCoachingTab onDrill prop; JournalFullPage URL sync + popstate; 41 tests.
 - [Directional Symmetry Audit (Phase 7M)](directional-symmetry-audit.md) — Market-Driven verdict; 23 tests; fixture lessons: MITIGATED_FLAG=False for SCALP, INST not TICKER key, stale-VWAP tests gate_debug.vwap_confirmed not score delta.
 - [Candidate Preview Panel](candidate-preview-panel.md) — TradePlanPanel reads p.candidate_preview (not strategy_scanner.trade_plan); 5-state model; _mb_candidate_preview() is the backend source; 18 tests.
