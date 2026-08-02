@@ -168,6 +168,12 @@ export const BOT1_ROUTES = [
   "/journal/coaching/intraday",
   // Phase 7O.3: Rating × Mistake/Emotion correlation analytics (display-only, SELECT only).
   "/journal/coaching/correlations",
+  // Phase 7K-A.2: Native Journal read API (DISPLAY/READ-ONLY; owner-only; NOT in
+  // dashboard-auth OPEN_PATHS). Reads only from native_journal table — never
+  // touches the gate, scoring, learning formulas, or any broker path.
+  "/journal/native-trades",
+  "/journal/native-trades/:id",
+  "/journal/native-counts",
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",

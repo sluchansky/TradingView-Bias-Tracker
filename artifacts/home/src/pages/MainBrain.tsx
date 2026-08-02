@@ -2485,6 +2485,59 @@ interface JDrillFilter {
   display_timezone?:  string;     // IANA timezone (default "America/New_York")
 }
 
+// ── Phase 7K-A.2 — Native Journal types ──────────────────────────────────────
+interface NJTrade {
+  id: string;
+  internal_trade_id: string | null;
+  created_at: string;
+  updated_at: string;
+  instrument: string;
+  contract: string | null;
+  direction: string | null;
+  mode: string | null;
+  session: string | null;
+  canonical_strategy_key: string | null;
+  strategy_display_name: string | null;
+  lifecycle_status: string;
+  source_label: string;
+  edge_score: number | null;
+  grade: string | null;
+  readiness: string | null;
+  planned_entry: number | null;
+  planned_stop: number | null;
+  planned_targets: unknown;
+  planned_risk: number | null;
+  planned_contracts: number | null;
+  broker_order_id: string | null;
+  traderspost_id: string | null;
+  review_status: string;
+  learning_eligible: boolean;
+  learning_blocked_reason: string | null;
+}
+
+interface NJTradeDetail extends NJTrade {
+  setup_name: string | null;
+  playbook: string | null;
+  thesis_direction: string | null;
+  thesis_strength: string | null;
+  thesis_alignment: string | null;
+  confirmations: unknown;
+  blockers: unknown;
+  opposing_structure: string | null;
+  risk_state: string | null;
+  planned_rr: number | null;
+  planned_dollar_risk: number | null;
+  market_data_timestamp: string | null;
+  decision_timestamp: string | null;
+  signal_id: string | null;
+  execution: Record<string, unknown> | null;
+  management_events: Record<string, unknown>[] | null;
+  outcome: Record<string, unknown> | null;
+  review_notes: string | null;
+  tradezella_trade_id: number | null;
+  legacy_journal_key: string | null;
+}
+
 interface JBatch {
   batch_id: string; filename: string | null; source: string;
   row_count: number; imported_count: number; skipped_count: number;
@@ -2575,6 +2628,30 @@ function jEligibilityBadge(status: string, reason: string): React.ReactNode {
       style={{ background: col + '22', color: col, borderRadius: 3,
         padding: '1px 5px', fontSize: 8, fontWeight: 700, letterSpacing: '0.04em',
         whiteSpace: 'nowrap', cursor: reason ? 'help' : 'default' }}>
+      {label}
+    </span>
+  );
+}
+
+function jLifecycleBadge(status: string): React.ReactNode {
+  const s = (status || 'STATUS_UNKNOWN').toUpperCase();
+  const cfg: Record<string, { col: string; label: string }> = {
+    PLANNED:          { col: '#60a5fa', label: 'PLANNED' },
+    SUBMITTED:        { col: '#60a5fa', label: 'SUBMITTED' },
+    ACKNOWLEDGED:     { col: '#60a5fa', label: "ACK'D" },
+    ACTIVE:           { col: T.cyan,    label: '● ACTIVE' },
+    PARTIALLY_CLOSED: { col: T.cyan,    label: 'PARTIAL' },
+    CLOSED:           { col: T.txtMuted,label: 'CLOSED' },
+    REJECTED:         { col: T.red,     label: 'REJECTED' },
+    CANCELED:         { col: T.red,     label: 'CANCELED' },
+    STATUS_UNKNOWN:   { col: T.amber,   label: '? UNKNOWN' },
+    NEEDS_REVIEW:     { col: T.amber,   label: '⚠ REVIEW' },
+  };
+  const { col, label } = cfg[s] ?? { col: T.txtMuted, label: s };
+  return (
+    <span style={{ background: col + '22', color: col, borderRadius: 3,
+      padding: '1px 5px', fontSize: 8, fontWeight: 700, letterSpacing: '0.04em',
+      whiteSpace: 'nowrap' }}>
       {label}
     </span>
   );
@@ -3547,6 +3624,466 @@ const _DRILL_SERVER_KEYS: (keyof JDrillFilter)[] = [
   'rating_min','rating_max','realized_r_min','realized_r_max','quality_classification',
 ];
 
+// ── Native Journal Trades Tab (Phase 7K-A.2) ─────────────────────────────────
+const JNativeTradesTab: React.FC = () => {
+  const [trades,       setTrades]       = useState<NJTrade[]>([]);
+  const [total,        setTotal]        = useState(0);
+  const limit = 50;
+  const [offset,       setOffset]       = useState(0);
+  const [loading,      setLoading]      = useState(false);
+  const [error,        setError]        = useState<string | null>(null);
+  const [authFail,     setAuthFail]     = useState(false);
+  const [dbReady,      setDbReady]      = useState<boolean | null>(null);
+
+  // Filters — stable across drawer open/close
+  const [search,      setSearch]      = useState('');
+  const [fInst,       setFInst]       = useState('');
+  const [fDir,        setFDir]        = useState('');
+  const [fLifecycle,  setFLifecycle]  = useState('');
+  const [fSource,     setFSource]     = useState('');
+  const [fReview,     setFReview]     = useState('');
+  const [fDateFrom,   setFDateFrom]   = useState('');
+  const [fDateTo,     setFDateTo]     = useState('');
+
+  // Detail drawer — opens without losing filter state
+  const [detail,        setDetail]        = useState<NJTradeDetail | null>(null);
+  const [detailLoading, setDetailLoading] = useState(false);
+  const [detailError,   setDetailError]   = useState<string | null>(null);
+
+  const fetchTrades = useCallback(async (off = 0) => {
+    setLoading(true); setError(null); setAuthFail(false);
+    try {
+      const params = new URLSearchParams({ limit: String(limit), offset: String(off) });
+      if (search)     params.set('search', search);
+      if (fInst)      params.set('instrument', fInst);
+      if (fDir)       params.set('direction', fDir);
+      if (fLifecycle) params.set('lifecycle_status', fLifecycle);
+      if (fSource)    params.set('source_label', fSource);
+      if (fReview)    params.set('review_status', fReview);
+      if (fDateFrom)  params.set('date_from', fDateFrom);
+      if (fDateTo)    params.set('date_to', fDateTo);
+      const r = await fetch(`/api/journal/native-trades?${params}`, { headers: getAuthHeader() });
+      if (r.status === 401 || r.status === 403) { setAuthFail(true); return; }
+      const d = await r.json();
+      if (d.db_ready === false) { setDbReady(false); return; }
+      if (!d.ok) throw new Error(d.error || 'query failed');
+      setDbReady(true);
+      setTrades(d.trades ?? []);
+      setTotal(d.total ?? 0);
+      setOffset(off);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'fetch failed');
+    } finally {
+      setLoading(false);
+    }
+  }, [search, fInst, fDir, fLifecycle, fSource, fReview, fDateFrom, fDateTo]);
+
+  useEffect(() => { fetchTrades(0); }, [fetchTrades]);
+
+  const openDetail = async (t: NJTrade) => {
+    setDetail(null); setDetailError(null); setDetailLoading(true);
+    try {
+      const r = await fetch(`/api/journal/native-trades/${t.id}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'not found');
+      setDetail(d.trade);
+    } catch (e: unknown) {
+      setDetailError(e instanceof Error ? e.message : 'load failed');
+    } finally {
+      setDetailLoading(false);
+    }
+  };
+
+  function safeStr(v: unknown): string {
+    if (v == null) return '—';
+    if (typeof v === 'object') {
+      try { return JSON.stringify(v); } catch { return '[object]'; }
+    }
+    return String(v);
+  }
+
+  const pages = Math.max(1, Math.ceil(total / limit));
+  const page  = Math.floor(offset / limit) + 1;
+
+  if (authFail) return (
+    <div style={{ textAlign: 'center', padding: '40px 20px' }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: T.amber, marginBottom: 8 }}>AUTH REQUIRED</div>
+      <div style={{ fontSize: 10, color: T.txtMuted }}>Log in to view native journal records.</div>
+    </div>
+  );
+
+  if (dbReady === false) return (
+    <div style={{ textAlign: 'center', padding: '40px 20px' }}>
+      <div style={{ fontSize: 13, fontWeight: 700, color: T.red, marginBottom: 8 }}>NATIVE JOURNAL UNAVAILABLE</div>
+      <div style={{ fontSize: 10, color: T.txtMuted }}>
+        The native_journal table is not ready. Apply the schema via Publish and restart.
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={{ position: 'relative' }}>
+      {/* Filter bar */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10, flexWrap: 'wrap', alignItems: 'center' }}>
+        <input placeholder="Search…" value={search} onChange={e => setSearch(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtPri, padding: '4px 8px', fontSize: 11, width: 110 }} />
+        <select value={fInst} onChange={e => setFInst(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Instruments</option>
+          {['MGC','MNQ','MES','MYM'].map(i => <option key={i} value={i}>{i}</option>)}
+        </select>
+        <select value={fDir} onChange={e => setFDir(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Dir</option>
+          <option value="long">Long</option>
+          <option value="short">Short</option>
+        </select>
+        <select value={fLifecycle} onChange={e => setFLifecycle(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Lifecycle</option>
+          {['SUBMITTED','ACKNOWLEDGED','ACTIVE','PARTIALLY_CLOSED','CLOSED',
+            'REJECTED','CANCELED','STATUS_UNKNOWN','NEEDS_REVIEW'].map(s =>
+            <option key={s} value={s}>{s.replace(/_/g,' ')}</option>)}
+        </select>
+        <select value={fSource} onChange={e => setFSource(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Sources</option>
+          {['SYSTEM_AUTO','SYSTEM_MANUAL_CONFIRM','PAPER','SIMULATION',
+            'EXTERNAL_MANUAL','TRADZELLA_IMPORT','LEGACY'].map(s =>
+            <option key={s} value={s}>{s.replace(/_/g,' ')}</option>)}
+        </select>
+        <select value={fReview} onChange={e => setFReview(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Reviews</option>
+          <option value="UNREVIEWED">Unreviewed</option>
+          <option value="REVIEWED">Reviewed</option>
+          <option value="EXCLUDED">Excluded</option>
+        </select>
+        <input type="date" value={fDateFrom} onChange={e => setFDateFrom(e.target.value)}
+          title="From date"
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }} />
+        <input type="date" value={fDateTo} onChange={e => setFDateTo(e.target.value)}
+          title="To date"
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }} />
+        <button onClick={() => fetchTrades(0)}
+          style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`, borderRadius: 4,
+            color: T.cyan, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>Search</button>
+        <button onClick={() => fetchTrades(offset)} title="Refresh"
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtMuted, padding: '4px 8px', fontSize: 11, cursor: 'pointer' }}>↺</button>
+      </div>
+
+      {loading && <div style={{ color: T.txtMuted, fontSize: 11, padding: '8px 0' }}>Loading…</div>}
+      {error && (
+        <div style={{ color: T.red, fontSize: 11, padding: '8px 0', display: 'flex', gap: 8, alignItems: 'center' }}>
+          Error: {error}
+          <button onClick={() => fetchTrades(offset)}
+            style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 3,
+              color: T.txtSec, padding: '2px 8px', fontSize: 10, cursor: 'pointer' }}>Retry</button>
+        </div>
+      )}
+
+      {!loading && !error && (
+        <>
+          <div style={{ fontSize: 10, color: T.txtMuted, marginBottom: 6 }}>
+            {total} native trade{total !== 1 ? 's' : ''} · page {page}/{pages}
+          </div>
+          <div style={{ overflowX: 'auto' }}>
+            <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+              <thead>
+                <tr>
+                  {['Date','Inst','Dir','Strategy','Lifecycle','Edge','Grade','Entry','Stop','Source','Review'].map(h => (
+                    <th key={h} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                      paddingBottom: 6, fontSize: 9, paddingRight: 8, whiteSpace: 'nowrap' }}>{h}</th>
+                  ))}
+                </tr>
+              </thead>
+              <tbody>
+                {trades.map(t => (
+                  <tr key={t.id}
+                    onClick={() => openDetail(t)}
+                    style={{ borderTop: `1px solid ${T.border}`, cursor: 'pointer' }}
+                    onMouseEnter={e => (e.currentTarget.style.background = T.panelAlt)}
+                    onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.txtMuted, whiteSpace: 'nowrap', fontSize: 9 }}>
+                      {jFmtDate(t.created_at)}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.cyan, fontFamily: T.mono, fontWeight: 700 }}>
+                      {t.instrument || '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: dirColor(t.direction), fontWeight: 700 }}>
+                      {t.direction ? t.direction.slice(0,5).toUpperCase() : '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, maxWidth: 110,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {t.strategy_display_name || t.canonical_strategy_key || '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0' }}>
+                      {jLifecycleBadge(t.lifecycle_status)}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', fontFamily: T.mono, fontWeight: 700,
+                      color: t.edge_score != null
+                        ? (t.edge_score >= 70 ? T.green : t.edge_score >= 50 ? T.cyan : T.txtMuted)
+                        : T.txtMuted }}>
+                      {t.edge_score != null ? t.edge_score.toFixed(0) : '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, fontFamily: T.mono }}>
+                      {t.grade || '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, fontFamily: T.mono, fontSize: 9 }}>
+                      {t.planned_entry != null ? t.planned_entry.toFixed(2) : '—'}
+                    </td>
+                    <td style={{ padding: '4px 8px 4px 0', color: T.red, fontFamily: T.mono, fontSize: 9 }}>
+                      {t.planned_stop != null ? t.planned_stop.toFixed(2) : '—'}
+                    </td>
+                    <td style={{ padding: '4px 4px 4px 0', fontSize: 8, color: T.txtMuted, whiteSpace: 'nowrap' }}>
+                      {(t.source_label || '—').replace(/_/g, '\u200B_')}
+                    </td>
+                    <td style={{ padding: '4px 0' }}>
+                      {jReviewBadge(t.review_status || 'UNREVIEWED')}
+                    </td>
+                  </tr>
+                ))}
+                {trades.length === 0 && (
+                  <tr>
+                    <td colSpan={11} style={{ textAlign: 'center', color: T.txtMuted, padding: '30px 0' }}>
+                      <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 8, color: T.txtSec }}>
+                        NO NATIVE TRADES YET
+                      </div>
+                      <div style={{ fontSize: 10 }}>
+                        New platform trades will appear here automatically after they pass through the execution gateway.
+                      </div>
+                    </td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
+          </div>
+
+          {/* Pagination */}
+          {pages > 1 && (
+            <div style={{ display: 'flex', gap: 4, marginTop: 10, justifyContent: 'center' }}>
+              <button onClick={() => fetchTrades(Math.max(0, offset - limit))} disabled={page <= 1}
+                style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 3,
+                  color: page <= 1 ? T.txtMuted : T.txtSec, padding: '3px 8px', fontSize: 10,
+                  cursor: page <= 1 ? 'default' : 'pointer' }}>‹</button>
+              {Array.from({ length: Math.min(pages, 7) }, (_, i) => {
+                const p = Math.max(1, Math.min(pages - 6, page - 3)) + i;
+                return (
+                  <button key={p} onClick={() => fetchTrades((p - 1) * limit)}
+                    style={{ background: p === page ? T.cyan + '33' : T.panelAlt,
+                      border: `1px solid ${p === page ? T.cyan + '66' : T.border}`,
+                      borderRadius: 3, color: p === page ? T.cyan : T.txtSec,
+                      padding: '3px 7px', fontSize: 10, cursor: 'pointer' }}>
+                    {p}
+                  </button>
+                );
+              })}
+              <button onClick={() => fetchTrades(Math.min((pages - 1) * limit, offset + limit))} disabled={page >= pages}
+                style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 3,
+                  color: page >= pages ? T.txtMuted : T.txtSec, padding: '3px 8px', fontSize: 10,
+                  cursor: page >= pages ? 'default' : 'pointer' }}>›</button>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Detail drawer — opens without resetting filters */}
+      {(detailLoading || detail || detailError) && (
+        <div style={{ position: 'fixed', right: 0, top: 0, bottom: 0, width: 360,
+          background: T.panel, borderLeft: `1px solid ${T.borderMid}`,
+          zIndex: 200, overflowY: 'auto', padding: 20,
+          boxShadow: '-8px 0 24px #00000055' }}>
+          <button onClick={() => { setDetail(null); setDetailError(null); }}
+            style={{ position: 'absolute', top: 12, right: 16, background: 'none',
+              border: 'none', color: T.txtMuted, fontSize: 18, cursor: 'pointer', lineHeight: 1 }}>
+            ×
+          </button>
+          {detailLoading && (
+            <div style={{ color: T.txtMuted, paddingTop: 40, textAlign: 'center' }}>Loading…</div>
+          )}
+          {detailError && (
+            <div style={{ color: T.red, fontSize: 11, paddingTop: 40 }}>{detailError}</div>
+          )}
+          {detail && (
+            <div style={{ paddingTop: 8 }}>
+              {/* Header */}
+              <div style={{ marginBottom: 14 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 4, flexWrap: 'wrap' }}>
+                  <span style={{ fontSize: 18, fontWeight: 800, color: T.cyan, fontFamily: T.mono }}>
+                    {detail.instrument || '—'}
+                  </span>
+                  <span style={{ color: dirColor(detail.direction), fontWeight: 700, fontSize: 13 }}>
+                    {(detail.direction || '').toUpperCase()}
+                  </span>
+                  {jLifecycleBadge(detail.lifecycle_status)}
+                </div>
+                <div style={{ fontSize: 8, color: T.txtMuted, letterSpacing: '0.06em' }}>
+                  {detail.source_label} · {jFmtDate(detail.created_at)}
+                </div>
+              </div>
+
+              {/* ── PLANNED BY SYSTEM ── */}
+              <div style={{ marginBottom: 14, background: T.cyan + '0a',
+                border: `1px solid ${T.cyan}33`, borderRadius: 6, padding: '8px 10px' }}>
+                <div style={{ fontSize: 8, fontWeight: 800, color: T.cyan,
+                  letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 2 }}>
+                  📋 Planned by System
+                </div>
+                <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 8, fontStyle: 'italic' }}>
+                  Captured at trade submission — historical values cannot be edited.
+                </div>
+                {(([
+                  ['Instrument',    detail.instrument],
+                  ['Contract',      detail.contract],
+                  ['Direction',     detail.direction?.toUpperCase()],
+                  ['Strategy',      detail.strategy_display_name || detail.canonical_strategy_key],
+                  ['Strategy Key',  detail.canonical_strategy_key],
+                  ['Setup',         detail.setup_name],
+                  ['Playbook',      detail.playbook],
+                  ['Mode',          detail.mode],
+                  ['Session',       detail.session],
+                  ['Thesis Dir',    detail.thesis_direction],
+                  ['Thesis Strength', detail.thesis_strength],
+                  ['Alignment',     detail.thesis_alignment],
+                  ['Edge Score',    detail.edge_score != null ? `${detail.edge_score.toFixed(0)}/110` : null],
+                  ['Grade',         detail.grade],
+                  ['Readiness',     detail.readiness],
+                  ['Risk State',    detail.risk_state],
+                  ['Opp Structure', detail.opposing_structure],
+                  ['Planned Entry', detail.planned_entry != null ? detail.planned_entry.toFixed(4) : null],
+                  ['Planned Stop',  detail.planned_stop  != null ? detail.planned_stop.toFixed(4)  : null],
+                  ['Planned R:R',   detail.planned_rr    != null ? `1:${detail.planned_rr.toFixed(1)}` : null],
+                  ['Planned Risk',  detail.planned_risk  != null ? `$${detail.planned_risk.toFixed(0)}` : null],
+                  ['Contracts',     detail.planned_contracts != null ? String(detail.planned_contracts) : null],
+                  ['Decision At',   detail.decision_timestamp ? jFmtDate(detail.decision_timestamp) : null],
+                  ['Mkt Data At',   detail.market_data_timestamp ? jFmtDate(detail.market_data_timestamp) : null],
+                ] as [string, string | null | undefined][])).map(([lbl, val]) => val ? (
+                  <div key={lbl} style={{ display: 'flex', justifyContent: 'space-between',
+                    padding: '2px 0', borderBottom: `1px solid ${T.border}22` }}>
+                    <span style={{ color: T.txtMuted, fontSize: 9, flexShrink: 0, paddingRight: 8 }}>{lbl}</span>
+                    <span style={{ color: T.txtSec, fontSize: 9, textAlign: 'right',
+                      maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                      {safeStr(val)}
+                    </span>
+                  </div>
+                ) : null)}
+                {detail.confirmations != null && (
+                  <div style={{ marginTop: 4, fontSize: 8 }}>
+                    <span style={{ color: T.txtMuted }}>Confirmations: </span>
+                    <span style={{ color: T.txtSec }}>{safeStr(detail.confirmations)}</span>
+                  </div>
+                )}
+                {detail.blockers != null && (
+                  <div style={{ marginTop: 2, fontSize: 8 }}>
+                    <span style={{ color: T.txtMuted }}>Blockers: </span>
+                    <span style={{ color: T.red }}>{safeStr(detail.blockers)}</span>
+                  </div>
+                )}
+              </div>
+
+              {/* ── EXECUTION ── */}
+              <div style={{ marginBottom: 14, background: T.panelAlt,
+                border: `1px solid ${T.border}`, borderRadius: 6, padding: '8px 10px' }}>
+                <div style={{ fontSize: 8, fontWeight: 800, color: T.txtSec,
+                  letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
+                  ⚡ Execution
+                </div>
+                {(([
+                  ['Lifecycle',       detail.lifecycle_status],
+                  ['Source Label',    detail.source_label],
+                  ['Signal ID',       detail.signal_id],
+                  ['Broker Order ID', detail.broker_order_id],
+                  ['TradersPost ID',  detail.traderspost_id],
+                  ['Submit Time',     detail.execution?.['submission_time'] != null
+                    ? safeStr(detail.execution['submission_time']) : null],
+                  ['Ack Time',        detail.execution?.['ack_time'] != null
+                    ? safeStr(detail.execution['ack_time']) : null],
+                  ['Actual Qty',      detail.execution?.['actual_qty'] != null
+                    ? safeStr(detail.execution['actual_qty']) : null],
+                  ['Avg Entry',       detail.execution?.['avg_entry'] != null
+                    ? safeStr(detail.execution['avg_entry']) : null],
+                  ['Reject Reason',   detail.execution?.['rejected_reason'] != null
+                    ? safeStr(detail.execution['rejected_reason']) : null],
+                  ['Timeout Status',  detail.execution?.['timeout_status'] != null
+                    ? safeStr(detail.execution['timeout_status']) : null],
+                ] as [string, string | null | undefined][])).map(([lbl, val]) => val ? (
+                  <div key={lbl} style={{ display: 'flex', justifyContent: 'space-between',
+                    padding: '2px 0', borderBottom: `1px solid ${T.border}22` }}>
+                    <span style={{ color: T.txtMuted, fontSize: 9 }}>{lbl}</span>
+                    <span style={{ color: T.txtSec, fontSize: 9, textAlign: 'right',
+                      maxWidth: 200, overflow: 'hidden', textOverflow: 'ellipsis' }}>{val}</span>
+                  </div>
+                ) : null)}
+                {detail.outcome && Object.keys(detail.outcome).length > 0 && (
+                  <div style={{ marginTop: 6, paddingTop: 6, borderTop: `1px solid ${T.border}33` }}>
+                    <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 2 }}>OUTCOME</div>
+                    {Object.entries(detail.outcome).map(([k, v]) => v != null ? (
+                      <div key={k} style={{ display: 'flex', justifyContent: 'space-between', padding: '1px 0' }}>
+                        <span style={{ color: T.txtMuted, fontSize: 8 }}>{k}</span>
+                        <span style={{ color: T.txtSec, fontSize: 8 }}>{safeStr(v)}</span>
+                      </div>
+                    ) : null)}
+                  </div>
+                )}
+              </div>
+
+              {/* ── CURRENT RECORD STATUS ── */}
+              <div style={{ background: T.panelAlt, border: `1px solid ${T.border}`,
+                borderRadius: 6, padding: '8px 10px' }}>
+                <div style={{ fontSize: 8, fontWeight: 800, color: T.txtSec,
+                  letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
+                  📁 Current Record Status
+                </div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center', marginBottom: 6, flexWrap: 'wrap' }}>
+                  {jReviewBadge(detail.review_status || 'UNREVIEWED')}
+                  <span style={{ fontSize: 8, color: T.txtMuted }}>Review</span>
+                  {detail.learning_eligible
+                    ? <span style={{ background: T.green + '22', color: T.green, borderRadius: 3,
+                        padding: '1px 5px', fontSize: 8, fontWeight: 700 }}>✓ Learning Eligible</span>
+                    : <span style={{ background: T.red + '11', color: T.txtMuted, borderRadius: 3,
+                        padding: '1px 5px', fontSize: 8 }}>Not Eligible</span>
+                  }
+                </div>
+                {detail.learning_blocked_reason && (
+                  <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 4 }}>
+                    Blocked: {detail.learning_blocked_reason}
+                  </div>
+                )}
+                {detail.review_notes && (
+                  <div style={{ fontSize: 9, color: T.txtSec, marginTop: 4, lineHeight: 1.5 }}>
+                    {detail.review_notes}
+                  </div>
+                )}
+                {(([
+                  ['Created',    jFmtDate(detail.created_at)],
+                  ['Updated',    jFmtDate(detail.updated_at)],
+                  ['TZ Link',    detail.tradezella_trade_id != null ? String(detail.tradezella_trade_id) : null],
+                  ['Legacy Key', detail.legacy_journal_key],
+                ] as [string, string | null | undefined][])).map(([lbl, val]) => val && val !== '—' ? (
+                  <div key={lbl} style={{ display: 'flex', justifyContent: 'space-between',
+                    padding: '2px 0', borderBottom: `1px solid ${T.border}22` }}>
+                    <span style={{ color: T.txtMuted, fontSize: 9 }}>{lbl}</span>
+                    <span style={{ color: T.txtSec, fontSize: 9 }}>{val}</span>
+                  </div>
+                ) : null)}
+              </div>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── Journal Trades Tab ────────────────────────────────────────────────────────
 const JTradesTab: React.FC<{
   drillFilter?: JDrillFilter | null;
@@ -3583,6 +4120,10 @@ const JTradesTab: React.FC<{
 
   // Phase 7N Batch C: per-trade learning eligibility (display-only cache)
   const [eligibilityMap, setEligibilityMap] = useState<Record<string, { status: string; reason: string }>>({});
+
+  // Phase 7K-A.2 — source selector (NATIVE / TRADZELLA / LEGACY) + live counts
+  const [jSrc,     setJSrc]     = useState<'native' | 'tradzella' | 'legacy'>('native');
+  const [njCounts, setNjCounts] = useState<{ native: number; tradzella: number; legacy: number } | null>(null);
 
   const fetchTrades = useCallback(async (pg = 1) => {
     setLoading(true); setError(null);
@@ -3650,6 +4191,17 @@ const JTradesTab: React.FC<{
           setEligibilityMap(m);
         }
       } catch { /* fail silently — badge is display-only */ }
+    })();
+  }, []);
+
+  // Phase 7K-A.2 — fetch source counts on mount (fail-open; display-only)
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await fetch('/api/journal/native-counts', { headers: getAuthHeader() });
+        const d = await r.json();
+        if (d.ok) setNjCounts({ native: d.native ?? 0, tradzella: d.tradzella ?? 0, legacy: d.legacy ?? 0 });
+      } catch { /* fail silently */ }
     })();
   }, []);
 
@@ -3750,6 +4302,43 @@ const JTradesTab: React.FC<{
 
   return (
     <div>
+      {/* Phase 7K-A.2 — Source selector: NATIVE / TRADZELLA / LEGACY */}
+      <div style={{ display: 'flex', gap: 0, marginBottom: 12,
+        background: T.panelAlt, borderRadius: 6, padding: 3,
+        border: `1px solid ${T.border}`, alignSelf: 'flex-start', width: 'fit-content' }}>
+        {(['native', 'tradzella', 'legacy'] as const).map(src => {
+          const labels: Record<string, string> = {
+            native: 'Native', tradzella: 'Tradzella', legacy: 'Legacy',
+          };
+          const count = njCounts ? njCounts[src] : null;
+          const active = jSrc === src;
+          return (
+            <button key={src} onClick={() => setJSrc(src)}
+              style={{ background: active ? T.cyan + '22' : 'transparent',
+                border: `1px solid ${active ? T.cyan + '55' : 'transparent'}`,
+                borderRadius: 4, color: active ? T.cyan : T.txtMuted,
+                padding: '4px 12px', fontSize: 10, cursor: 'pointer',
+                fontWeight: active ? 700 : 400, whiteSpace: 'nowrap',
+                display: 'flex', alignItems: 'center', gap: 5 }}>
+              {labels[src]}
+              {count != null && (
+                <span style={{ background: active ? T.cyan + '33' : T.border + '88',
+                  color: active ? T.cyan : T.txtMuted,
+                  borderRadius: 10, padding: '0 5px', fontSize: 8, fontWeight: 700 }}>
+                  {count}
+                </span>
+              )}
+            </button>
+          );
+        })}
+      </div>
+
+      {/* Native tab renders its own self-contained component */}
+      {jSrc === 'native' && <JNativeTradesTab />}
+
+      {/* Tradzella / Legacy use the existing tab content */}
+      {jSrc !== 'native' && (
+      <React.Fragment>
       {/* Phase 7O.1: Evidence banner — shown when drilling from a coaching insight */}
       {drillFilter && (
         <div style={{ background: T.cyan + '11', border: `1px solid ${T.cyan}44`,
@@ -4206,6 +4795,8 @@ const JTradesTab: React.FC<{
           onClose={() => setReviewTrade(null)}
           onSaved={onReviewSaved}
         />
+      )}
+      </React.Fragment>
       )}
     </div>
   );

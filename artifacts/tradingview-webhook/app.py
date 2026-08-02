@@ -47054,6 +47054,255 @@ def journal_trade_notes(source, trade_id):
             pass
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Native Journal read API (Phase 7K-A.2) — DISPLAY/READ-ONLY
+# ─────────────────────────────────────────────────────────────────────────────
+
+@app.route("/journal/native-trades", methods=["GET"])
+def nj_trades_list():
+    """Paginated native journal trade list.
+
+    Params: limit, offset, instrument, direction, lifecycle_status,
+            source_label, review_status, strategy, date_from, date_to, search
+    """
+    if not NJ_DB_READY:
+        return jsonify({"ok": False, "db_ready": False,
+                        "error": "NATIVE JOURNAL UNAVAILABLE"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        try:
+            limit  = max(1, min(int(request.args.get("limit",  50)), 200))
+            offset = max(0,     int(request.args.get("offset",  0)))
+        except (TypeError, ValueError):
+            limit, offset = 50, 0
+
+        flt_inst      = (request.args.get("instrument")       or "").strip().upper() or None
+        flt_dir       = (request.args.get("direction")        or "").strip().lower() or None
+        flt_lifecycle = (request.args.get("lifecycle_status") or "").strip().upper() or None
+        flt_source    = (request.args.get("source_label")     or "").strip().upper() or None
+        flt_review    = (request.args.get("review_status")    or "").strip().upper() or None
+        flt_strategy  = (request.args.get("strategy")         or "").strip() or None
+        date_from     = (request.args.get("date_from")        or "").strip() or None
+        date_to       = (request.args.get("date_to")          or "").strip() or None
+        search        = (request.args.get("search")           or "").strip() or None
+
+        where, params = ["1=1"], []
+        if flt_inst:
+            where.append("UPPER(instrument) = %s"); params.append(flt_inst)
+        if flt_dir:
+            where.append("LOWER(direction) = %s"); params.append(flt_dir)
+        if flt_lifecycle:
+            where.append("lifecycle_status = %s"); params.append(flt_lifecycle)
+        if flt_source:
+            where.append("source_label = %s"); params.append(flt_source)
+        if flt_review:
+            where.append("review_status = %s"); params.append(flt_review)
+        if flt_strategy:
+            where.append(
+                "(canonical_strategy_key ILIKE %s OR strategy_display_name ILIKE %s)"
+            )
+            params.extend([f"%{flt_strategy}%", f"%{flt_strategy}%"])
+        if date_from:
+            where.append("created_at >= %s::timestamptz"); params.append(date_from)
+        if date_to:
+            where.append("created_at <= (%s::date + interval '1 day')::timestamptz")
+            params.append(date_to)
+        if search:
+            where.append(
+                "(UPPER(instrument) LIKE %s"
+                " OR UPPER(canonical_strategy_key) LIKE %s"
+                " OR UPPER(strategy_display_name) LIKE %s)"
+            )
+            s = f"%{search.upper()}%"
+            params.extend([s, s, s])
+
+        where_clause = " AND ".join(where)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"SELECT COUNT(*) FROM native_journal WHERE {where_clause}",
+                params,
+            )
+            total = cur.fetchone()[0]
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT id, internal_trade_id, created_at, updated_at,
+                           instrument, contract, direction, mode, session,
+                           canonical_strategy_key, strategy_display_name,
+                           lifecycle_status, source_label,
+                           CAST(edge_score AS double precision),
+                           grade, readiness,
+                           CAST(planned_entry    AS double precision),
+                           CAST(planned_stop     AS double precision),
+                           planned_targets,
+                           CAST(planned_risk     AS double precision),
+                           planned_contracts,
+                           broker_order_id, traderspost_id,
+                           review_status, learning_eligible, learning_blocked_reason
+                    FROM native_journal
+                    WHERE {where_clause}
+                    ORDER BY created_at DESC
+                    LIMIT %s OFFSET %s""",
+                params + [limit, offset],
+            )
+            rows = cur.fetchall()
+
+        cols = (
+            "id", "internal_trade_id", "created_at", "updated_at",
+            "instrument", "contract", "direction", "mode", "session",
+            "canonical_strategy_key", "strategy_display_name",
+            "lifecycle_status", "source_label",
+            "edge_score", "grade", "readiness",
+            "planned_entry", "planned_stop", "planned_targets",
+            "planned_risk", "planned_contracts",
+            "broker_order_id", "traderspost_id",
+            "review_status", "learning_eligible", "learning_blocked_reason",
+        )
+        trades = []
+        for row in rows:
+            d = dict(zip(cols, row))
+            for k in ("created_at", "updated_at"):
+                if d.get(k) and hasattr(d[k], "isoformat"):
+                    d[k] = d[k].isoformat()
+            for k in ("id", "internal_trade_id"):
+                if d.get(k) is not None:
+                    d[k] = str(d[k])
+            trades.append(d)
+
+        applied_filters = {
+            k: v for k, v in {
+                "instrument": flt_inst, "direction": flt_dir,
+                "lifecycle_status": flt_lifecycle, "source_label": flt_source,
+                "review_status": flt_review, "strategy": flt_strategy,
+                "date_from": date_from, "date_to": date_to, "search": search,
+            }.items() if v is not None
+        }
+        return jsonify({
+            "ok": True,
+            "generated_at": datetime.utcnow().isoformat() + "Z",
+            "db_ready": True,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+            "filters": applied_filters,
+            "trades": trades,
+        })
+    except Exception as exc:
+        logger.warning("nj_trades_list failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/native-trades/<trade_id>", methods=["GET"])
+def nj_trade_detail(trade_id):
+    """Full native journal row by UUID id.  READ-ONLY."""
+    if not NJ_DB_READY:
+        return jsonify({"ok": False, "db_ready": False,
+                        "error": "NATIVE JOURNAL UNAVAILABLE"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, internal_trade_id, created_at, updated_at,
+                          instrument, contract, mode, session, direction,
+                          canonical_strategy_key, strategy_display_name,
+                          setup_name, playbook,
+                          thesis_direction, thesis_strength, thesis_alignment,
+                          CAST(edge_score AS double precision), grade, readiness,
+                          confirmations, blockers, opposing_structure, risk_state,
+                          CAST(planned_entry       AS double precision),
+                          CAST(planned_stop        AS double precision),
+                          planned_targets,
+                          CAST(planned_risk        AS double precision),
+                          planned_contracts,
+                          CAST(planned_rr          AS double precision),
+                          CAST(planned_dollar_risk AS double precision),
+                          market_data_timestamp, decision_timestamp,
+                          lifecycle_status, source_label,
+                          signal_id, broker_order_id, traderspost_id,
+                          execution, management_events, outcome,
+                          review_status, review_notes,
+                          learning_eligible, learning_blocked_reason,
+                          tradezella_trade_id, legacy_journal_key
+                   FROM native_journal WHERE id = %s::uuid""",
+                (trade_id,),
+            )
+            row = cur.fetchone()
+        if row is None:
+            return jsonify({"ok": False, "error": "trade not found"}), 404
+        cols = (
+            "id", "internal_trade_id", "created_at", "updated_at",
+            "instrument", "contract", "mode", "session", "direction",
+            "canonical_strategy_key", "strategy_display_name",
+            "setup_name", "playbook",
+            "thesis_direction", "thesis_strength", "thesis_alignment",
+            "edge_score", "grade", "readiness",
+            "confirmations", "blockers", "opposing_structure", "risk_state",
+            "planned_entry", "planned_stop", "planned_targets",
+            "planned_risk", "planned_contracts", "planned_rr", "planned_dollar_risk",
+            "market_data_timestamp", "decision_timestamp",
+            "lifecycle_status", "source_label",
+            "signal_id", "broker_order_id", "traderspost_id",
+            "execution", "management_events", "outcome",
+            "review_status", "review_notes",
+            "learning_eligible", "learning_blocked_reason",
+            "tradezella_trade_id", "legacy_journal_key",
+        )
+        d = dict(zip(cols, row))
+        for k in ("created_at", "updated_at", "market_data_timestamp", "decision_timestamp"):
+            if d.get(k) and hasattr(d[k], "isoformat"):
+                d[k] = d[k].isoformat()
+        for k in ("id", "internal_trade_id"):
+            if d.get(k) is not None:
+                d[k] = str(d[k])
+        return jsonify({"ok": True, "trade": d})
+    except Exception as exc:
+        logger.warning("nj_trade_detail failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/native-counts", methods=["GET"])
+def nj_source_counts():
+    """Row counts for native_journal, tradezella_trades, strategy_trades."""
+    result: dict = {
+        "ok": True, "db_ready": NJ_DB_READY,
+        "native": 0, "tradzella": 0, "legacy": 0,
+    }
+    if NJ_DB_READY:
+        conn = _learning_conn()
+        if conn is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM native_journal")
+                    result["native"] = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM tradezella_trades")
+                    result["tradzella"] = cur.fetchone()[0]
+                    cur.execute("SELECT COUNT(*) FROM strategy_trades")
+                    result["legacy"] = cur.fetchone()[0]
+            except Exception as exc:
+                logger.debug("nj_source_counts fail-open: %s", exc)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+    return jsonify(result)
+
+
 @app.route("/journal/analytics", methods=["GET"])
 def journal_analytics():
     """Win%, avg_r, profit factor, expectancy — optionally grouped.
