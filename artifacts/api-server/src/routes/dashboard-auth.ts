@@ -7,7 +7,16 @@ import { timingSafeEqual } from "node:crypto";
 //   "/webhook" -> TradingView alert delivery
 // Everything else (the dashboard page, its data reads, and all trade
 // mutations) requires the dashboard password.
-const OPEN_PATHS = new Set(["/", "/ping", "/webhook", "/vrm"]);
+const OPEN_PATHS = new Set([
+  "/",
+  "/ping",
+  "/webhook",
+  "/vrm",
+  // SSE tick stream — EventSource cannot send Authorization headers, so this
+  // display-only price-tick feed must be open.  It returns only live OHLCV
+  // ticks (no account data, no credentials, no gate or scoring state).
+  "/main-brain/tick-stream",
+]);
 
 // Methods that do not change state — no CSRF (origin) check needed.
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);

@@ -39340,6 +39340,97 @@ def _chart_connection_status(inst: str) -> str:
     return "STALE" if bars else "NO DATA"
 
 
+# ── Live tick SSE subscribers ─────────────────────────────────────────────────
+# Per-instrument list of queue.Queue objects — one per active SSE connection.
+# The Databento tick callback enqueues a small tick dict for every trade; each
+# SSE handler drains its own queue and streams JSON events to the browser.
+#
+# List mutations are protected by _TICK_SUBS_LOCK; individual Queue ops are
+# thread-safe by design; the list is snapshot-copied before each broadcast so
+# a disconnect (remove) mid-fanout cannot cause an IndexError.
+_TICK_SUBSCRIBERS: dict[str, list] = {inst: [] for inst in ("MGC", "MNQ", "MES", "MYM")}
+_TICK_SUBS_LOCK   = threading.Lock()
+
+
+def _databento_tick_broadcast(inst: str, ts_s: float, price: float,
+                               volume: int, side) -> None:
+    """Tick callback registered with DatabentoBrain — fans out to SSE queues.
+    Called on the Databento feed thread; must return immediately (never blocks)."""
+    tick = {
+        "ts_s":   round(ts_s, 6),
+        "price":  price,
+        "volume": int(volume),
+        "side":   side if side in ("A", "B") else "N",
+    }
+    with _TICK_SUBS_LOCK:
+        subs = list(_TICK_SUBSCRIBERS.get(inst, []))
+    for q in subs:
+        try:
+            q.put_nowait(tick)
+        except Exception:
+            pass   # queue full → subscriber is slow; drop tick (fail-open)
+
+
+@app.route("/main-brain/tick-stream", methods=["GET"])
+def get_main_brain_tick_stream():
+    """SSE stream of live Databento trade ticks for the real-time dashboard chart.
+
+    GET /main-brain/tick-stream?inst=MGC
+
+    Events:
+      data: {"ts_s": 1234567890.123, "price": 2675.4, "volume": 1, "side": "A"}
+      event: heartbeat\\ndata: {}   (every 15 s — keeps the connection alive)
+
+    Returns 503 JSON (not SSE) when DATABENTO_ENABLED=0 so the UI can
+    distinguish "feed off" from "route missing".
+
+    DISPLAY-ONLY — never reads or writes any gate, scoring, execution, or
+    money-path state.  Safe to leave in dashboard-auth OPEN_PATHS because it
+    returns only live price ticks (no account data, no credentials).
+    """
+    from flask import stream_with_context, Response as FlaskResponse  # noqa: PLC0415
+    if not DATABENTO_ENABLED or _DATABENTO_BRAIN is None:
+        return jsonify({"ok": False, "enabled": False,
+                        "reason": "DATABENTO_DISABLED"}), 503
+
+    inst = request.args.get("inst", "MNQ").upper()
+    if inst not in ("MGC", "MNQ", "MES", "MYM"):
+        return jsonify({"ok": False, "reason": "UNKNOWN_INSTRUMENT"}), 400
+
+    tick_q: queue.Queue = queue.Queue(maxsize=300)
+
+    with _TICK_SUBS_LOCK:
+        _TICK_SUBSCRIBERS[inst].append(tick_q)
+
+    def _generate():
+        try:
+            while True:
+                try:
+                    tick = tick_q.get(timeout=15)
+                    yield f"data: {_jj.dumps(tick)}\n\n"
+                except queue.Empty:
+                    # 15 s with no trade → send heartbeat to keep proxy alive
+                    yield "event: heartbeat\ndata: {}\n\n"
+        except GeneratorExit:
+            pass
+        finally:
+            with _TICK_SUBS_LOCK:
+                try:
+                    _TICK_SUBSCRIBERS[inst].remove(tick_q)
+                except ValueError:
+                    pass
+
+    return FlaskResponse(
+        stream_with_context(_generate()),
+        mimetype="text/event-stream",
+        headers={
+            "Cache-Control":     "no-cache, no-transform",
+            "X-Accel-Buffering": "no",
+            "Connection":        "keep-alive",
+        },
+    )
+
+
 @app.route("/main-brain/chart", methods=["GET"])
 def get_main_brain_chart():
     """
@@ -75473,6 +75564,7 @@ if __name__ == "__main__":
             _DATABENTO_BRAIN.start()
             _DATABENTO_BRAIN.register_bar_close_callback(_databento_bar_scan)
             _DATABENTO_BRAIN.register_structure_signal_callback(_databento_structure_trigger)
+            _DATABENTO_BRAIN.register_tick_callback(_databento_tick_broadcast)
             logger.info("DatabentoBrain: initialized and started")
         except Exception as _db_exc:
             logger.error("DatabentoBrain: failed to start — %s", _db_exc)

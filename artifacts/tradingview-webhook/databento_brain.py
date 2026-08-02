@@ -168,6 +168,10 @@ class DatabentoBrain:
         # Structure-signal callbacks: called for every BOS/CHOCH/CONFIRMATION alert.
         # Registered by app.py to enqueue a scored webhook analysis without a TV hit.
         self._structure_signal_callbacks: list = []
+        # Tick callbacks: called for every raw trade record (sub-second cadence).
+        # Registered by app.py to forward live ticks to SSE subscribers for the
+        # real-time dashboard chart.  Must return quickly — runs on the feed thread.
+        self._tick_callbacks: list = []
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -192,6 +196,12 @@ class DatabentoBrain:
         whenever _inject_alert fires a BOS, CHOCH, or CONFIRMATION alert.
         Called from the data-feed thread — fn must return quickly."""
         self._structure_signal_callbacks.append(fn)
+
+    def register_tick_callback(self, fn) -> None:
+        """Register a callable(inst, ts_s, price, volume, side) invoked for
+        every individual Databento trade record.  Runs on the feed thread —
+        fn must return immediately (enqueue or discard; never block or sleep)."""
+        self._tick_callbacks.append(fn)
 
     # ── HTTP symbology pre-fetch ──────────────────────────────────────────────
 
@@ -420,6 +430,16 @@ class DatabentoBrain:
             bar_minute = int(ts_s // 60) * 60
             self._check_session_reset(inst, bar_minute)
             self._tick_bar(inst, bar_minute, price, size)
+
+            # ── Live tick broadcast (SSE chart feed) ──
+            # Fire AFTER _tick_bar so DATABENTO_PARTIAL_BY_INST already reflects
+            # this tick.  Callbacks must return immediately — they run on the feed thread.
+            if self._tick_callbacks:
+                for _cb in self._tick_callbacks:
+                    try:
+                        _cb(inst, ts_s, price, size, side)
+                    except Exception:
+                        pass
 
         except Exception as exc:
             logger.debug("DatabentoBrain _on_trade error: %s", exc)

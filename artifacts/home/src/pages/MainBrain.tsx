@@ -8171,6 +8171,19 @@ export default function MainBrain() {
             <TradePlanPanel p={p} />
           </>
         );
+      case 'desk':
+        return (
+          <>
+            <div style={{ marginBottom:10 }}>
+              <ArmControlPanel />
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10 }} className="mb-grid-3">
+              <TradePlanPanel p={p} />
+              <ActiveTradesPanel p={p} />
+              <ExecutionPanel p={p} />
+            </div>
+          </>
+        );
       case 'trades':
         return (
           <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10 }} className="mb-grid-3">
@@ -8247,7 +8260,7 @@ export default function MainBrain() {
         <Header p={p} fetchState={fetchState} lastOk={lastOk} ticker={ticker} setTicker={handleSetTicker} refresh={refresh} onAskAi={() => setAskOpen(true)} />
 
         <main id="main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
-          {/* Execution section renders immediately — it has its own data source, no brain poll needed */}
+          {/* Execution renders immediately — it has its own data source (ARM hook), no brain poll needed */}
           {section === 'execution' ? renderSectionPanels() :
           isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
             <>
@@ -8273,6 +8286,7 @@ export default function MainBrain() {
                 ticker={ticker}
                 onInstrumentChange={handleSetTicker}
                 authHeader={getAuthHeader()['Authorization']}
+                tall={section === 'desk'}
               />
 
               {/* ── Cleanest Trade Available button strip ──────────────────── */}

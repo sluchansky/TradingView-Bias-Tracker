@@ -270,11 +270,17 @@ export const BOT1_ROUTES = [
   // /databento-status: connection health + per-instrument telemetry.
   // /main-brain/chart: unified chart endpoint — OHLCV + VWAP + structure events
   //   + active-trade overlay, with optional timeframe aggregation (1m/5m/15m).
+  // /main-brain/tick-stream: SSE stream of individual trade ticks — one JSON
+  //   event per trade, used by the dashboard real-time chart (EventSource).
+  //   Added to OPEN_PATHS in dashboard-auth.ts because EventSource cannot
+  //   send Authorization headers; the route returns only live price ticks
+  //   (no account data, no credentials).
   // All return {"ok":false,"enabled":false} when DATABENTO_ENABLED=0 so the
   // UI can distinguish "feed off" from "route missing".
   "/databento-bars",
   "/databento-status",
   "/main-brain/chart",
+  "/main-brain/tick-stream",
   // Right Brain status — training log, PF, mode, last per-instrument eval.
   // DISPLAY/READ-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
   "/right-brain",

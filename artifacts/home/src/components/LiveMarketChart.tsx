@@ -153,7 +153,7 @@ function barToCandle(b: ChartBar) {
 
 // ── Status strip ──────────────────────────────────────────────────────────────
 
-function StatusStrip({ data }: { data: ChartResponse | null }) {
+function StatusStrip({ data, sseConnected }: { data: ChartResponse | null; sseConnected: boolean }) {
   if (!data) {
     return (
       <div style={{ padding: "4px 10px", fontSize: 10, color: T.txtMuted, fontFamily: T.mono }}>
@@ -180,6 +180,12 @@ function StatusStrip({ data }: { data: ChartResponse | null }) {
         {(conn?.reconnects ?? 0) > 0 && (
           <span style={{ color: T.amber }}> ×{conn!.reconnects}</span>
         )}
+      </span>
+      <span style={{
+        color: sseConnected ? T.green : T.txtMuted,
+        fontWeight: sseConnected ? 700 : 400,
+      }}>
+        {sseConnected ? "● TICK LIVE" : "○ TICK OFF"}
       </span>
       {data.instrument && (
         <span>{data.instrument}
@@ -250,12 +256,16 @@ export interface LiveMarketChartProps {
   ticker: string;
   onInstrumentChange?: (inst: string) => void;
   authHeader?: string;
+  /** When true the chart renders at 450 px instead of the default 380 px.
+   *  Used by the Trade Desk section where the chart is the centrepiece. */
+  tall?: boolean;
 }
 
 export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   ticker,
   onInstrumentChange,
   authHeader,
+  tall = false,
 }) => {
   const [collapsed,     setCollapsed]     = useState(false);
   const [instrument,    setInstrument]    = useState(ticker || "MGC");
@@ -264,6 +274,10 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   const [showVwap,      setShowVwap]      = useState(true);
   const [showTrade,     setShowTrade]     = useState(true);
   const [showStructure, setShowStructure] = useState(true);
+  const [sseConnected,  setSseConnected]  = useState(false);
+
+  // Derived chart height — tall mode used by Trade Desk section
+  const chartH = tall ? 450 : CHART_H;
 
   // Sync instrument with parent ticker
   useEffect(() => {
@@ -274,19 +288,27 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   const wrapRef      = useRef<HTMLDivElement>(null);
 
   // Stable refs to chart / series (created once per mount cycle)
-  const chartRef       = useRef<IChartApi | null>(null);
+  const chartRef        = useRef<IChartApi | null>(null);
   const candleSeriesRef = useRef<ISeriesApi<"Candlestick"> | null>(null);
-  const vwapSeriesRef  = useRef<ISeriesApi<"Line"> | null>(null);
-  const volSeriesRef   = useRef<ISeriesApi<"Histogram"> | null>(null);
-  const markersApiRef  = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
+  const vwapSeriesRef   = useRef<ISeriesApi<"Line"> | null>(null);
+  const volSeriesRef    = useRef<ISeriesApi<"Histogram"> | null>(null);
+  const markersApiRef   = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
 
   // Price lines for active trade levels
   type PriceLine = ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]>;
-  const tradeLinesRef  = useRef<PriceLine[]>([]);
+  const tradeLinesRef   = useRef<PriceLine[]>([]);
 
-  const lastBarsRef    = useRef<ChartBar[]>([]);
-  const inFlightRef    = useRef(false);
-  const [fullscreen,   setFullscreen] = useState(false);
+  const lastBarsRef     = useRef<ChartBar[]>([]);
+  const inFlightRef     = useRef(false);
+  const [fullscreen,    setFullscreen] = useState(false);
+
+  // Tick-level partial bar — updated on every SSE tick so the current bar
+  // moves in real time.  Reset on instrument change and synced from the poll
+  // response so we always have a correct open/high/low baseline.
+  const partialBarRef   = useRef<{ts:number,open:number,high:number,low:number,close:number,volume:number} | null>(null);
+  // True while an SSE connection is alive — suppresses the poll-driven partial
+  // bar update (SSE has already rendered it tick-by-tick).
+  const sseActiveRef    = useRef(false);
 
   // ── Fetch ─────────────────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
@@ -318,13 +340,94 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     return () => clearInterval(id);
   }, [fetchData, collapsed]);
 
+  // ── SSE tick subscription ─────────────────────────────────────────────────
+  // Opens an EventSource connection to /api/main-brain/tick-stream for the
+  // selected instrument.  On each tick the current bar is updated in real time.
+  // EventSource cannot send Authorization headers, so the route is in OPEN_PATHS
+  // on the Express side (display-only price ticks — no credentials or gate data).
+  useEffect(() => {
+    if (collapsed) return;
+
+    let es: EventSource | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    let delay = 3_000;
+    let stopped = false;
+
+    const connect = () => {
+      if (stopped) return;
+      es = new EventSource(`/api/main-brain/tick-stream?inst=${instrument}`);
+
+      es.onopen = () => {
+        sseActiveRef.current = true;
+        setSseConnected(true);
+        delay = 3_000;
+      };
+
+      es.onmessage = (ev) => {
+        try {
+          const tick = JSON.parse(ev.data) as {
+            ts_s: number; price: number; volume: number; side: string;
+          };
+          // Build / update the partial bar from this tick
+          const barTs = Math.floor(tick.ts_s / 60) * 60;
+          const pb = partialBarRef.current;
+          if (!pb || pb.ts !== barTs) {
+            partialBarRef.current = {
+              ts: barTs, open: tick.price, high: tick.price,
+              low: tick.price, close: tick.price, volume: tick.volume,
+            };
+          } else {
+            if (tick.price > pb.high) pb.high = tick.price;
+            if (tick.price < pb.low)  pb.low  = tick.price;
+            pb.close  = tick.price;
+            pb.volume = (pb.volume ?? 0) + tick.volume;
+          }
+          // Push to chart — replaces / creates the current-bar candle
+          const b = partialBarRef.current!;
+          candleSeriesRef.current?.update({
+            time: b.ts as UTCTimestamp,
+            open: b.open, high: b.high, low: b.low, close: b.close,
+          });
+          volSeriesRef.current?.update({
+            time:  b.ts as UTCTimestamp,
+            value: b.volume ?? 0,
+            color: b.close >= b.open ? `${T.green}60` : `${T.red}60`,
+          });
+        } catch { /* ignore parse errors */ }
+      };
+
+      es.onerror = () => {
+        sseActiveRef.current = false;
+        setSseConnected(false);
+        es?.close();
+        es = null;
+        if (!stopped) {
+          timer = setTimeout(() => {
+            delay = Math.min(delay * 2, 30_000);
+            connect();
+          }, delay);
+        }
+      };
+    };
+
+    connect();
+
+    return () => {
+      stopped = true;
+      sseActiveRef.current = false;
+      setSseConnected(false);
+      es?.close();
+      if (timer) clearTimeout(timer);
+    };
+  }, [instrument, collapsed]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Create / destroy chart ────────────────────────────────────────────────
   useEffect(() => {
     if (collapsed || !containerRef.current) return;
 
     const chart = createChart(containerRef.current, {
       width:  containerRef.current.clientWidth,
-      height: CHART_H,
+      height: chartH,
       layout: {
         background: { color: T.surface },
         textColor:  T.txtMuted,
@@ -380,7 +483,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
 
     const ro = new ResizeObserver(() => {
       if (containerRef.current) {
-        chart.resize(containerRef.current.clientWidth, CHART_H);
+        chart.resize(containerRef.current.clientWidth, chartH);
       }
     });
     ro.observe(containerRef.current);
@@ -396,7 +499,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       tradeLinesRef.current   = [];
       lastBarsRef.current     = [];
     };
-  }, [collapsed]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [collapsed, chartH]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Apply data to chart ───────────────────────────────────────────────────
   useEffect(() => {
@@ -406,8 +509,25 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     const partial = data.partial_bar ?? null;
     const prev    = lastBarsRef.current;
 
+    // Sync partialBarRef from poll data so SSE ticks always have the correct
+    // open/high/low baseline, even on first connect or after an instrument switch.
+    if (partial && (!partialBarRef.current || partialBarRef.current.ts !== partial.ts)) {
+      partialBarRef.current = {
+        ts:     partial.ts,
+        open:   partial.open,
+        high:   partial.high,
+        low:    partial.low,
+        close:  partial.close,
+        volume: partial.volume ?? 0,
+      };
+    }
+
+    // When SSE is live, skip the poll-driven partial bar update — the SSE
+    // handler is already keeping it current tick-by-tick.
+    const pollPartial = sseActiveRef.current ? null : partial;
+
     // Build full candle list
-    const allCandles = [...bars, ...(partial ? [partial] : [])].map(barToCandle);
+    const allCandles = [...bars, ...(pollPartial ? [pollPartial] : [])].map(barToCandle);
     if (allCandles.length === 0) return;
 
     const needsReset =
@@ -513,7 +633,8 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   // ── Instrument / timeframe change handlers ────────────────────────────────
   const handleInstrument = (inst: string) => {
     setInstrument(inst);
-    lastBarsRef.current = [];
+    lastBarsRef.current   = [];
+    partialBarRef.current = null;   // reset tick state; SSE effect will reconnect
     if (onInstrumentChange) onInstrumentChange(inst);
   };
 
@@ -635,11 +756,11 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       {/* Body */}
       {!collapsed && (
         <>
-          <StatusStrip data={data} />
+          <StatusStrip data={data} sseConnected={sseConnected} />
 
           {isDisabled ? (
             <div style={{
-              height: CHART_H, display: "flex", alignItems: "center",
+              height: chartH, display: "flex", alignItems: "center",
               justifyContent: "center", flexDirection: "column", gap: 8,
             }}>
               <span style={{ fontSize: 13, color: T.txtMuted }}>DATABENTO FEED DISABLED</span>
@@ -650,7 +771,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
               </span>
             </div>
           ) : (
-            <div ref={containerRef} style={{ width: "100%", height: CHART_H }} />
+            <div ref={containerRef} style={{ width: "100%", height: chartH }} />
           )}
 
           {/* Active trade footer */}
