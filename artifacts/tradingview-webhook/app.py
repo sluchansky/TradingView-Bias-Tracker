@@ -35213,6 +35213,76 @@ _NJ_TERMINAL_OUTCOMES = frozenset({
     "CLOSED", "REJECTED", "CANCELED", "STATUS_UNKNOWN",
 })
 
+# ── Phase B: valid event-type and override-reason vocabularies ─────────────────
+_NJ_VALID_EVENT_TYPES = frozenset({
+    "STATUS_CHANGE", "ORDER_SUBMITTED", "ORDER_ACKNOWLEDGED",
+    "POSITION_OPENED", "STOP_PLACED", "TARGET_PLACED",
+    "STOP_MOVED", "BREAK_EVEN_MOVE", "TRAILING_STOP_UPDATE",
+    "TARGET_HIT", "PARTIAL_EXIT", "SCALE_OUT",
+    "MANUAL_EXIT", "EMERGENCY_FLATTEN", "THESIS_INVALIDATION_EXIT",
+    "TIME_STOP", "SESSION_CLOSE", "BROKER_RECONCILIATION",
+    "OPERATOR_OVERRIDE", "POSITION_CLOSED", "ORDER_REJECTED",
+    "STATUS_UNKNOWN",
+})
+
+_NJ_OVERRIDE_REASONS = frozenset({
+    "ANXIETY_FEAR", "DISCRETIONARY_JUDGMENT", "EMERGENCY",
+    "THESIS_INVALIDATED", "PLATFORM_MALFUNCTION", "BROKER_ISSUE", "OTHER",
+})
+
+# ── Phase C: review-workflow vocabularies ─────────────────────────────────────
+_NJ_REVIEW_STATUSES = frozenset({
+    "UNREVIEWED", "IN_PROGRESS", "REVIEWED", "NEEDS_REVIEW", "EXCLUDED",
+})
+
+_NJ_FOLLOWED_PLAN_VALUES = frozenset({
+    "YES", "PARTIALLY", "NO", "NOT_APPLICABLE",
+})
+
+_NJ_MISTAKE_TAGS = frozenset({
+    "ENTERED_EARLY", "ENTERED_LATE", "OVERTRADED", "REVENGE_TRADE",
+    "EXITED_EARLY", "MOVED_STOP_TOO_SOON", "WIDENED_STOP", "OVERSIZED",
+    "IGNORED_BLOCKER", "TOOK_COUNTERTREND", "MISSED_TARGET",
+    "MANUAL_INTERVENTION", "BROKE_SESSION_RULE", "OTHER",
+})
+
+_NJ_EMOTION_TAGS = frozenset({
+    "ANXIETY", "FEAR", "FOMO", "IMPATIENCE", "FRUSTRATION",
+    "REVENGE", "OVERCONFIDENCE", "HESITATION", "CALM", "DISCIPLINED", "OTHER",
+})
+
+_NJ_POSITIVE_TAGS = frozenset({
+    "FOLLOWED_PLAN", "WAITED_FOR_CONFIRMATION", "RESPECTED_STOP",
+    "LET_WINNER_RUN", "GOOD_RISK_CONTROL", "GOOD_PATIENCE",
+    "CLEAN_EXECUTION", "NO_INTERVENTION", "OTHER",
+})
+
+_NJ_SCREENSHOT_CATEGORIES = frozenset({
+    "PRE_ENTRY", "ENTRY", "MANAGEMENT", "EXIT", "REVIEW", "OTHER",
+})
+
+_NJ_OVERRIDE_ASSESSMENTS = frozenset({
+    "HELPFUL", "HARMFUL", "NEUTRAL", "CANNOT_DETERMINE",
+})
+
+# Fields that MUST NOT be changed via review PATCH — immutable historical record.
+_NJ_IMMUTABLE_FIELDS = frozenset({
+    "id", "internal_trade_id", "signal_id", "execution_fingerprint",
+    "broker_order_id", "traderspost_id", "lifecycle_status", "source_label",
+    "instrument", "contract", "mode", "session", "direction",
+    "canonical_strategy_key", "strategy_display_name", "setup_name", "playbook",
+    "thesis_direction", "thesis_strength", "thesis_alignment",
+    "edge_score", "grade", "readiness",
+    "confirmations", "blockers", "opposing_structure", "risk_state",
+    "planned_entry", "planned_stop", "planned_targets", "planned_risk",
+    "planned_contracts", "planned_rr", "planned_dollar_risk",
+    "market_data_timestamp", "decision_timestamp",
+    "execution", "management_events", "outcome", "override_comparison",
+    "learning_eligible", "learning_blocked_reason",
+    "tradezella_trade_id", "tradzella_enrichment", "legacy_journal_key",
+    "created_at", "updated_at",
+})
+
 
 def _boot_native_journal_table():
     """Probe native_journal (no DDL). Sets NJ_DB_READY.
@@ -35421,37 +35491,66 @@ def _nj_update_execution(internal_trade_id, patch):
 
 
 def _nj_append_management_event(internal_trade_id, event_type,
-                                  old_value=None, new_value=None,
-                                  source="system_auto", reason=None,
-                                  automated=True, operator_id=None):
+                                   old_value=None, new_value=None,
+                                   source="system_auto", reason=None,
+                                   automated=True, operator_id=None,
+                                   event_id=None, reason_code=None,
+                                   price=None, quantity=None, metadata=None):
     """Append one management event to native_journal.management_events.
 
+    Phase B: extended canonical 12-field shape.
+    - event_id: when supplied, NOT EXISTS dedup prevents double-appending.
+    - event_type: validated against _NJ_VALID_EVENT_TYPES (unknown → silent drop).
     FAIL-OPEN — never raises.
     """
     if not NJ_DB_READY or not internal_trade_id:
         return
+    if event_type not in _NJ_VALID_EVENT_TYPES:
+        logger.debug("_nj_append_management_event: unknown event_type %r — dropped", event_type)
+        return
+    _event_id = event_id if event_id is not None else str(uuid.uuid4())
     evt = {
-        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-        "event_type": event_type,
-        "old_value": old_value,
-        "new_value": new_value,
-        "source": source,
-        "reason": reason,
-        "automated": automated,
+        "event_id":    _event_id,
+        "timestamp":   datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "event_type":  event_type,
+        "old_value":   old_value,
+        "new_value":   new_value,
+        "price":       price,
+        "quantity":    quantity,
+        "source":      source,
+        "reason_code": reason_code,
+        "reason":      reason,
+        "automated":   automated,
         "operator_id": operator_id,
+        "metadata":    metadata or {},
     }
     conn = _learning_conn()
     if conn is None:
         return
     try:
         cur = conn.cursor()
-        cur.execute(
-            """UPDATE native_journal
-               SET management_events = management_events || %s::jsonb,
-                   updated_at        = NOW()
-               WHERE internal_trade_id = %s""",
-            (json.dumps([evt], default=str), str(internal_trade_id)),
-        )
+        if event_id is not None:
+            cur.execute(
+                """UPDATE native_journal
+                   SET management_events = management_events || %s::jsonb,
+                       updated_at        = NOW()
+                   WHERE internal_trade_id = %s
+                     AND NOT EXISTS (
+                       SELECT 1 FROM jsonb_array_elements(management_events) AS e
+                       WHERE e->>'event_id' = %s
+                     )""",
+                (json.dumps([evt], default=str),
+                 str(internal_trade_id),
+                 str(_event_id)),
+            )
+        else:
+            cur.execute(
+                """UPDATE native_journal
+                   SET management_events = management_events || %s::jsonb,
+                       updated_at        = NOW()
+                   WHERE internal_trade_id = %s""",
+                (json.dumps([evt], default=str), str(internal_trade_id)),
+            )
         conn.commit()
         cur.close()
     except Exception as exc:
@@ -35462,18 +35561,22 @@ def _nj_append_management_event(internal_trade_id, event_type,
         except Exception:
             pass
 
-
 def _nj_check_and_set_learning_eligible(internal_trade_id):
     """Evaluate and persist learning eligibility for one NJ row.
 
-    Criteria (all must pass):
-      lifecycle_status == 'CLOSED'
+    Phase C: review-aware eligibility by source_label:
+      SYSTEM_AUTO           — review optional (must not be STATUS_UNKNOWN/EXCLUDED)
+      SYSTEM_MANUAL_CONFIRM — review required: review_status must be REVIEWED
+      EXTERNAL_MANUAL       — review + attribution required
+      TRADZELLA_IMPORT      — review required
+      EXCLUDED              — always blocked
+
+    Base criteria (all must pass):
+      lifecycle_status == CLOSED
       canonical_strategy_key is not null
       planned_risk is not null
-      execution is not null and has avg_entry or fill_prices
+      execution has avg_entry or fill_prices
       outcome is not null
-      review_status != 'STATUS_UNKNOWN'
-
     FAIL-OPEN — never raises.
     """
     if not NJ_DB_READY or not internal_trade_id:
@@ -35485,7 +35588,7 @@ def _nj_check_and_set_learning_eligible(internal_trade_id):
         cur = conn.cursor()
         cur.execute(
             """SELECT lifecycle_status, canonical_strategy_key, planned_risk,
-                      execution, outcome, review_status
+                      execution, outcome, review_status, source_label
                FROM native_journal WHERE internal_trade_id = %s""",
             (str(internal_trade_id),),
         )
@@ -35493,9 +35596,13 @@ def _nj_check_and_set_learning_eligible(internal_trade_id):
         if not row:
             cur.close()
             return
-        lifecycle, strategy, planned_risk, execution, outcome, review_status = row
+        lifecycle, strategy, planned_risk, execution, outcome, review_status, source_label = row
+        rs = (review_status or "UNREVIEWED")
+        sl = (source_label  or "SYSTEM_AUTO")
         blocked = None
-        if lifecycle != "CLOSED":
+        if rs == "EXCLUDED":
+            blocked = "review_excluded"
+        elif lifecycle != "CLOSED":
             blocked = f"lifecycle={lifecycle}"
         elif not strategy:
             blocked = "missing_strategy"
@@ -35508,8 +35615,12 @@ def _nj_check_and_set_learning_eligible(internal_trade_id):
             blocked = "missing_execution_data"
         elif not outcome:
             blocked = "missing_outcome"
-        elif (review_status or "") == "STATUS_UNKNOWN":
+        elif rs == "STATUS_UNKNOWN":
             blocked = "unresolved_status"
+        elif sl in ("SYSTEM_MANUAL_CONFIRM", "TRADZELLA_IMPORT") and rs != "REVIEWED":
+            blocked = f"review_required_for_{sl.lower()}"
+        elif sl == "EXTERNAL_MANUAL" and rs != "REVIEWED":
+            blocked = "review_and_attribution_required"
         eligible = blocked is None
         cur.execute(
             """UPDATE native_journal
@@ -35533,13 +35644,17 @@ def _nj_check_and_set_learning_eligible(internal_trade_id):
         except Exception:
             pass
 
-
 def _nj_set_outcome(internal_trade_id, outcome_data,
-                     exit_reason=None, pnl_dollars=None):
+                     exit_reason=None, pnl_dollars=None, actual_exit=None):
     """Set outcome JSONB, transition to CLOSED, recheck learning eligibility.
 
-    R is computed from immutable planned_entry/planned_stop (never the moved
-    stop) so BE moves cannot inflate the R number.
+    Phase B:
+    - actual_exit param merges into outcome block.
+    - Idempotency guard: rows already CLOSED/REJECTED/CANCELED are skipped.
+    - 5-col SELECT: adds created_at + lifecycle_status for duration + guard.
+    - Deterministic POSITION_CLOSED event (dedup via NOT EXISTS on event_id).
+    - data_completeness.missing_fields tracked.
+    R is computed from immutable planned_entry/planned_stop.
     FAIL-OPEN — never raises.
     """
     if not NJ_DB_READY or not internal_trade_id:
@@ -35550,7 +35665,7 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
     try:
         cur = conn.cursor()
         cur.execute(
-            """SELECT planned_entry, planned_stop, direction
+            """SELECT planned_entry, planned_stop, direction, created_at, lifecycle_status
                FROM native_journal WHERE internal_trade_id = %s""",
             (str(internal_trade_id),),
         )
@@ -35558,12 +35673,30 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
         if not row:
             cur.close()
             return
-        planned_entry, planned_stop, direction = row
+        planned_entry, planned_stop, direction, created_at_row, current_lifecycle = row
+        # Idempotency guard — already terminal
+        if (current_lifecycle or "") in _NJ_TERMINAL_OUTCOMES:
+            cur.close()
+            return
         out = dict(outcome_data) if isinstance(outcome_data, dict) else {}
+        if actual_exit is not None:
+            out["actual_exit"] = actual_exit
         if exit_reason:
             out["exit_reason"] = exit_reason
         if pnl_dollars is not None:
             out["net_pnl"] = round(float(pnl_dollars), 2)
+        # Duration
+        if created_at_row is not None:
+            try:
+                from datetime import timezone as _tz
+                _ca = (created_at_row
+                       if created_at_row.tzinfo
+                       else created_at_row.replace(tzinfo=_tz.utc))
+                out["duration_seconds"] = max(0, int(
+                    (datetime.now(_tz.utc) - _ca).total_seconds()
+                ))
+            except Exception:
+                pass
         # Realized R — uses immutable planned_stop always
         if (planned_entry is not None and planned_stop is not None
                 and planned_entry != planned_stop
@@ -35576,23 +35709,43 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
                 )
             except (TypeError, ValueError, ZeroDivisionError):
                 pass
+        # data_completeness
+        _missing = [k for k in ("actual_exit", "net_pnl", "realized_r")
+                    if out.get(k) is None]
+        if _missing:
+            out["data_completeness"] = {"missing_fields": _missing}
+        # Deterministic POSITION_CLOSED event (idempotent via NOT EXISTS)
+        _eid = f"{internal_trade_id}:POSITION_CLOSED"
         evt = {
-            "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
-            "event_type": "STATUS_CHANGE",
-            "new_value": {"lifecycle_status": "CLOSED"},
-            "source": "system_auto",
-            "automated": True,
-            "reason": exit_reason or "trade_closed",
+            "event_id":   _eid,
+            "timestamp":  datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+            "event_type": "POSITION_CLOSED",
+            "new_value":  {"lifecycle_status": "CLOSED",
+                           "net_pnl": out.get("net_pnl"),
+                           "realized_r": out.get("realized_r")},
+            "source":     "system_auto",
+            "automated":  True,
+            "reason":     exit_reason or "trade_closed",
+            "metadata":   {},
         }
         cur.execute(
             """UPDATE native_journal
                SET lifecycle_status  = 'CLOSED',
                    outcome           = %s::jsonb,
-                   management_events = management_events || %s::jsonb,
+                   management_events = CASE
+                     WHEN NOT EXISTS (
+                       SELECT 1 FROM jsonb_array_elements(management_events) AS e
+                       WHERE e->>'event_id' = %s
+                     )
+                     THEN management_events || %s::jsonb
+                     ELSE management_events
+                   END,
                    updated_at        = NOW()
-               WHERE internal_trade_id = %s""",
+               WHERE internal_trade_id = %s
+                 AND lifecycle_status NOT IN ('CLOSED','REJECTED','CANCELED')""",
             (
                 json.dumps(out, default=str),
+                _eid,
                 json.dumps([evt], default=str),
                 str(internal_trade_id),
             ),
@@ -35612,7 +35765,6 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
             pass
     # Eligibility check runs outside the connection block (fail-open pattern)
     _nj_check_and_set_learning_eligible(internal_trade_id)
-
 
 def _nj_find_open_by_instrument(instrument, direction=None):
     """Return internal_trade_id (str) for the most recent open NJ row.
@@ -35672,6 +35824,281 @@ def _nj_close_by_instrument(instrument, direction, exit_reason,
 # ─────────────────────────────────────────────────────────────────────────────
 # End Native Journal Phase A helpers
 # ─────────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Native Journal Phase C helpers — Review Workflow
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _nj_patch_review(internal_trade_id, patch):
+    """Apply a review-data patch to a native_journal row.
+
+    Only review_status, review_notes, and review_data sub-fields are writable.
+    _NJ_IMMUTABLE_FIELDS blocks attempts to change planned context or execution.
+    Status transitions are audited inside review_data.status_history.
+    FAIL-OPEN — returns (ok: bool, blocked_reason: str|None).
+    """
+    if not NJ_DB_READY or not internal_trade_id:
+        return False, "db_not_ready"
+    bad = set(patch.keys()) & _NJ_IMMUTABLE_FIELDS
+    if bad:
+        return False, f"immutable_fields:{','.join(sorted(bad))}"
+
+    _ALLOWED_REVIEW_FIELDS = {
+        "review_status", "review_notes",
+        "followed_plan", "setup_quality", "execution_quality",
+        "management_quality", "emotional_control",
+        "mistake_tags", "emotion_tags", "positive_tags",
+        "lesson", "what_went_well", "what_to_improve",
+        "operator_exit_reason", "override_assessment",
+        "status_change_reason",
+    }
+    unknown = set(patch.keys()) - _ALLOWED_REVIEW_FIELDS
+    if unknown:
+        return False, f"unknown_fields:{','.join(sorted(unknown))}"
+
+    # Enum validation
+    if "review_status" in patch and patch["review_status"] is not None:
+        if patch["review_status"] not in _NJ_REVIEW_STATUSES:
+            return False, f"invalid_review_status:{patch['review_status']}"
+    if "followed_plan" in patch and patch["followed_plan"] is not None:
+        if patch["followed_plan"] not in _NJ_FOLLOWED_PLAN_VALUES:
+            return False, f"invalid_followed_plan:{patch['followed_plan']}"
+    for tag_field, valid_set in (
+        ("mistake_tags",  _NJ_MISTAKE_TAGS),
+        ("emotion_tags",  _NJ_EMOTION_TAGS),
+        ("positive_tags", _NJ_POSITIVE_TAGS),
+    ):
+        if tag_field in patch:
+            if not isinstance(patch[tag_field], list):
+                return False, f"{tag_field}_must_be_list"
+            bad_tags = [t for t in patch[tag_field] if t not in valid_set]
+            if bad_tags:
+                return False, f"invalid_{tag_field}:{','.join(bad_tags)}"
+    for q_field in ("setup_quality", "execution_quality",
+                    "management_quality", "emotional_control"):
+        if q_field in patch and patch[q_field] is not None:
+            try:
+                v = int(patch[q_field])
+                if not (1 <= v <= 5):
+                    return False, f"{q_field}_out_of_range"
+            except (TypeError, ValueError):
+                return False, f"{q_field}_not_integer"
+    if "override_assessment" in patch and patch["override_assessment"] is not None:
+        if patch["override_assessment"] not in _NJ_OVERRIDE_ASSESSMENTS:
+            return False, f"invalid_override_assessment:{patch['override_assessment']}"
+
+    conn = _learning_conn()
+    if conn is None:
+        return False, "db_unavailable"
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT review_status, review_data FROM native_journal"
+            " WHERE internal_trade_id = %s",
+            (str(internal_trade_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return False, "not_found"
+        old_status, existing_rd = row
+        rd = dict(existing_rd) if isinstance(existing_rd, dict) else {}
+
+        new_status = patch.get("review_status", old_status) or "UNREVIEWED"
+        new_notes  = patch.get("review_notes")  # None means no-change
+
+        # Merge review_data sub-fields
+        for f in ("followed_plan", "setup_quality", "execution_quality",
+                  "management_quality", "emotional_control",
+                  "mistake_tags", "emotion_tags", "positive_tags",
+                  "lesson", "what_went_well", "what_to_improve",
+                  "operator_exit_reason", "override_assessment"):
+            if f in patch:
+                rd[f] = patch[f]
+
+        # Status transition audit trail
+        now_iso = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+        if new_status != (old_status or "UNREVIEWED"):
+            history = rd.get("status_history") or []
+            history.append({
+                "changed_at":   now_iso,
+                "from_status":  old_status,
+                "to_status":    new_status,
+                "operator":     "operator",
+                "reason":       patch.get("status_change_reason"),
+            })
+            rd["status_history"] = history
+
+        if new_status in ("REVIEWED", "IN_PROGRESS"):
+            rd["reviewed_at"] = now_iso
+            rd["reviewed_by"] = "operator"
+
+        updates = ["review_status = %s", "review_data = %s::jsonb", "updated_at = NOW()"]
+        params  = [new_status, json.dumps(rd, default=str)]
+        if new_notes is not None:
+            updates.append("review_notes = %s")
+            params.append(str(new_notes)[:10000])
+        params.append(str(internal_trade_id))
+
+        cur.execute(
+            f"UPDATE native_journal SET {', '.join(updates)}"
+            f" WHERE internal_trade_id = %s",
+            params,
+        )
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as exc:
+        logger.debug("_nj_patch_review fail-open: %s", exc)
+        return False, "db_error"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_compute_review_completeness(review_data, source_label, has_manual_override):
+    """Compute review completeness for display. NEVER gates learning — display-only.
+
+    Returns dict with completed/required/optional/missing_required keys.
+    """
+    rd = review_data or {}
+    required = ["followed_plan", "setup_quality", "execution_quality"]
+    if (source_label or "") in ("SYSTEM_MANUAL_CONFIRM", "EXTERNAL_MANUAL"):
+        required += ["management_quality", "emotional_control"]
+    if has_manual_override:
+        required.append("override_assessment")
+    optional = [
+        "lesson", "what_went_well", "what_to_improve",
+        "mistake_tags", "emotion_tags", "positive_tags",
+    ]
+
+    def _non_empty(v):
+        return v is not None and v != "" and v != []
+
+    completed_req = sum(1 for f in required if _non_empty(rd.get(f)))
+    completed_opt = sum(1 for f in optional if _non_empty(rd.get(f)))
+    return {
+        "completed":           completed_req + completed_opt,
+        "required":            len(required),
+        "optional":            len(optional),
+        "completed_required":  completed_req,
+        "completed_optional":  completed_opt,
+        "total":               len(required) + len(optional),
+        "missing_required":    [f for f in required if not _non_empty(rd.get(f))],
+    }
+
+
+def _nj_add_screenshot(internal_trade_id, attachment_id, category,
+                         caption, storage_key, mime_type, file_size,
+                         uploaded_by="operator"):
+    """Append screenshot metadata to native_journal.screenshots JSONB array.
+
+    Validates category, enforces max 10 screenshots per trade, rejects
+    unsafe storage_key patterns.
+    FAIL-OPEN — returns (ok: bool, error_reason: str|None).
+    """
+    if not NJ_DB_READY or not internal_trade_id:
+        return False, "db_not_ready"
+    cat = (category or "OTHER").upper()
+    if cat not in _NJ_SCREENSHOT_CATEGORIES:
+        return False, f"invalid_category:{cat}"
+    sk = str(storage_key or "")
+    if sk.startswith("/") or ".." in sk or sk.startswith("~"):
+        return False, "unsafe_storage_key"
+    try:
+        fsize = int(file_size or 0)
+    except (TypeError, ValueError):
+        fsize = 0
+    if fsize > 5 * 1024 * 1024:
+        return False, "file_too_large"
+
+    conn = _learning_conn()
+    if conn is None:
+        return False, "db_unavailable"
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT jsonb_array_length(COALESCE(screenshots, '[]'::jsonb))"
+            " FROM native_journal WHERE internal_trade_id = %s",
+            (str(internal_trade_id),),
+        )
+        row = cur.fetchone()
+        if not row:
+            cur.close()
+            return False, "not_found"
+        if (row[0] or 0) >= 10:
+            cur.close()
+            return False, "max_attachments_reached"
+        meta = {
+            "attachment_id": str(attachment_id),
+            "category":      cat,
+            "caption":       str(caption or "")[:500],
+            "storage_key":   sk,
+            "mime_type":     str(mime_type or ""),
+            "file_size":     fsize,
+            "uploaded_by":   str(uploaded_by or "operator"),
+            "uploaded_at":   datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        }
+        cur.execute(
+            """UPDATE native_journal
+               SET screenshots = COALESCE(screenshots, '[]'::jsonb) || %s::jsonb,
+                   updated_at  = NOW()
+               WHERE internal_trade_id = %s""",
+            (json.dumps([meta], default=str), str(internal_trade_id)),
+        )
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as exc:
+        logger.debug("_nj_add_screenshot fail-open: %s", exc)
+        return False, "db_error"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _nj_delete_screenshot(internal_trade_id, attachment_id):
+    """Remove one screenshot entry by attachment_id. FAIL-OPEN."""
+    if not NJ_DB_READY or not internal_trade_id or not attachment_id:
+        return False, "db_not_ready"
+    conn = _learning_conn()
+    if conn is None:
+        return False, "db_unavailable"
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            """UPDATE native_journal
+               SET screenshots = COALESCE(
+                   (SELECT jsonb_agg(elem)
+                    FROM jsonb_array_elements(screenshots) AS elem
+                    WHERE elem->>'attachment_id' != %s),
+                   '[]'::jsonb
+               ),
+               updated_at = NOW()
+               WHERE internal_trade_id = %s""",
+            (str(attachment_id), str(internal_trade_id)),
+        )
+        conn.commit()
+        cur.close()
+        return True, None
+    except Exception as exc:
+        logger.debug("_nj_delete_screenshot fail-open: %s", exc)
+        return False, "db_error"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# End Native Journal Phase C helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
 
 
 def _dq_has_active_trade(inst, direction):
@@ -47202,7 +47629,10 @@ def nj_trades_list():
 
 @app.route("/journal/native-trades/<trade_id>", methods=["GET"])
 def nj_trade_detail(trade_id):
-    """Full native journal row by UUID id.  READ-ONLY."""
+    """Full native journal row by UUID id.  READ-ONLY.
+
+    Phase C: also returns review_data, screenshots, review_completeness.
+    """
     if not NJ_DB_READY:
         return jsonify({"ok": False, "db_ready": False,
                         "error": "NATIVE JOURNAL UNAVAILABLE"}), 503
@@ -47230,7 +47660,8 @@ def nj_trade_detail(trade_id):
                           lifecycle_status, source_label,
                           signal_id, broker_order_id, traderspost_id,
                           execution, management_events, outcome,
-                          review_status, review_notes,
+                          review_status, review_notes, review_data,
+                          screenshots,
                           learning_eligible, learning_blocked_reason,
                           tradezella_trade_id, legacy_journal_key
                    FROM native_journal WHERE id = %s::uuid""",
@@ -47253,7 +47684,8 @@ def nj_trade_detail(trade_id):
             "lifecycle_status", "source_label",
             "signal_id", "broker_order_id", "traderspost_id",
             "execution", "management_events", "outcome",
-            "review_status", "review_notes",
+            "review_status", "review_notes", "review_data",
+            "screenshots",
             "learning_eligible", "learning_blocked_reason",
             "tradezella_trade_id", "legacy_journal_key",
         )
@@ -47264,9 +47696,257 @@ def nj_trade_detail(trade_id):
         for k in ("id", "internal_trade_id"):
             if d.get(k) is not None:
                 d[k] = str(d[k])
+        # Phase C: compute review_completeness
+        has_override = bool(
+            (d.get("management_events") or [])
+            and any(
+                (e or {}).get("source") == "operator"
+                for e in (d.get("management_events") or [])
+            )
+        )
+        d["review_completeness"] = _nj_compute_review_completeness(
+            d.get("review_data"),
+            d.get("source_label"),
+            has_override,
+        )
+        # screenshots defaults to [] if null
+        if d.get("screenshots") is None:
+            d["screenshots"] = []
         return jsonify({"ok": True, "trade": d})
     except Exception as exc:
         logger.warning("nj_trade_detail failed: %s", exc)
+        return jsonify({"ok": False, "error": "query failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+@app.route("/journal/native-trades/<trade_id>/review", methods=["PATCH"])
+def nj_review_patch(trade_id):
+    """PATCH review fields for one native journal trade.
+
+    Writable fields: review_status, review_notes, followed_plan,
+    setup_quality, execution_quality, management_quality, emotional_control,
+    mistake_tags, emotion_tags, positive_tags, lesson, what_went_well,
+    what_to_improve, operator_exit_reason, override_assessment.
+    Immutable fields (_NJ_IMMUTABLE_FIELDS) return 400.
+    """
+    if not NJ_DB_READY:
+        return jsonify({"ok": False, "error": "NATIVE JOURNAL UNAVAILABLE"}), 503
+    body = request.get_json(force=True, silent=True) or {}
+    if not body:
+        return jsonify({"ok": False, "error": "empty body"}), 400
+    # Resolve by UUID id -> internal_trade_id
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT internal_trade_id FROM native_journal WHERE id = %s::uuid",
+                (trade_id,),
+            )
+            row = cur.fetchone()
+    except Exception as exc:
+        logger.warning("nj_review_patch lookup failed: %s", exc)
+        return jsonify({"ok": False, "error": "lookup failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not row:
+        return jsonify({"ok": False, "error": "trade not found"}), 404
+    iid = str(row[0])
+    ok, reason = _nj_patch_review(iid, body)
+    if not ok:
+        status = 400 if reason not in ("db_error", "db_unavailable") else 500
+        return jsonify({"ok": False, "error": reason}), status
+    # Re-evaluate learning eligibility after review update
+    _nj_check_and_set_learning_eligible(iid)
+    return jsonify({"ok": True, "internal_trade_id": iid})
+
+
+@app.route("/journal/native-trades/<trade_id>/screenshots", methods=["POST"])
+def nj_screenshot_add(trade_id):
+    """Register screenshot metadata after the file has been uploaded to App Storage.
+
+    Body: { attachment_id, category, caption?, storage_key, mime_type, file_size }
+    The actual file upload is handled by the Express api-server screenshot routes.
+    """
+    if not NJ_DB_READY:
+        return jsonify({"ok": False, "error": "NATIVE JOURNAL UNAVAILABLE"}), 503
+    body = request.get_json(force=True, silent=True) or {}
+    required_fields = ("attachment_id", "storage_key", "mime_type")
+    missing = [f for f in required_fields if not body.get(f)]
+    if missing:
+        return jsonify({"ok": False, "error": f"missing fields: {missing}"}), 400
+    # Resolve UUID -> internal_trade_id
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT internal_trade_id FROM native_journal WHERE id = %s::uuid",
+                (trade_id,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        return jsonify({"ok": False, "error": "lookup failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not row:
+        return jsonify({"ok": False, "error": "trade not found"}), 404
+    iid = str(row[0])
+    ok, reason = _nj_add_screenshot(
+        iid,
+        body["attachment_id"],
+        body.get("category", "OTHER"),
+        body.get("caption", ""),
+        body["storage_key"],
+        body["mime_type"],
+        body.get("file_size", 0),
+    )
+    if not ok:
+        status = 400 if reason not in ("db_error", "db_unavailable") else 500
+        return jsonify({"ok": False, "error": reason}), status
+    return jsonify({"ok": True, "internal_trade_id": iid,
+                    "attachment_id": body["attachment_id"]})
+
+
+@app.route("/journal/native-trades/<trade_id>/screenshots/<attachment_id>",
+           methods=["DELETE"])
+def nj_screenshot_delete(trade_id, attachment_id):
+    """Remove one screenshot metadata entry from native_journal.screenshots."""
+    if not NJ_DB_READY:
+        return jsonify({"ok": False, "error": "NATIVE JOURNAL UNAVAILABLE"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT internal_trade_id FROM native_journal WHERE id = %s::uuid",
+                (trade_id,),
+            )
+            row = cur.fetchone()
+    except Exception:
+        return jsonify({"ok": False, "error": "lookup failed"}), 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not row:
+        return jsonify({"ok": False, "error": "trade not found"}), 404
+    iid = str(row[0])
+    ok, reason = _nj_delete_screenshot(iid, attachment_id)
+    if not ok:
+        return jsonify({"ok": False, "error": reason}), 500
+    return jsonify({"ok": True})
+
+
+@app.route("/journal/native-review-queue", methods=["GET"])
+def nj_review_queue():
+    """Review queue: closed native trades ordered by review priority.
+
+    Priority: EXCLUDED last, UNREVIEWED first, then by edge_score desc.
+    Optional filters: instrument, lifecycle_status, review_status.
+    Returns up to 100 records + counts by bucket.
+    """
+    if not NJ_DB_READY:
+        return jsonify({"ok": False, "db_ready": False,
+                        "error": "NATIVE JOURNAL UNAVAILABLE"}), 503
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "database unavailable"}), 503
+    try:
+        flt_inst   = (request.args.get("instrument")    or "").strip().upper() or None
+        flt_review = (request.args.get("review_status") or "").strip().upper() or None
+
+        # Include any trade that is resolved (not still open/pending) so that
+        # STATUS_UNKNOWN, REJECTED, CANCELED, and any other terminal lifecycle
+        # states are surfaced for review alongside CLOSED trades.
+        # ACTIVE / PENDING / OPENING are excluded — they are still in-flight.
+        where = ["lifecycle_status NOT IN ('ACTIVE','PENDING','OPENING')"]
+        params = []
+        if flt_inst:
+            where.append("UPPER(instrument) = %s"); params.append(flt_inst)
+        if flt_review:
+            where.append("review_status = %s"); params.append(flt_review)
+        where_clause = " AND ".join(where)
+
+        with conn.cursor() as cur:
+            # Bucket counts
+            cur.execute(
+                f"""SELECT review_status, COUNT(*)
+                    FROM native_journal
+                    WHERE {where_clause}
+                    GROUP BY review_status""",
+                params,
+            )
+            buckets = {r[0] or "UNREVIEWED": int(r[1]) for r in cur.fetchall()}
+
+            # Priority-ordered list
+            cur.execute(
+                f"""SELECT id, internal_trade_id, created_at,
+                           instrument, direction, mode,
+                           canonical_strategy_key, strategy_display_name,
+                           CAST(edge_score AS double precision), grade,
+                           source_label, review_status, learning_eligible,
+                           learning_blocked_reason
+                    FROM native_journal
+                    WHERE {where_clause}
+                    ORDER BY
+                      CASE review_status
+                        WHEN 'EXCLUDED'    THEN 4
+                        WHEN 'REVIEWED'    THEN 3
+                        WHEN 'IN_PROGRESS' THEN 1
+                        ELSE 0             -- UNREVIEWED / NEEDS_REVIEW first
+                      END ASC,
+                      edge_score DESC NULLS LAST,
+                      created_at DESC
+                    LIMIT 100""",
+                params,
+            )
+            rows = cur.fetchall()
+
+        trades = []
+        for row in rows:
+            t = dict(zip((
+                "id", "internal_trade_id", "created_at",
+                "instrument", "direction", "mode",
+                "canonical_strategy_key", "strategy_display_name",
+                "edge_score", "grade",
+                "source_label", "review_status", "learning_eligible",
+                "learning_blocked_reason",
+            ), row))
+            if t.get("created_at") and hasattr(t["created_at"], "isoformat"):
+                t["created_at"] = t["created_at"].isoformat()
+            for k in ("id", "internal_trade_id"):
+                if t.get(k) is not None:
+                    t[k] = str(t[k])
+            trades.append(t)
+
+        unreviewed = buckets.get("UNREVIEWED", 0) + buckets.get("NEEDS_REVIEW", 0)
+        return jsonify({
+            "ok":               True,
+            "db_ready":         True,
+            "generated_at":     datetime.utcnow().isoformat() + "Z",
+            "unreviewed_count": unreviewed,
+            "buckets":          buckets,
+            "trades":           trades,
+            "next_trade":       trades[0] if trades and trades[0]["review_status"]
+                                             in ("UNREVIEWED", "NEEDS_REVIEW", "IN_PROGRESS") else None,
+        })
+    except Exception as exc:
+        logger.warning("nj_review_queue failed: %s", exc)
         return jsonify({"ok": False, "error": "query failed"}), 500
     finally:
         try:

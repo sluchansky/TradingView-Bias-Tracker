@@ -4,6 +4,7 @@ import { dashboardAuth } from "./dashboard-auth";
 import { createFlaskProxy, BOT1_ROUTES, BOT2_ROUTES } from "./flask-proxy";
 import { mintLinkToken, randomPassword } from "./view-tokens";
 import journalAttachmentsRouter from "./journal-attachments";
+import njScreenshotsRouter from "./nj-screenshots";
 
 // LIVE trading bot — mounted at /api (Flask on port 8000). Behavior unchanged.
 const router: IRouter = Router();
@@ -45,6 +46,11 @@ router.post("/view-link", (req, res) => {
 // Journal attachment routes — Express-native (GCS + DB).  Sit before the Flask
 // proxy so they are handled locally.  dashboardAuth is already applied above.
 router.use(journalAttachmentsRouter);
+
+// NJ screenshot routes — upload/serve/delete backed by GCS.  Express generates
+// server-side keys; Flask JSONB metadata is registered internally (never from client).
+// Mounted before Flask proxy so Express intercepts DELETE and GET for screenshots.
+router.use(njScreenshotsRouter);
 
 router.use(createFlaskProxy({ port: 8000, routes: BOT1_ROUTES }));
 

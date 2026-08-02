@@ -173,7 +173,16 @@ export const BOT1_ROUTES = [
   // touches the gate, scoring, learning formulas, or any broker path.
   "/journal/native-trades",
   "/journal/native-trades/:id",
+  // Phase 7K-C: Native journal review workflow (owner-only; PATCH review fields,
+  // upload/delete screenshot attachments — never modifies planned context or execution).
+  "/journal/native-trades/:id/review",
+  // POST /screenshots and DELETE /screenshots/:attachment_id are Express-native
+  // (nj-screenshots.ts handles GCS upload with server-generated keys); only
+  // the metadata-query path (/journal/native-counts) stays Flask-proxied.
   "/journal/native-counts",
+  // Phase 7K-C: Native journal review queue (owner-only; aggregation of CLOSED
+  // trades pending review — display-only SELECT, never touches any money path).
+  "/journal/native-review-queue",
   "/journal/analytics",
   "/journal/playbook",
   "/journal/learning",

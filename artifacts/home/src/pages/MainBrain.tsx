@@ -2515,6 +2515,41 @@ interface NJTrade {
   learning_blocked_reason: string | null;
 }
 
+interface NJReviewData {
+  followed_plan?: string | null;
+  setup_quality?: number | null;
+  execution_quality?: number | null;
+  management_quality?: number | null;
+  emotional_control?: number | null;
+  mistake_tags?: string[];
+  emotion_tags?: string[];
+  positive_tags?: string[];
+  lesson?: string | null;
+  what_went_well?: string | null;
+  what_to_improve?: string | null;
+  override_assessment?: string | null;
+  status_history?: Array<{ from_status: string; to_status: string; changed_at: string }>;
+  [key: string]: unknown;
+}
+interface NJScreenshotMeta {
+  attachment_id: string;
+  category: string;
+  caption: string | null;
+  storage_key: string;
+  mime_type: string;
+  file_size: number;
+  uploaded_at: string;
+}
+interface NJReviewCompleteness {
+  completed: number;
+  required: number;
+  optional: number;
+  completed_required: number;
+  completed_optional: number;
+  total: number;
+  missing_required: string[];
+}
+
 interface NJTradeDetail extends NJTrade {
   setup_name: string | null;
   playbook: string | null;
@@ -2536,6 +2571,10 @@ interface NJTradeDetail extends NJTrade {
   review_notes: string | null;
   tradezella_trade_id: number | null;
   legacy_journal_key: string | null;
+  // Phase 7K-C additions
+  review_data?: NJReviewData;
+  screenshots?: NJScreenshotMeta[];
+  review_completeness?: NJReviewCompleteness;
 }
 
 interface JBatch {
@@ -3624,8 +3663,638 @@ const _DRILL_SERVER_KEYS: (keyof JDrillFilter)[] = [
   'rating_min','rating_max','realized_r_min','realized_r_max','quality_classification',
 ];
 
+// ── NJ Screenshot Section (Phase 7K-C) ───────────────────────────────────────
+const NJScreenshotSection: React.FC<{
+  tradeId: string;
+  screenshots: NJScreenshotMeta[];
+  onUpdated: (updated: NJScreenshotMeta[]) => void;
+}> = ({ tradeId, screenshots, onUpdated }) => {
+  const [uploadState, setUploadState] = useState<'idle' | 'uploading' | 'error'>('idle');
+  const [uploadError, setUploadError] = useState<string | null>(null);
+  const [deletingId,  setDeletingId]  = useState<string | null>(null);
+  const [category,    setCategory]    = useState('ENTRY');
+  const [caption,     setCaption]     = useState('');
+  // Blob URL cache for authenticated image loading.
+  // <img src> cannot send Authorization headers, so we fetch each image with
+  // getAuthHeader() and create an object URL from the response blob.
+  const [blobUrls, setBlobUrls] = useState<Record<string, string>>({});
+  const fileRef = React.useRef<HTMLInputElement>(null);
+
+  // Load blob URLs for any screenshot that doesn't have one yet.
+  useEffect(() => {
+    const ids = screenshots.map(s => s.attachment_id);
+    const missing = ids.filter(id => !blobUrls[id]);
+    if (missing.length === 0) return;
+    let cancelled = false;
+    Promise.all(
+      missing.map(async id => {
+        try {
+          const r = await fetch(`/api/journal/native-screenshot/${id}`, { headers: getAuthHeader() });
+          if (!r.ok) return null;
+          const blob = await r.blob();
+          const url = URL.createObjectURL(blob);
+          return { id, url };
+        } catch { return null; }
+      })
+    ).then(results => {
+      if (cancelled) return;
+      const updates: Record<string, string> = {};
+      for (const r of results) { if (r) updates[r.id] = r.url; }
+      if (Object.keys(updates).length > 0) {
+        setBlobUrls(prev => ({ ...prev, ...updates }));
+      }
+    });
+    return () => { cancelled = true; };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [screenshots]);
+
+  // Revoke blob URLs when the component unmounts to avoid memory leaks.
+  useEffect(() => {
+    return () => { Object.values(blobUrls).forEach(url => URL.revokeObjectURL(url)); };
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const handleUpload = async (file: File) => {
+    setUploadState('uploading'); setUploadError(null);
+    try {
+      const params = new URLSearchParams({ category, caption: caption.slice(0, 200) });
+      const r = await fetch(
+        `/api/journal/native-trades/${tradeId}/screenshots/upload?${params}`,
+        {
+          method: 'POST',
+          headers: { ...getAuthHeader(), 'Content-Type': file.type || 'image/jpeg' },
+          body: file,
+        }
+      );
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'upload failed');
+      const newMeta: NJScreenshotMeta = {
+        attachment_id: d.attachment_id,
+        category:      d.category,
+        caption:       d.caption,
+        storage_key:   d.storage_key,
+        mime_type:     d.mime_type,
+        file_size:     d.file_size,
+        uploaded_at:   d.uploaded_at,
+      };
+      // Pre-load blob URL for the newly uploaded image using the original file
+      // (avoids a round-trip immediately after upload).
+      const newBlobUrl = URL.createObjectURL(file);
+      setBlobUrls(prev => ({ ...prev, [d.attachment_id]: newBlobUrl }));
+      onUpdated([...screenshots, newMeta]);
+      setCaption('');
+      setUploadState('idle');
+      if (fileRef.current) fileRef.current.value = '';
+    } catch (e: unknown) {
+      setUploadError(e instanceof Error ? e.message : 'upload failed');
+      setUploadState('error');
+    }
+  };
+
+  const handleDelete = async (attachmentId: string) => {
+    setDeletingId(attachmentId);
+    try {
+      const r = await fetch(
+        `/api/journal/native-trades/${tradeId}/screenshots/${attachmentId}`,
+        { method: 'DELETE', headers: getAuthHeader() }
+      );
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'delete failed');
+      // Revoke and remove the blob URL for the deleted screenshot.
+      setBlobUrls(prev => {
+        const copy = { ...prev };
+        if (copy[attachmentId]) { URL.revokeObjectURL(copy[attachmentId]); delete copy[attachmentId]; }
+        return copy;
+      });
+      onUpdated(screenshots.filter(s => s.attachment_id !== attachmentId));
+    } catch (e: unknown) {
+      console.error('screenshot delete failed:', e);
+    } finally {
+      setDeletingId(null);
+    }
+  };
+
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 4, fontWeight: 700 }}>
+        📷 Screenshots ({screenshots.length}/{10})
+      </div>
+
+      {/* Existing screenshots — rendered from authenticated blob URLs */}
+      {screenshots.length > 0 && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+          {screenshots.map(s => (
+            <div key={s.attachment_id} style={{ position: 'relative', width: 120 }}>
+              {blobUrls[s.attachment_id] ? (
+                <img
+                  src={blobUrls[s.attachment_id]}
+                  alt={s.caption || s.category}
+                  style={{ width: 120, height: 80, objectFit: 'cover', borderRadius: 5,
+                    border: `1px solid ${T.border}`, display: 'block' }}
+                />
+              ) : (
+                <div style={{ width: 120, height: 80, borderRadius: 5,
+                  border: `1px solid ${T.border}`, background: T.panelAlt,
+                  display: 'flex', alignItems: 'center', justifyContent: 'center',
+                  fontSize: 8, color: T.txtMuted }}>
+                  Loading…
+                </div>
+              )}
+              <div style={{ fontSize: 7, color: T.txtMuted, marginTop: 2, textAlign: 'center' }}>
+                {s.category}{s.caption ? ` · ${s.caption.slice(0,20)}` : ''}
+              </div>
+              <button
+                onClick={() => handleDelete(s.attachment_id)}
+                disabled={deletingId === s.attachment_id}
+                title="Delete screenshot"
+                style={{ position: 'absolute', top: 3, right: 3, background: T.red + 'cc',
+                  border: 'none', borderRadius: 3, color: '#fff', padding: '1px 5px',
+                  fontSize: 10, cursor: 'pointer', lineHeight: 1.2 }}>
+                {deletingId === s.attachment_id ? '…' : '×'}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Upload controls */}
+      {screenshots.length < 10 && (
+        <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap', alignItems: 'center' }}>
+          <select value={category} onChange={e => setCategory(e.target.value)}
+            style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+              color: T.txtSec, padding: '3px 6px', fontSize: 9 }}>
+            {['PRE_ENTRY','ENTRY','MANAGEMENT','EXIT','REVIEW','OTHER'].map(c => (
+              <option key={c} value={c}>{c.replace(/_/g,' ')}</option>
+            ))}
+          </select>
+          <input type="text" value={caption} onChange={e => setCaption(e.target.value)}
+            placeholder="Caption (optional)"
+            style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+              color: T.txtSec, padding: '3px 7px', fontSize: 9, width: 130 }} />
+          <input ref={fileRef} type="file" accept="image/jpeg,image/png,image/gif,image/webp"
+            style={{ display: 'none' }}
+            onChange={e => {
+              const file = e.target.files?.[0];
+              if (file) handleUpload(file);
+            }} />
+          <button onClick={() => fileRef.current?.click()}
+            disabled={uploadState === 'uploading'}
+            style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`,
+              borderRadius: 4, color: T.cyan, padding: '3px 10px', fontSize: 9,
+              cursor: uploadState === 'uploading' ? 'default' : 'pointer', whiteSpace: 'nowrap' }}>
+            {uploadState === 'uploading' ? 'Uploading…' : '📷 Add Screenshot'}
+          </button>
+        </div>
+      )}
+      {uploadState === 'error' && uploadError && (
+        <div style={{ fontSize: 8, color: T.red, marginTop: 3 }}>Upload failed: {uploadError}</div>
+      )}
+    </div>
+  );
+};
+
+// ── NJ Review Section (Phase 7K-C) ───────────────────────────────────────────
+const NJReviewSection: React.FC<{
+  detail: NJTradeDetail;
+  onSaved: (updated: Partial<NJTradeDetail>) => void;
+}> = ({ detail, onSaved }) => {
+  const rd = detail.review_data || {};
+  const rc = detail.review_completeness;
+
+  // Local form state — mirrors review_data + top-level fields
+  const [status,      setStatus]      = useState<string>(detail.review_status || 'UNREVIEWED');
+  const [notes,       setNotes]       = useState<string>(detail.review_notes || '');
+  const [followedPlan,setFollowedPlan]= useState<string>(rd.followed_plan || '');
+  const [setupQ,      setSetupQ]      = useState<number | ''>(rd.setup_quality ?? '');
+  const [execQ,       setExecQ]       = useState<number | ''>(rd.execution_quality ?? '');
+  const [mgmtQ,       setMgmtQ]       = useState<number | ''>(rd.management_quality ?? '');
+  const [emotionCtrl, setEmotionCtrl] = useState<number | ''>(rd.emotional_control ?? '');
+  const [mistakeTags, setMistakeTags] = useState<string[]>(rd.mistake_tags || []);
+  const [emotionTags, setEmotionTags] = useState<string[]>(rd.emotion_tags || []);
+  const [positiveTags,setPositiveTags]= useState<string[]>(rd.positive_tags || []);
+  const [lesson,      setLesson]      = useState<string>(rd.lesson || '');
+  const [wentWell,    setWentWell]    = useState<string>(rd.what_went_well || '');
+  const [toImprove,   setToImprove]   = useState<string>(rd.what_to_improve || '');
+  const [overrideAss, setOverrideAss] = useState<string>(rd.override_assessment || '');
+  const [saveState,   setSaveState]   = useState<'idle' | 'saving' | 'saved' | 'error'>('idle');
+  const [dirty,       setDirty]       = useState(false);
+
+  const hasManualOverride = Boolean(
+    (detail.management_events || []).some((e: unknown) => (e as Record<string,unknown>)['source'] === 'operator')
+  );
+
+  const markDirty = () => setDirty(true);
+
+  const handleSave = async () => {
+    setSaveState('saving');
+    try {
+      const body: Record<string, unknown> = {
+        review_status: status,
+        review_notes: notes,
+        followed_plan: followedPlan || null,
+        setup_quality: setupQ !== '' ? Number(setupQ) : null,
+        execution_quality: execQ !== '' ? Number(execQ) : null,
+        management_quality: mgmtQ !== '' ? Number(mgmtQ) : null,
+        emotional_control: emotionCtrl !== '' ? Number(emotionCtrl) : null,
+        mistake_tags:  mistakeTags,
+        emotion_tags:  emotionTags,
+        positive_tags: positiveTags,
+        lesson, what_went_well: wentWell, what_to_improve: toImprove,
+        override_assessment: overrideAss || null,
+      };
+      const r = await fetch(`/api/journal/native-trades/${detail.id}/review`, {
+        method: 'PATCH',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      });
+      const d = await r.json();
+      if (!d.ok) throw new Error(d.error || 'save failed');
+      setSaveState('saved');
+      setDirty(false);
+      onSaved({ review_status: status, review_notes: notes });
+      setTimeout(() => setSaveState('idle'), 2500);
+    } catch {
+      setSaveState('error');
+      setTimeout(() => setSaveState('idle'), 3000);
+    }
+  };
+
+  const Rating: React.FC<{ label: string; value: number | ''; onChange: (v: number | '') => void }> = ({ label, value, onChange }) => (
+    <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 4 }}>
+      <span style={{ fontSize: 9, color: T.txtMuted, width: 100, flexShrink: 0 }}>{label}</span>
+      <div style={{ display: 'flex', gap: 2 }}>
+        {[1,2,3,4,5].map(n => (
+          <button key={n} onClick={() => { onChange(value === n ? '' : n); markDirty(); }}
+            style={{ width: 20, height: 20, borderRadius: 3, border: `1px solid ${Number(value) >= n ? T.cyan + '88' : T.border}`,
+              background: Number(value) >= n ? T.cyan + '22' : 'transparent',
+              color: Number(value) >= n ? T.cyan : T.txtMuted, fontSize: 9, cursor: 'pointer', lineHeight: 1 }}>
+            {n}
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+
+  const TagToggle: React.FC<{
+    tags: string[]; allTags: string[]; onChange: (t: string[]) => void;
+    color?: string;
+  }> = ({ tags, allTags, onChange, color }) => (
+    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 3, marginTop: 3 }}>
+      {allTags.map(t => {
+        const active = tags.includes(t);
+        return (
+          <button key={t} onClick={() => { onChange(active ? tags.filter(x => x !== t) : [...tags, t]); markDirty(); }}
+            style={{ padding: '2px 6px', borderRadius: 10, fontSize: 8, cursor: 'pointer',
+              background: active ? (color || T.amber) + '33' : T.panelAlt,
+              border: `1px solid ${active ? (color || T.amber) + '77' : T.border}`,
+              color: active ? (color || T.amber) : T.txtMuted }}>
+            {t.replace(/_/g,' ')}
+          </button>
+        );
+      })}
+    </div>
+  );
+
+  return (
+    <div>
+      {/* Divider */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
+        <div style={{ flex: 1, height: 1, background: T.border + '55' }} />
+        <span style={{ fontSize: 8, color: T.txtMuted, letterSpacing: '0.08em', whiteSpace: 'nowrap' }}>
+          OPERATOR REVIEW — EDITABLE
+        </span>
+        <div style={{ flex: 1, height: 1, background: T.border + '55' }} />
+      </div>
+
+      {/* Completeness bar */}
+      {rc && (
+        <div style={{ marginBottom: 10 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+            <span style={{ fontSize: 8, color: T.txtMuted }}>
+              Review completeness: {rc.completed_required}/{rc.required} required, {rc.completed_optional}/{rc.optional} optional
+            </span>
+            {rc.missing_required.length > 0 && (
+              <span style={{ fontSize: 8, color: T.amber }}>
+                Missing: {rc.missing_required.map((f: string) => f.replace(/_/g,' ')).join(', ')}
+              </span>
+            )}
+          </div>
+          <div style={{ background: T.border + '44', borderRadius: 3, height: 4, overflow: 'hidden' }}>
+            <div style={{
+              height: '100%', borderRadius: 3,
+              background: rc.completed_required >= rc.required ? T.green : T.amber,
+              width: `${rc.total > 0 ? Math.round(rc.completed / rc.total * 100) : 0}%`,
+              transition: 'width 0.3s ease',
+            }} />
+          </div>
+        </div>
+      )}
+
+      {/* Status transitions */}
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 4 }}>Review Status</div>
+        <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+          {['UNREVIEWED','IN_PROGRESS','REVIEWED','NEEDS_REVIEW','EXCLUDED'].map(s => (
+            <button key={s} onClick={() => { setStatus(s); markDirty(); }}
+              style={{ padding: '3px 8px', borderRadius: 4, fontSize: 8, cursor: 'pointer',
+                background: status === s ? (s === 'EXCLUDED' ? T.red + '33' : s === 'REVIEWED' ? T.green + '22' : T.cyan + '22') : T.panelAlt,
+                border: `1px solid ${status === s ? (s === 'EXCLUDED' ? T.red + '66' : s === 'REVIEWED' ? T.green + '44' : T.cyan + '44') : T.border}`,
+                color: status === s ? (s === 'EXCLUDED' ? T.red : s === 'REVIEWED' ? T.green : T.cyan) : T.txtMuted,
+                fontWeight: status === s ? 700 : 400 }}>
+              {s.replace(/_/g,' ')}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Followed plan */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 3 }}>Followed Plan?</div>
+        <div style={{ display: 'flex', gap: 4 }}>
+          {['YES','PARTIALLY','NO','NOT_APPLICABLE'].map(v => (
+            <button key={v} onClick={() => { setFollowedPlan(followedPlan === v ? '' : v); markDirty(); }}
+              style={{ padding: '3px 8px', borderRadius: 4, fontSize: 8, cursor: 'pointer',
+                background: followedPlan === v ? T.cyan + '22' : T.panelAlt,
+                border: `1px solid ${followedPlan === v ? T.cyan + '44' : T.border}`,
+                color: followedPlan === v ? T.cyan : T.txtMuted, fontWeight: followedPlan === v ? 700 : 400 }}>
+              {v.replace(/_/g,' ')}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {/* Quality ratings */}
+      <div style={{ marginBottom: 8, background: T.panelAlt, borderRadius: 5, padding: '6px 8px',
+        border: `1px solid ${T.border}` }}>
+        <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 4 }}>Quality Ratings (1-5)</div>
+        <Rating label="Setup quality"      value={setupQ}      onChange={v => { setSetupQ(v); markDirty(); }} />
+        <Rating label="Execution quality"  value={execQ}       onChange={v => { setExecQ(v); markDirty(); }} />
+        <Rating label="Management quality" value={mgmtQ}       onChange={v => { setMgmtQ(v); markDirty(); }} />
+        <Rating label="Emotional control"  value={emotionCtrl} onChange={v => { setEmotionCtrl(v); markDirty(); }} />
+      </div>
+
+      {/* Tags */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 8, color: T.red, marginBottom: 2 }}>⚠ Mistakes</div>
+        <TagToggle tags={mistakeTags} color={T.red}
+          allTags={['ENTERED_EARLY','ENTERED_LATE','OVERTRADED','REVENGE_TRADE','EXITED_EARLY',
+            'MOVED_STOP_TOO_SOON','WIDENED_STOP','OVERSIZED','IGNORED_BLOCKER',
+            'TOOK_COUNTERTREND','MISSED_TARGET','MANUAL_INTERVENTION','BROKE_SESSION_RULE','OTHER']}
+          onChange={setMistakeTags} />
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 8, color: T.amber, marginBottom: 2 }}>🧠 Emotions</div>
+        <TagToggle tags={emotionTags} color={T.amber}
+          allTags={['ANXIETY','FEAR','FOMO','IMPATIENCE','FRUSTRATION','REVENGE',
+            'OVERCONFIDENCE','HESITATION','CALM','DISCIPLINED','OTHER']}
+          onChange={setEmotionTags} />
+      </div>
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 8, color: T.green, marginBottom: 2 }}>✅ Positives</div>
+        <TagToggle tags={positiveTags} color={T.green}
+          allTags={['FOLLOWED_PLAN','WAITED_FOR_CONFIRMATION','RESPECTED_STOP',
+            'LET_WINNER_RUN','GOOD_RISK_CONTROL','GOOD_PATIENCE','CLEAN_EXECUTION',
+            'NO_INTERVENTION','OTHER']}
+          onChange={setPositiveTags} />
+      </div>
+
+      {/* Manual override assessment (only when relevant) */}
+      {hasManualOverride && (
+        <div style={{ marginBottom: 8 }}>
+          <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 3 }}>Override Assessment</div>
+          <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap' }}>
+            {['HELPFUL','HARMFUL','NEUTRAL','CANNOT_DETERMINE'].map(v => (
+              <button key={v} onClick={() => { setOverrideAss(overrideAss === v ? '' : v); markDirty(); }}
+                style={{ padding: '3px 8px', borderRadius: 4, fontSize: 8, cursor: 'pointer',
+                  background: overrideAss === v ? T.amber + '22' : T.panelAlt,
+                  border: `1px solid ${overrideAss === v ? T.amber + '44' : T.border}`,
+                  color: overrideAss === v ? T.amber : T.txtMuted, fontWeight: overrideAss === v ? 700 : 400 }}>
+                {v.replace(/_/g,' ')}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Notes and lesson */}
+      <div style={{ marginBottom: 6 }}>
+        <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 2 }}>Notes</div>
+        <textarea value={notes} onChange={e => { setNotes(e.target.value); markDirty(); }} rows={3}
+          placeholder="Operator notes…"
+          style={{ width: '100%', background: T.panelAlt, border: `1px solid ${T.border}`,
+            borderRadius: 4, color: T.txtSec, padding: '5px 7px', fontSize: 9, resize: 'vertical',
+            boxSizing: 'border-box' }} />
+      </div>
+      <div style={{ marginBottom: 6 }}>
+        <div style={{ fontSize: 8, color: T.txtMuted, marginBottom: 2 }}>Lesson Learned</div>
+        <textarea value={lesson} onChange={e => { setLesson(e.target.value); markDirty(); }} rows={2}
+          placeholder="Key takeaway…"
+          style={{ width: '100%', background: T.panelAlt, border: `1px solid ${T.border}`,
+            borderRadius: 4, color: T.txtSec, padding: '5px 7px', fontSize: 9, resize: 'vertical',
+            boxSizing: 'border-box' }} />
+      </div>
+      <div style={{ marginBottom: 6 }}>
+        <div style={{ fontSize: 8, color: T.green, marginBottom: 2 }}>What went well</div>
+        <textarea value={wentWell} onChange={e => { setWentWell(e.target.value); markDirty(); }} rows={2}
+          style={{ width: '100%', background: T.panelAlt, border: `1px solid ${T.border}`,
+            borderRadius: 4, color: T.txtSec, padding: '5px 7px', fontSize: 9, resize: 'vertical',
+            boxSizing: 'border-box' }} />
+      </div>
+      <div style={{ marginBottom: 10 }}>
+        <div style={{ fontSize: 8, color: T.amber, marginBottom: 2 }}>What to improve</div>
+        <textarea value={toImprove} onChange={e => { setToImprove(e.target.value); markDirty(); }} rows={2}
+          style={{ width: '100%', background: T.panelAlt, border: `1px solid ${T.border}`,
+            borderRadius: 4, color: T.txtSec, padding: '5px 7px', fontSize: 9, resize: 'vertical',
+            boxSizing: 'border-box' }} />
+      </div>
+
+      {/* Screenshots — upload, view, delete */}
+      <NJScreenshotSection
+        tradeId={detail.id}
+        screenshots={detail.screenshots || []}
+        onUpdated={updated => {
+          onSaved({ screenshots: updated });
+        }}
+      />
+
+      {/* Save button */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <button onClick={handleSave} disabled={saveState === 'saving'}
+          style={{ background: dirty ? T.cyan + '22' : T.panelAlt,
+            border: `1px solid ${dirty ? T.cyan + '55' : T.border}`,
+            borderRadius: 5, color: dirty ? T.cyan : T.txtMuted,
+            padding: '6px 16px', fontSize: 10, cursor: saveState === 'saving' ? 'default' : 'pointer',
+            fontWeight: 700 }}>
+          {saveState === 'saving' ? 'Saving…' : saveState === 'saved' ? '✓ Saved' : 'Save Review'}
+        </button>
+        {dirty && saveState === 'idle' && (
+          <span style={{ fontSize: 8, color: T.amber }}>Unsaved changes</span>
+        )}
+        {saveState === 'error' && (
+          <span style={{ fontSize: 8, color: T.red }}>Save failed — try again</span>
+        )}
+      </div>
+    </div>
+  );
+};
+
+// ── NJ Review Queue Tab (Phase 7K-C) ─────────────────────────────────────────
+const NJReviewQueueTab: React.FC<{ onOpenTrade: (id: string) => void }> = ({ onOpenTrade }) => {
+  const [qData,    setQData]    = useState<null | { unreviewed_count: number; buckets: Record<string,number>; trades: Record<string,unknown>[] }>(null);
+  const [loading,  setLoading]  = useState(false);
+  const [error,    setError]    = useState<string | null>(null);
+  const [fInst,    setFInst]    = useState('');
+  const [fReview,  setFReview]  = useState('');
+
+  const fetchQueue = useCallback(async () => {
+    setLoading(true); setError(null);
+    try {
+      const params = new URLSearchParams();
+      if (fInst)   params.set('instrument', fInst);
+      if (fReview) params.set('review_status', fReview);
+      const r = await fetch(`/api/journal/native-review-queue?${params}`, { headers: getAuthHeader() });
+      const d = await r.json();
+      if (d.db_ready === false) { setError('Native journal not ready'); return; }
+      if (!d.ok) throw new Error(d.error || 'queue failed');
+      setQData(d);
+    } catch (e: unknown) {
+      setError(e instanceof Error ? e.message : 'fetch failed');
+    } finally {
+      setLoading(false);
+    }
+  }, [fInst, fReview]);
+
+  useEffect(() => { fetchQueue(); }, [fetchQueue]);
+
+  const bucketColor = (bucket: string) => {
+    if (bucket === 'REVIEWED')    return T.green;
+    if (bucket === 'EXCLUDED')    return T.red;
+    if (bucket === 'IN_PROGRESS') return T.cyan;
+    if (bucket === 'NEEDS_REVIEW') return T.amber;
+    return T.txtMuted;
+  };
+
+  return (
+    <div>
+      {/* Summary buckets */}
+      {qData && (
+        <div style={{ display: 'flex', gap: 8, marginBottom: 12, flexWrap: 'wrap' }}>
+          {Object.entries(qData.buckets).map(([bucket, count]) => (
+            <div key={bucket} style={{ background: T.panelAlt, border: `1px solid ${T.border}`,
+              borderRadius: 6, padding: '6px 12px', textAlign: 'center' }}>
+              <div style={{ fontSize: 16, fontWeight: 800, color: bucketColor(bucket), fontFamily: T.mono }}>
+                {count as number}
+              </div>
+              <div style={{ fontSize: 8, color: T.txtMuted }}>{bucket.replace(/_/g,' ')}</div>
+            </div>
+          ))}
+          {qData.unreviewed_count > 0 && (
+            <div style={{ background: T.amber + '11', border: `1px solid ${T.amber}33`,
+              borderRadius: 6, padding: '6px 12px', display: 'flex', alignItems: 'center', gap: 6 }}>
+              <span style={{ fontSize: 11, color: T.amber, fontWeight: 700 }}>
+                {qData.unreviewed_count} pending review
+              </span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Filters */}
+      <div style={{ display: 'flex', gap: 6, marginBottom: 10, alignItems: 'center', flexWrap: 'wrap' }}>
+        <select value={fInst} onChange={e => setFInst(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Instruments</option>
+          {['MGC','MNQ','MES','MYM'].map(i => <option key={i} value={i}>{i}</option>)}
+        </select>
+        <select value={fReview} onChange={e => setFReview(e.target.value)}
+          style={{ background: T.panelAlt, border: `1px solid ${T.border}`, borderRadius: 4,
+            color: T.txtSec, padding: '4px 6px', fontSize: 11 }}>
+          <option value="">All Statuses</option>
+          {['UNREVIEWED','IN_PROGRESS','REVIEWED','NEEDS_REVIEW','EXCLUDED'].map(s =>
+            <option key={s} value={s}>{s.replace(/_/g,' ')}</option>)}
+        </select>
+        <button onClick={fetchQueue}
+          style={{ background: T.cyan + '22', border: `1px solid ${T.cyan}44`, borderRadius: 4,
+            color: T.cyan, padding: '4px 10px', fontSize: 11, cursor: 'pointer' }}>↺ Refresh</button>
+      </div>
+
+      {loading && <div style={{ color: T.txtMuted, fontSize: 11, padding: '8px 0' }}>Loading…</div>}
+      {error && <div style={{ color: T.red, fontSize: 11, padding: '8px 0' }}>Error: {error}</div>}
+
+      {qData && !loading && (
+        <div style={{ overflowX: 'auto' }}>
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+            <thead>
+              <tr>
+                {['Date','Inst','Dir','Strategy','Edge','Grade','Source','Review','Eligible'].map(h => (
+                  <th key={h} style={{ textAlign: 'left', color: T.txtMuted, fontWeight: 600,
+                    paddingBottom: 6, fontSize: 9, paddingRight: 8, whiteSpace: 'nowrap' }}>{h}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {qData.trades.map((t: Record<string,unknown>) => (
+                <tr key={String(t['id'])}
+                  onClick={() => onOpenTrade(String(t['id']))}
+                  style={{ borderTop: `1px solid ${T.border}`, cursor: 'pointer' }}
+                  onMouseEnter={e => (e.currentTarget.style.background = T.panelAlt)}
+                  onMouseLeave={e => (e.currentTarget.style.background = 'transparent')}>
+                  <td style={{ padding: '4px 8px 4px 0', color: T.txtMuted, fontSize: 9, whiteSpace: 'nowrap' }}>
+                    {jFmtDate(String(t['created_at'] || ''))}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', color: T.cyan, fontFamily: T.mono, fontWeight: 700 }}>
+                    {String(t['instrument'] || '—')}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', color: dirColor(String(t['direction'] || '')), fontWeight: 700 }}>
+                    {String(t['direction'] || '—').slice(0,5).toUpperCase()}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, maxWidth: 110,
+                    overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {String(t['strategy_display_name'] || t['canonical_strategy_key'] || '—')}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', fontFamily: T.mono, fontWeight: 700,
+                    color: t['edge_score'] != null
+                      ? (Number(t['edge_score']) >= 70 ? T.green : Number(t['edge_score']) >= 50 ? T.cyan : T.txtMuted)
+                      : T.txtMuted }}>
+                    {t['edge_score'] != null ? Number(t['edge_score']).toFixed(0) : '—'}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', color: T.txtSec, fontFamily: T.mono }}>
+                    {String(t['grade'] || '—')}
+                  </td>
+                  <td style={{ padding: '4px 8px 4px 0', fontSize: 8, color: T.txtMuted, whiteSpace: 'nowrap' }}>
+                    {String(t['source_label'] || '—').replace(/_/g,'\u200B_')}
+                  </td>
+                  <td style={{ padding: '4px 4px 4px 0' }}>
+                    {jReviewBadge(String(t['review_status'] || 'UNREVIEWED'))}
+                  </td>
+                  <td style={{ padding: '4px 0', fontSize: 8 }}>
+                    {t['learning_eligible']
+                      ? <span style={{ color: T.green, fontWeight: 700 }}>✓</span>
+                      : <span style={{ color: T.txtMuted }}>—</span>}
+                  </td>
+                </tr>
+              ))}
+              {qData.trades.length === 0 && (
+                <tr>
+                  <td colSpan={9} style={{ textAlign: 'center', color: T.txtMuted, padding: '30px 0' }}>
+                    <div style={{ fontWeight: 700, fontSize: 12, marginBottom: 8, color: T.green }}>
+                      ✓ All Reviewed
+                    </div>
+                    <div style={{ fontSize: 10 }}>No closed trades pending review.</div>
+                  </td>
+                </tr>
+              )}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── Native Journal Trades Tab (Phase 7K-A.2) ─────────────────────────────────
-const JNativeTradesTab: React.FC = () => {
+const JNativeTradesTab: React.FC<{ pendingOpenId?: string | null }> = ({ pendingOpenId }) => {
   const [trades,       setTrades]       = useState<NJTrade[]>([]);
   const [total,        setTotal]        = useState(0);
   const limit = 50;
@@ -3680,10 +4349,10 @@ const JNativeTradesTab: React.FC = () => {
 
   useEffect(() => { fetchTrades(0); }, [fetchTrades]);
 
-  const openDetail = async (t: NJTrade) => {
+  const openDetailById = useCallback(async (id: string) => {
     setDetail(null); setDetailError(null); setDetailLoading(true);
     try {
-      const r = await fetch(`/api/journal/native-trades/${t.id}`, { headers: getAuthHeader() });
+      const r = await fetch(`/api/journal/native-trades/${id}`, { headers: getAuthHeader() });
       const d = await r.json();
       if (!d.ok) throw new Error(d.error || 'not found');
       setDetail(d.trade);
@@ -3692,7 +4361,14 @@ const JNativeTradesTab: React.FC = () => {
     } finally {
       setDetailLoading(false);
     }
-  };
+  }, []);
+
+  // When the queue tab navigates to a specific trade, open its drawer immediately
+  useEffect(() => {
+    if (pendingOpenId) { openDetailById(pendingOpenId); }
+  }, [pendingOpenId, openDetailById]);
+
+  const openDetail = async (t: NJTrade) => { openDetailById(t.id); };
 
   function safeStr(v: unknown): string {
     if (v == null) return '—';
@@ -4037,7 +4713,7 @@ const JNativeTradesTab: React.FC = () => {
               </div>
 
               {/* ── CURRENT RECORD STATUS ── */}
-              <div style={{ background: T.panelAlt, border: `1px solid ${T.border}`,
+              <div style={{ marginBottom: 14, background: T.panelAlt, border: `1px solid ${T.border}`,
                 borderRadius: 6, padding: '8px 10px' }}>
                 <div style={{ fontSize: 8, fontWeight: 800, color: T.txtSec,
                   letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 6 }}>
@@ -4058,11 +4734,6 @@ const JNativeTradesTab: React.FC = () => {
                     Blocked: {detail.learning_blocked_reason}
                   </div>
                 )}
-                {detail.review_notes && (
-                  <div style={{ fontSize: 9, color: T.txtSec, marginTop: 4, lineHeight: 1.5 }}>
-                    {detail.review_notes}
-                  </div>
-                )}
                 {(([
                   ['Created',    jFmtDate(detail.created_at)],
                   ['Updated',    jFmtDate(detail.updated_at)],
@@ -4076,6 +4747,12 @@ const JNativeTradesTab: React.FC = () => {
                   </div>
                 ) : null)}
               </div>
+
+              {/* ── OPERATOR REVIEW — EDITABLE ── */}
+              <NJReviewSection detail={detail} onSaved={updated => {
+                setDetail(d => d ? { ...d, ...updated } : d);
+                fetchTrades(offset);
+              }} />
             </div>
           )}
         </div>
@@ -4121,9 +4798,12 @@ const JTradesTab: React.FC<{
   // Phase 7N Batch C: per-trade learning eligibility (display-only cache)
   const [eligibilityMap, setEligibilityMap] = useState<Record<string, { status: string; reason: string }>>({});
 
-  // Phase 7K-A.2 — source selector (NATIVE / TRADZELLA / LEGACY) + live counts
-  const [jSrc,     setJSrc]     = useState<'native' | 'tradzella' | 'legacy'>('native');
+  // Phase 7K-A.2 — source selector (NATIVE / QUEUE / TRADZELLA / LEGACY) + live counts
+  const [jSrc,     setJSrc]     = useState<'native' | 'queue' | 'tradzella' | 'legacy'>('native');
   const [njCounts, setNjCounts] = useState<{ native: number; tradzella: number; legacy: number } | null>(null);
+  // When queue tab opens a trade row, we store the UUID here and switch to Native tab.
+  // JNativeTradesTab reads the prop on mount and opens the drawer immediately.
+  const [pendingNativeId, setPendingNativeId] = useState<string | null>(null);
 
   const fetchTrades = useCallback(async (pg = 1) => {
     setLoading(true); setError(null);
@@ -4302,28 +4982,29 @@ const JTradesTab: React.FC<{
 
   return (
     <div>
-      {/* Phase 7K-A.2 — Source selector: NATIVE / TRADZELLA / LEGACY */}
+      {/* Phase 7K-A.2 / 7K-C — Source selector: NATIVE / QUEUE / TRADZELLA / LEGACY */}
       <div style={{ display: 'flex', gap: 0, marginBottom: 12,
         background: T.panelAlt, borderRadius: 6, padding: 3,
         border: `1px solid ${T.border}`, alignSelf: 'flex-start', width: 'fit-content' }}>
-        {(['native', 'tradzella', 'legacy'] as const).map(src => {
+        {(['native', 'queue', 'tradzella', 'legacy'] as const).map(src => {
           const labels: Record<string, string> = {
-            native: 'Native', tradzella: 'Tradzella', legacy: 'Legacy',
+            native: 'Native', queue: 'Review Queue', tradzella: 'Tradzella', legacy: 'Legacy',
           };
-          const count = njCounts ? njCounts[src] : null;
+          const count = src === 'queue' ? (queueCount ?? null) : (njCounts ? (njCounts as Record<string,number>)[src] ?? null : null);
           const active = jSrc === src;
+          const accent = src === 'queue' ? T.amber : T.cyan;
           return (
             <button key={src} onClick={() => setJSrc(src)}
-              style={{ background: active ? T.cyan + '22' : 'transparent',
-                border: `1px solid ${active ? T.cyan + '55' : 'transparent'}`,
-                borderRadius: 4, color: active ? T.cyan : T.txtMuted,
+              style={{ background: active ? accent + '22' : 'transparent',
+                border: `1px solid ${active ? accent + '55' : 'transparent'}`,
+                borderRadius: 4, color: active ? accent : T.txtMuted,
                 padding: '4px 12px', fontSize: 10, cursor: 'pointer',
                 fontWeight: active ? 700 : 400, whiteSpace: 'nowrap',
                 display: 'flex', alignItems: 'center', gap: 5 }}>
               {labels[src]}
-              {count != null && (
-                <span style={{ background: active ? T.cyan + '33' : T.border + '88',
-                  color: active ? T.cyan : T.txtMuted,
+              {count != null && count > 0 && (
+                <span style={{ background: active ? accent + '33' : T.border + '88',
+                  color: active ? accent : T.txtMuted,
                   borderRadius: 10, padding: '0 5px', fontSize: 8, fontWeight: 700 }}>
                   {count}
                 </span>
@@ -4334,10 +5015,18 @@ const JTradesTab: React.FC<{
       </div>
 
       {/* Native tab renders its own self-contained component */}
-      {jSrc === 'native' && <JNativeTradesTab />}
+      {jSrc === 'native' && <JNativeTradesTab pendingOpenId={pendingNativeId} />}
 
-      {/* Tradzella / Legacy use the existing tab content */}
-      {jSrc !== 'native' && (
+      {/* Review Queue tab (Phase 7K-C) */}
+      {jSrc === 'queue' && <NJReviewQueueTab onOpenTrade={(id: string) => {
+        // Switch to Native tab and open the drawer for this specific trade immediately.
+        // pendingNativeId is read by JNativeTradesTab on mount via useEffect.
+        setPendingNativeId(id);
+        setJSrc('native');
+      }} />}
+
+      {/* Tradzella / Legacy use the existing tab content — NOT rendered for Native or Queue */}
+      {(jSrc === 'tradzella' || jSrc === 'legacy') && (
       <React.Fragment>
       {/* Phase 7O.1: Evidence banner — shown when drilling from a coaching insight */}
       {drillFilter && (

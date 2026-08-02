@@ -450,8 +450,16 @@ class TestNJSetOutcome(unittest.TestCase):
 
     def _mock_db_row(self, planned_entry=19500.0, planned_stop=19480.0,
                      direction="Long"):
-        """Make cursor.fetchone() return the NJ row needed by _nj_set_outcome."""
-        self._cur.fetchone.return_value = (planned_entry, planned_stop, direction)
+        """Make cursor.fetchone() return the NJ row needed by _nj_set_outcome.
+
+        Phase B: SELECT now fetches 5 columns:
+          planned_entry, planned_stop, direction, created_at, lifecycle_status
+        created_at=None (skips duration calc), lifecycle_status="ACTIVE"
+        (passes the idempotency guard).
+        """
+        self._cur.fetchone.return_value = (
+            planned_entry, planned_stop, direction, None, "ACTIVE"
+        )
 
     def _update_params(self):
         for c in self._cur.execute.call_args_list:
@@ -569,14 +577,17 @@ class TestNJLearningEligibility(unittest.TestCase):
         app.NJ_DB_READY = False
 
     def _set_row(self, lifecycle="CLOSED", strategy="LSR", planned_risk=20.0,
-                 execution=_UNSET, outcome=_UNSET, review_status="UNREVIEWED"):
+                 execution=_UNSET, outcome=_UNSET, review_status="UNREVIEWED",
+                 source_label="SYSTEM_AUTO"):
         # Use sentinel so callers can explicitly pass None to simulate a NULL column
+        # Phase C: SELECT now fetches 7 cols (added source_label for review-aware eligibility).
         if execution is _UNSET:
             execution = {"avg_entry": 19502.5}
         if outcome is _UNSET:
             outcome = {"net_pnl": 100.0, "realized_r": 1.0}
         self._cur.fetchone.return_value = (
-            lifecycle, strategy, planned_risk, execution, outcome, review_status
+            lifecycle, strategy, planned_risk, execution, outcome,
+            review_status, source_label,
         )
 
     def _update_params(self):

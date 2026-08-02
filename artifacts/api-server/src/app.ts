@@ -54,14 +54,17 @@ app.use(
   ],
   express.raw({ type: () => true, limit: "32mb" }),
 );
-// Journal screenshot uploads — up to 5 MB per image, owner-only path.
-// Dynamic path (:source/:id/attachment) cannot be listed literally, so we
-// match with a function predicate instead.
+// Journal screenshot uploads — up to 5 MB per image, owner-only paths.
+// Dynamic paths cannot be listed literally, so we match with a predicate.
+// Covers both the legacy trade attachment route and the new NJ screenshot upload route.
 app.use(
   (req, _res, next) => {
     if (
       req.method === "POST" &&
-      /^\/api\/journal\/trade\/[^/]+\/\d+\/attachment$/.test(req.path)
+      (
+        /^\/api\/journal\/trade\/[^/]+\/\d+\/attachment$/.test(req.path) ||
+        /^\/api\/journal\/native-trades\/[^/]+\/screenshots\/upload$/.test(req.path)
+      )
     ) {
       express.raw({ type: () => true, limit: "5mb" })(req, _res, next);
     } else {
