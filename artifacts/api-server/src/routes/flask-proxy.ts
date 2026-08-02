@@ -280,7 +280,13 @@ export const BOT1_ROUTES = [
   "/databento-bars",
   "/databento-status",
   "/main-brain/chart",
+  // SSE stream — EventSource; Flask validates the short-lived ?token= param
   "/main-brain/tick-stream",
+  // SSE token issuance — auth-protected at Express edge; issues a 45s token
+  // that the browser uses once to authenticate the EventSource connection.
+  "/main-brain/tick-stream-token",
+  // SSE diagnostics — subscriber counts, queue depths, drop counters, limits
+  "/main-brain/tick-stream/diagnostics",
   // Right Brain status — training log, PF, mode, last per-instrument eval.
   // DISPLAY/READ-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS.
   "/right-brain",

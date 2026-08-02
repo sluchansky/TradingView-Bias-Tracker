@@ -39340,85 +39340,294 @@ def _chart_connection_status(inst: str) -> str:
     return "STALE" if bars else "NO DATA"
 
 
-# ── Live tick SSE subscribers ─────────────────────────────────────────────────
-# Per-instrument list of queue.Queue objects — one per active SSE connection.
-# The Databento tick callback enqueues a small tick dict for every trade; each
-# SSE handler drains its own queue and streams JSON events to the browser.
+# ── Live tick SSE — security, subscriber store, and broadcast ─────────────────
 #
-# List mutations are protected by _TICK_SUBS_LOCK; individual Queue ops are
-# thread-safe by design; the list is snapshot-copied before each broadcast so
-# a disconnect (remove) mid-fanout cannot cause an IndexError.
-_TICK_SUBSCRIBERS: dict[str, list] = {inst: [] for inst in ("MGC", "MNQ", "MES", "MYM")}
-_TICK_SUBS_LOCK   = threading.Lock()
+# Authentication flow:
+#   1. Browser sends authenticated POST /main-brain/tick-stream-token?inst=MGC
+#      (Express Basic-auth wall).  Flask issues a short-lived cryptographic token.
+#   2. Browser opens EventSource /main-brain/tick-stream?inst=MGC&token=<tok>.
+#      This route IS in dashboard-auth OPEN_PATHS because EventSource cannot
+#      send Authorization headers.  The Flask handler validates the token and
+#      rejects all tokenless/expired/wrong-instrument requests with 401 BEFORE
+#      allocating any subscriber queue.  Anonymous clients cannot allocate queues.
+#   3. Token is marked "connection_started" on first use.  Reconnect must obtain
+#      a fresh token through the authenticated token endpoint.
+#
+# Connection limits:
+#   _SSE_MAX_PER_OWNER  — concurrent streams per authenticated owner
+#   _SSE_MAX_TOTAL      — total streams across all owners
+#
+# Subscriber store:
+#   Per-instrument list of dicts.
+#   Each dict: {q, inst, connected_at, drops, sub_id}
+#   Mutations guarded by _TICK_SUBS_LOCK; broadcast snapshots the list before
+#   iterating so a mid-fan-out disconnect cannot raise IndexError.
+#   Queue.put_nowait() is non-blocking — slow subscribers drop ticks, never
+#   block the Databento feed thread.
 
+_SSE_TOKEN_TTL      = 45    # seconds before an unused token expires
+_SSE_MAX_PER_OWNER  = 3     # max simultaneous streams per authenticated owner
+_SSE_MAX_TOTAL      = 20    # max simultaneous streams across all owners
+_SSE_QUEUE_DEPTH    = 300   # per-subscriber queue capacity
+_SSE_HEARTBEAT_S    = 15    # heartbeat interval (keeps proxies alive)
+
+# Token store: {token_str: {inst, expires_mono, expires_iso, connection_started}}
+# Populated by POST /tick-stream-token; cleaned up by background daemon.
+_SSE_TOKENS: dict      = {}
+_SSE_TOKENS_LOCK       = threading.Lock()
+
+# Per-instrument subscriber list (each entry is a dict — see above)
+_TICK_SUBSCRIBERS: dict[str, list] = {inst: [] for inst in ("MGC", "MNQ", "MES", "MYM")}
+_TICK_SUBS_LOCK    = threading.Lock()
+_SSE_TOTAL_CONNS   = 0    # total active streams; guarded by _TICK_SUBS_LOCK
+_SSE_DISCONNECTS   = 0    # lifetime disconnect count; guarded by _TICK_SUBS_LOCK
+
+
+# ── Token helpers ──────────────────────────────────────────────────────────────
+
+def _prune_expired_sse_tokens() -> None:
+    """Remove expired tokens from _SSE_TOKENS.
+    Caller MUST hold _SSE_TOKENS_LOCK."""
+    _now = time.monotonic()
+    _dead = [t for t, v in _SSE_TOKENS.items() if v["expires_mono"] < _now]
+    for _t in _dead:
+        del _SSE_TOKENS[_t]
+
+
+def _sse_token_cleanup_daemon() -> None:
+    """Background daemon — prunes expired SSE tokens every 30 s."""
+    while True:
+        try:
+            time.sleep(30)
+            with _SSE_TOKENS_LOCK:
+                _prune_expired_sse_tokens()
+        except Exception:
+            pass
+
+
+threading.Thread(
+    target=_sse_token_cleanup_daemon, daemon=True, name="sse-token-cleanup"
+).start()
+
+
+# ── Broadcast ─────────────────────────────────────────────────────────────────
 
 def _databento_tick_broadcast(inst: str, ts_s: float, price: float,
                                volume: int, side) -> None:
     """Tick callback registered with DatabentoBrain — fans out to SSE queues.
-    Called on the Databento feed thread; must return immediately (never blocks)."""
-    tick = {
-        "ts_s":   round(ts_s, 6),
-        "price":  price,
-        "volume": int(volume),
-        "side":   side if side in ("A", "B") else "N",
+    Called on the Databento feed thread; MUST return immediately (non-blocking).
+
+    Enqueues an enriched tick payload that includes the server-authoritative
+    partial-bar snapshot (already updated by _tick_bar before this fires).
+    put_nowait() is used throughout — a full queue drops the tick and increments
+    the subscriber's drop counter.  The Databento feed thread is never blocked.
+    """
+    _side = side if side in ("A", "B") else "N"
+    tick_data: dict = {
+        "instrument": inst,
+        "ts_s":       round(ts_s, 6),
+        "price":      price,
+        "size":       int(volume),
+        "side":       _side,
     }
+    # Include the server-authoritative partial bar (updated by _tick_bar already).
+    # Use globals().get() because DATABENTO_PARTIAL_BY_INST is imported lazily
+    # inside Flask route functions; it may not be in global scope when the feed
+    # is disabled (DATABENTO_ENABLED=0) or during test collection.
+    _dpbi   = globals().get("DATABENTO_PARTIAL_BY_INST") or {}
+    _partial = _dpbi.get(inst)
+    if _partial:
+        tick_data["partial_bar"] = {
+            "open":     _partial.get("open"),
+            "high":     _partial.get("high"),
+            "low":      _partial.get("low"),
+            "close":    _partial.get("close"),
+            "volume":   _partial.get("volume"),
+            "complete": False,
+        }
+
     with _TICK_SUBS_LOCK:
         subs = list(_TICK_SUBSCRIBERS.get(inst, []))
-    for q in subs:
+    for _sub in subs:
         try:
-            q.put_nowait(tick)
+            _sub["q"].put_nowait(tick_data)
         except Exception:
-            pass   # queue full → subscriber is slow; drop tick (fail-open)
+            _sub["drops"] += 1   # GIL-safe dict-value mutation; never blocks
 
+
+# ── Token issuance endpoint ────────────────────────────────────────────────────
+
+@app.route("/main-brain/tick-stream-token", methods=["POST"])
+def post_tick_stream_token():
+    """Issue a short-lived SSE access token for a specific instrument.
+
+    POST /main-brain/tick-stream-token?inst=MGC
+
+    Auth: enforced at the Express /api edge (this route is NOT in dashboard-auth
+    OPEN_PATHS — the Basic-auth wall applies).
+
+    Response:
+      {"ok": true, "token": "...", "expires_at": "...",
+       "ttl_seconds": 45, "allowed_instruments": ["MGC"]}
+
+    The token value is redacted from Flask logs.
+    Tokens expire within _SSE_TOKEN_TTL seconds if not used to open a stream.
+    Reconnect must obtain a fresh token; the same token cannot be reused.
+    DISPLAY-ONLY — no gate, scoring, execution, or money-path side effects.
+    """
+    import secrets as _sec   # stdlib; deferred to keep top-level imports clean
+
+    inst = request.args.get("inst", "").upper()
+    if inst not in ("MGC", "MNQ", "MES", "MYM"):
+        return jsonify({"ok": False, "reason": "UNKNOWN_INSTRUMENT"}), 400
+
+    token_str   = _sec.token_urlsafe(32)   # 43 URL-safe base64 chars; crypto-strong
+    _now_mono   = time.monotonic()
+    _now_iso    = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    with _SSE_TOKENS_LOCK:
+        _prune_expired_sse_tokens()
+        _SSE_TOKENS[token_str] = {
+            "inst":               inst,
+            "expires_mono":       _now_mono + _SSE_TOKEN_TTL,
+            "expires_iso":        _now_iso,
+            "connection_started": False,
+        }
+
+    # Redact the token value from structured logs; only log the instrument
+    logger.debug("SSE token issued — inst=%s ttl=%ds", inst, _SSE_TOKEN_TTL)
+    return jsonify({
+        "ok":                  True,
+        "token":               token_str,
+        "expires_at":          _now_iso,
+        "ttl_seconds":         _SSE_TOKEN_TTL,
+        "allowed_instruments": [inst],
+    })
+
+
+# ── SSE stream ────────────────────────────────────────────────────────────────
 
 @app.route("/main-brain/tick-stream", methods=["GET"])
 def get_main_brain_tick_stream():
     """SSE stream of live Databento trade ticks for the real-time dashboard chart.
 
-    GET /main-brain/tick-stream?inst=MGC
+    GET /main-brain/tick-stream?inst=MGC&token=<short-lived-token>
 
-    Events:
-      data: {"ts_s": 1234567890.123, "price": 2675.4, "volume": 1, "side": "A"}
-      event: heartbeat\\ndata: {}   (every 15 s — keeps the connection alive)
+    Auth: short-lived cryptographic token issued by POST /tick-stream-token
+    (which is auth-protected at Express).  This route is in dashboard-auth
+    OPEN_PATHS solely because EventSource cannot send Authorization headers;
+    the Flask handler validates the token and returns 401 before allocating
+    any subscriber queue, so anonymous clients are rejected at the gate.
 
-    Returns 503 JSON (not SSE) when DATABENTO_ENABLED=0 so the UI can
-    distinguish "feed off" from "route missing".
+    SSE event types:
+      event: status     — initial connection confirmation
+      event: tick       — one per Databento trade; includes partial_bar snapshot
+      event: heartbeat  — every 15 s with no trade (keeps proxies alive)
 
-    DISPLAY-ONLY — never reads or writes any gate, scoring, execution, or
-    money-path state.  Safe to leave in dashboard-auth OPEN_PATHS because it
-    returns only live price ticks (no account data, no credentials).
+    Error responses (JSON, not SSE):
+      401  SSE_TOKEN_REQUIRED / SSE_TOKEN_INVALID_OR_EXPIRED /
+           SSE_TOKEN_INSTRUMENT_MISMATCH / SSE_TOKEN_ALREADY_USED
+      400  UNKNOWN_INSTRUMENT
+      429  SSE_CONNECTION_LIMIT_PER_OWNER / SSE_CONNECTION_LIMIT_TOTAL
+      503  DATABENTO_DISABLED
+
+    DISPLAY-ONLY — never reads or writes gate, scoring, execution, or learning state.
     """
     from flask import stream_with_context, Response as FlaskResponse  # noqa: PLC0415
+
+    # 1. Instrument validation (safe to check early — reveals no auth state)
+    inst = request.args.get("inst", "").upper()
+    if inst not in ("MGC", "MNQ", "MES", "MYM"):
+        return jsonify({"ok": False, "reason": "UNKNOWN_INSTRUMENT"}), 400
+
+    # 2. Token validation — MANDATORY; anonymous requests rejected before any
+    #    resource allocation or feature-gate reveal (security-first ordering).
+    token_str = request.args.get("token", "").strip()
+    if not token_str:
+        return jsonify({"ok": False, "reason": "SSE_TOKEN_REQUIRED"}), 401
+
+    with _SSE_TOKENS_LOCK:
+        _prune_expired_sse_tokens()
+        _entry = _SSE_TOKENS.get(token_str)
+        if _entry is None:
+            return jsonify({"ok": False,
+                            "reason": "SSE_TOKEN_INVALID_OR_EXPIRED"}), 401
+        if _entry["inst"] != inst:
+            return jsonify({"ok": False,
+                            "reason": "SSE_TOKEN_INSTRUMENT_MISMATCH"}), 401
+        if _entry["connection_started"]:
+            # Already consumed — reconnect must obtain a fresh token
+            return jsonify({"ok": False,
+                            "reason": "SSE_TOKEN_ALREADY_USED"}), 401
+        # Consume the token (prevents replay)
+        _entry["connection_started"] = True
+
+    # 3. Feature gate — checked after auth so anonymous requests never learn
+    #    whether the feed is enabled or not
     if not DATABENTO_ENABLED or _DATABENTO_BRAIN is None:
         return jsonify({"ok": False, "enabled": False,
                         "reason": "DATABENTO_DISABLED"}), 503
 
-    inst = request.args.get("inst", "MNQ").upper()
-    if inst not in ("MGC", "MNQ", "MES", "MYM"):
-        return jsonify({"ok": False, "reason": "UNKNOWN_INSTRUMENT"}), 400
-
-    tick_q: queue.Queue = queue.Queue(maxsize=300)
-
+    # 4. Connection limits
     with _TICK_SUBS_LOCK:
-        _TICK_SUBSCRIBERS[inst].append(tick_q)
+        global _SSE_TOTAL_CONNS
+        if _SSE_TOTAL_CONNS >= _SSE_MAX_TOTAL:
+            return jsonify({"ok": False, "reason": "SSE_CONNECTION_LIMIT_TOTAL",
+                            "limit": _SSE_MAX_TOTAL}), 429
+        _owner_count = sum(len(v) for v in _TICK_SUBSCRIBERS.values())
+        if _owner_count >= _SSE_MAX_PER_OWNER:
+            return jsonify({"ok": False, "reason": "SSE_CONNECTION_LIMIT_PER_OWNER",
+                            "limit": _SSE_MAX_PER_OWNER}), 429
 
+    # 5. Allocate subscriber
+    _sub_id  = str(uuid.uuid4())[:8]
+    tick_q: queue.Queue = queue.Queue(maxsize=_SSE_QUEUE_DEPTH)
+    _sub_rec = {
+        "q":            tick_q,
+        "inst":         inst,
+        "connected_at": time.monotonic(),
+        "drops":        0,
+        "sub_id":       _sub_id,
+    }
+    with _TICK_SUBS_LOCK:
+        _TICK_SUBSCRIBERS[inst].append(_sub_rec)
+        _SSE_TOTAL_CONNS += 1
+
+    logger.debug("SSE subscriber %s connected — inst=%s", _sub_id, inst)
+
+    # 6. Stream generator
     def _generate():
+        global _SSE_TOTAL_CONNS, _SSE_DISCONNECTS
+
+        # Initial status event confirms the stream is live
+        _db_status   = globals().get("DATABENTO_STATUS") or {}
+        _status_data = json.dumps({
+            "instrument":     inst,
+            "connection":     "live",
+            "feed_connected": bool(_db_status.get("connected")),
+            "sub_id":         _sub_id,
+        })
+        yield f"event: status\ndata: {_status_data}\n\n"
+
         try:
             while True:
                 try:
-                    tick = tick_q.get(timeout=15)
-                    yield f"data: {_jj.dumps(tick)}\n\n"
+                    _tick = tick_q.get(timeout=_SSE_HEARTBEAT_S)
+                    yield f"event: tick\ndata: {json.dumps(_tick)}\n\n"
                 except queue.Empty:
-                    # 15 s with no trade → send heartbeat to keep proxy alive
                     yield "event: heartbeat\ndata: {}\n\n"
         except GeneratorExit:
             pass
         finally:
             with _TICK_SUBS_LOCK:
                 try:
-                    _TICK_SUBSCRIBERS[inst].remove(tick_q)
+                    _TICK_SUBSCRIBERS[inst].remove(_sub_rec)
                 except ValueError:
                     pass
+                _SSE_TOTAL_CONNS   = max(0, _SSE_TOTAL_CONNS - 1)
+                _SSE_DISCONNECTS  += 1
+            logger.debug("SSE subscriber %s disconnected — inst=%s drops=%d",
+                         _sub_id, inst, _sub_rec["drops"])
 
     return FlaskResponse(
         stream_with_context(_generate()),
@@ -39429,6 +39638,51 @@ def get_main_brain_tick_stream():
             "Connection":        "keep-alive",
         },
     )
+
+
+# ── SSE diagnostics ───────────────────────────────────────────────────────────
+
+@app.route("/main-brain/tick-stream/diagnostics", methods=["GET"])
+def get_tick_stream_diagnostics():
+    """Read-only SSE diagnostics.  Owner-only (Express /api auth is the primary guard;
+    this route is NOT in dashboard-auth OPEN_PATHS and is not accessible anonymously).
+
+    Returns per-instrument subscriber metadata, queue depths, drop counts,
+    connection ages, total/disconnect counters, and token store size.
+    Token values and subscriber identities are NEVER exposed.
+    """
+    _now = time.monotonic()
+    _per_inst = {}
+    with _TICK_SUBS_LOCK:
+        _total = _SSE_TOTAL_CONNS
+        _disconnects = _SSE_DISCONNECTS
+        for _ik, _subs in _TICK_SUBSCRIBERS.items():
+            _per_inst[_ik] = [
+                {
+                    "sub_id":      s["sub_id"],
+                    "age_s":       round(_now - s["connected_at"], 1),
+                    "queue_depth": s["q"].qsize(),
+                    "drops":       s["drops"],
+                }
+                for s in _subs
+            ]
+    with _SSE_TOKENS_LOCK:
+        _token_count = len(_SSE_TOKENS)
+
+    return jsonify({
+        "ok":                True,
+        "total_conns":       _total,
+        "total_disconnects": _disconnects,
+        "token_store_size":  _token_count,
+        "limits": {
+            "max_per_owner": _SSE_MAX_PER_OWNER,
+            "max_total":     _SSE_MAX_TOTAL,
+            "token_ttl_s":   _SSE_TOKEN_TTL,
+            "queue_depth":   _SSE_QUEUE_DEPTH,
+            "heartbeat_s":   _SSE_HEARTBEAT_S,
+        },
+        "subscribers": _per_inst,
+    })
 
 
 @app.route("/main-brain/chart", methods=["GET"])

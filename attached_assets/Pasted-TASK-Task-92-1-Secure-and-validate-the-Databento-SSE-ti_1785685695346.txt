@@ -1,0 +1,315 @@
+TASK: Task #92.1 — Secure and validate the Databento SSE tick stream before beginning Trade Desk Task #93.
+
+CONTEXT
+
+Task #92 added:
+
+- Databento tick callbacks
+- SSE fan-out through `/main-brain/tick-stream`
+- sub-second chart updates
+- reconnect behavior
+- TICK LIVE / TICK OFF status
+- Trade Desk navigation and layout
+
+Because native EventSource cannot send the current Basic Authorization header, the SSE endpoint was added to OPEN_PATHS.
+
+GOAL
+
+Preserve real-time tick updates without exposing an unauthenticated market-data stream or allowing uncontrolled SSE resource consumption.
+
+Do not begin Task #93 until this hardening pass is complete.
+
+STRICT SCOPE
+
+Do not modify:
+
+- Databento subscriptions
+- tick or bar calculations
+- strategy calculations
+- Edge Score
+- readiness
+- alerts
+- risk rules
+- TradersPost
+- execution behavior
+- learning logic
+
+PART 1 — REMOVE PERMANENT OPEN ACCESS
+
+Do not leave `/main-brain/tick-stream` as a generally unauthenticated OPEN_PATH.
+
+Use one secure authentication method compatible with streaming.
+
+Preferred options, in order:
+
+1. Same-origin secure HttpOnly session cookie, if the existing authentication layer can issue and validate one safely.
+2. Short-lived, single-purpose SSE access token issued through an authenticated endpoint.
+3. An authenticated fetch-based streaming client using `fetch()` and `ReadableStream`, allowing the existing Authorization header.
+
+Do not place long-lived Basic credentials in:
+
+- query strings
+- browser history
+- server logs
+- analytics
+- referrer headers
+
+Do not use a permanent reusable token embedded in frontend code.
+
+PART 2 — RECOMMENDED TOKEN FLOW
+
+If using a short-lived SSE token:
+
+Authenticated request:
+
+POST `/api/main-brain/tick-stream-token`
+
+Response:
+
+{
+  "token": "...",
+  "expires_at": "...",
+  "allowed_instruments": ["MGC", "MNQ", "MES", "MYM"]
+}
+
+Then connect:
+
+GET `/main-brain/tick-stream?inst=MGC&token=<short-lived-token>`
+
+Token requirements:
+
+- cryptographically strong
+- expires within approximately 30–60 seconds for connection establishment
+- scoped only to the SSE route
+- scoped to the authenticated owner
+- scoped to permitted instruments
+- single-use or safely replay-limited
+- never stored in localStorage
+- redacted from logs
+- invalid after logout
+- not accepted by execution or other API routes
+
+An established SSE connection may remain open after the initial token-expiration time, but reconnect must obtain a fresh token.
+
+PART 3 — CONNECTION LIMITS
+
+Add server-side limits:
+
+- maximum SSE connections per authenticated user
+- maximum total SSE connections
+- maximum one active stream per instrument per browser/session where practical
+- idle/heartbeat timeout
+- clean disconnect removal
+- bounded queue per subscriber
+- rate-limited reconnect attempts
+
+When a limit is reached, return an explicit safe error such as:
+
+429 SSE_CONNECTION_LIMIT
+
+Do not allow anonymous clients to allocate subscriber queues.
+
+PART 4 — QUEUE AND BACKPRESSURE DIAGNOSTICS
+
+Expose read-only internal metrics:
+
+- active subscribers
+- subscribers by instrument
+- queue depth
+- dropped events
+- connection age
+- reconnect count
+- disconnect cleanup count
+
+Do not expose subscriber identities or credentials publicly.
+
+Confirm that a slow or disconnected client cannot block the Databento feed thread.
+
+The Databento callback must remain fail-open and non-blocking.
+
+PART 5 — STREAM EVENT CONTRACT
+
+Document the exact SSE event types and schema.
+
+Suggested events:
+
+event: tick
+data: {
+  "instrument": "MGC",
+  "native_contract": "MGCQ6",
+  "timestamp": "...",
+  "price": 0,
+  "size": 0,
+  "partial_bar": {
+    "timestamp": "...",
+    "open": 0,
+    "high": 0,
+    "low": 0,
+    "close": 0,
+    "volume": 0,
+    "complete": false
+  }
+}
+
+event: heartbeat
+
+event: status
+
+Validate all server-generated payloads before serialization.
+
+Do not transmit internal objects or secrets.
+
+PART 6 — INSTRUMENT SWITCHING
+
+When the user switches instruments:
+
+1. Close the old SSE stream.
+2. Confirm subscriber cleanup.
+3. Acquire new stream authorization if required.
+4. Open exactly one stream for the new instrument.
+5. Reset partial-bar state.
+6. Prevent old ticks from updating the new instrument chart.
+
+Use a generation ID or instrument check so late events from a closing stream are ignored.
+
+PART 7 — RECONNECT SAFETY
+
+On disconnect:
+
+- close the old connection explicitly
+- request a fresh access token when required
+- reconnect with bounded exponential backoff
+- prevent overlapping reconnect timers
+- stop reconnecting on authentication failure
+- stop when the chart is collapsed
+- stop on component unmount
+- restart exactly once when expanded
+
+Do not reconnect indefinitely after a 401/403.
+
+Display:
+
+AUTH REQUIRED
+
+rather than repeatedly showing TICK OFF and retrying.
+
+PART 8 — CHART CORRECTNESS
+
+Verify that SSE ticks:
+
+- update only the current partial candle
+- never rewrite completed candles
+- do not duplicate volume
+- do not apply the same trade twice
+- do not produce out-of-order candle regression
+- do not cross instrument boundaries
+- correctly hand off when the minute closes
+- remain consistent with the next canonical HTTP chart response
+
+Compare the partial bar after a sequence of SSE ticks with `DATABENTO_PARTIAL_BY_INST`.
+
+PART 9 — TRADE DESK LOADING
+
+Preserve the intended layout:
+
+- Trade Desk must show the tall chart.
+- Trade Desk must wait for the normal authenticated Main Brain payload where required.
+- Execution controls may use their independent authenticated endpoint.
+- A Main Brain loading failure must not expose unauthenticated execution controls.
+
+Verify the final authenticated Trade Desk includes:
+
+- tall Databento chart
+- ARM/Enable controls
+- Trade Plan
+- Active Trades
+- Execution Status
+
+PART 10 — AUTHENTICATED BROWSER VALIDATION
+
+Capture authenticated browser evidence showing:
+
+1. Trade Desk route loaded
+2. TICK LIVE status
+3. Candle updating between HTTP poll cycles
+4. Instrument switch closes old stream and opens one new stream
+5. Collapse closes the stream
+6. Expand opens exactly one stream
+7. Logout or invalid authentication stops reconnecting
+8. Anonymous request is rejected
+9. Connection limit rejection
+
+Use browser network evidence, not code inspection alone.
+
+PART 11 — TESTS
+
+Add tests for:
+
+- anonymous SSE request rejected
+- expired token rejected
+- wrong-instrument token rejected
+- valid token accepted
+- token cannot access another endpoint
+- connection limit
+- queue overflow drops safely
+- subscriber removed on disconnect
+- instrument switching
+- stale stream event ignored
+- no duplicate reconnect timer
+- auth failure stops reconnect
+- collapse/unmount cleanup
+- heartbeat
+- Databento-disabled 503
+- slow subscriber does not block tick callback
+- completed candle not modified by late tick
+- partial bar remains consistent with canonical store
+
+Run all existing Task #92 tests and Main Brain regressions.
+
+PART 12 — VALIDATION
+
+Run:
+
+- SSE security tests
+- chart endpoint tests
+- LiveMarketChart tests
+- Trade Desk tests
+- navigation tests
+- authentication tests
+- Databento bar tests
+- stale-partial flush tests
+- execution-control tests
+- TypeScript typecheck
+- production build
+- git diff --check
+
+Report full TypeScript status honestly.
+
+PART 13 — COMMIT
+
+Create one clean commit containing Task #92 and this security hardening.
+
+Do not begin Task #93 until:
+
+- anonymous SSE access is rejected
+- authenticated live stream is proven
+- cleanup and reconnect behavior are proven
+- the Trade Desk chart renders in a real authenticated session
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Authentication design selected
+4. Confirmation that tick stream is no longer generally open
+5. Token/cookie/stream-auth lifetime and scope
+6. Connection limits
+7. Queue/backpressure behavior
+8. Subscriber cleanup proof
+9. Browser network evidence
+10. Trade Desk screenshots
+11. Test results
+12. Full TypeScript and build status
+13. Confirmation that no market-data calculation, trading, scoring, risk, or execution behavior changed

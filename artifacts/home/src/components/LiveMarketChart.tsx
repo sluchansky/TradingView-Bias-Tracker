@@ -153,7 +153,15 @@ function barToCandle(b: ChartBar) {
 
 // ── Status strip ──────────────────────────────────────────────────────────────
 
-function StatusStrip({ data, sseConnected }: { data: ChartResponse | null; sseConnected: boolean }) {
+function StatusStrip({
+  data,
+  sseConnected,
+  sseAuthFailed,
+}: {
+  data: ChartResponse | null;
+  sseConnected: boolean;
+  sseAuthFailed: boolean;
+}) {
   if (!data) {
     return (
       <div style={{ padding: "4px 10px", fontSize: 10, color: T.txtMuted, fontFamily: T.mono }}>
@@ -182,10 +190,10 @@ function StatusStrip({ data, sseConnected }: { data: ChartResponse | null; sseCo
         )}
       </span>
       <span style={{
-        color: sseConnected ? T.green : T.txtMuted,
-        fontWeight: sseConnected ? 700 : 400,
+        color:      sseAuthFailed ? T.amber : (sseConnected ? T.green : T.txtMuted),
+        fontWeight: (sseConnected || sseAuthFailed) ? 700 : 400,
       }}>
-        {sseConnected ? "● TICK LIVE" : "○ TICK OFF"}
+        {sseAuthFailed ? "⚠ AUTH REQUIRED" : (sseConnected ? "● TICK LIVE" : "○ TICK OFF")}
       </span>
       {data.instrument && (
         <span>{data.instrument}
@@ -309,6 +317,12 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   // True while an SSE connection is alive — suppresses the poll-driven partial
   // bar update (SSE has already rendered it tick-by-tick).
   const sseActiveRef    = useRef(false);
+  // Generation counter — incremented on every instrument/collapsed change.
+  // Stale events from a closing stream are ignored when gen !== generationRef.current.
+  const generationRef   = useRef(0);
+  // Auth-failure latch — set when the token endpoint returns 401/403;
+  // prevents infinite reconnect on authentication failure.
+  const [sseAuthFailed, setSseAuthFailed] = useState(false);
 
   // ── Fetch ─────────────────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
@@ -341,48 +355,117 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   }, [fetchData, collapsed]);
 
   // ── SSE tick subscription ─────────────────────────────────────────────────
-  // Opens an EventSource connection to /api/main-brain/tick-stream for the
-  // selected instrument.  On each tick the current bar is updated in real time.
-  // EventSource cannot send Authorization headers, so the route is in OPEN_PATHS
-  // on the Express side (display-only price ticks — no credentials or gate data).
+  // Secure token-based EventSource flow:
+  //   1. POST /api/main-brain/tick-stream-token (authenticated with authHeader)
+  //      → short-lived 45-second token.
+  //   2. Open EventSource /api/main-brain/tick-stream?inst=…&token=<tok>.
+  //      Flask validates the token; anonymous connections are rejected with 401.
+  //   3. Handle typed SSE events: "tick", "heartbeat", "status".
+  //   4. On disconnect: close, acquire a fresh token, reconnect with backoff.
+  //   5. Stop reconnecting on 401/403 from the token endpoint (show AUTH REQUIRED).
+  //
+  // generationRef guards against stale ticks from a closing stream arriving after
+  // an instrument switch — each effect run increments the generation counter and
+  // tick handlers check it before mutating chart state.
   useEffect(() => {
     if (collapsed) return;
+
+    // Capture this effect's generation; stale events from previous runs are ignored.
+    const gen = ++generationRef.current;
 
     let es: EventSource | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
     let delay = 3_000;
     let stopped = false;
 
-    const connect = () => {
-      if (stopped) return;
-      es = new EventSource(`/api/main-brain/tick-stream?inst=${instrument}`);
+    const connect = async () => {
+      if (stopped || gen !== generationRef.current) return;
+
+      // Step 1 — obtain a fresh short-lived token via authenticated POST
+      let token: string;
+      try {
+        const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+        if (authHeader) headers['Authorization'] = authHeader;
+        const resp = await fetch(
+          `/api/main-brain/tick-stream-token?inst=${instrument}`,
+          { method: 'POST', headers },
+        );
+        if (resp.status === 401 || resp.status === 403) {
+          // Auth failure — stop retrying; show AUTH REQUIRED in the status strip
+          if (!stopped && gen === generationRef.current) {
+            setSseAuthFailed(true);
+            sseActiveRef.current = false;
+            setSseConnected(false);
+          }
+          return;
+        }
+        if (!resp.ok) throw new Error(`token-fetch ${resp.status}`);
+        const body = await resp.json() as { token: string };
+        token = body.token;
+      } catch {
+        // Network / parse error — retry with backoff
+        if (!stopped && gen === generationRef.current) {
+          timer = setTimeout(() => { delay = Math.min(delay * 2, 30_000); void connect(); }, delay);
+        }
+        return;
+      }
+
+      if (stopped || gen !== generationRef.current) return;
+
+      // Step 2 — open EventSource with token in query string
+      es = new EventSource(
+        `/api/main-brain/tick-stream?inst=${instrument}&token=${encodeURIComponent(token)}`,
+      );
 
       es.onopen = () => {
+        if (gen !== generationRef.current) { es?.close(); return; }
         sseActiveRef.current = true;
         setSseConnected(true);
+        setSseAuthFailed(false);
         delay = 3_000;
       };
 
-      es.onmessage = (ev) => {
+      // Typed "tick" events — use server-authoritative partial_bar when present
+      es.addEventListener('tick', (rawEv: Event) => {
+        if (gen !== generationRef.current) return;
         try {
+          const ev = rawEv as MessageEvent;
           const tick = JSON.parse(ev.data) as {
-            ts_s: number; price: number; volume: number; side: string;
+            ts_s: number;
+            price: number;
+            size: number;
+            side: string;
+            partial_bar?: {
+              open: number; high: number; low: number; close: number;
+              volume: number; complete: boolean;
+            };
           };
-          // Build / update the partial bar from this tick
           const barTs = Math.floor(tick.ts_s / 60) * 60;
-          const pb = partialBarRef.current;
-          if (!pb || pb.ts !== barTs) {
+
+          if (tick.partial_bar) {
+            // Use server-authoritative snapshot — already aggregated by the backend
+            const pb = tick.partial_bar;
             partialBarRef.current = {
-              ts: barTs, open: tick.price, high: tick.price,
-              low: tick.price, close: tick.price, volume: tick.volume,
+              ts: barTs, open: pb.open, high: pb.high,
+              low: pb.low, close: pb.close, volume: pb.volume ?? 0,
             };
           } else {
-            if (tick.price > pb.high) pb.high = tick.price;
-            if (tick.price < pb.low)  pb.low  = tick.price;
-            pb.close  = tick.price;
-            pb.volume = (pb.volume ?? 0) + tick.volume;
+            // Fallback: build client-side aggregate (no partial_bar field)
+            const pb = partialBarRef.current;
+            if (!pb || pb.ts !== barTs) {
+              partialBarRef.current = {
+                ts: barTs, open: tick.price, high: tick.price,
+                low: tick.price, close: tick.price, volume: tick.size ?? 0,
+              };
+            } else {
+              if (tick.price > pb.high) pb.high = tick.price;
+              if (tick.price < pb.low)  pb.low  = tick.price;
+              pb.close  = tick.price;
+              pb.volume = (pb.volume ?? 0) + (tick.size ?? 0);
+            }
           }
-          // Push to chart — replaces / creates the current-bar candle
+
+          // Push the updated bar to the chart (replaces current-minute candle)
           const b = partialBarRef.current!;
           candleSeriesRef.current?.update({
             time: b.ts as UTCTimestamp,
@@ -394,32 +477,39 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
             color: b.close >= b.open ? `${T.green}60` : `${T.red}60`,
           });
         } catch { /* ignore parse errors */ }
-      };
+      });
+
+      // "status" event — feed-level connection confirmation; no chart mutation
+      es.addEventListener('status', () => { /* informational */ });
+
+      // "heartbeat" event — keep-alive; no chart mutation
+      es.addEventListener('heartbeat', () => { /* keep-alive noop */ });
 
       es.onerror = () => {
         sseActiveRef.current = false;
         setSseConnected(false);
         es?.close();
         es = null;
-        if (!stopped) {
+        if (!stopped && gen === generationRef.current) {
           timer = setTimeout(() => {
             delay = Math.min(delay * 2, 30_000);
-            connect();
+            void connect(); // fresh token on each reconnect attempt
           }, delay);
         }
       };
     };
 
-    connect();
+    void connect();
 
     return () => {
       stopped = true;
+      generationRef.current++; // invalidate any in-flight tick events immediately
       sseActiveRef.current = false;
       setSseConnected(false);
       es?.close();
       if (timer) clearTimeout(timer);
     };
-  }, [instrument, collapsed]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [instrument, collapsed, authHeader]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Create / destroy chart ────────────────────────────────────────────────
   useEffect(() => {
@@ -756,7 +846,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       {/* Body */}
       {!collapsed && (
         <>
-          <StatusStrip data={data} sseConnected={sseConnected} />
+          <StatusStrip data={data} sseConnected={sseConnected} sseAuthFailed={sseAuthFailed} />
 
           {isDisabled ? (
             <div style={{

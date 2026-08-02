@@ -1,5 +1,7 @@
 # Memory Index
 
+- [SSE tick-stream security hardening](sse-security-hardening.md) — token-before-feature-gate ordering; DATABENTO_PARTIAL_BY_INST lazy-import gotcha; raising=False monkeypatch pattern.
+
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
 - [Main Brain population wiring](main-brain-population-wiring.md) — normalizeMainBrainPayload() is the single bridge; 29 schema mismatches; voice=dict extract narration; active_trades/alerts are bare lists; coach.weight_updated is boolean.
 - [VWAP source authority (Phase 1A)](vwap-source-authority.md) — Grace window removed. CHART_VWAP_BY_TICKER secondary store + get_vwap_diagnostics(); result["vwap_diagnostics"] always present.

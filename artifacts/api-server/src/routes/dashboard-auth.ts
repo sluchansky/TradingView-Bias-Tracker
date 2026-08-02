@@ -12,9 +12,13 @@ const OPEN_PATHS = new Set([
   "/ping",
   "/webhook",
   "/vrm",
-  // SSE tick stream — EventSource cannot send Authorization headers, so this
-  // display-only price-tick feed must be open.  It returns only live OHLCV
-  // ticks (no account data, no credentials, no gate or scoring state).
+  // SSE tick stream — EventSource cannot send Authorization headers, so Express
+  // cannot enforce Basic-auth on this route.  Security is provided at the Flask
+  // layer via a short-lived cryptographic token: the browser first POSTs to
+  // /main-brain/tick-stream-token (which IS auth-protected at this Express edge),
+  // receives a 45-second token, and then opens EventSource with ?token=<tok>.
+  // Flask rejects all tokenless/expired/wrong-instrument requests with 401 before
+  // allocating any subscriber queue — anonymous clients are rejected at the gate.
   "/main-brain/tick-stream",
 ]);
 
