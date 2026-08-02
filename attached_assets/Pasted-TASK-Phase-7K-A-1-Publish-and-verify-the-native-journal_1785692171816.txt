@@ -1,0 +1,202 @@
+TASK: Phase 7K-A.1 — Publish and verify the native journal schema in production.
+
+CONTEXT
+
+Phase A created the native_journal foundation in development:
+
+- native_journal table
+- 50 columns
+- 6 indexes
+- send-time snapshot linkage
+- lifecycle helpers
+- execution merge
+- terminal close linkage
+- learning eligibility checks
+- 61 focused tests passing
+
+The development server reports:
+
+native_journal table ready — native journal enabled
+
+GOAL
+
+Apply the committed native journal schema safely to the published production database and prove that the deployed application can create and read native journal records.
+
+This is a schema deployment and evidence task.
+
+Do not add new journal features.
+
+STRICT SCOPE
+
+DO NOT modify:
+
+- strategy logic
+- Edge Score
+- readiness
+- Databento
+- risk
+- TradersPost payloads
+- execution gateway behavior
+- active-trade management
+- learning formulas
+- Main Brain polling
+- authentication
+
+PART 1 — VERIFY SCHEMA ARTIFACT
+
+Inspect:
+
+db_native_journal_schema.sql
+
+Report:
+
+- exact table name
+- exact column count
+- exact index count
+- unique constraints
+- default values
+- JSONB defaults
+- timestamp columns
+- whether pgcrypto/gen_random_uuid() is required
+- whether the file is fully idempotent
+
+Do not rely on the earlier design document if the implemented schema differs.
+
+The schema file is the source of truth.
+
+PART 2 — PRODUCTION MIGRATION SAFETY
+
+Before applying:
+
+- confirm the production database target
+- confirm native_journal does not already exist with an incompatible schema
+- inspect any existing table if present
+- compare development and production schemas
+- create no destructive migration
+- do not drop or rename existing columns
+- do not delete rows
+- do not alter legacy journal tables
+
+Use additive and idempotent SQL only.
+
+PART 3 — APPLY THE SCHEMA
+
+Apply db_native_journal_schema.sql using the project’s normal production publish/migration mechanism.
+
+Do not execute DDL from a request handler.
+
+Capture:
+
+- migration start time
+- migration completion time
+- statements applied
+- statements skipped as already present
+- any warnings or errors
+
+PART 4 — VERIFY PRODUCTION TABLE
+
+After migration, verify:
+
+- table exists
+- all required columns exist
+- all required indexes exist
+- unique internal_trade_id constraint works
+- JSONB defaults work
+- created_at and updated_at defaults work
+- a transaction can insert and roll back a test row
+
+Do not leave disposable test rows in production.
+
+PART 5 — DEPLOYED BOOT PROBE
+
+Republish/restart the application.
+
+Verify the deployed logs show:
+
+native_journal table ready — native journal enabled
+
+Confirm:
+
+- NJ_DB_READY = true
+- no boot warning
+- no schema mismatch
+- no fallback to legacy-only behavior
+
+PART 6 — SAFE END-TO-END SMOKE TEST
+
+Use a paper or simulation trade only.
+
+Do not send a real order.
+
+Verify:
+
+1. A trade snapshot is created.
+2. Exactly one native_journal row is created.
+3. internal_trade_id matches the snapshot.
+4. lifecycle status is correct.
+5. source label is correct.
+6. strategy and thesis are preserved.
+7. Edge Score and readiness are preserved.
+8. planned entry, stop, targets and risk are present.
+9. execution block is populated appropriately.
+10. repeated processing does not create a duplicate row.
+
+Then read the row back through the existing debug/database path.
+
+PART 7 — LEGACY SAFETY
+
+Verify after publish:
+
+- journal_entries still works
+- tradezella_trades still works
+- strategy_trades still works
+- open_trades still works
+- existing Journal UI still loads
+- existing learning tests remain green
+
+PART 8 — TESTS
+
+Run:
+
+- native journal Phase A tests
+- trade snapshot tests
+- DB persistence tests
+- execution gateway tests
+- TradersPost tests
+- execution enable/arm tests
+- existing journal tests
+- learning tests
+- parity
+- scalp golden
+- dual-sim
+- breakout smoke
+- TypeScript typecheck
+- production build
+- git diff --check
+
+Do not report TypeScript as clean if unrelated pre-existing errors remain.
+
+PART 9 — COMMIT AND REPORT
+
+If the schema artifact or deployment documentation changes, create one clean commit.
+
+Do not begin Trade Log UI or Phase B management timeline work.
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Exact final native_journal schema
+4. Production migration result
+5. Production column and index verification
+6. Boot-probe result
+7. Paper/simulation smoke-test evidence
+8. Duplicate-prevention proof
+9. Legacy journal safety proof
+10. Test results
+11. Full TypeScript status
+12. Production build result
+13. Confirmation that no real order was sent
+14. Confirmation that no trading, risk, execution, Databento, scoring, readiness, or learning behavior changed
