@@ -314,6 +314,15 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   // moves in real time.  Reset on instrument change and synced from the poll
   // response so we always have a correct open/high/low baseline.
   const partialBarRef   = useRef<{ts:number,open:number,high:number,low:number,close:number,volume:number} | null>(null);
+
+  // Tracks the last display context so the chart can be immediately populated
+  // after it is recreated (e.g. when chartH or collapsed changes).
+  const latestDisplayRef = useRef<{
+    data: ChartResponse | null;
+    showVwap: boolean;
+    showStructure: boolean;
+    showTrade: boolean;
+  }>({ data: null, showVwap: true, showStructure: true, showTrade: true });
   // True while an SSE connection is alive — suppresses the poll-driven partial
   // bar update (SSE has already rendered it tick-by-tick).
   const sseActiveRef    = useRef(false);
@@ -511,6 +520,149 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     };
   }, [instrument, collapsed, authHeader]); // eslint-disable-line react-hooks/exhaustive-deps
 
+  // ── Apply data to chart ───────────────────────────────────────────────────
+  // Declared BEFORE the createChart effect so it can be called immediately
+  // after building a fresh chart — prevents "blank chart until next poll"
+  // when chartH or collapsed changes and the chart is recreated.
+  const applyDataToChart = useCallback(() => {
+    const { data: d, showVwap: sv, showStructure: ss, showTrade: st } = latestDisplayRef.current;
+    if (!d || !candleSeriesRef.current || !chartRef.current) return;
+
+    const bars    = d.bars ?? [];
+    const partial = d.partial_bar ?? null;
+    const prev    = lastBarsRef.current;
+
+    // Sync partialBarRef from poll data so SSE ticks always have the correct
+    // open/high/low baseline, even on first connect or after an instrument switch.
+    if (partial && (!partialBarRef.current || partialBarRef.current.ts !== partial.ts)) {
+      partialBarRef.current = {
+        ts:     partial.ts,
+        open:   partial.open,
+        high:   partial.high,
+        low:    partial.low,
+        close:  partial.close,
+        volume: partial.volume ?? 0,
+      };
+    }
+
+    // When SSE is live, skip the poll-driven partial bar update — the SSE
+    // handler is already keeping it current tick-by-tick.
+    const pollPartial = sseActiveRef.current ? null : partial;
+
+    // Build full candle list
+    const allCandles = [...bars, ...(pollPartial ? [pollPartial] : [])].map(barToCandle);
+    if (allCandles.length === 0) return;
+
+    const needsReset =
+      prev.length === 0 ||
+      bars.length < prev.length ||
+      (bars.length > 0 && prev.length > 0 && bars[0].ts !== prev[0].ts);
+
+    try {
+      if (needsReset) {
+        candleSeriesRef.current.setData(allCandles);
+        if (prev.length === 0) chartRef.current.timeScale().scrollToRealTime();
+      } else {
+        // Incremental: update last 2 candles (latest complete + partial)
+        const from = Math.max(0, allCandles.length - 2);
+        for (let i = from; i < allCandles.length; i++) {
+          candleSeriesRef.current.update(allCandles[i]);
+        }
+      }
+    } catch { /* chart may have been destroyed mid-render — ignore */ }
+    lastBarsRef.current = bars;
+
+    // Volume histogram
+    if (volSeriesRef.current) {
+      const all = [...bars, ...(partial ? [partial] : [])];
+      try {
+        volSeriesRef.current.setData(
+          all.map((b) => ({
+            time:  b.ts as UTCTimestamp,
+            value: b.volume ?? 0,
+            color: b.close >= b.open ? `${T.green}60` : `${T.red}60`,
+          })),
+        );
+      } catch { /* ignore */ }
+    }
+
+    // VWAP overlay — single horizontal line at current session value
+    if (vwapSeriesRef.current) {
+      try {
+        if (sv && d.vwap?.value) {
+          const v = d.vwap.value;
+          const all = [...bars, ...(partial ? [partial] : [])];
+          vwapSeriesRef.current.setData(
+            all.map((b) => ({ time: b.ts as UTCTimestamp, value: v })),
+          );
+        } else {
+          vwapSeriesRef.current.setData([]);
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Structure event markers
+    if (markersApiRef.current) {
+      try {
+        if (ss) {
+          const markers = (d.structure_events ?? [])
+            .filter(ev => ev.price != null)
+            .map(ev => {
+              const isBull  = /demand|BOS|CHOCH|BULLISH|HH|HL/i.test(ev.type);
+              const isSweep = /sweep/i.test(ev.type);
+              const color   = isSweep ? T.purple : isBull ? T.green : T.red;
+              const pos     = isBull ? "belowBar" : "aboveBar";
+              const shape   = isBull ? "arrowUp"  : "arrowDown";
+              return {
+                time:     ev.ts as UTCTimestamp,
+                position: pos  as "belowBar" | "aboveBar",
+                color,
+                shape:    shape as "arrowUp" | "arrowDown",
+                text:     ev.type.replace(/^(MGC|MNQ|MES|MYM) /i, "").slice(0, 14),
+                size:     1,
+              };
+            })
+            .sort((a, b) => (a.time as number) - (b.time as number));
+          markersApiRef.current.setMarkers(markers);
+        } else {
+          markersApiRef.current.setMarkers([]);
+        }
+      } catch { /* ignore */ }
+    }
+
+    // Active trade price lines
+    if (candleSeriesRef.current) {
+      for (const pl of tradeLinesRef.current) {
+        try { candleSeriesRef.current.removePriceLine(pl); } catch { /* gone */ }
+      }
+      tradeLinesRef.current = [];
+
+      if (st && d.active_trade) {
+        const at = d.active_trade;
+        const addLine = (
+          price: number | undefined,
+          color: string,
+          title: string,
+        ) => {
+          if (price == null || !isFinite(price)) return;
+          try {
+            const pl = candleSeriesRef.current!.createPriceLine({
+              price, color, lineWidth: 1,
+              lineStyle: LineStyle.Dashed,
+              axisLabelVisible: true,
+              title,
+            });
+            tradeLinesRef.current.push(pl);
+          } catch { /* ignore */ }
+        };
+        addLine(at.entry,   T.cyan,  "Entry");
+        addLine(at.stop,    T.red,   "Stop");
+        addLine(at.target1, T.green, "TP1");
+        if (at.target2 != null) addLine(at.target2, "#86efac", "TP2");
+      }
+    }
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Create / destroy chart ────────────────────────────────────────────────
   useEffect(() => {
     if (collapsed || !containerRef.current) return;
@@ -571,6 +723,12 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     volSeriesRef.current    = vol;
     markersApiRef.current   = markersApi;
 
+    // Apply any data we already have so the chart is never blank after
+    // recreation (e.g. navigating to Trade Desk changes chartH, which
+    // destroys and recreates the chart — without this the canvas stays
+    // empty until the next 5-second poll).
+    applyDataToChart();
+
     const ro = new ResizeObserver(() => {
       if (containerRef.current) {
         chart.resize(containerRef.current.clientWidth, chartH);
@@ -580,7 +738,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
 
     return () => {
       ro.disconnect();
-      chart.remove();
+      try { chart.remove(); } catch { /* container may already be detached */ }
       chartRef.current        = null;
       candleSeriesRef.current = null;
       vwapSeriesRef.current   = null;
@@ -589,136 +747,15 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       tradeLinesRef.current   = [];
       lastBarsRef.current     = [];
     };
-  }, [collapsed, chartH]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [collapsed, chartH, applyDataToChart]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── Apply data to chart ───────────────────────────────────────────────────
+  // ── Sync display state + re-apply data on change ──────────────────────────
   useEffect(() => {
-    if (!data || !candleSeriesRef.current || !chartRef.current) return;
-
-    const bars    = data.bars ?? [];
-    const partial = data.partial_bar ?? null;
-    const prev    = lastBarsRef.current;
-
-    // Sync partialBarRef from poll data so SSE ticks always have the correct
-    // open/high/low baseline, even on first connect or after an instrument switch.
-    if (partial && (!partialBarRef.current || partialBarRef.current.ts !== partial.ts)) {
-      partialBarRef.current = {
-        ts:     partial.ts,
-        open:   partial.open,
-        high:   partial.high,
-        low:    partial.low,
-        close:  partial.close,
-        volume: partial.volume ?? 0,
-      };
-    }
-
-    // When SSE is live, skip the poll-driven partial bar update — the SSE
-    // handler is already keeping it current tick-by-tick.
-    const pollPartial = sseActiveRef.current ? null : partial;
-
-    // Build full candle list
-    const allCandles = [...bars, ...(pollPartial ? [pollPartial] : [])].map(barToCandle);
-    if (allCandles.length === 0) return;
-
-    const needsReset =
-      prev.length === 0 ||
-      bars.length < prev.length ||
-      (bars.length > 0 && prev.length > 0 && bars[0].ts !== prev[0].ts);
-
-    if (needsReset) {
-      candleSeriesRef.current.setData(allCandles);
-      if (prev.length === 0) chartRef.current.timeScale().scrollToRealTime();
-    } else {
-      // Incremental: update last 2 candles (latest complete + partial)
-      const from = Math.max(0, allCandles.length - 2);
-      for (let i = from; i < allCandles.length; i++) {
-        candleSeriesRef.current.update(allCandles[i]);
-      }
-    }
-    lastBarsRef.current = bars;
-
-    // Volume histogram
-    if (volSeriesRef.current) {
-      const all = [...bars, ...(partial ? [partial] : [])];
-      volSeriesRef.current.setData(
-        all.map((b) => ({
-          time:  b.ts as UTCTimestamp,
-          value: b.volume ?? 0,
-          color: b.close >= b.open ? `${T.green}60` : `${T.red}60`,
-        })),
-      );
-    }
-
-    // VWAP overlay — single horizontal line at current session value
-    if (vwapSeriesRef.current) {
-      if (showVwap && data.vwap?.value) {
-        const v = data.vwap.value;
-        const all = [...bars, ...(partial ? [partial] : [])];
-        vwapSeriesRef.current.setData(
-          all.map((b) => ({ time: b.ts as UTCTimestamp, value: v })),
-        );
-      } else {
-        vwapSeriesRef.current.setData([]);
-      }
-    }
-
-    // Structure event markers
-    if (markersApiRef.current) {
-      if (showStructure) {
-        const markers = (data.structure_events ?? [])
-          .filter(ev => ev.price != null)
-          .map(ev => {
-            const isBull  = /demand|BOS|CHOCH|BULLISH|HH|HL/i.test(ev.type);
-            const isSweep = /sweep/i.test(ev.type);
-            const color   = isSweep ? T.purple : isBull ? T.green : T.red;
-            const pos     = isBull ? "belowBar" : "aboveBar";
-            const shape   = isBull ? "arrowUp"  : "arrowDown";
-            return {
-              time:     ev.ts as UTCTimestamp,
-              position: pos  as "belowBar" | "aboveBar",
-              color,
-              shape:    shape as "arrowUp" | "arrowDown",
-              text:     ev.type.replace(/^(MGC|MNQ|MES|MYM) /i, "").slice(0, 14),
-              size:     1,
-            };
-          })
-          .sort((a, b) => (a.time as number) - (b.time as number));
-        markersApiRef.current.setMarkers(markers);
-      } else {
-        markersApiRef.current.setMarkers([]);
-      }
-    }
-
-    // Active trade price lines
-    if (candleSeriesRef.current) {
-      for (const pl of tradeLinesRef.current) {
-        try { candleSeriesRef.current.removePriceLine(pl); } catch { /* gone */ }
-      }
-      tradeLinesRef.current = [];
-
-      if (showTrade && data.active_trade) {
-        const at = data.active_trade;
-        const addLine = (
-          price: number | undefined,
-          color: string,
-          title: string,
-        ) => {
-          if (price == null || !isFinite(price)) return;
-          const pl = candleSeriesRef.current!.createPriceLine({
-            price, color, lineWidth: 1,
-            lineStyle: LineStyle.Dashed,
-            axisLabelVisible: true,
-            title,
-          });
-          tradeLinesRef.current.push(pl);
-        };
-        addLine(at.entry,   T.cyan,  "Entry");
-        addLine(at.stop,    T.red,   "Stop");
-        addLine(at.target1, T.green, "TP1");
-        if (at.target2 != null) addLine(at.target2, "#86efac", "TP2");
-      }
-    }
-  }, [data, showVwap, showStructure, showTrade]);
+    // Keep the ref current so applyDataToChart (called from createChart effect)
+    // always has the latest values without needing to be re-created.
+    latestDisplayRef.current = { data, showVwap, showStructure, showTrade };
+    applyDataToChart();
+  }, [data, showVwap, showStructure, showTrade, applyDataToChart]);
 
   // ── Instrument / timeframe change handlers ────────────────────────────────
   const handleInstrument = (inst: string) => {
@@ -848,21 +885,39 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
         <>
           <StatusStrip data={data} sseConnected={sseConnected} sseAuthFailed={sseAuthFailed} />
 
-          {isDisabled ? (
-            <div style={{
-              height: chartH, display: "flex", alignItems: "center",
-              justifyContent: "center", flexDirection: "column", gap: 8,
-            }}>
-              <span style={{ fontSize: 13, color: T.txtMuted }}>DATABENTO FEED DISABLED</span>
-              <span style={{ fontSize: 10, color: T.txtMuted }}>
-                Set{" "}
-                <code style={{ fontFamily: T.mono, color: T.cyan }}>DATABENTO_ENABLED=1</code>
-                {" "}to enable live data
-              </span>
-            </div>
-          ) : (
-            <div ref={containerRef} style={{ width: "100%", height: chartH }} />
-          )}
+          {/* The chart container is always rendered so containerRef stays
+              stable. Swapping it in/out (via isDisabled) was unmounting the
+              DOM node, orphaning the lightweight-charts instance and causing
+              a permanent blank canvas when the feed re-enabled.
+              The disabled overlay is positioned on top instead. */}
+          <div style={{ position: "relative" }}>
+            <div
+              ref={containerRef}
+              style={{
+                width: "100%",
+                height: chartH,
+                // Hide the canvas visually when disabled, but keep it in the
+                // layout so ResizeObserver keeps firing and clientWidth stays
+                // valid for chart.resize() calls.
+                visibility: isDisabled ? "hidden" : "visible",
+                pointerEvents: isDisabled ? "none" : "auto",
+              }}
+            />
+            {isDisabled && (
+              <div style={{
+                position: "absolute", inset: 0,
+                display: "flex", alignItems: "center",
+                justifyContent: "center", flexDirection: "column", gap: 8,
+              }}>
+                <span style={{ fontSize: 13, color: T.txtMuted }}>DATABENTO FEED DISABLED</span>
+                <span style={{ fontSize: 10, color: T.txtMuted }}>
+                  Set{" "}
+                  <code style={{ fontFamily: T.mono, color: T.cyan }}>DATABENTO_ENABLED=1</code>
+                  {" "}to enable live data
+                </span>
+              </div>
+            )}
+          </div>
 
           {/* Active trade footer */}
           {!isDisabled && at && showTrade && (
