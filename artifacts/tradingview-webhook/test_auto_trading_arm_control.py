@@ -92,6 +92,7 @@ def _arm_session(insts=None, max_trades=3, max_contracts=None, duration_min=30,
     expires_at = armed_at + timedelta(minutes=duration_min)
     with APP._ARM_STATE_LOCK:
         APP._ARM_STATE.update({
+            "execution_enabled":      True,          # required by check 0 in _check_arm_for_transmission
             "armed":                  True,
             "armed_at":               armed_at.isoformat(),
             "expires_at":             expires_at.isoformat(),
@@ -221,8 +222,12 @@ class TestStartupDefaults(unittest.TestCase):
 
     def test_no_live_order_when_disarmed_even_with_traderspost_mode(self):
         """Spec §1: live mode + disarmed → arm check returns False, no broker call."""
-        # Verify the arm gate directly: disarmed state must block transmission
-        _reset_arm_state()   # system is disarmed
+        # Verify the arm gate directly: disarmed state must block transmission.
+        # Set execution_enabled=True so we reach the disarmed check (check 2).
+        # The gate must still return False because armed=False.
+        _reset_arm_state()   # system is disarmed (armed=False)
+        with APP._ARM_STATE_LOCK:
+            APP._ARM_STATE["execution_enabled"] = True  # pass check 0; reach check 2
         ok, reason, _ = APP._check_arm_for_transmission("MGC", 1)
         self.assertFalse(ok, "Disarmed system must not allow transmission")
         self.assertEqual(reason, APP.RC_DISARMED)

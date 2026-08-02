@@ -7685,6 +7685,7 @@ const ErrorScreen: React.FC<{ msg: string | null; refresh: () => void }> = ({ ms
 // that the legacy Flask dashboard uses.
 
 interface ArmStateData {
+  execution_enabled: boolean;
   armed: boolean;
   effective_state: string;
   armed_at: string | null;
@@ -7706,6 +7707,7 @@ interface ArmStateData {
   allowed_strategies: string[] | null;
   direction_restriction: string | null;
   single_position_only: boolean;
+  active_trade_count: number;
 }
 
 function useArmStateData() {
@@ -7794,6 +7796,18 @@ const ArmControlPanel: React.FC = () => {
     finally { setPending(false); }
   }
 
+  async function handleEnable() {
+    const ok = await doAction('enable', { confirm_phrase: 'ENABLE AUTO TRADING', by: 'operator' });
+    if (ok) setEnableModalOpen(false);
+  }
+
+  async function handleDisable() {
+    if (!window.confirm(
+      'Disable auto trading?\n\nThis will disarm and block all new automated entries.\nExisting protective orders on open trades are not affected.'
+    )) return;
+    await doAction('disable', { reason: 'operator_manual', by: 'operator' });
+  }
+
   async function handleArm() {
     if (confirmPhrase !== _ARM_CONFIRM_PHRASE) return;
     const insts = armInstruments.split(',').map(s => s.trim()).filter(Boolean);
@@ -7810,13 +7824,15 @@ const ArmControlPanel: React.FC = () => {
     if (ok) { setArmModalOpen(false); setConfirmPhrase(''); }
   }
 
-  const armed    = effState === 'live_armed';
-  const disarmed = effState === 'live_available_disarmed';
-  const locked   = effState === 'safety_locked';
+  const execEnabled = armData?.execution_enabled ?? false;
+  const armed       = effState === 'live_armed';
+  const disarmed    = effState === 'live_available_disarmed';
+  const locked      = effState === 'safety_locked';
   const tradesOver = (armData?.trades_used ?? 0) >= (armData?.max_trades ?? 9999);
   const lossNear   = armData?.max_session_loss != null
     && armData?.session_pnl < 0
     && Math.abs(armData.session_pnl) >= armData.max_session_loss * 0.8;
+  const [enableModalOpen, setEnableModalOpen] = useState(false);
 
   const btn = (color: string, label: string, onClick: () => void, disabled?: boolean) => (
     <button onClick={onClick} disabled={pending || !!disabled}
@@ -7834,8 +7850,18 @@ const ArmControlPanel: React.FC = () => {
     boxSizing: 'border-box',
   };
 
+  // Derived display values
+  const newEntriesAllowed = execEnabled && armed && !locked;
+  const modeLabel = (() => {
+    const m = armData?.effective_mode ?? '';
+    if (m === 'traderspost' || m === 'pickmytrade') return 'LIVE';
+    if (m === 'paper') return 'PAPER';
+    if (m === 'manual_only') return 'OBSERVE';
+    return m.toUpperCase() || '—';
+  })();
+
   return (
-    <Panel title="Execution Arm Control" id="execution-arm-control"
+    <Panel title="Execution Control" id="execution-arm-control"
       badge={<Pill text={stateLabel[effState] ?? effState.toUpperCase()} color={stateColor} />}
       right={
         <button onClick={refreshArm} disabled={pending}
@@ -7851,51 +7877,108 @@ const ArmControlPanel: React.FC = () => {
         </div>
       )}
 
-      {/* Mode notice — explain what state the gateway is in */}
+      {/* ── Required 6-field status block ── */}
+      <div style={{
+        display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 0',
+        marginBottom: 14, padding: '10px 12px',
+        background: '#060f1e', border: `1px solid ${T.border}`, borderRadius: 7,
+      }}>
+        {([
+          ['AUTO TRADING',           execEnabled ? 'ENABLED'  : 'DISABLED',  execEnabled ? T.green : T.red],
+          ['ARM STATE',              armed        ? 'ARMED'    : 'DISARMED',  armed ? T.green : T.amber],
+          ['MODE',                   modeLabel,                               T.txtPri],
+          ['NEW ENTRIES',            newEntriesAllowed ? 'ALLOWED' : 'BLOCKED', newEntriesAllowed ? T.green : T.red],
+          ['TRADE MANAGEMENT',       (armData?.active_trade_count ?? 0) > 0 ? 'ACTIVE' : 'NONE', (armData?.active_trade_count ?? 0) > 0 ? T.green : T.txtMuted],
+          ['LAST CHANGED',           fmtTs(armData?.last_changed_at),         T.txtSec],
+        ] as [string, string, string][]).map(([label, value, color]) => (
+          <React.Fragment key={label}>
+            <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.07em',
+              padding: '4px 0 4px 0', borderBottom: `1px solid ${T.border}33` }}>
+              {label}
+            </div>
+            <div style={{ fontSize: 10.5, color, fontWeight: 700, textAlign: 'right',
+              padding: '4px 0 4px 0', borderBottom: `1px solid ${T.border}33` }}>
+              {value}
+            </div>
+          </React.Fragment>
+        ))}
+      </div>
+
+      {/* Mode / config notices */}
       {effState === 'disabled' && (
         <div style={{ color: T.amber, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
           background: `${T.amber}0e`, border: `1px solid ${T.amber}33`, borderRadius: 5, lineHeight: 1.5 }}>
-          <strong>Auto-trading is DISABLED.</strong> Set <code style={{ background: `${T.amber}18`, borderRadius: 3, padding: '1px 4px' }}>EXECUTION_MODE=traderspost</code> (or <code style={{ background: `${T.amber}18`, borderRadius: 3, padding: '1px 4px' }}>pickmytrade</code>) in Secrets, then republish to enable live execution. You can still ARM a session now — it will take effect once the mode is switched.
+          <strong>Gateway DISABLED.</strong> Set <code style={{ background: `${T.amber}18`, borderRadius: 3, padding: '1px 4px' }}>EXECUTION_MODE=traderspost</code> in Secrets, then republish.
         </div>
       )}
       {effState === 'paper' && (
         <div style={{ color: T.txtMuted, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
           background: '#ffffff08', border: `1px solid ${T.border}`, borderRadius: 5, lineHeight: 1.5 }}>
-          <strong>PAPER mode.</strong> No live orders will be sent. ARM controls paper-simulation auto-execution only.
+          <strong>PAPER mode.</strong> No live orders will be sent.
+        </div>
+      )}
+      {locked && (
+        <div style={{ color: T.red, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
+          background: `${T.red}0e`, border: `1px solid ${T.red}44`, borderRadius: 5, lineHeight: 1.5 }}>
+          <strong>⚠ SAFETY LOCKED</strong> — {armData?.safety_lock_reason ?? 'emergency kill switch active'}.
+          Reset the lock before re-enabling.
         </div>
       )}
 
-      {/* Status grid */}
-      <div style={{ marginBottom: 12 }}>
-        <KV label="Effective State"       value={stateLabel[effState] ?? effState} valueColor={stateColor} />
-        <KV label="Configured Mode"       value={armData?.configured_mode ?? '—'} mono />
-        <KV label="Session Expires"       value={armed ? countdown : '—'} valueColor={armed && countdown !== '—' && countdown.includes('m') && !countdown.includes('h') && parseInt(countdown) < 5 ? T.amber : T.txtPri} />
-        <KV label="Trades Used / Limit"   value={armData ? `${armData.trades_used} / ${armData.max_trades ?? '—'}` : '—'} valueColor={tradesOver ? T.red : T.txtPri} />
-        <KV label="Allowed Instruments"   value={armData?.allowed_instruments?.join(', ') ?? '—'} />
-        <KV label="Max Contracts"         value={armData?.max_contracts ? Object.entries(armData.max_contracts).map(([k,v]) => `${k}:${v}`).join(', ') : '—'} />
-        <KV label="Session P&L"           value={armData?.session_pnl != null ? `$${armData.session_pnl.toFixed(0)}` : '—'} valueColor={(armData?.session_pnl ?? 0) < 0 ? (lossNear ? T.red : T.amber) : T.green} />
-        <KV label="Session Loss Limit"    value={armData?.max_session_loss != null ? `$${armData.max_session_loss.toFixed(0)}` : 'None'} />
-        <KV label="Direction Restriction" value={armData?.direction_restriction ?? 'None'} />
-        <KV label="Safety Locked"         value={locked ? (armData?.safety_lock_reason ?? 'Yes') : 'No'} valueColor={locked ? T.red : T.txtMuted} />
-        <KV label="Last Disarm Reason"    value={armData?.disarm_reason ?? '—'} />
-        <KV label="Last Changed"          value={fmtTs(armData?.last_changed_at)} />
-      </div>
-
-      {/* Action buttons — ARM always visible when not safety-locked */}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: actMsg ? 10 : 0 }}>
-        {!locked && btn(T.green, '⊙ ARM', () => { setArmModalOpen(true); setConfirmPhrase(''); setActMsg(null); })}
-        {armed && !locked && btn(T.amber, '◎ DISARM NEW ENTRIES', () => doAction('disarm', { reason: 'operator_manual' }))}
-        {(disarmed || armed) && !locked && btn(T.red, '⚠ KILL SWITCH', () => {
-          if (window.confirm('Activate emergency kill switch?\n\nThis will lock auto-execution and require a manual safety-lock reset.')) {
-            doAction('kill-switch', {});
-          }
+      {/* ── Primary action buttons (spec-required layout) ── */}
+      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: actMsg ? 10 : 8 }}>
+        {/* DISABLED state: only ENABLE */}
+        {!execEnabled && !locked && btn(T.green, '▶ ENABLE AUTO TRADING', () => {
+          setEnableModalOpen(true); setActMsg(null);
         })}
+
+        {/* ENABLED + DISARMED: ARM + DISABLE */}
+        {execEnabled && !armed && !locked && btn(T.green, '⊙ ARM AUTO TRADING', () => {
+          setArmModalOpen(true); setConfirmPhrase(''); setActMsg(null);
+        })}
+        {execEnabled && !armed && !locked && btn(T.red, '■ DISABLE AUTO TRADING', handleDisable)}
+
+        {/* ENABLED + ARMED: DISARM + DISABLE */}
+        {execEnabled && armed && !locked && btn(T.amber, '◎ DISARM AUTO TRADING', () =>
+          doAction('disarm', { reason: 'operator_manual' })
+        )}
+        {execEnabled && armed && !locked && btn(T.red, '■ DISABLE AUTO TRADING', handleDisable)}
+
+        {/* SAFETY LOCKED: DISABLE (still available) + RESET LOCK */}
+        {locked && execEnabled && btn(T.red, '■ DISABLE AUTO TRADING', handleDisable)}
         {locked && btn(T.purple, '↺ RESET SAFETY LOCK', () => {
           if (window.confirm('Reset the safety lock? Ensure the system is safe before proceeding.')) {
             doAction('reset-safety-lock', {});
           }
         })}
       </div>
+
+      {/* Emergency kill switch — small danger link, available when execution_enabled */}
+      {execEnabled && !locked && (
+        <div style={{ marginBottom: 8 }}>
+          <button onClick={() => {
+            if (window.confirm('Activate emergency kill switch?\n\nThis will immediately lock auto-execution and require a manual safety-lock reset.')) {
+              doAction('kill-switch', {});
+            }
+          }} disabled={pending}
+            style={{ background: 'none', border: 'none', color: `${T.red}99`, fontSize: 9.5,
+              cursor: 'pointer', padding: 0, textDecoration: 'underline', letterSpacing: '0.04em' }}>
+            ⚠ emergency kill switch
+          </button>
+        </div>
+      )}
+
+      {/* Detailed session info (secondary) */}
+      {(armed || disarmed) && armData && (
+        <div style={{ marginBottom: 8, opacity: 0.85 }}>
+          <KV label="Session Expires"       value={armed ? countdown : '—'} valueColor={armed && countdown !== '—' && !countdown.includes('h') && parseInt(countdown) < 5 ? T.amber : T.txtPri} />
+          <KV label="Trades Used / Limit"   value={`${armData.trades_used} / ${armData.max_trades ?? '—'}`} valueColor={tradesOver ? T.red : T.txtPri} />
+          <KV label="Session P&L"           value={`$${armData.session_pnl.toFixed(0)}`} valueColor={armData.session_pnl < 0 ? (lossNear ? T.red : T.amber) : T.green} />
+          <KV label="Instruments"           value={armData.allowed_instruments?.join(', ') ?? '—'} />
+          <KV label="Max Contracts"         value={armData.max_contracts ? Object.entries(armData.max_contracts).map(([k,v]) => `${k}:${v}`).join(', ') : '—'} />
+        </div>
+      )}
+      <KV label="Last Disarm Reason" value={armData?.disarm_reason ?? '—'} />
 
       {/* Feedback */}
       {actMsg && (
@@ -7904,6 +7987,40 @@ const ArmControlPanel: React.FC = () => {
           color: actMsg.ok ? T.green : T.red,
           border: `1px solid ${actMsg.ok ? T.green : T.red}44` }}>
           {actMsg.ok ? '✓' : '✗'} {actMsg.text}
+        </div>
+      )}
+
+      {/* ENABLE Modal */}
+      {enableModalOpen && (
+        <div style={{ position: 'fixed', inset: 0, background: 'rgba(5,12,26,0.85)',
+          zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
+          onClick={e => { if (e.target === e.currentTarget) setEnableModalOpen(false); }}>
+          <div style={{ background: T.panel, border: `1px solid ${T.green}55`,
+            borderRadius: 12, padding: '24px 28px', width: 380, maxWidth: '95vw',
+            boxShadow: `0 0 40px ${T.green}18` }}>
+            <div style={{ fontSize: 12, fontWeight: 700, color: T.green, marginBottom: 4, letterSpacing: '0.08em' }}>
+              ▶ ENABLE AUTO TRADING
+            </div>
+            <div style={{ fontSize: 10, color: T.txtSec, marginBottom: 20, lineHeight: 1.65 }}>
+              Enabling auto trading allows the system to accept ARM sessions and
+              execute automated orders through the configured broker.
+              You must ARM a session separately before any orders are sent.
+            </div>
+            <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
+              <button onClick={() => { setEnableModalOpen(false); setActMsg(null); }}
+                style={{ background: 'none', border: `1px solid ${T.border}`, color: T.txtSec,
+                  borderRadius: 6, padding: '7px 14px', fontSize: 10.5, cursor: 'pointer' }}>
+                Cancel
+              </button>
+              <button onClick={handleEnable} disabled={pending}
+                style={{ background: `${T.green}20`, border: `1px solid ${T.green}`,
+                  color: T.green, borderRadius: 6, padding: '7px 18px', fontSize: 10.5,
+                  fontWeight: 700, cursor: pending ? 'not-allowed' : 'pointer',
+                  opacity: pending ? 0.5 : 1, letterSpacing: '0.06em' }}>
+                {pending ? '…' : '▶ CONFIRM ENABLE'}
+              </button>
+            </div>
+          </div>
         </div>
       )}
 

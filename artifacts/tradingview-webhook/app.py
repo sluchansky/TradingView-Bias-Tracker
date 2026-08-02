@@ -9536,6 +9536,11 @@ ARM_DEFAULT_MAX_TRADES   = 3
 ARM_DEFAULT_MAX_CONTRACTS = 1
 
 _ARM_STATE: dict = {
+    # User-controlled software enable/disable toggle — separate from the arm
+    # session.  execution_enabled=True is required before arming is possible.
+    # Persists across restarts (restored from execution_arm_audit on boot).
+    # armed=True additionally requires an active arm session (time-limited).
+    "execution_enabled":      False,
     "armed":                  False,
     "armed_at":               None,
     "expires_at":             None,
@@ -9578,6 +9583,7 @@ EXECUTION_ARM_AUDIT_DB_READY = False
 _CRITICAL_ARM_ACTIONS = frozenset({
     "arm", "disarm", "safety_lock", "reset_safety_lock",
     "candidate_authorized", "candidate_blocked_final",
+    "enable", "disable",
 })
 
 
@@ -9641,6 +9647,7 @@ RC_ARM_TRADE_LIMIT           = "RC_ARM_TRADE_LIMIT"
 RC_ARM_SESSION_LOSS_LIMIT    = "RC_ARM_SESSION_LOSS_LIMIT"
 RC_ARM_DIRECTION_RESTRICTED  = "RC_ARM_DIRECTION_RESTRICTED"
 RC_SAFETY_LOCKED             = "RC_SAFETY_LOCKED"
+RC_EXECUTION_DISABLED        = "RC_EXECUTION_DISABLED"
 
 
 def _effective_execution_state(arm_state=None):
@@ -9727,6 +9734,78 @@ def _disarm(reason="operator_manual", by="system"):
     _record_arm_audit("disarm", prev, new, reason=reason, by=by)
     logger.info("Execution DISARMED by %s — reason: %s", by, reason)
     return prev
+
+
+def _enable_execution(by="operator"):
+    """Enable the execution software switch.
+    Sets execution_enabled=True; leaves armed unchanged (still requires ARM).
+    Persisted via execution_arm_audit (action='enable').
+    Returns (prev_state, new_state).
+    """
+    with _ARM_STATE_LOCK:
+        prev = dict(_ARM_STATE)
+        _ARM_STATE["execution_enabled"] = True
+        _ARM_STATE["last_changed_at"]   = now_utc().isoformat()
+        _ARM_STATE["last_changed_by"]   = by
+        new = dict(_ARM_STATE)
+    _record_arm_audit("enable", prev, new, by=by)
+    logger.info("Execution ENABLED by %s", by)
+    return prev, new
+
+
+def _disable_execution(reason="operator_manual", by="operator"):
+    """Disable the execution software switch and immediately disarm.
+    Sets execution_enabled=False + armed=False.
+    Existing active-trade protective orders are NOT affected.
+    Persisted via execution_arm_audit (action='disable').
+    Returns (prev_state, new_state).
+    """
+    with _ARM_STATE_LOCK:
+        prev = dict(_ARM_STATE)
+        _ARM_STATE["execution_enabled"] = False
+        _ARM_STATE["armed"]             = False
+        _ARM_STATE["arm_session_id"]    = None
+        _ARM_STATE["armed_by"]          = None
+        _ARM_STATE["armed_at"]          = None
+        _ARM_STATE["expires_at"]        = None
+        _ARM_STATE["disarm_reason"]     = reason
+        _ARM_STATE["last_changed_at"]   = now_utc().isoformat()
+        _ARM_STATE["last_changed_by"]   = by
+        new = dict(_ARM_STATE)
+    _record_arm_audit("disable", prev, new, reason=reason, by=by)
+    logger.info("Execution DISABLED by %s — reason: %s", by, reason)
+    return prev, new
+
+
+def _restore_execution_enabled_from_db():
+    """Restore execution_enabled from the last enable/disable audit record.
+    Called at boot AFTER _probe_execution_arm_audit_table() succeeds.
+    Fail-open: any error leaves execution_enabled=False (safe default).
+    """
+    if not EXECUTION_ARM_AUDIT_DB_READY:
+        return
+    try:
+        _conn = get_db_connection()
+        if _conn is None:
+            return
+        with _conn:
+            with _conn.cursor() as _cur:
+                _cur.execute(
+                    """SELECT action FROM execution_arm_audit
+                       WHERE action IN ('enable', 'disable')
+                       ORDER BY recorded_at DESC LIMIT 1"""
+                )
+                row = _cur.fetchone()
+        _conn.close()
+        if row and row[0] == "enable":
+            with _ARM_STATE_LOCK:
+                _ARM_STATE["execution_enabled"] = True
+            logger.info("execution_enabled restored: True (last action=enable)")
+        else:
+            logger.info("execution_enabled boot default: False (no prior enable or last=disable)")
+    except Exception as _exc:
+        logger.warning(
+            "execution_enabled restore failed (fail-open, staying False): %s", _exc)
 
 
 def _safety_lock(reason="emergency_kill_switch", by="system"):
@@ -9896,7 +9975,14 @@ def _check_arm_for_transmission(instrument, contracts, strategy=None, arm_sessio
             "time_remaining_sec": None,
         }
 
-        # Check 1: safety lock (highest priority — blocks even if armed)
+        # Check 0: execution software switch must be enabled.
+        # FAIL-CLOSED: absent key treated as disabled.
+        if not st.get("execution_enabled"):
+            return False, RC_EXECUTION_DISABLED, {**diag,
+                "reason": "execution is disabled — call POST /execution/enable first",
+                "effective_state": "execution_disabled"}
+
+        # Check 1: safety lock (highest priority among armed checks)
         if st.get("safety_locked"):
             return False, RC_SAFETY_LOCKED, {**diag, "reason": "system is safety-locked",
                                               "effective_state": "safety_locked"}
@@ -52730,7 +52816,17 @@ def execution_state_route():
                 (datetime.fromisoformat(exp_raw) - now_utc()).total_seconds(), 0)
         except Exception:
             pass
+    # Count active managed trades for the panel display (fail-open)
+    try:
+        _active_count = sum(
+            1 for _inst in ASSETS.keys()
+            if active_trade_for(_inst) is not None
+        )
+    except Exception:
+        _active_count = 0
+
     return jsonify({
+        "execution_enabled":      st.get("execution_enabled", False),
         "armed":                  st["armed"],
         "effective_state":        eff,
         "armed_at":               st.get("armed_at"),
@@ -52752,6 +52848,7 @@ def execution_state_route():
         "allowed_strategies":     st.get("allowed_strategies"),
         "direction_restriction":  st.get("direction_restriction"),
         "single_position_only":   st.get("single_position_only", True),
+        "active_trade_count":     _active_count,
     })
 
 
@@ -52788,6 +52885,15 @@ def execution_arm_route():
             "reason": (f"Exact confirmation phrase required. "
                        f"Send: confirm_phrase: '{ARM_CONFIRM_PHRASE}'"),
         }), 400
+
+    # Execution software switch must be on before arming is permitted.
+    with _ARM_STATE_LOCK:
+        if not _ARM_STATE.get("execution_enabled"):
+            return jsonify({
+                "status":      "error",
+                "reason":      "EXECUTION_DISABLED — call POST /execution/enable before arming.",
+                "reason_code": RC_EXECUTION_DISABLED,
+            }), 409
 
     # Pre-arm checks
     ok, errors = _arm_preflight_check(data)
@@ -52915,6 +53021,74 @@ def execution_disarm_route():
         "disarm_reason":    reason,
         "was_armed":        prev.get("armed", False),
         "arm_session_id":   prev.get("arm_session_id"),
+    })
+
+
+@app.route("/execution/enable", methods=["POST"])
+@_arm_owner_required
+def execution_enable_route():
+    """Enable the execution software switch.
+    Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
+
+    Sets execution_enabled=True, leaves armed=False.
+    Requires POST body: { "confirm_phrase": "ENABLE AUTO TRADING" }
+
+    Returns:
+      200  { status: "enabled_disarmed", execution_enabled: true, armed: false, effective_state: ... }
+      400  Wrong confirmation phrase
+    """
+    data   = request.get_json(force=True, silent=True) or {}
+    phrase = data.get("confirm_phrase", "")
+    if phrase != "ENABLE AUTO TRADING":
+        return jsonify({
+            "status": "error",
+            "reason": "Exact confirmation phrase required: 'ENABLE AUTO TRADING'",
+        }), 400
+    by = str(data.get("by") or "operator")[:100]
+    _prev, new = _enable_execution(by=by)
+    eff = _effective_execution_state(new)
+    logger.info("POST /execution/enable — execution_enabled=True, by=%s", by)
+    return jsonify({
+        "status":             "enabled_disarmed",
+        "execution_enabled":  True,
+        "armed":              new.get("armed", False),
+        "effective_state":    eff,
+        "last_changed_at":    new.get("last_changed_at"),
+    })
+
+
+@app.route("/execution/disable", methods=["POST"])
+@_arm_owner_required
+def execution_disable_route():
+    """Disable the execution software switch and immediately disarm.
+    Owner-only; auth enforced at the Express /api edge (not in OPEN_PATHS).
+
+    Sets execution_enabled=False + armed=False.
+    Does NOT affect existing active-trade protective orders.
+    Persisted to execution_arm_audit (action='disable').
+
+    Returns:
+      200  { status: "disabled", execution_enabled: false, armed: false, effective_state: ... }
+    """
+    data   = request.get_json(force=True, silent=True) or {}
+    reason = str(data.get("reason") or "operator_manual")[:200]
+    by     = str(data.get("by")     or "operator")[:100]
+    _VALID_DISABLE_REASONS = {
+        "operator_manual", "deployment_restart", "emergency", "scheduled_maintenance",
+        "daily_loss_limit", "drawdown_limit", "broker_state_unknown", "authentication_failure",
+    }
+    if reason not in _VALID_DISABLE_REASONS:
+        reason = "operator_manual"
+    _prev, new = _disable_execution(reason=reason, by=by)
+    eff = _effective_execution_state(new)
+    logger.info("POST /execution/disable — execution_enabled=False, by=%s, reason=%s", by, reason)
+    return jsonify({
+        "status":             "disabled",
+        "execution_enabled":  False,
+        "armed":              False,
+        "effective_state":    eff,
+        "disable_reason":     reason,
+        "last_changed_at":    new.get("last_changed_at"),
     })
 
 
@@ -75783,6 +75957,7 @@ if __name__ == "__main__":
         _check_market_state_cache_db_ready()       # probe market_state_cache (no DDL; created via DB tool/publish diff) — in-memory market-state persistence (CVD, vol-spike, TP dedup, AUTO_FIRED_KEYS, alert history)
         _check_dq_db_ready()                       # probe decision_snapshots (no DDL; created via DB tool/publish diff) — decision quality & signal calibration (Phase 5F — DISPLAY-ONLY)
         _probe_execution_arm_audit_table()          # probe execution_arm_audit (no DDL; created via DB tool/publish diff) — arm audit persistence (critical arm/disarm events; in-memory deque stays primary)
+        _restore_execution_enabled_from_db()       # restore execution_enabled from last enable/disable audit record (fail-open; safe default=False)
         _boot_snapshots_table()                    # probe internal_trade_snapshots (no DDL; created via DB tool/publish diff) — immutable send-time context for TradeZella matching
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)

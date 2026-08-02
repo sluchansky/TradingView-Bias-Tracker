@@ -1,0 +1,195 @@
+STOP: The completed work hardened the Databento SSE chart stream, but it did not implement the requested automated-execution Enable/Disable control.
+
+Do not remove or undo the SSE security work.
+
+Now complete the original Execution-panel task.
+
+REQUIRED BEHAVIOR
+
+The system must have two separate backend-controlled concepts:
+
+1. execution_enabled
+2. armed
+
+Required state flow:
+
+DISABLED
+→ ENABLE
+→ ENABLED / DISARMED
+→ ARM
+→ ENABLED / ARMED
+
+DISABLE from any enabled state must produce:
+
+execution_enabled = false
+armed = false
+
+Disabling or disarming must block NEW automated entries immediately.
+
+It must not abandon or remove protective management for existing open trades.
+
+BACKEND SOURCE OF TRUTH
+
+Add or reuse persistent canonical fields:
+
+- execution_enabled
+- armed
+- execution_mode
+- safety_locked
+- updated_at
+- updated_by
+- disable_reason
+
+Do not store this only in React state or localStorage.
+
+ENABLE
+
+When disabled, show:
+
+ENABLE AUTO TRADING
+
+After authenticated confirmation:
+
+- set execution_enabled = true
+- leave armed = false
+- return ENABLED_DISARMED
+- do not submit an order
+
+DISABLE
+
+When enabled, show:
+
+DISABLE AUTO TRADING
+
+After authenticated confirmation:
+
+- set execution_enabled = false
+- set armed = false
+- block new automated entries
+- continue existing active-trade protection
+- create an audit entry
+
+ARM
+
+Show only when:
+
+- execution_enabled = true
+- armed = false
+- configured mode is valid
+- no safety lock
+- authenticated owner
+
+ARM must never enable execution automatically.
+
+If disabled, backend ARM request must return:
+
+EXECUTION_DISABLED
+
+DISARM
+
+When armed:
+
+- set armed = false
+- leave execution_enabled = true
+- block new automated entries
+- preserve active-trade management
+
+EXECUTION GATE
+
+Immediately before every automated transmission, backend must require:
+
+execution_enabled == true
+armed == true
+
+A frontend button state is not sufficient.
+
+UI
+
+Execution panel must show separately:
+
+AUTO TRADING
+ENABLED / DISABLED
+
+ARM STATE
+ARMED / DISARMED
+
+MODE
+PAPER / LIVE / OBSERVE
+
+NEW ENTRIES
+ALLOWED / BLOCKED
+
+ACTIVE TRADE MANAGEMENT
+ACTIVE / NONE
+
+LAST CHANGED
+timestamp
+
+Buttons:
+
+Disabled:
+- ENABLE AUTO TRADING
+
+Enabled + Disarmed:
+- ARM AUTO TRADING
+- DISABLE AUTO TRADING
+
+Enabled + Armed:
+- DISARM AUTO TRADING
+- DISABLE AUTO TRADING
+
+Safety Locked:
+- no ARM
+- DISABLE remains available
+
+RESTART POLICY
+
+- enabled state may persist
+- armed must reset to false after backend restart unless an existing proven recovery contract explicitly supports persistent arming
+- never silently re-arm after deployment
+
+AUTHENTICATION
+
+Owner authentication is required for:
+
+- state read
+- enable
+- disable
+- arm
+- disarm
+- policy modification
+
+TESTS REQUIRED
+
+1. Disabled → enable produces enabled=true, armed=false.
+2. Enable canceled changes nothing.
+3. Enabled/disarmed exposes ARM and DISABLE.
+4. Arm produces enabled=true, armed=true.
+5. Disable while armed produces false/false.
+6. Disarm produces true/false.
+7. Automated transmission while disabled returns EXECUTION_DISABLED.
+8. Automated transmission while disarmed returns EXECUTION_DISARMED.
+9. Safety lock prevents arming.
+10. Disable remains possible during safety lock.
+11. Existing active trade continues protective management after disable.
+12. Refresh reloads backend state.
+13. Restart resets armed=false.
+14. Unauthenticated reads and writes are rejected.
+15. Repeated clicks produce one transition.
+16. No real order is sent during testing.
+
+FINAL REPORT
+
+Provide:
+
+- starting and final commit
+- files changed
+- persistence mechanism
+- endpoint schemas
+- exact state machine
+- gateway enforcement proof
+- restart behavior
+- active-trade behavior
+- screenshots of disabled, enabled/disarmed, enabled/armed, and locked states
+- test results
+- confirmation no real order was sent

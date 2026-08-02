@@ -68,6 +68,7 @@ def _arm_session(insts=None, max_trades=3, max_contracts=None, duration_min=30,
     session_id = f"race_test_session_{_uuid.uuid4().hex[:8]}"
     with APP._ARM_STATE_LOCK:
         APP._ARM_STATE.update({
+            "execution_enabled":   True,             # required by check 0 in _check_arm_for_transmission
             "armed":               True,
             "armed_at":            datetime.now(timezone.utc).isoformat(),
             "expires_at":          (datetime.now(timezone.utc) + timedelta(minutes=duration_min)).isoformat(),
