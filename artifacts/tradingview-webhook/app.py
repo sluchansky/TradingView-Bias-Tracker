@@ -58505,18 +58505,36 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     # before candidate claim, and NOW — immediately before the outbound wire.
     # Guards against a disarm that races with the send after all prior checks passed.
     # Paper/manual_only are exempt (arm control is live-execution only).
+    #
+    # Manual source (dashboard two-click ENTER): the operator is literally at the
+    # keyboard confirming each trade — the two-click confirm IS the session gate.
+    # We still require execution_enabled (DB-persistent, must be explicitly set) but
+    # skip the armed/session-expiry checks that exist to prevent autonomous fires.
+    # Every other live source keeps the full ARM check.
     if execution_is_live(mode):
-        _fa_arm_ok, _fa_arm_reason, _fa_arm_diag = _check_arm_for_transmission(
-            instrument, contracts, strategy=None, direction=direction)
-        if not _fa_arm_ok:
-            logger.warning(
-                "Execution blocked at final arm gate for %s — %s",
-                instrument, _fa_arm_reason)
-            return {"status": "error",
-                    "reason": (f"System disarmed before transmission — {_fa_arm_reason}. "
-                               "No order was sent."),
-                    "reason_code": _fa_arm_reason,
-                    "arm_diagnostics": _fa_arm_diag}, 409
+        if source == "manual":
+            # Execution-enabled check only — skip armed / session-expiry for operator clicks.
+            with _ARM_STATE_LOCK:
+                _manual_exec_enabled = _ARM_STATE.get("execution_enabled", False)
+            if not _manual_exec_enabled:
+                logger.warning(
+                    "Manual ENTER blocked for %s — execution not enabled", instrument)
+                return {"status": "error",
+                        "reason": ("Execution is not enabled. "
+                                   "Go to the Execution panel and click Enable Execution first."),
+                        "reason_code": RC_EXECUTION_DISABLED}, 409
+        else:
+            _fa_arm_ok, _fa_arm_reason, _fa_arm_diag = _check_arm_for_transmission(
+                instrument, contracts, strategy=None, direction=direction)
+            if not _fa_arm_ok:
+                logger.warning(
+                    "Execution blocked at final arm gate for %s — %s",
+                    instrument, _fa_arm_reason)
+                return {"status": "error",
+                        "reason": (f"System disarmed before transmission — {_fa_arm_reason}. "
+                                   "No order was sent."),
+                        "reason_code": _fa_arm_reason,
+                        "arm_diagnostics": _fa_arm_diag}, 409
 
     # Audited send sink (shared with the LIVE 2-contract runner legs / reduce in
     # Phase 3b). Byte-identical for the single-order path: it logs the redacted

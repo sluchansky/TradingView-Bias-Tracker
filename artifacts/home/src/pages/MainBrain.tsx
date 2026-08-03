@@ -9515,6 +9515,62 @@ const ArmControlPanel: React.FC = () => {
 };
 
 
+// ── Bell Toast — fixed bottom-centre banner shown when any audio event fires ──
+interface BellToastData {
+  key:      number;
+  icon:     string;
+  label:    string;
+  sublabel: string;
+  color:    string;
+}
+
+const BellToast: React.FC<{ data: BellToastData; onDismiss: () => void }> = ({ data, onDismiss }) => {
+  useEffect(() => {
+    const t = setTimeout(onDismiss, 4_500);
+    return () => clearTimeout(t);
+  }, [data.key, onDismiss]);
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      onClick={onDismiss}
+      style={{
+        position: 'fixed', bottom: 28, left: '50%',
+        transform: 'translateX(-50%)',
+        zIndex: 9999, cursor: 'pointer',
+        animation: 'bellToastIn 0.22s ease forwards',
+        background: 'rgba(10,17,26,0.96)',
+        border: `1px solid ${data.color}55`,
+        borderRadius: 12,
+        padding: '10px 18px 10px 14px',
+        display: 'flex', alignItems: 'center', gap: 10,
+        boxShadow: `0 6px 28px rgba(0,0,0,0.55), 0 0 0 1px ${data.color}18`,
+        backdropFilter: 'blur(14px)',
+        maxWidth: 460,
+      }}
+    >
+      <span style={{ fontSize: 17, lineHeight: 1, flexShrink: 0 }}>{data.icon}</span>
+      <div style={{ flex: 1, minWidth: 0 }}>
+        <div style={{ fontSize: 12, fontWeight: 700, color: data.color,
+                      letterSpacing: '0.06em', whiteSpace: 'nowrap',
+                      overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          {data.label}
+        </div>
+        {data.sublabel && (
+          <div style={{ fontSize: 10, color: T.txtSec, marginTop: 2,
+                        whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+            {data.sublabel}
+          </div>
+        )}
+      </div>
+      <span style={{ fontSize: 9, color: T.txtMuted, flexShrink: 0,
+                     letterSpacing: '0.04em', marginLeft: 4 }}>tap ×</span>
+    </div>
+  );
+};
+
+
 export default function MainBrain() {
   // Section param — present when route is /main-brain/:section, absent at /main-brain
   const params = useParams<{ section?: string }>();
@@ -9637,6 +9693,9 @@ export default function MainBrain() {
   const prevFetchOkRef     = useRef<boolean>(false);        // true once we had a 'loaded' state
   const prevScannerKeyRef  = useRef<string>('');
 
+  // Bell toast — shown at the bottom of the screen whenever a sound fires.
+  const [bellToast, setBellToast] = useState<BellToastData | null>(null);
+
   useEffect(() => {
     // Ignore during initial loading — wait for first real payload.
     if (!payload) return;
@@ -9652,16 +9711,34 @@ export default function MainBrain() {
     // prevActionableRef starts null so the very first READY payload also fires.
     if (isActionable && prevActionableRef.current !== true) {
       audioManager.play(SoundEvent.READY_TO_TRADE);
+      const inst  = safeStr((p.market as Record<string, unknown>)?.instrument, '');
+      const cp    = (p.candidate_preview ?? {}) as Record<string, unknown>;
+      const dir   = safeStr(cp.direction ?? verdict.direction, '');
+      const eb    = (p.edge_breakdown   ?? {}) as Record<string, unknown>;
+      const score = safeNum(eb.score ?? eb.total_score);
+      const strat = safeStr(sc.selected_strategy, '');
+      const parts = ([dir, score != null ? `Edge ${score}` : null, strat || null] as (string|null)[]).filter(Boolean);
+      setBellToast({
+        key:      Date.now(),
+        icon:     '🔔',
+        label:    `${inst ? inst + '  ' : ''}READY TO TRADE`,
+        sublabel: parts.join('  ·  '),
+        color:    T.green,
+      });
     }
     prevActionableRef.current = isActionable;
 
     // SYSTEM_ONLINE — fires when we transition from disconnected/initial → connected.
     if (isConnected && !prevFetchOkRef.current) {
       audioManager.play(SoundEvent.SYSTEM_ONLINE);
+      setBellToast({ key: Date.now(), icon: '✓', label: 'System connected',
+                     sublabel: '', color: T.green });
     }
     // SYSTEM_OFFLINE — fires when we transition from connected → error.
     if (isDisconnected && prevFetchOkRef.current) {
       audioManager.play(SoundEvent.SYSTEM_OFFLINE);
+      setBellToast({ key: Date.now(), icon: '⚠', label: 'Feed disconnected',
+                     sublabel: 'Retrying automatically…', color: T.amber });
     }
     if (isConnected) prevFetchOkRef.current = true;
     if (isDisconnected) prevFetchOkRef.current = false;
@@ -9671,6 +9748,14 @@ export default function MainBrain() {
     const scannerKey = String(sc.selected_strategy ?? '');
     if (scannerKey && scannerKey !== prevScannerKeyRef.current) {
       audioManager.play(SoundEvent.SCAN_FOUND);
+      const inst = safeStr((p.market as Record<string, unknown>)?.instrument, '');
+      setBellToast({
+        key:      Date.now(),
+        icon:     '🔍',
+        label:    'New setup found',
+        sublabel: [inst, scannerKey].filter(Boolean).join('  ·  '),
+        color:    T.cyan,
+      });
     }
     prevScannerKeyRef.current = scannerKey;
 
@@ -9858,6 +9943,11 @@ export default function MainBrain() {
         p={p}
       />
 
+      {/* Bell toast — fixed bottom-centre banner, auto-dismisses after 4.5 s */}
+      {bellToast && (
+        <BellToast data={bellToast} onDismiss={() => setBellToast(null)} />
+      )}
+
       {/* Cleanest Trade modal — rendered outside the scroll container */}
       <CleanestTradeModal
         open={cleanestOpen}
@@ -9892,6 +9982,10 @@ export default function MainBrain() {
         @keyframes mbDot {
           0%, 100% { opacity: 0.25; transform: scale(0.8); }
           50%       { opacity: 1;   transform: scale(1.1); }
+        }
+        @keyframes bellToastIn {
+          from { opacity: 0; transform: translateX(-50%) translateY(10px) scale(0.97); }
+          to   { opacity: 1; transform: translateX(-50%) translateY(0)     scale(1);   }
         }
         :focus-visible { outline: 2px solid #38bdf8; outline-offset: 2px; }
         ::-webkit-scrollbar { width: 5px; height: 5px; }
