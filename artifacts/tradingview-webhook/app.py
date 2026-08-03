@@ -40645,16 +40645,38 @@ def get_main_brain_tick_stream():
         return jsonify({"ok": False, "enabled": False,
                         "reason": "DATABENTO_DISABLED"}), 503
 
-    # 4. Connection limits
+    # 4. Connection limits + stale-subscriber eviction
+    #
+    # Problem: behind a buffering reverse-proxy (Express → Flask) the browser's
+    # EventSource.close() does not propagate a TCP RST to Flask, so the old
+    # generator never receives GeneratorExit and the subscriber stays in
+    # _TICK_SUBSCRIBERS indefinitely.  After 6 reconnects the per-owner limit
+    # is hit and every subsequent attempt gets a permanent 429.
+    #
+    # Fix: when a new connection arrives for instrument X, atomically evict ALL
+    # existing subscribers for X and register the new one.  Old generators are
+    # signalled via a None sentinel so they exit cleanly; if they somehow miss
+    # the sentinel their finally block sees ValueError on remove() (already
+    # evicted) and does NOT double-decrement _SSE_TOTAL_CONNS.
+    _evicted_subs: list = []
     with _TICK_SUBS_LOCK:
         global _SSE_TOTAL_CONNS
         if _SSE_TOTAL_CONNS >= _SSE_MAX_TOTAL:
             return jsonify({"ok": False, "reason": "SSE_CONNECTION_LIMIT_TOTAL",
                             "limit": _SSE_MAX_TOTAL}), 429
-        _owner_count = sum(len(v) for v in _TICK_SUBSCRIBERS.values())
-        if _owner_count >= _SSE_MAX_PER_OWNER:
-            return jsonify({"ok": False, "reason": "SSE_CONNECTION_LIMIT_PER_OWNER",
-                            "limit": _SSE_MAX_PER_OWNER}), 429
+        # Evict stale same-instrument subscribers
+        _evicted_subs = _TICK_SUBSCRIBERS[inst][:]
+        if _evicted_subs:
+            _TICK_SUBSCRIBERS[inst].clear()
+            _SSE_TOTAL_CONNS = max(0, _SSE_TOTAL_CONNS - len(_evicted_subs))
+            logger.debug("SSE evicted %d stale subscriber(s) for %s", len(_evicted_subs), inst)
+
+    # Signal evicted generators to exit (sentinel bypasses queue.Full by replace)
+    for _old in _evicted_subs:
+        try:
+            _old["q"].put_nowait(None)   # None sentinel → generator breaks
+        except queue.Full:
+            pass   # generator is already blocked/dead — it will exit via finally
 
     # 5. Allocate subscriber
     _sub_id  = str(uuid.uuid4())[:8]
@@ -40690,6 +40712,10 @@ def get_main_brain_tick_stream():
             while True:
                 try:
                     _tick = tick_q.get(timeout=_SSE_HEARTBEAT_S)
+                    if _tick is None:
+                        # Eviction sentinel — a newer connection for this
+                        # instrument has taken over; exit cleanly.
+                        break
                     yield f"event: tick\ndata: {json.dumps(_tick)}\n\n"
                 except queue.Empty:
                     yield "event: heartbeat\ndata: {}\n\n"
@@ -40699,9 +40725,11 @@ def get_main_brain_tick_stream():
             with _TICK_SUBS_LOCK:
                 try:
                     _TICK_SUBSCRIBERS[inst].remove(_sub_rec)
+                    # Only decrement if we were still in the list — evicted
+                    # subscribers have already been counted out at eviction time.
+                    _SSE_TOTAL_CONNS = max(0, _SSE_TOTAL_CONNS - 1)
                 except ValueError:
-                    pass
-                _SSE_TOTAL_CONNS   = max(0, _SSE_TOTAL_CONNS - 1)
+                    pass  # already evicted; _SSE_TOTAL_CONNS already adjusted
                 _SSE_DISCONNECTS  += 1
             logger.debug("SSE subscriber %s disconnected — inst=%s drops=%d",
                          _sub_id, inst, _sub_rec["drops"])
