@@ -383,9 +383,35 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     const gen = ++generationRef.current;
 
     let es: EventSource | null = null;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-    let delay = 5_000;   // start at 5 s; backs off to 30 s on repeated 429s
+    let timer:    ReturnType<typeof setTimeout> | null = null;
+    let watchdog: ReturnType<typeof setTimeout> | null = null;
+    // MGC/MNQ must be the most responsive pairs — keep backoff tight.
+    // 2 s initial, cap at 8 s (was 5 s → 30 s which left the chart frozen for
+    // 30 s between attempts after a few failures).
+    let delay = 2_000;
+    const MAX_DELAY = 8_000;
+    // Watchdog: if no tick OR heartbeat arrives within 25 s (server sends
+    // heartbeats every 15 s), the proxy has silently dropped the connection.
+    // Proactively close and reconnect — onerror alone is unreliable for proxied
+    // long-lived SSE connections.
+    const WATCHDOG_MS = 25_000;
     let stopped = false;
+
+    const clearWatchdog = () => { if (watchdog) { clearTimeout(watchdog); watchdog = null; } };
+    const resetWatchdog = () => {
+      clearWatchdog();
+      if (stopped || gen !== generationRef.current) return;
+      watchdog = setTimeout(() => {
+        if (stopped || gen !== generationRef.current) return;
+        // Stale connection — close cleanly and reconnect immediately (reset delay;
+        // this is not a repeated failure, just a silent proxy drop).
+        es?.close(); es = null;
+        sseActiveRef.current = false;
+        setSseConnected(false);
+        delay = 2_000;
+        void connect();
+      }, WATCHDOG_MS);
+    };
 
     const connect = async () => {
       if (stopped || gen !== generationRef.current) return;
@@ -414,7 +440,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       } catch {
         // Network / parse error — retry with backoff
         if (!stopped && gen === generationRef.current) {
-          timer = setTimeout(() => { delay = Math.min(delay * 2, 30_000); void connect(); }, delay);
+          timer = setTimeout(() => { delay = Math.min(delay * 2, MAX_DELAY); void connect(); }, delay);
         }
         return;
       }
@@ -431,12 +457,14 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
         sseActiveRef.current = true;
         setSseConnected(true);
         setSseAuthFailed(false);
-        delay = 3_000;
+        delay = 2_000;
+        resetWatchdog(); // arm the watchdog once the stream is open
       };
 
       // Typed "tick" events — use server-authoritative partial_bar when present
       es.addEventListener('tick', (rawEv: Event) => {
         if (gen !== generationRef.current) return;
+        resetWatchdog(); // live tick = connection confirmed
         try {
           const ev = rawEv as MessageEvent;
           const tick = JSON.parse(ev.data) as {
@@ -488,20 +516,22 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
         } catch { /* ignore parse errors */ }
       });
 
-      // "status" event — feed-level connection confirmation; no chart mutation
-      es.addEventListener('status', () => { /* informational */ });
+      // "status" event — feed-level connection confirmation
+      es.addEventListener('status', () => { resetWatchdog(); });
 
-      // "heartbeat" event — keep-alive; no chart mutation
-      es.addEventListener('heartbeat', () => { /* keep-alive noop */ });
+      // "heartbeat" event — keep-alive ping from server every 15 s.
+      // Reset the watchdog so we only force-reconnect when genuinely silent.
+      es.addEventListener('heartbeat', () => { resetWatchdog(); });
 
       es.onerror = () => {
+        clearWatchdog();
         sseActiveRef.current = false;
         setSseConnected(false);
         es?.close();
         es = null;
         if (!stopped && gen === generationRef.current) {
           timer = setTimeout(() => {
-            delay = Math.min(delay * 2, 30_000);
+            delay = Math.min(delay * 2, MAX_DELAY);
             void connect(); // fresh token on each reconnect attempt
           }, delay);
         }
@@ -516,7 +546,8 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       sseActiveRef.current = false;
       setSseConnected(false);
       es?.close();
-      if (timer) clearTimeout(timer);
+      if (timer)    clearTimeout(timer);
+      if (watchdog) clearTimeout(watchdog);
     };
   }, [instrument, collapsed, authHeader]); // eslint-disable-line react-hooks/exhaustive-deps
 
