@@ -44086,7 +44086,8 @@ def _scalp_sim_open_insert(sim_key, setup_anchor, strategy_key, inst, direction,
                 "VALUES (%s,%s,%s,%s,'open',%s,%s,%s,%s,%s,%s,%s,%s,%s, now(), %s, %s) "
                 "ON CONFLICT (sim_key) DO NOTHING",
                 (sim_key, strategy_key, inst, direction, cand["entry"], cand["stop"],
-                 cand["target"], cand["rr"], session, regime, edge, cand["fidelity"],
+                 cand["target"], cand["rr"], session, regime, edge,
+                 (json.dumps(cand["fidelity"]) if isinstance(cand.get("fidelity"), dict) else cand.get("fidelity")),
                  setup_anchor, now_utc().timestamp(), ctx_json))
             inserted = (cur.rowcount == 1)
         conn.commit()
