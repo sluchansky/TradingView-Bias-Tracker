@@ -40421,7 +40421,7 @@ def _chart_connection_status(inst: str) -> str:
 #   block the Databento feed thread.
 
 _SSE_TOKEN_TTL      = 45    # seconds before an unused token expires
-_SSE_MAX_PER_OWNER  = 3     # max simultaneous streams per authenticated owner
+_SSE_MAX_PER_OWNER  = 6     # max simultaneous streams per authenticated owner
 _SSE_MAX_TOTAL      = 20    # max simultaneous streams across all owners
 _SSE_QUEUE_DEPTH    = 300   # per-subscriber queue capacity
 _SSE_HEARTBEAT_S    = 15    # heartbeat interval (keeps proxies alive)

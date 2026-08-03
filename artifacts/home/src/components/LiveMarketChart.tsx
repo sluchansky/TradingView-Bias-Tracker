@@ -384,7 +384,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
 
     let es: EventSource | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
-    let delay = 3_000;
+    let delay = 5_000;   // start at 5 s; backs off to 30 s on repeated 429s
     let stopped = false;
 
     const connect = async () => {
