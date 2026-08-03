@@ -144,6 +144,9 @@ class DatabentoBrain:
         # e.g. 42002887 → "MGC"  (IDs change each rollover — never hardcode them)
         self._id_to_inst: dict[int, str] = {}
 
+        # Unknown instrument_ids seen — logged once each so they don't spam.
+        self._unknown_ids_warned: set = set()
+
         # Per-instrument working state (all keyed by bot instrument: MGC/MNQ/…)
         self._bars:        dict[str, list]        = {i: [] for i in DB_SYMBOLS}
         self._partial:     dict[str, Any]         = {i: None for i in DB_SYMBOLS}
@@ -310,6 +313,7 @@ class DatabentoBrain:
         # Reset per-session state so reconnects don't carry stale instrument_ids
         # (exchange IDs change on contract rollover).
         self._id_to_inst = {}
+        self._unknown_ids_warned = set()   # re-warn after each reconnect/re-prefetch
 
         logger.info("DatabentoBrain: connecting to %s …", DB_DATASET)
         DATABENTO_STATUS["error"] = None
@@ -400,6 +404,19 @@ class DatabentoBrain:
                         break
 
             if inst is None:
+                # Unknown instrument_id — could be a post-rollover id not in the
+                # prefetch map.  Log once per unique id so we can diagnose silently
+                # dropped ticks without flooding the log.
+                # id=0 is a Databento system/heartbeat record, not a real trade — skip silently.
+                if iid is not None and iid != 0 and iid not in self._unknown_ids_warned:
+                    self._unknown_ids_warned.add(iid)
+                    sym_hint = getattr(rec, "symbol", None) or ""
+                    logger.warning(
+                        "DatabentoBrain: unrecognized instrument_id=%s (sym=%r) — "
+                        "tick dropped. Known ids: %s. This may indicate a contract "
+                        "rollover where the id changed mid-session.",
+                        iid, sym_hint, list(self._id_to_inst.keys()),
+                    )
                 return
 
             # Databento uses nanosecond epoch integers for timestamps and
