@@ -9025,7 +9025,7 @@ const ArmControlPanel: React.FC = () => {
   const [armInstruments,setArmInstruments]  = useState('MGC');
   const [armMaxCt,      setArmMaxCt]        = useState('1');
   const [pending,       setPending]         = useState(false);
-  const [actMsg,        setActMsg]          = useState<{ ok: boolean; text: string } | null>(null);
+  const [actMsg,        setActMsg]          = useState<{ ok: boolean; text: string; errors?: string[] } | null>(null);
   const expiresAtRef = useRef<string | null>(null);
   const [countdown, setCountdown] = useState('—');
 
@@ -9069,7 +9069,8 @@ const ArmControlPanel: React.FC = () => {
         body: JSON.stringify(body ?? {}),
       });
       const j = await r.json().catch(() => ({}));
-      setActMsg({ ok: r.ok, text: j.reason ?? j.message ?? (r.ok ? 'Done' : `Error ${r.status}`) });
+      const errs: string[] | undefined = Array.isArray(j.errors) && j.errors.length ? j.errors : undefined;
+      setActMsg({ ok: r.ok, text: j.reason ?? j.message ?? (r.ok ? 'Done' : `Error ${r.status}`), errors: errs });
       if (r.ok) { await refreshArm(); }
       return r.ok;
     } catch { setActMsg({ ok: false, text: 'Network error' }); return false; }
@@ -9267,6 +9268,11 @@ const ArmControlPanel: React.FC = () => {
           color: actMsg.ok ? T.green : T.red,
           border: `1px solid ${actMsg.ok ? T.green : T.red}44` }}>
           {actMsg.ok ? '✓' : '✗'} {actMsg.text}
+          {actMsg.errors && actMsg.errors.length > 0 && (
+            <ul style={{ margin: '4px 0 0 0', paddingLeft: 14, listStyle: 'disc' }}>
+              {actMsg.errors.map((e, i) => <li key={i} style={{ marginBottom: 2 }}>{e}</li>)}
+            </ul>
+          )}
         </div>
       )}
 
@@ -9362,6 +9368,11 @@ const ArmControlPanel: React.FC = () => {
                 color: actMsg.ok ? T.green : T.red,
                 border: `1px solid ${actMsg.ok ? T.green : T.red}44` }}>
                 {actMsg.ok ? '✓' : '✗'} {actMsg.text}
+                {actMsg.errors && actMsg.errors.length > 0 && (
+                  <ul style={{ margin: '4px 0 0 0', paddingLeft: 14, listStyle: 'disc' }}>
+                    {actMsg.errors.map((e, i) => <li key={i} style={{ marginBottom: 2 }}>{e}</li>)}
+                  </ul>
+                )}
               </div>
             )}
 
