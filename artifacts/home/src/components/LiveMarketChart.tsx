@@ -788,11 +788,21 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     applyDataToChart();
   }, [data, showVwap, showStructure, showTrade, applyDataToChart]);
 
+  // Clear stale chart data whenever the instrument changes so applyDataToChart
+  // never renders the previous instrument's bars on top of the new feed.
+  // Without this, applyDataToChart fires with old data + empty lastBarsRef →
+  // repopulates lastBarsRef with wrong-instrument bars → when fresh data
+  // arrives the needsReset check sees matching first-bar timestamps and only
+  // does an incremental update, leaving the majority of old bars on screen.
+  useEffect(() => {
+    setData(null);
+    lastBarsRef.current   = [];
+    partialBarRef.current = null;
+  }, [instrument]); // eslint-disable-line react-hooks/exhaustive-deps
+
   // ── Instrument / timeframe change handlers ────────────────────────────────
   const handleInstrument = (inst: string) => {
     setInstrument(inst);
-    lastBarsRef.current   = [];
-    partialBarRef.current = null;   // reset tick state; SSE effect will reconnect
     if (onInstrumentChange) onInstrumentChange(inst);
   };
 
