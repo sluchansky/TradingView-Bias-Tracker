@@ -8922,6 +8922,26 @@ const Header: React.FC<{
         }}>
           {loading ? '↻ …' : '↻ Refresh'}
         </button>
+
+        {/* ── Page nav pill ── */}
+        <div style={{ display:'flex', gap:1, borderRadius:6, border:`1px solid rgba(255,255,255,0.07)`, padding:'2px 3px', background:'rgba(255,255,255,0.020)', marginLeft:4 }}>
+          <span style={{ fontSize:9.5, fontFamily:T.mono, fontWeight:700, color:T.cyan, padding:'3px 9px', borderRadius:4, background:`${T.cyan}18`, letterSpacing:'0.08em' }}>MAIN BRAIN</span>
+          {([
+            { label:'DASHBOARD', href:'/dashboard' },
+            { label:'COCKPIT',   href:'/cockpit'   },
+          ] as const).map(({ label, href }) => (
+            <a key={label} href={href} style={{ fontSize:9.5, fontFamily:T.mono, color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em', transition:'color 0.15s' }}
+              onMouseEnter={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.70)'}
+              onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.28)'}>
+              {label}
+            </a>
+          ))}
+          <a href="/api/dashboard" target="_blank" rel="noreferrer" style={{ fontSize:9.5, fontFamily:T.mono, color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em', transition:'color 0.15s' }}
+            onMouseEnter={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.70)'}
+            onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.28)'}>
+            ENGINE ↗
+          </a>
+        </div>
       </div>
     </header>
   );

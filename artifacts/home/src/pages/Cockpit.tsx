@@ -572,14 +572,36 @@ export default function Cockpit() {
             <span style={{ fontSize: "8px", color: C.textFaint, letterSpacing: "0.5px" }}>{item.label}</span>
           </button>
         ))}
-        <a href="/" title="Back to AI Brain" style={{
-          width: "44px", height: "42px", background: "transparent", border: "none",
-          borderRadius: "10px", cursor: "pointer", textDecoration: "none",
-          display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "2px",
-        }}>
-          <span style={{ fontSize: "15px", lineHeight: 1 }}>🧠</span>
-          <span style={{ fontSize: "7px", color: C.textFaint, letterSpacing: "0.5px" }}>Brain</span>
-        </a>
+        {/* Page navigation — Brain / Dashboard / Engine */}
+        <div style={{ width: "100%", borderTop: `1px solid ${C.border}`, paddingTop: 6, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+          {([
+            { href: "/",            emoji: "🧠", label: "Brain"  },
+            { href: "/dashboard",   emoji: "📊", label: "Dash"   },
+          ] as const).map(({ href, emoji, label }) => (
+            <a key={label} href={href} title={label} style={{
+              width: "44px", height: "38px", background: "transparent", border: "none",
+              borderRadius: "10px", cursor: "pointer", textDecoration: "none",
+              display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "2px",
+            }}
+              onMouseEnter={e => (e.currentTarget as HTMLAnchorElement).style.background = "rgba(255,255,255,0.05)"}
+              onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.background = "transparent"}
+            >
+              <span style={{ fontSize: "14px", lineHeight: 1 }}>{emoji}</span>
+              <span style={{ fontSize: "7px", color: C.textFaint, letterSpacing: "0.5px" }}>{label}</span>
+            </a>
+          ))}
+          <a href="/api/dashboard" target="_blank" rel="noreferrer" title="Engineering dashboard" style={{
+            width: "44px", height: "38px", background: "transparent", border: "none",
+            borderRadius: "10px", cursor: "pointer", textDecoration: "none",
+            display: "flex", flexDirection: "column", alignItems: "center", justifyContent: "center", gap: "2px",
+          }}
+            onMouseEnter={e => (e.currentTarget as HTMLAnchorElement).style.background = "rgba(255,255,255,0.05)"}
+            onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.background = "transparent"}
+          >
+            <span style={{ fontSize: "13px", lineHeight: 1 }}>⚙</span>
+            <span style={{ fontSize: "7px", color: C.textFaint, letterSpacing: "0.5px" }}>Engine</span>
+          </a>
+        </div>
       </nav>
 
       {/* ── SECTION 1: BRAIN DECISION ──────────────────────────────────────────── */}
