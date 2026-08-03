@@ -1,16 +1,9 @@
 # Memory Index
 
-- [SSE tick-stream security hardening](sse-security-hardening.md) — token-before-feature-gate ordering; DATABENTO_PARTIAL_BY_INST lazy-import gotcha; raising=False monkeypatch pattern.
-
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
 - [Main Brain population wiring](main-brain-population-wiring.md) — normalizeMainBrainPayload() is the single bridge; 29 schema mismatches; voice=dict extract narration; active_trades/alerts are bare lists; coach.weight_updated is boolean.
-- [VWAP source authority (Phase 1A)](vwap-source-authority.md) — Grace window removed. CHART_VWAP_BY_TICKER secondary store + get_vwap_diagnostics(); result["vwap_diagnostics"] always present.
-- [Left Brain Market Intelligence (Phase 1B + 2)](left-brain-mi.md) — Flag-gated DISPLAY-ONLY MI + Dynamic Thesis; compute_left_brain_thesis() direction/strength/momentum/narrative/playbook; _LB_THESIS_BY_INST + _LB_MARKET_MEMORY_BY_INST(maxlen=200); 128 tests.
 - [Left Brain thesis staleness & key mismatch](lb-thesis-staleness.md) — MGC gets ~1 bar/overnight (vs 127 MNQ); key bug lastUpdatedAt vs last_updated_at; diagnosis block added; ThesisPanel shows 4 states.
-- [Right Brain Trade Management v1](rbtm-shadow-mode.md) — Phase 6B.2 shadow advisory; flag default-OFF; _right_brain_orchestrate() is sole full_analysis seam; 47 tests; RBTM_VALID_RECOMMENDATIONS frozenset; near-stop CRITICAL not HIGH.
 - [Flask zombie-prevention guards](flask-zombie-prevention.md) — 3 os._exit guards (SIGTERM + sys.excepthook + app.run() finally) stop non-daemon Timer threads from keeping zombie Flask alive.
-- [Databento live feed integration](databento-integration.md) — flag-gated (DATABENTO_ENABLED=1 + DATABENTO_API_KEY); routes return disabled-JSON not 404; dashboard panel shows OFFLINE safely.
-- [Databento live chart endpoint](databento-chart-endpoint.md) — GET /main-brain/chart; lightweight-charts v5 (addSeries+CandlestickSeries, createSeriesMarkers); DATABENTO_PARTIAL_BY_INST module-level export; 20 backend tests.
 - [Databento MGC overnight silence + partial-flush fix](databento-mgc-overnight-silence.md) — MGC has 0 Databento records overnight (genuine COMEX silence); partial-flush daemon closes stale low-volume bars within 70s; thread-safety via _partial_lock.
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
@@ -19,7 +12,6 @@
 - [Strict trade ruleset](strict-trade-ruleset.md) — READY gate MODE-TUNABLE: SWING zone+vwap+structure@80; SCALP demotes ZONE ONLY; Edge bands 40/50/60; alert_level≠conviction_tier; ticker-authoritative.
 - [full_analysis single return path](full-analysis-return-parity.md) — one return dict; hard-indexed consumers make a missing key a state-dependent 500; mirror keys if an early return is re-added.
 - [Zone Mitigated detection](zone-mitigated-detection.md) — mitigation is PER-INSTRUMENT w/ SCALP TTL; SCALP fully demotes zone at EVERY site (gate, full_analysis override, webhook short-circuit, structure-reset), cfg-guarded; demoting a gate flag alone LEAKS.
-- [full_analysis data quirks & card seam](analysis-data-quirks.md) — vwap_status is freshness NOT direction; _build_card_entry is single source for journal+card; screenshots passed to Discord never fetched.
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.
 - [Production deployment topology](deployment-topology.md) — deploy as one Reserved VM; api-server prod build/run supervises Flask+Express; static `home` artifact serves `/`; target chosen in Publish UI.
 - [App-side DB convention: INSERT/SELECT only](db-app-insert-select-only.md) — app.py runs NO DDL; boot does no-DDL readiness probe + `*_DB_READY` flag; new tables via database tool (dev) + Publish schema-diff (prod).
@@ -32,11 +24,7 @@
 - [Cockpit Mode JS-in-Python escape trap](cockpit-mode-escape-bug.md) — JS string literals in Python triple-quotes: `\n`/`\t`/astral emoji → raw newline / UTF-8 500; fix with `\\n`; py_compile misses it — node --check the SERVED <script>.
 - [Multi-strategy engine](strategy-engine.md) — regime→strategy (fixed priority); ORB replaced Exhaustion Fade; display's ONLY money-path effect = sanctioned ORB 1:4 retarget; closed-override needs key parity.
 - [Adaptive Learning Engine](adaptive-learning-engine.md) — Postgres per-strategy analytics DISPLAY-ONLY (never gate/sizing/dedupe/traderspost), fail-open, weights 0.65–1.35; best-hours bucket on opened_at; no in-app DDL.
-- [Learning namespace isolation](learning-namespace-isolation.md) — SWING/SCALP/MICRO_SCALP caches NEVER share a slot; _ns_learning_key("{mode}::{key}"); eligibility keys are "{inst}::{mode}".
 - [Learning Engine v2](learning-engine-v2.md) — Governor/Memory/25-trade report display-only; sole money-path = flag-gated demote-only veto (READY→WAIT, default OFF); governor uses RAW win-rates.
-- [Read-only backtesting engine](backtest-engine.md) — /backtest/* walled off; "INSERT/SELECT only" = no runtime DDL + no live-table mutation; worst-case fills incl runner→BE same bar; owner-only auth.
-- [Dashboard inline-JS escape bug](dashboard-js-string-escape-bug.md) — single \n in triple-quoted HTML = raw newline = whole-script SyntaxError; node --check the served <script>, py_compile misses it.
-- [Backtest single-run management](backtest-single-run-management.md) — "really bad numbers" = BE-capped partial exit caps winners (~+0.5R); fix via management selector + MIN_TARGET_R ≤ 1.0 (1.5 zeroes MGC).
 - [Per-instrument MUTE ALERTS](alerts-mute-per-instrument.md) — server-side in-memory flag suppresses ONLY NEW-SETUP Discord; resolve from ticker OR instrument OR alert_type; senders driving accounting must return dispatched bool.
 - [Auto-trade arming lifecycle & "no trades" diagnosis](auto-trade-arming-lifecycle.md) — AUTO arm resets OFF every restart/republish + only fires live on published instance; arming intentionally NON-persistent.
 - [Active trade persistence via open_trades table](active-trade-persistence.md) — ACTIVE_TRADES_BY_INST write-through to open_trades; _persist_active_trade OUTSIDE the lock; boot restores INERT; SWING thesis uses swing_theses table.
@@ -67,7 +55,6 @@
 - [Curated endpoint serialization](curated-endpoint-serialization.md) — /status & peer reads whitelist keys; a new field needs adding to each route's dict or it's None on the wire despite being computed.
 - [Dashboard ENTER → execution gateway](dashboard-enter-broker-bridge.md) — ENTER drives ONE gateway via audited /traderspost; gatewayEligible = execution_enabled + no typed price + snapshot=selected + READY; send-before-track.
 - [Market-session (CME/COMEX) awareness](market-session-hours.md) — MNQ/MGC pause weekend + daily 17-18 ET halt + US holidays; closed-override runs LAST in full_analysis; new override goes before it.
-- [Trade Idea Review (/review-idea)](trade-idea-review.md) — owner-only display-only grading by REUSING read-only engines; manual ticket only, NEVER a money path; goldens byte-identical.
 - [TradeZella integration](tradezella-integration.md) — imported journal feeds memory as DOWN-WEIGHTED source:"tradezella" + display-only presenter; memory DB read stays OUTSIDE LEARNING_LOCK (only swap is locked).
 - [TradeZella auto-seed reviews](tradezella-autoseed.md) — tradezella_auto_seed.py (pure, no app import); ON CONFLICT WHERE review_status='UNREVIEWED' guards manual reviews; reseed endpoint at /tradezella/reseed-reviews; auto_reviewed count in confirm response.
 - [Entry Quality location engine](entry-quality-engine.md) — 0-100 LOCATION scorer; display-first flag-gated DEMOTE-ONLY veto (score<70 & not Edge≥90), veto DEFAULT ON; ATR uses MODE-CORRECT ATR; absence-of-bad subs default 1.0.
@@ -81,7 +68,6 @@
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
 - [Main Brain cognitive layer](main-brain-cognitive.md) — 7 display-only keys at full_analysis seam (mirror in closed-override); _mb_cached None→coerce neutral; heartbeat capture fail-open, never gates.
-- [Simulation realism overlay](sim-realism-overlay.md) — dashboard scoreboard overlay nets out commission+slippage (default-ON display-only); must never touch money path; fail-open, goldens pin OFF.
 - [Scalp strategy advisory ("potential trades")](scalp-strategy-advisory.md) — DISPLAY-ONLY Main-Brain layer ranking 16 research scalp strategies; votes come from scalp_live_sim.diagnose_strategies; NEVER a money path; flag-OFF byte-identical.
 - [Learning influences live scoring](learning-score-influence.md) — master-flag bounded ±15 Edge-Score adjust; MUST fold inside _analysis_edge_breakdown; ONLY when eb.score>0 (hard-block 0 must not resurrect); OFF byte-identical.
 - [Scalp Research Engine](scalp-research-engine.md) — research/display-only scalp-strategy lab; separate detector registry (never bt.DETECTORS); live_status∈{watch,sim,recommended}; GET never recomputes; owner-only.
@@ -121,29 +107,24 @@
 - [View-only share link](view-only-share-link.md) — Express-only /view; new route prefix must be in artifact.toml proxy `paths`; login under `no-referrer` sends `Origin: null` → strict sameOrigin CSRF 403s (use `same-origin`).
 - [Micro Scalp Mode](micro-scalp-mode.md) — sweep→trap→trigger; ghost ledger always + separate restart-resetting LIVE arm via shared gateway; SINGLE EXIT target1==target2; smokes must force _EXECUTION_MODE_RAW + stub sends.
 - [Real Learning Rule Engine](learning-rule-engine.md) — GHOST_ONLY/LIVE_ELIGIBLE per-instrument gate in execute_trade_gateway; demote-only FAIL-OPEN; 50-sample threshold; recomputed on every Nth close + boot.
+- [Test-trade GHOST_ONLY trap](test-trade-ghost-only-trap.md) — test_p6_* fixture rows in strategy_trades trigger GHOST_ONLY (n=1–49 range), silently rerouting live orders to paper; _boot_purge_test_trades() deletes them at boot.
 - [Thesis Tracker system](thesis-tracker.md) — outcome-based analyst memory; snapshot→25-75min resolve→lesson+reflection; pattern memory SQL (≥3 samples); DISPLAY-ONLY/fail-open; _mb_capture_cognitive is the heartbeat hook.
 - [Left Brain / Right Brain dual-engine](right-brain-engine.md) — bar-close scanner + training-mode executor; Right Brain eval runs dev+prod; Flask has NO @owner_required; proxy whitelist required.
-- [Market Data Engine phases](market-data-engine.md) — Phase 1 done (ALERT-ONLY status panel + Phase 5 staleness gate default-OFF); Phase 2 = Databento; Phases 3-5 follow.
 - [Brain Conflict Resolver](brain-conflict-resolver.md) — 10-priority display-only conflict engine; BLOCK on hard vetoes, WAIT/ALLOW on soft penalty; wired at mb_out["conflict_resolver"].
-- [Verdict Board](verdict-board.md) — 4-bucket plain-English classifier (supports/opposes/missing/vetoes); reads observations+BCR+result; mb_out["verdict_board"]; never feeds money path.
-- [Main Brain architecture](main-brain-architecture.md) — 3-layer rule: orchestrate(_mb_orchestrate)+learning(_mb_learning_snapshot)+sole-speaker(compute_main_brain); never collapse layers.
 - [Operator Mode UI](operator-mode-ui.md) — conversational Brain interface at `/`; auth=localStorage Basic Auth; narration=main_brain_voice; chat=/assistant; Engineering=/api/dashboard.
 - [Swing Mode V2 engine](swing-mode-v2.md) — flag-gated SWING_MODE_V2_ENABLED default-OFF 9-category 0-100 HTF scorer + SCANNING→READY lifecycle; Tier-2 via SWING_EMA_UPDATE webhook; /swing-analysis route; goldens byte-identical.
 - [Persistent thesis + hysteresis](thesis-hysteresis.md) — confidence-inertia over evaluate_strict_setup; reversal flip needs prev=None reset before needs_new; 4 integration points; 16 tests; flag-OFF byte-identical.
 - [Phase 3 Thesis Enforcement](thesis-phase3-enforcement.md) — shadow gate evaluates READY vs thesis, display-only by default; confidence_adj is NEVER added to edge_score.
 - [Main Brain UI redesign](main-brain-ui-redesign.md) — Apple×OpenAI: brain-hero/orb-halo/brain-state-pill/brain-intel 2×2/brain-details-toggle; data-brain-state drives CSS; all IDs preserved; goldens byte-identical.
 - [Strategy scan coverage (Phase 6)](strategy-scan-coverage.md) — 3-system audit: 29 total defs; all 5 main-engine scorers always called; OPENING_DRIVE only eligibility gate (outside_session); STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER pattern.
-- [Potential-plan sweep+VWAP gate](potential-plan-sweep-vwap.md) — potential_plan generates on sweep+vwap_confirmed (not only structure_confirmed); display-only, goldens byte-identical.
 - [Fast-entry structure bridge](fast-entry-bridge.md) — MICRO_CHOCH/SWEEP_RECLAIM never reached ALERT_HISTORY (fast-side early return); bridge injects CHOCH SUPPLY/DEMAND/LH/HL so structure_confirmed fires.
 - [Decision Quality analytics (Phase 5F)](decision-quality-analytics.md) — DB-backed snapshot analytics; dedup pattern; component win-rate computation; outcome hook location.
 - [Overnight volatility fetch (ES/NQ bar scarcity)](overnight-volatility-fetch.md) — ES/NQ return only ~12 bars overnight; VOL_MIN_BARS must stay ≤ that or MES/MNQ ATR silently breaks.
 - [Fast Entry Trigger](fast-entry-trigger.md) — DISPLAY-FIRST 1s/5s timing layer (2 flags default OFF); only sharpens timing on already valid/aligned HTF setup; reuses legacy FULL-READY auto fire-once key; goldens DON'T cover it (own smoke).
 - [Paper managed-trade same-bar fill guard](paper-managed-samebar-fill-guard.md) — paper watcher must skip exit-eval on bars opened at/before entry_epoch or fresh paper trade "instantly fills"; entry_epoch=registration≈fill (sub-ms) — don't move it.
 - [Main Brain dashboard](main-brain-dashboard.md) — mod-report id is DUPLICATED→use class not id; one-time layout VER reset floats Main Brain; Manual Trade Management: COPY+analysis=result, canonical action/invalidated, single-writer under MANUAL_TRADES_LOCK, MANAGING hidden when market closed.
-- [Analyst professional game-plan](analyst-game-plan.md) — DISPLAY-ONLY nested analyst["game_plan"] NOT a top-level block; fail-open; flows to /status via wholesale analyst pass; own smoke not goldens.
 - [Per-instrument dashboard view](per-instrument-dashboard-view.md) — MGC/MNQ tabs switch via /status?ticker → full_analysis(ticker_override); per-instrument price/VWAP/price-context invariants.
 - [Live alert trade-card](live-alert-card.md) — clean card is the single alert format for journal + main channel; fires once per READY setup + re-posts every TRADE_READY_INTERVAL; per-instrument throttle prevents double-post.
-- [Dashboard display modules: equity & news](display-modules-equity-news.md) — equity curve (today, no backfill) + ForexFactory news are /status-fed DISPLAY-ONLY; news must NEVER feed the gate.
 - [EARLY tier, score-aware conflict & alert_diagnostics](early-tier-and-alert-diagnostics.md) — SCALP 75/75 → READY-or-WAIT (no EARLY tier); single alert_diagnostics block feeding /status+Discord+dashboard (incl. CVD/RVOL); use verdict helpers not literal strings.
 - [Per-direction dashboard toggle](per-direction-dashboard-toggle.md) — Long/Short toggle shows bull/bear via result["directions"]; favored side reuses authoritative edge; non-favored never floored; conflict zeros both.
 - [Tiered alerts & webhook-tail latency](tiered-alerts-and-webhook-tail-latency.md) — alert_level is display-only; any Discord POST in /webhook tail must go through _enqueue_slow, not inline.
@@ -151,9 +132,12 @@
 - [Per-gate webhook diagnostics](gate-diagnostics.md) — owner-only /diagnostics shows per-gate PASS/FAIL + real "Blocked by" (authoritative "why WAIT"); no-VWAP candidate defaults opposite the alert (not a bug).
 - [Focus vs Mute decoupling](focus-vs-mute-decoupling.md) — dashboard focus = display-only/per-device; mute = server-side/global `/alerts/mute`; mute is in-memory (restart→all-unmuted); only NEW-SETUP alerts muted.
 - [TradersPost connectivity probe](traderspost-connectivity-probe.md) — HTTP 400 invalid-payload = password VALID, `invalid-password` = bad URL segment, HTTP 000 = transient OR trailing-whitespace; app .strip()s it; probe the STRIPPED value.
-- [Request-logger redaction](request-logger-redaction.md) — before_request logger echoes EVERY body unless on allowlist; _redact() only masks keys named password/token; new sensitive endpoints need their own metadata-only branch.
 - [Unified Edge Score](unified-edge-score.md) — transparent score is the only user-visible Edge Score; zone-broken blocker must be instrument-scoped or it zeros the other instrument.
-- [Dashboard potential-plan preview](dashboard-potential-plan-preview.md) — forming-setup entry/stop/TP preview is display-only in directions[*].potential_plan; money path keys ONLY off actionable verdict + top-level trade_plan.
 - [Observability / eval-metrics heartbeat](observability-eval-metrics.md) — diagnostic heartbeat re-eval + counters; must stay full_analysis+_record_eval_metrics only; COUNTERS_LOCK never inside EVAL_METRICS_LOCK; WAIT reason is strict_reason not reason.
 - [EARLY intrabar pre-READY alert](early-pre-ready-alert.md) — display-only ⚡EARLY fires on sweep+structure before candle-close; never touches gate; fire-once dedupe; READY owns the signal.
 - [Per-instrument structure isolation](instrument-structure-isolation.md) — suspected cross-instrument BOS/CHOCH leak DISPROVEN; all 3 structure readers share a_inst!=inst filter; diagnose by replaying real webhooks + rebasing timestamps.
+- [Scalp live paper-sim](scalp-live-sim.md) — research strategies PAPER-simulated on live stream, walled off (default-OFF flag); SHORT R must be (entry-exit)/risk or signs invert silently; watcher live-gate must be INSIDE self-rescheduling loop.
+- [Analyst professional game-plan](analyst-game-plan.md) — DISPLAY-ONLY nested analyst["game_plan"] NOT a top-level block; fail-open; flows to /status via wholesale analyst pass; own smoke not goldens.
+- [Potential-plan sweep+VWAP gate](potential-plan-sweep-vwap.md) — potential_plan generates on sweep+vwap_confirmed (not only structure_confirmed); display-only, goldens byte-identical.
+- [Dashboard display modules: equity & news](display-modules-equity-news.md) — equity curve (today, no backfill) + ForexFactory news are /status-fed DISPLAY-ONLY; news must NEVER feed the gate.
+- [Dashboard potential-plan preview](dashboard-potential-plan-preview.md) — forming-setup entry/stop/TP preview is display-only in directions[*].potential_plan; money path keys ONLY off actionable verdict + top-level trade_plan.

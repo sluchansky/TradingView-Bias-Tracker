@@ -13643,6 +13643,40 @@ def _recompute_learning_eligibility(conn):
         logger.warning("_recompute_learning_eligibility failed: %s", exc)
 
 
+def _boot_purge_test_trades():
+    """One-time boot cleanup: delete strategy_trades rows whose managed_key starts
+    with 'test_p6_'.  These were inserted during Phase-6 integration testing and
+    accidentally crossed the n=0 bootstrap threshold, activating GHOST_ONLY for
+    MGC::SCALP and MNQ::SCALP and silently rerouting live orders to paper.
+
+    Safe to run on every boot — DELETE WHERE 'test_p6_%' is a no-op after the
+    first pass and never touches real trade rows (real managed_keys never carry
+    this prefix).  Always completes before _recompute_learning so the cache warms
+    from clean data."""
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = None
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        cur = conn.cursor()
+        cur.execute("DELETE FROM strategy_trades WHERE managed_key LIKE 'test_p6_%%'")
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        if deleted:
+            logger.info("boot_purge_test_trades: removed %d test fixture row(s) from strategy_trades", deleted)
+        else:
+            logger.debug("boot_purge_test_trades: no test rows found (already clean)")
+    except Exception as exc:
+        logger.warning("boot_purge_test_trades failed (non-critical): %s", exc)
+    finally:
+        if conn:
+            try: conn.close()
+            except Exception: pass
+
+
 def _recompute_learning():
     """Recompute per-strategy analytics + bounded weights from strategy_trades and
     swap the in-memory caches atomically. Also persists strategy_weights for
@@ -77547,6 +77581,7 @@ if __name__ == "__main__":
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:
+        _boot_purge_test_trades()                                            # remove test_p6_* fixture rows before recompute so they never trigger GHOST_ONLY
         threading.Thread(target=_recompute_learning, daemon=True).start()  # warm the learning cache from Postgres at boot (display-only)
         threading.Thread(target=_load_last_report, daemon=True).start()    # warm the last performance report from Postgres at boot (display-only)
         threading.Thread(target=_recompute_main_brain_review, daemon=True).start()  # warm the Main Brain review cache from Postgres at boot (display-only)
