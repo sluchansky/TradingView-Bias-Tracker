@@ -9883,14 +9883,23 @@ def _arm_preflight_check(data):
                           "(TRADERSPOST_WEBHOOK_URL env var missing).")
 
     # 4. Databento health (if enabled; fail-closed on exception)
+    #    At arm time we check connectivity/tick freshness only.  Data-staleness codes
+    #    (STALE_VWAP, STALE_BAR) are NOT arm-blockers — they resolve on the next bar/push
+    #    and are re-checked hard at actual execution time inside _maybe_auto_execute().
+    _ARM_DATA_STALE_OK = {RC_STALE_VWAP, RC_STALE_BAR, "STALE_VWAP", "STALE_BAR",
+                          "databento_bar_stale", "vwap_stale", "vwap_unavailable",
+                          "vwap_missing", "vwap_ok"}
     if DATABENTO_ENABLED:
         instruments = data.get("instruments") or list(ASSETS.keys())
         _probe_inst = instruments[0] if instruments else None
         if _probe_inst and _probe_inst in ASSETS:
             try:
                 db_ok, db_reason, _ = _check_databento_execution_health(_probe_inst)
-                if not db_ok:
+                if not db_ok and db_reason not in _ARM_DATA_STALE_OK:
                     errors.append(f"Databento feed unhealthy: {db_reason}")
+                elif not db_ok:
+                    logger.info("Arm preflight: Databento data-staleness (%s) — "
+                                "allowed at arm time, will be re-checked at execution.", db_reason)
             except Exception as _db_e:
                 errors.append(f"Databento health check failed: {type(_db_e).__name__}")
 
