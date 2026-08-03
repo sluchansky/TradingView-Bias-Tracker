@@ -13892,7 +13892,7 @@ def _recompute_learning():
             }
 
         analytics = {
-            "enabled": True, "ready": total > 0, "total_trades": total,
+            "enabled": True, "ready": True, "total_trades": total,
             "ranking": ranking, "best_hours": best_hours,
             "best_conditions": best_conditions, "top_strategy": top_strategy,
             "bottom_strategy": bottom_strategy, "trend": trend,
