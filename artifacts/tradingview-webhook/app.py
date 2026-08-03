@@ -13485,6 +13485,7 @@ def _recompute_learning_eligibility(conn):
                 avg((r_multiple >= 0.9)::int::float) AS tp1_hit_rate
             FROM strategy_trades
             WHERE symbol IS NOT NULL AND result IS NOT NULL
+              AND (managed_key IS NULL OR managed_key NOT LIKE 'test_%%')
             GROUP BY symbol, COALESCE(trading_mode, 'SWING')
         """)
         inst_rows = {(r["symbol"], r["trading_mode"]): r for r in (cur.fetchall() or [])}
@@ -13497,6 +13498,7 @@ def _recompute_learning_eligibility(conn):
                            ORDER BY closed_at DESC NULLS LAST) AS rn
                 FROM strategy_trades
                 WHERE symbol IS NOT NULL AND closed_at IS NOT NULL
+                  AND (managed_key IS NULL OR managed_key NOT LIKE 'test_%%')
             )
             SELECT symbol, trading_mode, avg(r_multiple) AS last_20_avg_r
             FROM ranked WHERE rn <= 20
@@ -13514,6 +13516,7 @@ def _recompute_learning_eligibility(conn):
                    avg(r_multiple) AS expectancy
             FROM strategy_trades
             WHERE symbol IS NOT NULL AND strategy_key IS NOT NULL AND result IS NOT NULL
+              AND (managed_key IS NULL OR managed_key NOT LIKE 'test_%%')
             GROUP BY symbol, COALESCE(trading_mode, 'SWING'), strategy_key
             HAVING count(*) >= %s
         """, (LEARNING_SETUP_DISABLE_MIN_N,))
@@ -77581,7 +77584,7 @@ if __name__ == "__main__":
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:
-        _boot_purge_test_trades()                                            # remove test_p6_* fixture rows before recompute so they never trigger GHOST_ONLY
+        # (test_p6_* rows are kept in strategy_trades and excluded from LRE counts via SQL filter)
         threading.Thread(target=_recompute_learning, daemon=True).start()  # warm the learning cache from Postgres at boot (display-only)
         threading.Thread(target=_load_last_report, daemon=True).start()    # warm the last performance report from Postgres at boot (display-only)
         threading.Thread(target=_recompute_main_brain_review, daemon=True).start()  # warm the Main Brain review cache from Postgres at boot (display-only)
