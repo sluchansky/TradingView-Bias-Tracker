@@ -10079,10 +10079,26 @@ def _arm_update_session_pnl(pnl_delta):
         _ARM_STATE["session_pnl"] = _ARM_STATE.get("session_pnl", 0.0) + pnl_delta
 
 
+# ── Databento watcher grace-period state ─────────────────────────────────────
+# Counts consecutive 30-second ticks where the feed is hard-unhealthy.
+# A brief reconnect (<60 s) will not disarm; only a sustained outage will.
+_DB_WATCHER_UNHEALTHY_TICKS = 0
+_DB_WATCHER_GRACE_TICKS     = 2   # require 2 consecutive bad ticks (~60 s) to disarm
+# Only these reason codes are treated as "hard" connectivity failures by the
+# watcher.  Data-staleness codes (STALE_VWAP, STALE_BAR, stale tick age) are
+# NOT watcher-level disarm triggers — they are re-checked at execution time.
+_DB_WATCHER_HARD_CODES = frozenset({
+    "databento_disconnected",
+    "databento_instrument_not_subscribed",
+    "databento_tick_timestamp_missing",
+})
+
+
 def _auto_disarm_watcher():
     """Daemon thread: auto-disarm on arm expiry, Databento disconnect, daily loss, etc.
     Runs every 30 seconds. Fail-open: exceptions are swallowed to keep the thread alive.
     """
+    global _DB_WATCHER_UNHEALTHY_TICKS
     while True:
         try:
             time.sleep(30)
@@ -10094,6 +10110,7 @@ def _auto_disarm_watcher():
                 sess_pnl  = _ARM_STATE.get("session_pnl", 0.0)
                 safety_locked = _ARM_STATE.get("safety_locked", False)
             if not armed:
+                _DB_WATCHER_UNHEALTHY_TICKS = 0   # reset grace counter when not armed
                 continue
 
             # (A) Arm expired
@@ -10101,20 +10118,41 @@ def _auto_disarm_watcher():
                 try:
                     if now_utc() > datetime.fromisoformat(exp_raw):
                         _disarm("arm_expired", by="auto_watcher")
+                        _DB_WATCHER_UNHEALTHY_TICKS = 0
                         continue
                 except Exception:
                     _disarm("arm_expired", by="auto_watcher")
+                    _DB_WATCHER_UNHEALTHY_TICKS = 0
                     continue
 
-            # (B) Databento disconnected
+            # (B) Databento hard connectivity failure — with grace period.
+            #     Transient reconnects (~10 s) should NOT disarm; only a sustained
+            #     outage (≥ GRACE_TICKS × 30 s ≈ 60 s) triggers disarm.
+            #     Data-staleness reasons (STALE_VWAP, stale bar/tick age) are
+            #     intentionally excluded — they are re-checked at trade time.
             if DATABENTO_ENABLED and insts:
                 try:
                     db_ok, db_reason, _ = _check_databento_execution_health(insts[0])
-                    if not db_ok and "disabled" not in db_reason.lower():
-                        _disarm("databento_disconnected", by="auto_watcher")
-                        continue
+                    is_hard_fail = (not db_ok
+                                    and db_reason in _DB_WATCHER_HARD_CODES
+                                    and "disabled" not in db_reason.lower())
+                    if is_hard_fail:
+                        _DB_WATCHER_UNHEALTHY_TICKS += 1
+                        logger.warning(
+                            "Databento watcher: hard failure (%s) — grace %d/%d%s",
+                            db_reason, _DB_WATCHER_UNHEALTHY_TICKS, _DB_WATCHER_GRACE_TICKS,
+                            " — disarming now" if _DB_WATCHER_UNHEALTHY_TICKS >= _DB_WATCHER_GRACE_TICKS else " — holding",
+                        )
+                        if _DB_WATCHER_UNHEALTHY_TICKS >= _DB_WATCHER_GRACE_TICKS:
+                            _disarm("databento_disconnected", by="auto_watcher")
+                            _DB_WATCHER_UNHEALTHY_TICKS = 0
+                            continue
+                    else:
+                        if _DB_WATCHER_UNHEALTHY_TICKS > 0:
+                            logger.info("Databento watcher: feed recovered — resetting grace counter")
+                        _DB_WATCHER_UNHEALTHY_TICKS = 0
                 except Exception:
-                    pass  # fail-open for watcher
+                    _DB_WATCHER_UNHEALTHY_TICKS = 0   # fail-open for watcher
 
             # (C) Daily loss limit breached for any allowed instrument
             try:
