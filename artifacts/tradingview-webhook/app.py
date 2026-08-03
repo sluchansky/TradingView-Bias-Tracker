@@ -24503,6 +24503,7 @@ def _mb_market_state(result, errors):
 def _mb_left_brain(inst, result, errors):
     available  = True
     thesis_out = None
+    raw_thesis = None          # kept at function scope so diagnosis block can read it
     try:
         raw_thesis = _LB_THESIS_BY_INST.get(inst)
         if raw_thesis is not None:
@@ -24622,6 +24623,15 @@ def _mb_left_brain(inst, result, errors):
         except Exception:
             _fb_blocked_r = "UNKNOWN"
 
+        # True when the thesis is the silent _neutral_thesis() fallback (available=False)
+        # rather than a genuine NEUTRAL market read (available=True). Surfaces to the UI
+        # so the operator panel can show "DATA QUALITY LOW" instead of misreading silence
+        # as genuine market conflict.
+        _thesis_is_fallback = bool(
+            thesis_out is not None and raw_thesis is not None
+            and raw_thesis.get("available") is False
+        )
+
         diagnosis = {
             "instrument":              inst,
             "status":                  _diag_status,
@@ -24642,14 +24652,17 @@ def _mb_left_brain(inst, result, errors):
             "fallback_blocked_reason": _fb_blocked_r,
             "observations_available":  obs_count,
             "observations_required":   LB_MIN_OBS_FOR_FALLBACK,
+            # ── Task #56: distinguish silent fallback NEUTRAL from genuine NEUTRAL ──
+            "thesis_is_mi_fallback":   _thesis_is_fallback,
         }
     except Exception as _de:
         logger.debug("_mb_left_brain diagnosis: %s", _de)
         diagnosis = {
-            "instrument":  inst,
-            "status":      "ERROR",
-            "error_code":  "DIAGNOSIS_FAILED",
-            "source":      "left_brain_store",
+            "instrument":            inst,
+            "status":                "ERROR",
+            "error_code":            "DIAGNOSIS_FAILED",
+            "source":                "left_brain_store",
+            "thesis_is_mi_fallback": False,
         }
 
     return {

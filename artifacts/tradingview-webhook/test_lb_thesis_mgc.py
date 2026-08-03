@@ -127,17 +127,23 @@ def _diagnosis(raw_thesis, obs_count, source_sym="MGC.c.0", db_bars=127):
         blocked = None
 
     _calc_at = (thesis_out or {}).get("generated_at")
+    # Task #56: mirror the thesis_is_mi_fallback field added to _mb_left_brain
+    _thesis_is_fallback = bool(
+        thesis_out is not None and raw_thesis is not None
+        and raw_thesis.get("available") is False
+    )
     return {
-        "instrument":          "MGC",
-        "status":              status,
-        "canonical_symbol":    "MGC",
-        "source_symbol":       source_sym,
-        "observation_count":   obs_count,
-        "databento_bars":      db_bars,
-        "last_calculation_at": _calc_at,
-        "thesis_age_seconds":  _thesis_age,
-        "blocked_reason":      blocked,
-        "thesis_out":          thesis_out,
+        "instrument":            "MGC",
+        "status":                status,
+        "canonical_symbol":      "MGC",
+        "source_symbol":         source_sym,
+        "observation_count":     obs_count,
+        "databento_bars":        db_bars,
+        "last_calculation_at":   _calc_at,
+        "thesis_age_seconds":    _thesis_age,
+        "blocked_reason":        blocked,
+        "thesis_out":            thesis_out,
+        "thesis_is_mi_fallback": _thesis_is_fallback,
     }
 
 
@@ -609,6 +615,46 @@ class TestKeyBugRegression(unittest.TestCase):
         # The key assertion is that it does NOT silently show AVAILABLE when stale
         self.assertNotEqual(d_fixed["status"], "AVAILABLE",
                             "A 100-min old thesis must not appear as AVAILABLE")
+
+
+# ── Task #56: thesis_is_mi_fallback flag ─────────────────────────────────────
+class TestMiFallbackFlag(unittest.TestCase):
+    """Verify that _diagnosis() (and therefore _mb_left_brain) correctly sets
+    thesis_is_mi_fallback=True only when the stored thesis has available=False,
+    distinguishing a silent _neutral_thesis() fallback from a genuine NEUTRAL read."""
+
+    def test_fallback_neutral_sets_flag_true(self):
+        """_make_thesis with available=False (i.e. _neutral_thesis output) must set
+        thesis_is_mi_fallback=True so the UI can show DATA QUALITY LOW."""
+        thesis = _make_thesis("NEUTRAL", age_offset_sec=0, available=False)
+        d = _diagnosis(raw_thesis=thesis, obs_count=10)
+        self.assertTrue(d["thesis_is_mi_fallback"],
+                        "Fallback NEUTRAL thesis (available=False) must set thesis_is_mi_fallback=True")
+
+    def test_genuine_neutral_does_not_set_flag(self):
+        """A real NEUTRAL thesis (available=True, market genuinely contested) must NOT
+        set thesis_is_mi_fallback — the operator should see the direction without the
+        DATA QUALITY LOW badge."""
+        thesis = _make_thesis("NEUTRAL", age_offset_sec=0, available=True)
+        d = _diagnosis(raw_thesis=thesis, obs_count=10)
+        self.assertFalse(d["thesis_is_mi_fallback"],
+                         "Genuine NEUTRAL thesis (available=True) must not set thesis_is_mi_fallback")
+
+    def test_directional_thesis_never_sets_flag(self):
+        """A fresh BULLISH thesis with available=True must never set the fallback flag."""
+        thesis = _make_thesis("BULLISH", age_offset_sec=30, available=True)
+        d = _diagnosis(raw_thesis=thesis, obs_count=20)
+        self.assertFalse(d["thesis_is_mi_fallback"],
+                         "Directional thesis (available=True) must not set thesis_is_mi_fallback")
+        self.assertEqual(d["status"], "AVAILABLE")
+
+    def test_no_thesis_does_not_set_flag(self):
+        """When no thesis exists in the store (raw_thesis=None), the flag must be
+        False — there is nothing to call a fallback."""
+        d = _diagnosis(raw_thesis=None, obs_count=0)
+        self.assertFalse(d["thesis_is_mi_fallback"],
+                         "Absent thesis must not set thesis_is_mi_fallback")
+        self.assertEqual(d["status"], "NO_DATA")
 
 
 if __name__ == "__main__":

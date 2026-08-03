@@ -714,9 +714,19 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const calcAt      = fmtTs(diag.last_calculation_at);
   const sourceSym   = safeStr(diag.source_symbol, '');
 
+  // Task #56: true when the thesis is the silent _neutral_thesis() fallback (available=False)
+  // rather than a real NEUTRAL market read. The operator sees "NEUTRAL" either way —
+  // this flag lets us show a DATA QUALITY LOW sub-badge instead of implying genuine conflict.
+  const isMiFallback = Boolean(diag.thesis_is_mi_fallback);
+
   // Badge shown in the panel header
   const badge = isAvailable
-    ? <Badge label={dir || 'NEUTRAL'} color={dCol} />
+    ? isMiFallback
+      ? <div style={{ display: 'flex', gap: 4 }}>
+          <Badge label={dir || 'NEUTRAL'} color={dCol} />
+          <Badge label="DATA QUALITY LOW" color={T.amber} />
+        </div>
+      : <Badge label={dir || 'NEUTRAL'} color={dCol} />
     : isStale
       ? <Badge label="STALE" color={T.amber} />
       : isCollect
@@ -797,6 +807,23 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
       {/* ── AVAILABLE — fresh, real thesis ─── */}
       {isAvailable && (
         <>
+          {/* DATA QUALITY LOW note — fallback NEUTRAL (no bar-close data), not genuine conflict */}
+          {isMiFallback && (
+            <div style={{
+              background: `${T.amber}10`, border: `1px solid ${T.amber}40`,
+              borderRadius: 7, padding: '8px 12px', marginBottom: 10,
+            }}>
+              <div style={{ fontSize: 10, fontWeight: 700, color: T.amber,
+                            letterSpacing: '0.07em', marginBottom: 3 }}>
+                DATA QUALITY LOW
+              </div>
+              <div style={{ fontSize: 10.5, color: T.txtSec, lineHeight: 1.45 }}>
+                NEUTRAL reflects insufficient bar-close data — not genuine market conflict.
+                Directional thesis will update once more bars close.
+              </div>
+            </div>
+          )}
+
           {/* Direction + confidence bar */}
           <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
             <div>
@@ -1730,6 +1757,15 @@ type MbSendOutcome =
   | { type: 'rejected'; reason: string; ts: string }
   | { type: 'unknown';  ts: string };
 
+// Session send log — resets on page refresh, max 10 entries (oldest drops off).
+interface SendLogEntry {
+  ts:         string;
+  instrument: string;
+  direction:  string | null | undefined;
+  entryPrice: string | null;
+  outcome:    MbSendOutcome;
+}
+
 const MbSendModal: React.FC<{
   p:         Record<string, unknown>;
   onClose:   () => void;
@@ -1986,6 +2022,7 @@ const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   // ── Send-to-TradersPost state ─────────────────────────────────────────────
   const [modalOpen,  setModalOpen]  = useState(false);
   const [sendResult, setSendResult] = useState<MbSendOutcome | null>(null);
+  const [sendLog,    setSendLog]    = useState<SendLogEntry[]>([]);
   const sendingRef = useRef(false);
 
   const eligibility = getMbSendEligibility(p);
@@ -2176,6 +2213,55 @@ const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                 )}
               </div>
             )}
+
+            {/* ── Session send log (Task #57) — hidden when empty, max 10 entries ── */}
+            {sendLog.length > 0 && (
+              <div style={{ marginTop: 12, paddingTop: 10, borderTop: `1px solid ${T.border}` }}>
+                <div style={{ fontSize: 9, color: T.txtMuted, letterSpacing: '0.07em',
+                              marginBottom: 6, fontWeight: 700 }}>
+                  SESSION SEND LOG
+                </div>
+                {sendLog.map((e, i) => {
+                  const isSuccess = e.outcome.type === 'success';
+                  const isUnknown = e.outcome.type === 'unknown';
+                  const col   = isSuccess ? T.green : isUnknown ? T.amber : T.red;
+                  const icon  = isSuccess ? '✓' : isUnknown ? '⚠' : '✗';
+                  const label = isSuccess
+                    ? (e.outcome.status === 'sent'       ? 'SENT'
+                     : e.outcome.status === 'simulated'  ? 'PAPER'
+                     :                                     'MANUAL')
+                    : isUnknown ? 'UNKNOWN'
+                    : `${e.outcome.reason}`;
+                  const timeStr = e.ts
+                    ? new Date(e.ts).toLocaleTimeString('en-US',
+                        { hour: '2-digit', minute: '2-digit', hour12: true,
+                          timeZone: 'America/New_York' })
+                    : '';
+                  return (
+                    <div key={i} style={{
+                      display: 'flex', alignItems: 'center', gap: 5,
+                      padding: '3px 0',
+                      borderBottom: i < sendLog.length - 1
+                        ? `1px solid ${T.border}` : 'none',
+                      fontSize: 9.5,
+                    }}>
+                      <span style={{ color: col, fontFamily: T.mono, flexShrink: 0 }}>{icon}</span>
+                      <span style={{ color: T.txtMuted, fontFamily: T.mono, flexShrink: 0 }}>{timeStr}</span>
+                      <span style={{ color: T.txtSec, flex: 1, overflow: 'hidden',
+                                     textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {e.instrument}{e.direction ? ` ${e.direction}` : ''}
+                        {e.entryPrice ? ` @ ${e.entryPrice}` : ''}
+                      </span>
+                      <span style={{ color: col, fontWeight: 600, flexShrink: 0,
+                                     maxWidth: 100, overflow: 'hidden',
+                                     textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {label}
+                      </span>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </>
         )}
       </Panel>
@@ -2189,6 +2275,15 @@ const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             const outcome = await handleMbSend();
             setSendResult(outcome);
             setModalOpen(false);
+            // Append to session send log (max 10, newest first)
+            const entry: SendLogEntry = {
+              ts:         outcome.ts,
+              instrument: safeStr((p.market as Record<string, unknown>)?.instrument, ''),
+              direction:  cp.direction as string | null | undefined,
+              entryPrice: (cp.entry_zone as string | null | undefined) ?? null,
+              outcome,
+            };
+            setSendLog(prev => [entry, ...prev].slice(0, 10));
             return outcome;
           }}
         />
