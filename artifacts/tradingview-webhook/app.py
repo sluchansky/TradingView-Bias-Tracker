@@ -965,7 +965,7 @@ MODES = {
         #    WAIT). CONFLICT_DOMINANT_GAP (>= 20 ahead) flags a clearly dominant side
         #    in the diagnostics block. SWING keeps the original always-WAIT behaviour. ──
         "CONFLICT_SCORE_AWARE":   True,
-        "CONFLICT_WAIT_GAP":      10,
+        "CONFLICT_WAIT_GAP":      0,
         "CONFLICT_DOMINANT_GAP":  20,
         # Tiered WATCH/ARMED early alerts (SCALP only — fire before a full READY).
         "ENABLE_TIERED_ALERTS":     True,
