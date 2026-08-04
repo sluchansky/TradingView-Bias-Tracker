@@ -1,0 +1,241 @@
+TASK: Add a simple “Explain Decision” drawer to Main Brain using existing diagnostics only.
+
+GOAL
+
+Make the bot’s current reasoning understandable without changing trading behavior.
+
+This is a read-only display and formatting task.
+
+Do not build a new AI reasoning engine.
+
+DO NOT modify:
+
+- Databento
+- Left Brain calculations
+- strategy calculations
+- Long/Short scoring
+- Edge Score
+- readiness gates
+- opposing-structure logic
+- alerts
+- risk
+- TradersPost
+- execution
+- learning
+- polling
+
+PART 1 — REUSE EXISTING DATA
+
+Identify and reuse the canonical Main Brain fields for:
+
+- current verdict
+- actionable status
+- Long score
+- Short score
+- score difference
+- Left Brain thesis
+- thesis confidence/strength
+- candidate direction
+- candidate strategy
+- candidate status
+- alignment state
+- positive score contributors
+- negative score contributors
+- confirmations passed
+- confirmations missing
+- hard blockers
+- opposing structure
+- risk state
+- data freshness
+- latest relevant timeline events
+
+Do not recalculate these values in React.
+
+PART 2 — ADD BUTTON
+
+Add a button near the Verdict panel:
+
+EXPLAIN DECISION
+
+The button opens a drawer or modal.
+
+Do not place it in the sidebar.
+
+PART 3 — SUMMARY HEADER
+
+At the top show:
+
+CURRENT VERDICT
+WAIT / READY / BLOCKED
+
+BEST CANDIDATE
+LONG / SHORT / NONE
+
+MARKET THESIS
+BULLISH / BEARISH / NEUTRAL / CONFLICTED
+
+ALIGNMENT
+FULLY ALIGNED / COUNTER-TREND / NEUTRAL / CONFLICTED
+
+PART 4 — LONG VS SHORT
+
+Show both directional scores side by side:
+
+LONG SCORE: X
+SHORT SCORE: Y
+
+Show:
+
+DECISION MARGIN:
+LONG +N
+or
+SHORT +N
+or
+TIED
+
+Clearly distinguish:
+
+- selected candidate direction
+- higher score direction
+- actionable direction
+
+They may not always be the same.
+
+Do not hide a contradiction.
+
+PART 5 — WHY EACH SIDE SCORED
+
+Show existing score components grouped by direction.
+
+Example:
+
+WHY LONG SCORED
+
++ Bullish BOS: +15
++ VWAP reclaim: +10
++ Positive CVD: +8
+- Opposing bearish structure: -10
+
+WHY SHORT SCORED
+
++ Bearish CHOCH: +18
++ VWAP rejection: +12
++ Negative delta: +8
+
+Only show actual canonical factors.
+
+If component values are unavailable, show:
+
+SCORE BREAKDOWN UNAVAILABLE
+
+Do not generate estimated weights.
+
+PART 6 — WHY IT IS NOT READY
+
+Show the exact current blockers and missing confirmations.
+
+Example:
+
+WHY WAITING
+
+- Bullish BOS missing
+- Bearish structure ACTIVE
+- Long score trails Short by 12 points
+- Trade plan is POTENTIAL, not READY
+
+If no hard block exists, state:
+
+NO HARD BLOCK — WAITING FOR CONFIRMATION
+
+PART 7 — WHAT MUST CHANGE
+
+Construct this section only from existing missing confirmations, blocker expiry data, and score diagnostics.
+
+Example:
+
+TO BECOME READY
+
+- Bullish BOS must confirm
+- Opposing structure must become OVERRIDDEN or EXPIRED
+- Long score must exceed the readiness threshold
+- Risk State must remain NORMAL
+
+Do not invent requirements.
+
+PART 8 — RECENT DECISION CHANGES
+
+Show the latest 5–10 relevant existing timeline events:
+
+- thesis changed
+- structure detected
+- structure overridden
+- VWAP reclaim/rejection
+- score changed
+- candidate changed
+- verdict changed
+- blocker activated/expired
+
+Use the existing timeline formatter.
+
+Never render `[object Object]`.
+
+PART 9 — PLAIN-ENGLISH SUMMARY
+
+Build one deterministic summary from structured fields.
+
+Example:
+
+“The market thesis is bearish and the Short score is currently 12 points higher. A potential Long reclaim exists, but it is counter-trend and still missing bullish structure confirmation. The system is correctly waiting rather than recommending a Long entry.”
+
+Do not call an LLM to generate this summary.
+
+Use templates only.
+
+PART 10 — STATES
+
+Support:
+
+- READY and aligned
+- READY counter-trend
+- WAIT with candidate
+- BLOCKED
+- no candidate
+- thesis unavailable
+- score breakdown unavailable
+- stale data
+
+Do not present unavailable data as neutral.
+
+PART 11 — TESTS
+
+Test:
+
+1. Long score higher than Short.
+2. Short score higher than Long.
+3. Candidate direction differs from higher score.
+4. Bullish thesis + Long candidate.
+5. Bearish thesis + Long candidate.
+6. Hard blocker shown.
+7. Missing confirmation shown.
+8. Opposing structure ACTIVE.
+9. Opposing structure OVERRIDDEN.
+10. No score breakdown.
+11. No candidate.
+12. Stale thesis.
+13. Timeline objects format safely.
+14. Summary contains no invented facts.
+15. Drawer creates no polling loop.
+16. Existing Main Brain tests remain green.
+
+FINAL RESPONSE REQUIRED
+
+Provide:
+
+- files changed
+- exact existing fields reused
+- drawer layout
+- long/short score comparison
+- summary templates
+- screenshots
+- tests
+- confirmation that no scoring, readiness, alerts, or execution behavior changed

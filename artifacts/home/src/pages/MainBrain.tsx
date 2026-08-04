@@ -19,6 +19,10 @@ import {
   SCAN_INSTRUMENTS, SCAN_MODES,
   type StatusRecord, type CleanestCandidate, type RankInput,
 } from '../lib/cleanestTrade';
+import {
+  extractExplainData, buildPlainEnglishSummary,
+  type ScoreComponent,
+} from '../lib/explainDecision';
 
 // ── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -885,8 +889,333 @@ const WEIGHT_STATUS_COLOR: Record<string, string> = {
   DB_DISABLED:          '#64748b',
 };
 
+// ── Explain Decision Drawer ───────────────────────────────────────────────────
+// Read-only drawer that explains the current Main Brain decision using only
+// existing payload fields.  No new polling, no trading-logic changes.
+const ExplainDecisionDrawer: React.FC<{
+  p: Record<string, unknown>;
+  onClose: () => void;
+}> = ({ p, onClose }) => {
+  const d       = extractExplainData(p);
+  const summary = buildPlainEnglishSummary(d);
+
+  // Close on Escape
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    document.addEventListener('keydown', handler);
+    return () => document.removeEventListener('keydown', handler);
+  }, [onClose]);
+
+  const verdictCol = d.isActionable ? T.green : /block/i.test(d.verdict) ? T.red : T.amber;
+  const candCol    = d.candidateDir === 'LONG' ? T.green : d.candidateDir === 'SHORT' ? T.red : T.txtMuted;
+  const alignCol   = d.alignment === 'FULLY ALIGNED' ? T.green
+    : d.alignment === 'COUNTER-TREND' ? T.red
+    : d.alignment === 'NEUTRAL' ? T.amber : T.txtMuted;
+
+  const SectionHead: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+    <div style={{
+      fontSize:9, fontWeight:700, letterSpacing:'0.12em', color:T.cyan,
+      textTransform:'uppercase', marginBottom:10,
+      paddingBottom:6, borderBottom:`1px solid rgba(56,189,248,0.15)`,
+    }}>{children}</div>
+  );
+
+  const renderComps = (comps: ScoreComponent[], title: string, col: string) => {
+    if (comps.length === 0) return (
+      <div>
+        <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.08em', marginBottom:4 }}>{title.toUpperCase()}</div>
+        <div style={{ fontSize:10, color:T.txtMuted, fontStyle:'italic' }}>SCORE BREAKDOWN UNAVAILABLE</div>
+      </div>
+    );
+    return (
+      <div>
+        <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.08em', marginBottom:6 }}>{title.toUpperCase()}</div>
+        {comps.map((c, i) => (
+          <div key={i} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:4 }}>
+            <span style={{ fontSize:11, color:c.present ? col : 'rgba(255,255,255,0.18)', width:14, flexShrink:0, lineHeight:1 }}>
+              {c.present ? '+' : '−'}
+            </span>
+            <span style={{ fontSize:10, color:c.present ? T.txtSec : T.txtMuted, flex:1 }}>{c.label}</span>
+            <span style={{ fontSize:9.5, fontFamily:T.mono, color:c.present ? col : T.txtMuted, flexShrink:0 }}>
+              {c.present ? `+${c.points}` : '—'}
+            </span>
+          </div>
+        ))}
+      </div>
+    );
+  };
+
+  return (
+    <>
+      {/* Backdrop */}
+      <div
+        onClick={onClose}
+        aria-hidden
+        style={{
+          position:'fixed', inset:0,
+          background:'rgba(0,0,0,0.65)',
+          backdropFilter:'blur(2px)',
+          zIndex:2000,
+        }}
+      />
+      {/* Drawer panel */}
+      <div
+        role="dialog"
+        aria-label="Explain Decision"
+        aria-modal="true"
+        style={{
+          position:'fixed', top:0, right:0, bottom:0,
+          width:'min(520px,100vw)',
+          background:T.panel,
+          borderLeft:`1px solid ${T.borderMid}`,
+          zIndex:2001,
+          overflowY:'auto',
+          display:'flex', flexDirection:'column',
+        }}
+      >
+        {/* Sticky header */}
+        <div style={{
+          position:'sticky', top:0, zIndex:1,
+          background:T.panel, borderBottom:`1px solid ${T.border}`,
+          padding:'14px 18px', display:'flex', alignItems:'center', gap:10,
+        }}>
+          <span style={{ fontSize:11, fontWeight:700, letterSpacing:'0.12em', color:T.cyan, flex:1 }}>
+            EXPLAIN DECISION
+          </span>
+          <button
+            onClick={onClose}
+            aria-label="Close explain decision drawer"
+            style={{
+              background:'none', border:'none', cursor:'pointer',
+              color:T.txtMuted, fontSize:18, lineHeight:1, padding:'2px 6px', borderRadius:4,
+            }}
+          >✕</button>
+        </div>
+
+        {/* Body */}
+        <div style={{ padding:'18px 18px 32px', flex:1, display:'flex', flexDirection:'column', gap:22 }}>
+
+          {/* ── 1. Decision Summary (4-quadrant) ── */}
+          <div>
+            <SectionHead>Decision Summary</SectionHead>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+              {[
+                { label:'Current Verdict', value:d.verdict,      col:verdictCol },
+                { label:'Best Candidate',  value:d.candidateDir, col:candCol    },
+                { label:'Market Thesis',   value:d.thesisDir,    col:dirColor(d.thesisDir) },
+                { label:'Alignment',       value:d.alignment,    col:alignCol   },
+              ].map(({ label, value, col }) => (
+                <div key={label} style={{
+                  padding:'10px 12px', borderRadius:8,
+                  background:`${col}0d`, border:`1px solid ${col}33`,
+                }}>
+                  <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', marginBottom:4 }}>
+                    {label.toUpperCase()}
+                  </div>
+                  <div style={{ fontSize:12, fontWeight:800, color:col, letterSpacing:'0.04em', wordBreak:'break-word' }}>
+                    {value}
+                  </div>
+                </div>
+              ))}
+            </div>
+            {d.contradiction && (
+              <div style={{
+                marginTop:8, padding:'7px 10px',
+                background:`${T.amber}0d`, border:`1px solid ${T.amber}40`, borderRadius:6,
+                fontSize:10, color:T.amber,
+              }}>
+                ⚠ Candidate ({d.candidateDir}) differs from higher-scoring side ({d.higherSide})
+              </div>
+            )}
+          </div>
+
+          {/* ── 2. Plain-English Summary ── */}
+          <div>
+            <SectionHead>Plain-English Summary</SectionHead>
+            <div style={{
+              padding:'10px 12px',
+              background:'rgba(56,189,248,0.04)', border:`1px solid rgba(56,189,248,0.14)`,
+              borderLeft:`3px solid ${T.cyan}55`, borderRadius:7,
+              fontSize:11, color:T.txtSec, lineHeight:1.6,
+            }}>
+              {summary}
+            </div>
+          </div>
+
+          {/* ── 3. Long vs Short Scores ── */}
+          <div>
+            <SectionHead>Long vs Short</SectionHead>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:10 }}>
+              {([['LONG', d.longScore, T.green], ['SHORT', d.shortScore, T.red]] as const).map(([side, sc, col]) => {
+                const isCandidate = d.candidateDir === side;
+                const isHigher    = d.higherSide === side;
+                return (
+                  <div key={side} style={{
+                    padding:'10px 12px', borderRadius:8,
+                    background:`${col}0d`, border:`1px solid ${col}${isCandidate ? '55' : '22'}`,
+                  }}>
+                    <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', marginBottom:3 }}>{side} SCORE</div>
+                    <div style={{ fontSize:22, fontWeight:800, color:col, fontFamily:T.mono, lineHeight:1 }}>{sc}</div>
+                    <div style={{ display:'flex', gap:4, flexWrap:'wrap', marginTop:5 }}>
+                      {isCandidate && (
+                        <span style={{ fontSize:8.5, color:col, border:`1px solid ${col}55`, borderRadius:3, padding:'1px 5px', fontWeight:700 }}>
+                          SELECTED
+                        </span>
+                      )}
+                      {isHigher && d.higherSide !== 'TIED' && (
+                        <span style={{ fontSize:8.5, color:T.amber, border:`1px solid ${T.amber}55`, borderRadius:3, padding:'1px 5px', fontWeight:700 }}>
+                          HIGHER
+                        </span>
+                      )}
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+            <div style={{
+              padding:'7px 12px', borderRadius:7,
+              background:'rgba(255,255,255,0.03)', border:`1px solid ${T.border}`,
+              display:'flex', alignItems:'center', gap:8,
+            }}>
+              <span style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.08em' }}>DECISION MARGIN</span>
+              <span style={{
+                fontSize:12, fontWeight:700, fontFamily:T.mono, marginLeft:'auto',
+                color: d.marginLabel === 'TIED' ? T.txtSec
+                  : d.marginLabel.startsWith('LONG') ? T.green : T.red,
+              }}>
+                {d.marginLabel}
+              </span>
+            </div>
+          </div>
+
+          {/* ── 4. Why Each Side Scored ── */}
+          <div>
+            <SectionHead>Why Each Side Scored</SectionHead>
+            {!d.hasComponents ? (
+              <div style={{ fontSize:10, color:T.txtMuted, fontStyle:'italic' }}>SCORE BREAKDOWN UNAVAILABLE</div>
+            ) : (
+              <div style={{ display:'flex', flexDirection:'column', gap:14 }}>
+                {renderComps(d.longComponents,  'Why Long Scored',  T.green)}
+                {renderComps(d.shortComponents, 'Why Short Scored', T.red)}
+              </div>
+            )}
+          </div>
+
+          {/* ── 5. Why Waiting ── */}
+          <div>
+            <SectionHead>Why Waiting</SectionHead>
+            {d.isActionable ? (
+              <div style={{ fontSize:10, color:T.green, fontWeight:600 }}>✓ NO HARD BLOCK — SETUP IS READY</div>
+            ) : d.hardBlockers.length === 0 && d.missingConfirmations.length === 0 && !d.opposingStructure ? (
+              <div style={{ fontSize:10, color:T.amber }}>NO HARD BLOCK — WAITING FOR CONFIRMATION</div>
+            ) : (
+              <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
+                {d.hardBlockers.map((b, i) => (
+                  <div key={i} style={{
+                    display:'flex', gap:8, padding:'6px 10px',
+                    background:`${T.red}0d`, border:`1px solid ${T.red}33`, borderRadius:6,
+                  }}>
+                    <span style={{ color:T.red, flexShrink:0, fontSize:11 }}>⊘</span>
+                    <span style={{ fontSize:10, color:T.txtSec }}>{b}</span>
+                  </div>
+                ))}
+                {d.missingConfirmations.map((m, i) => (
+                  <div key={i} style={{
+                    display:'flex', gap:8, padding:'6px 10px',
+                    background:'rgba(255,255,255,0.02)', border:`1px solid ${T.border}`, borderRadius:6,
+                  }}>
+                    <span style={{ color:T.amber, flexShrink:0, fontSize:11 }}>○</span>
+                    <span style={{ fontSize:10, color:T.txtSec }}>{m} missing</span>
+                  </div>
+                ))}
+                {d.opposingStructure && d.opposingStructure.effect !== 'NONE' && d.opposingStructure.effect !== 'OBSERVED' && (
+                  <div style={{
+                    display:'flex', flexDirection:'column', gap:3, padding:'8px 10px',
+                    background:`${T.red}0a`, border:`1px solid ${T.red}40`, borderRadius:6,
+                    borderLeft:`3px solid ${T.red}`,
+                  }}>
+                    <div style={{ fontSize:10, color:T.red, fontWeight:700 }}>OPPOSING STRUCTURE ACTIVE</div>
+                    <div style={{ fontSize:9.5, color:T.txtSec }}>
+                      {d.opposingStructure.direction} {d.opposingStructure.eventType}
+                      {d.opposingStructure.remainingSeconds != null && (
+                        <> · {Math.ceil(d.opposingStructure.remainingSeconds / 60)}m remaining</>
+                      )}
+                    </div>
+                  </div>
+                )}
+                {d.opposingStructure && (d.opposingStructure.effect === 'OBSERVED' || d.opposingStructure.effect === 'NONE') && (
+                  <div style={{
+                    padding:'6px 10px', borderRadius:6,
+                    background:`${T.green}08`, border:`1px solid ${T.green}25`,
+                    fontSize:9.5, color:T.txtMuted,
+                  }}>
+                    Opposing {d.opposingStructure.direction} {d.opposingStructure.eventType} — OVERRIDDEN / not blocking
+                  </div>
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* ── 6. To Become Ready ── */}
+          <div>
+            <SectionHead>To Become Ready</SectionHead>
+            {d.mustChange.length === 0 ? (
+              <div style={{ fontSize:10, color: d.isActionable ? T.green : T.txtMuted }}>
+                {d.isActionable ? '✓ Already READY' : 'Requirements unknown — check diagnostics'}
+              </div>
+            ) : (
+              <ol style={{ margin:0, paddingLeft:18, display:'flex', flexDirection:'column', gap:4 }}>
+                {d.mustChange.map((item, i) => (
+                  <li key={i} style={{ fontSize:10, color:T.txtSec, lineHeight:1.5 }}>{item}</li>
+                ))}
+              </ol>
+            )}
+          </div>
+
+          {/* ── 7. Recent Decision Changes (timeline) ── */}
+          <div>
+            <SectionHead>Recent Decision Changes</SectionHead>
+            {d.timelineEvents.length === 0 ? (
+              <div style={{ fontSize:10, color:T.txtMuted }}>No timeline events recorded this session</div>
+            ) : (
+              <div>
+                {d.timelineEvents.map((e, i) => {
+                  const detailTxt = e.details != null ? fmtEventDetail(e.details) : '';
+                  return (
+                    <div key={i} style={{ display:'flex', gap:10, paddingBottom:8, position:'relative' }}>
+                      <div style={{ display:'flex', flexDirection:'column', alignItems:'center', flexShrink:0 }}>
+                        <div style={{ width:7, height:7, borderRadius:'50%',
+                          background:e.eventType === 'THESIS_TRANSITION' ? T.amber : T.cyan, marginTop:2 }} />
+                        {i < d.timelineEvents.length - 1 && (
+                          <div style={{ width:1, flex:1, background:T.border, marginTop:3 }} />
+                        )}
+                      </div>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ fontSize:10, fontWeight:600, color:T.txtPri, marginBottom:1 }}>{e.eventLabel}</div>
+                        <div style={{ fontSize:9, color:T.txtMuted }}>
+                          {fmtTs(e.timestamp)}{e.source ? ` · ${e.source}` : ''}
+                        </div>
+                        {detailTxt && (
+                          <div style={{ fontSize:9.5, color:T.txtSec, marginTop:2 }}>{detailTxt}</div>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
+        </div>
+      </div>
+    </>
+  );
+};
+
 // ── Verdict Panel ─────────────────────────────────────────────────────────────
 const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  const [showExplain, setShowExplain] = useState(false);
+
   const v          = (p.verdict ?? {}) as Record<string, unknown>;
   const avail      = v.available !== false;
   const score      = safeNum(v.edge_score) ?? 0;
@@ -913,8 +1242,26 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const mb          = (p.main_brain ?? {}) as Record<string, unknown>;
   const explanation = safeStr(mb.voice, '');
 
+  const explainBtn = (
+    <button
+      onClick={() => setShowExplain(true)}
+      style={{
+        background:'rgba(56,189,248,0.08)', border:`1px solid rgba(56,189,248,0.3)`,
+        borderRadius:5, cursor:'pointer', padding:'2px 8px',
+        fontSize:9, fontWeight:700, letterSpacing:'0.08em', color:T.cyan,
+        lineHeight:1.5, transition:'background 0.15s',
+      }}
+      onMouseEnter={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(56,189,248,0.16)'; }}
+      onMouseLeave={e => { (e.currentTarget as HTMLElement).style.background = 'rgba(56,189,248,0.08)'; }}
+    >
+      EXPLAIN
+    </button>
+  );
+
   return (
-    <Panel title="Verdict" badge={<Badge label={ready || 'UNKNOWN'} color={rCol} />}>
+    <>
+      {showExplain && <ExplainDecisionDrawer p={p} onClose={() => setShowExplain(false)} />}
+      <Panel title="Verdict" badge={<Badge label={ready || 'UNKNOWN'} color={rCol} />} right={explainBtn}>
       {!avail ? <UnavailableNote msg="Verdict unavailable" /> : (
         <div>
           {/* Score header */}
@@ -1068,6 +1415,7 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
         </div>
       )}
     </Panel>
+    </>
   );
 };
 
