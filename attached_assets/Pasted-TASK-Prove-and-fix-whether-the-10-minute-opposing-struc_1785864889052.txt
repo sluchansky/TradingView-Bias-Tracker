@@ -1,0 +1,397 @@
+TASK: Prove and fix whether the 10-minute opposing-structure rule is suppressing nearly all SCALP opportunities.
+
+CURRENT CONCERN
+
+The operator believes the “conflicting sides within 10 minutes” rule is killing most or all trade opportunities.
+
+The system generates many market alerts but very few or zero READY setups.
+
+A prior change enabled STRUCTURE_REVERSAL_DEMOTE and added:
+
+- ACTIVE
+- CHALLENGED
+- OVERRIDDEN
+- EXPIRED
+
+However, it is not yet proven that a fresh confirmed reversal inside the same 10-minute window actually releases the old opposing structure block.
+
+GOAL
+
+Determine whether the rule is the dominant READY blocker and, if proven, change it from a simple recency rule into an unresolved-conflict rule.
+
+Do not simply disable opposing-structure protection.
+
+Do not shorten the 10-minute window blindly.
+
+STRICT SCOPE
+
+Do not modify:
+
+- Databento ingestion
+- base Edge Score weights
+- strategy formulas
+- risk controls
+- TradersPost
+- execution
+- active-trade management
+- learning formulas
+- authentication
+- Main Brain polling
+
+==================================================
+PART 1 — MEASURE THE ACTUAL IMPACT
+==================================================
+
+For the most recent trustworthy production period, report:
+
+- total unique SCALP candidates
+- Long candidates
+- Short candidates
+- candidates that reached POTENTIAL
+- candidates evaluated for READY
+- candidates blocked by opposing structure
+- candidates blocked by another rule
+- candidates where opposing structure was only informational
+- READY setups
+- alerts emitted
+
+For every candidate blocked by opposing structure, record:
+
+- instrument
+- direction
+- strategy
+- candidate score
+- opposing score
+- score gap
+- opposing event type
+- opposing event timestamp
+- event age
+- lifecycle status
+- duplicate event count
+- newest same-direction event
+- whether reclaim occurred
+- whether newer BOS/CHOCH occurred
+- final block reason
+
+Answer directly:
+
+What percentage of otherwise eligible SCALP candidates were stopped by this rule?
+
+==================================================
+PART 2 — TRACE THE CURRENT ALGORITHM
+==================================================
+
+Trace the exact production path:
+
+structure event
+→ structure cache/state
+→ opposing_present
+→ true_conflict
+→ structure demotion
+→ score-aware block
+→ readiness
+→ alert suppression
+
+Provide:
+
+- files
+- functions
+- conditions
+- thresholds
+- timestamp source
+- exact role of CONFLICT_WINDOW_MIN
+- exact role of CONFLICT_WAIT_GAP
+- exact conditions required for STRUCTURE_REVERSAL_DEMOTE to fire
+
+Clarify the prior report’s ambiguous statement:
+
+“newer reversal is more than 10 minutes clearer than the older one”
+
+State the literal code condition.
+
+==================================================
+PART 3 — REQUIRED RAPID-REVERSAL PROOF
+==================================================
+
+Build this deterministic scenario:
+
+08:30 Bearish CHOCH
+08:34 Bullish CHOCH
+08:36 Bullish BOS
+08:37 Range/VWAP reclaim
+08:38 Long candidate
+
+Expected behavior:
+
+- bearish 08:30 event remains in historical timeline
+- bearish event status = OVERRIDDEN
+- bullish structure status = ACTIVE
+- true_conflict = false
+- opposing structure does not block the Long
+- all other readiness gates continue normally
+
+Create the mirrored Short fixture.
+
+If this scenario still blocks, the existing demotion does not solve the actual problem.
+
+==================================================
+PART 4 — DEFINE UNRESOLVED CONFLICT
+==================================================
+
+Opposing structure should block only when it remains unresolved.
+
+Proposed blocking conditions:
+
+ACTIVE opposition
+
+- recent opposing structure exists
+- no later confirmed structure shift has superseded it
+- price has not reclaimed the relevant level
+- opposing direction remains competitive
+- event has not expired
+- event is not a duplicate refresh
+
+CHALLENGED opposition
+
+- opposing event remains relevant
+- newer evidence is challenging it
+- not enough proof yet to override
+- may remain informational or apply a score penalty
+- should not automatically hard-block unless the canonical conflict contract requires it
+
+OVERRIDDEN opposition
+
+- later same-direction BOS/CHOCH or reclaim confirms the candidate direction
+- old event remains visible historically
+- old event contributes zero block
+- old event does not restart its timer
+
+EXPIRED opposition
+
+- outside the window
+- contributes no block
+
+Only ACTIVE unresolved opposition should hard-block.
+
+==================================================
+PART 5 — OVERRIDE CONTRACT
+==================================================
+
+Define a deterministic override.
+
+For a Long candidate, an older bearish event may become OVERRIDDEN when all required evidence exists:
+
+1. A newer bullish structure transition occurs after the bearish event.
+2. The bullish event belongs to the same instrument, mode, session, and active setup.
+3. Price reclaims the relevant structure/range/VWAP level when applicable.
+4. The newer event is not a duplicate.
+5. The bullish evidence has not already expired.
+6. No still-newer bearish structure reactivates the conflict.
+
+Mirror for Short.
+
+Do not require the old event to age beyond 10 minutes before it can be overridden.
+
+==================================================
+PART 6 — DUPLICATE TIMER PROTECTION
+==================================================
+
+Audit whether repeated identical events restart recency.
+
+Use stable event identity based on canonical fields such as:
+
+- instrument
+- event type
+- direction
+- source timestamp
+- structure level
+- setup/range ID
+
+Requirements:
+
+- duplicate delivery does not refresh event_time
+- duplicate delivery does not restart remaining_seconds
+- duplicate delivery does not create a new conflict
+- genuinely new structure may create a new event
+
+Do not deduplicate separate real events merely because their labels match.
+
+==================================================
+PART 7 — SEPARATE HISTORY FROM BLOCKING STATE
+==================================================
+
+Maintain two concepts:
+
+STRUCTURE HISTORY
+
+All valid recent events for the timeline and explanation.
+
+CURRENT BLOCKING STATE
+
+Only the latest unresolved directional conflict relevant to the candidate.
+
+The readiness engine must not scan an unordered collection of every event in the last 10 minutes and conclude conflict merely because both directions appear somewhere.
+
+==================================================
+PART 8 — SCORE-GAP ROLE
+==================================================
+
+Audit the current 10-point score-gap behavior.
+
+Determine whether score gap should:
+
+- decide hard block,
+- demote ACTIVE to CHALLENGED,
+- or serve only as supporting evidence.
+
+Recommended initial policy:
+
+- structural override decides whether old structure remains blocking
+- score gap may classify unresolved conflict as ACTIVE versus CHALLENGED
+- score gap alone should not erase a structurally unresolved event
+- score gap alone should not preserve an event already structurally overridden
+
+Keep CONFLICT_WAIT_GAP unchanged unless testing proves the implementation cannot work correctly without changing it.
+
+==================================================
+PART 9 — SCALP-ONLY INITIAL FIX
+==================================================
+
+Apply the corrected unresolved-conflict lifecycle to SCALP first.
+
+Do not change SWING behavior in this task.
+
+Keep the 10-minute historical window.
+
+The change is:
+
+FROM:
+Both directional structures occurred inside 10 minutes → conflict
+
+TO:
+A recent opposing structure remains unresolved → conflict
+
+==================================================
+PART 10 — MAIN BRAIN DIAGNOSTICS
+==================================================
+
+Expose:
+
+OPPOSING STRUCTURE
+
+Event:
+Bearish CHOCH
+
+Detected:
+08:30:14
+
+Age:
+8m 02s
+
+Lifecycle:
+OVERRIDDEN
+
+Overridden by:
+Bullish BOS at 08:36:09
+
+Reclaim:
+Confirmed at 08:37:21
+
+Blocking:
+NO
+
+Reason:
+Newer bullish structure and reclaim superseded the bearish event.
+
+Also show:
+
+- raw opposing event count
+- unique opposing event count
+- active blocking event count
+- duplicate events ignored
+- current true_conflict
+- effect on readiness
+- remaining block time only when actually ACTIVE
+
+==================================================
+PART 11 — SHADOW COMPARISON BEFORE PRODUCTION
+==================================================
+
+Replay recent candidates under:
+
+A. CURRENT LOGIC
+B. UNRESOLVED-CONFLICT LOGIC
+
+Report:
+
+- candidates newly released
+- candidates still blocked
+- additional hypothetical READY setups
+- Long/Short symmetry
+- number of released setups that immediately invalidated
+- number that reached TP1 before stop, when safely reconstructable
+
+Do not claim profitability if outcome data is incomplete.
+
+The purpose is to verify that the change releases coherent sequences rather than every noisy setup.
+
+==================================================
+PART 12 — TESTS
+==================================================
+
+1. Active bearish opposition blocks Long.
+2. Active bullish opposition blocks Short.
+3. New bullish CHOCH after bearish event challenges it.
+4. New bullish BOS plus reclaim overrides bearish event.
+5. Mirrored bearish override works.
+6. Overridden event remains in history.
+7. Overridden event contributes no block.
+8. Duplicate bearish event does not restart timer.
+9. Genuine new bearish event may reactivate conflict.
+10. Event outside 10 minutes expires.
+11. Wrong instrument cannot override.
+12. Wrong mode cannot override.
+13. Wrong session/setup cannot override.
+14. Reclaim before structure transition does not falsely override when both are required.
+15. Missing timestamps fail safely.
+16. Long/Short mirrored fixtures are symmetric.
+17. SWING behavior remains unchanged.
+18. Existing score thresholds remain unchanged.
+19. Existing readiness gates remain unchanged.
+20. Existing strategy and execution regressions remain green.
+
+==================================================
+PART 13 — KILL SWITCH
+==================================================
+
+Preserve an environment rollback switch.
+
+Example:
+
+STRUCTURE_REVERSAL_DEMOTE_ENABLED=0
+
+or introduce a narrowly named SCALP unresolved-conflict flag if necessary.
+
+The rollback must restore the prior behavior without a code rollback.
+
+==================================================
+FINAL RESPONSE REQUIRED
+==================================================
+
+Provide:
+
+1. Audit period and sample coverage
+2. Percentage of candidates blocked by opposing structure
+3. Exact current algorithm
+4. Exact existing demotion condition
+5. Rapid-reversal fixture result before fix
+6. New unresolved-conflict contract
+7. Duplicate-timer findings
+8. Files changed
+9. Shadow comparison
+10. Test results
+11. Rapid-reversal fixture result after fix
+12. Main Brain diagnostic screenshot
+13. Confirmation the 10-minute history window remains
+14. Confirmation CONFLICT_WAIT_GAP remains unchanged unless explicitly justified
+15. Confirmation SWING, Databento, scoring weights, risk, execution, and learning were untouched
