@@ -8,6 +8,7 @@
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); MGC/MNQ string symmetry; any scoring change must keep invariants.
+- [ATR stop multiplier history](atr-stop-multiplier-history.md) — now 2.5/3.0 (normal/high); MAX_RISK_DOLLARS must be raised in lockstep or MNQ goes over_cap and is silently blocked.
 - [Switching the live trading mode](switching-live-trading-mode.md) — durable mode switch = TRADING_MODE env + republish; /mode toggle is in-memory/non-durable; "correctly quiet vs broken" via swing_diagnostics.
 - [Strict trade ruleset](strict-trade-ruleset.md) — READY gate MODE-TUNABLE: SWING zone+vwap+structure@80; SCALP demotes ZONE ONLY; Edge bands 40/50/60; alert_level≠conviction_tier; ticker-authoritative.
 - [full_analysis single return path](full-analysis-return-parity.md) — one return dict; hard-indexed consumers make a missing key a state-dependent 500; mirror keys if an early return is re-added.

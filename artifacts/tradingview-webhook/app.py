@@ -975,18 +975,19 @@ MODES = {
         # not gated. (Set True to restore the strict ">= 1:2 on TP2 or no trade" veto.)
         "ENFORCE_MIN_RR":           False,
         # ── Quick-scalp tuning (SCALP only; SWING keeps its own values below) ──
-        # ATR-stop multiplier (normal vol / elevated vol). Widened from the original
-        # 0.75 / 1.25 to 1.5 / 2.0 (now matching SWING) because sub-ATR scalp stops
-        # were tighter than instrument noise and getting wicked out instantly (every
-        # journaled outcome was a full stop-out). Paired with per-instrument SCALP
+        # ATR-stop multiplier (normal vol / elevated vol). Raised from 1.5 / 2.0 to
+        # 2.5 / 3.0 after live stop-out feedback — 1.5× stops (already widened once
+        # from 0.75 / 1.25) were still getting wicked out on all instruments before
+        # price moved in the intended direction. Paired with per-instrument SCALP
         # minimum-stop floors (scalp_min_stop_pts) so a quiet-ATR moment can never
         # reproduce a microscopic stop. Volatility still wins over mode (the elevated
         # multiplier applies in HIGH_CAUTION / HIGH_BLOCK regimes).
-        "STOP_ATR_MULT":            1.5,
-        "STOP_ATR_MULT_HIGH":       2.0,
-        # Smaller per-trade dollar ceiling for SCALP (env MAX_RISK_DOLLARS_PER_TRADE
-        # still overrides). SWING keeps 100.
-        "MAX_RISK_DOLLARS":         50,
+        "STOP_ATR_MULT":            2.5,
+        "STOP_ATR_MULT_HIGH":       3.0,
+        # Per-trade dollar ceiling raised from $50 → $100 to match the wider 2.5×ATR
+        # stops (MNQ at 2.5×ATR ≈ $71/contract; $50 cap would block MNQ as over_cap).
+        # Env MAX_RISK_DOLLARS_PER_TRADE still overrides. SWING keeps $500.
+        "MAX_RISK_DOLLARS":         100,
         # Faster READY re-check / re-post cadence (seconds) so the probability tracks
         # fresh moves. SWING keeps 300. Env TRADE_READY_INTERVAL still overrides.
         "TRADE_READY_INTERVAL_SEC": 120,
@@ -1085,12 +1086,11 @@ MODES = {
         "WATCH_ARMED_COOLDOWN_SEC": 900,
         # SWING keeps the original strict "TP2 must be >= 1:2 R:R or no trade" veto.
         "ENFORCE_MIN_RR":           True,
-        # LEGACY / flag-off SWING keeps the historical stop multipliers (1.5 normal /
-        # 2.0 elevated) — read ONLY when _swing_htf_enabled() is False (the
-        # SWING_HTF_ENABLED=0 kill-switch / flag-off golden), so flipping the kill-switch
-        # fully restores legacy SWING stop geometry. The 5-min READY cadence is shared.
-        "STOP_ATR_MULT":            1.5,
-        "STOP_ATR_MULT_HIGH":       2.0,
+        # LEGACY / flag-off SWING stop multipliers updated to 2.5 / 3.0 (matching
+        # SCALP) after live stop-out feedback. Read ONLY when _swing_htf_enabled() is
+        # False (SWING_HTF_ENABLED=0 kill-switch / flag-off golden).
+        "STOP_ATR_MULT":            2.5,
+        "STOP_ATR_MULT_HIGH":       3.0,
         # Flag-on (LIVE) SWING uses WIDER ATR stops — 2.25x normal / 2.75x elevated —
         # selected in _dynamic_stop_plan via _swing_htf_enabled(). Sized so all four
         # instruments stay tradeable under the $500 per-trade risk ceiling below.
@@ -8313,8 +8313,8 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
 
     Multiplier precedence — VOLATILITY WINS over trading mode (mode-tunable knobs):
       STOP_ATR_MULT_HIGH when the regime is elevated/extreme (HIGH_CAUTION /
-      HIGH_BLOCK), else STOP_ATR_MULT. SCALP 1.5 / 2.0 (widened from 0.75 / 1.25 — the
-      old multipliers produced stops tighter than instrument noise); SWING 1.5 / 2.0.
+      HIGH_BLOCK), else STOP_ATR_MULT. SCALP 2.5 / 3.0 (raised from 1.5 / 2.0 after
+      live stop-out feedback — 1.5× still wicked out on all instruments); SWING 2.5 / 3.0.
 
     FAIL-CLOSED at the trade-plan layer only: returns {"ok": False, "reason": ...}
     when the ATR reading needed to size the stop is missing/stale, or when the
