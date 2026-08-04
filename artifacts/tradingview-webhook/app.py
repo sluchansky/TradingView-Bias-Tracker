@@ -7199,8 +7199,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     )
     structure_demoted = None
     if STRUCTURE_REVERSAL_DEMOTE_ENABLED and not bool(cfg("VOL_HARD_GATE")):
-        _dem_struct_ts = max([t for t in (bos_dem_ts, choch_dem_ts, hh_ts, hl_ts) if t], default=None)
-        _sup_struct_ts = max([t for t in (bos_sup_ts, choch_sup_ts, lh_ts, ll_ts) if t], default=None)
+        # BOS/CHOCH only — HH/HL/LH/LL are minor swing events that fire constantly
+        # and must not trigger structure nulling. Only a genuine reversal (BOS/CHOCH)
+        # on the opposite side is strong enough to demote the stale candidate's credit.
+        _dem_struct_ts = max([t for t in (bos_dem_ts, choch_dem_ts) if t], default=None)
+        _sup_struct_ts = max([t for t in (bos_sup_ts, choch_sup_ts) if t], default=None)
         if (_dem_struct_ts and _sup_struct_ts
                 and abs((_dem_struct_ts - _sup_struct_ts).total_seconds()) > CONFLICT_WINDOW_MIN * 60):
             if _sup_struct_ts > _dem_struct_ts:
@@ -7351,8 +7354,12 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     # ── Conflict (recency-aware): opposing structure on BOTH sides within a short
     #    window = genuinely choppy → stand aside. A STALE opposite structure does
     #    NOT block (replaces the old over-broad "any opposite in window" rule). ──
-    long_struct_ts  = max([t for t in (bos_dem_ts, choch_dem_ts, hh_ts, hl_ts) if t], default=None)
-    short_struct_ts = max([t for t in (bos_sup_ts, choch_sup_ts, lh_ts, ll_ts) if t], default=None)
+    # Conflict clock uses BOS/CHOCH only — HH/HL/LH/LL are minor swing events
+    # that fire constantly in any live market, causing opposing_present to be
+    # permanently true and blocking every setup. Only a genuine structural
+    # reversal (BOS or CHOCH) on both sides constitutes a real conflict.
+    long_struct_ts  = max([t for t in (bos_dem_ts, choch_dem_ts) if t], default=None)
+    short_struct_ts = max([t for t in (bos_sup_ts, choch_sup_ts) if t], default=None)
     opposing_present = bool(
         long_struct_ts and short_struct_ts
         and abs((long_struct_ts - short_struct_ts).total_seconds()) <= CONFLICT_WINDOW_MIN * 60
