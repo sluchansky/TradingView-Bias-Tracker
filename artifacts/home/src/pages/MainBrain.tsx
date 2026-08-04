@@ -2334,6 +2334,170 @@ const ActiveTradesPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   );
 };
 
+// ── Recommendation Card ───────────────────────────────────────────────────────
+const RecommendationCard: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  const v   = (p.verdict    ?? {}) as Record<string, unknown>;
+  const vol = (p.volatility ?? {}) as Record<string, unknown>;
+  const dirs = (p.directions ?? {}) as Record<string, unknown>;
+
+  const direction  = safeStr(v.direction, '');
+  const score      = safeNum(v.edge_score) ?? 0;
+  const isLong     = direction.toLowerCase() === 'long';
+  const isShort    = direction.toLowerCase() === 'short';
+  const dirCol     = isLong ? T.green : isShort ? T.red : T.txtMuted;
+
+  // Positive factors — edge_components where present === true
+  const edgeComps      = Array.isArray(v.edge_components)
+    ? v.edge_components as Record<string, unknown>[] : [];
+  const positiveFactors = edgeComps.filter(c => c.present === true);
+
+  // Negative factors — aggregated from multiple sources
+  const negativeFactors: Array<{ label: string; points: number }> = [];
+
+  // 1. SCALP modifiers (already negative-signed)
+  const modifiers = Array.isArray(v.modifiers) ? v.modifiers as Record<string, unknown>[] : [];
+  for (const m of modifiers) {
+    const pts = safeNum(m.points) ?? 0;
+    if (pts < 0) negativeFactors.push({ label: safeStr(m.label, 'Penalty'), points: pts });
+  }
+
+  // 2. Opposing structure alert
+  const os = (v.opposing_structure ?? null) as Record<string, unknown> | null;
+  if (os && os.detected === true) {
+    const ageS   = safeNum(os.age_seconds);
+    const ageStr = ageS != null ? ` ${Math.round(ageS / 60)} min ago` : '';
+    const evType = safeStr(os.event_type, 'structure event');
+    const oppDir = safeStr(os.direction, '');
+    negativeFactors.push({ label: `${oppDir} ${evType}${ageStr}`, points: -8 });
+  }
+
+  // 3. ATR / volatility elevated
+  const volLabel = safeStr(vol.volatility_label, '').toLowerCase();
+  if (volLabel === 'elevated' || volLabel === 'extreme') {
+    negativeFactors.push({ label: 'ATR elevated', points: volLabel === 'extreme' ? -6 : -3 });
+  }
+
+  // Long vs Short scores from directions.bull / directions.bear
+  const bull       = (dirs.bull ?? {}) as Record<string, unknown>;
+  const bear       = (dirs.bear ?? {}) as Record<string, unknown>;
+  const longScore  = safeNum(bull.edge_score) ?? (isLong  ? score : 0);
+  const shortScore = safeNum(bear.edge_score) ?? (isShort ? score : 0);
+  const winner     = longScore >= shortScore ? 'LONG' : 'SHORT';
+  const winnerCol  = winner === 'LONG' ? T.green : T.red;
+
+  const avail = v.available !== false && edgeComps.length > 0;
+
+  return (
+    <Panel title="Recommendation">
+      {!avail ? <UnavailableNote msg="No active setup data" /> : (
+        <>
+          {/* ── Direction + confidence header ──────────────────────────── */}
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:14,
+            padding:'10px 12px', borderRadius:10,
+            background: isLong ? 'rgba(34,197,94,0.07)' : isShort ? 'rgba(239,68,68,0.07)' : 'rgba(100,116,139,0.07)',
+            border:`1px solid ${isLong ? 'rgba(34,197,94,0.2)' : isShort ? 'rgba(239,68,68,0.2)' : 'rgba(100,116,139,0.2)'}` }}>
+            <div>
+              <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', marginBottom:4 }}>DIRECTION</div>
+              <div style={{ fontSize:16, fontWeight:800, color:dirCol, letterSpacing:'0.06em' }}>
+                {direction.toUpperCase() || 'NEUTRAL'}
+              </div>
+            </div>
+            <div style={{ textAlign:'right' }}>
+              <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', marginBottom:4 }}>CONFIDENCE</div>
+              <div style={{ fontSize:26, fontWeight:800, fontFamily:T.mono, lineHeight:1,
+                color: score >= 70 ? T.green : score >= 50 ? T.amber : T.red }}>
+                {score}<span style={{ fontSize:13, fontWeight:500, color:T.txtMuted }}>%</span>
+              </div>
+            </div>
+          </div>
+
+          {/* ── Positive factors ──────────────────────────────────────── */}
+          {positiveFactors.length > 0 && (
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', fontWeight:700, marginBottom:6 }}>REASONING</div>
+              {positiveFactors.map((c, i) => {
+                const lbl = safeStr(c.label, safeStr(c.key, '').replace(/_/g, ' '));
+                const pts = safeNum(c.points) ?? 0;
+                return (
+                  <div key={i} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:5,
+                    padding:'5px 8px', borderRadius:6,
+                    background:'rgba(34,197,94,0.04)', border:'1px solid rgba(34,197,94,0.12)' }}>
+                    <span style={{ color:T.green, fontSize:11, flexShrink:0, lineHeight:1 }}>✓</span>
+                    <span style={{ fontSize:10, color:T.txtSec, flex:1 }}>{lbl}</span>
+                    <div style={{ display:'flex', alignItems:'center', gap:6, flexShrink:0 }}>
+                      <div style={{ width:36, height:3, background:'rgba(255,255,255,0.07)', borderRadius:2 }}>
+                        <div style={{ height:'100%', width:`${Math.round(pts/20*100)}%`, background:T.green, borderRadius:2 }} />
+                      </div>
+                      <span style={{ fontSize:9.5, fontFamily:T.mono, color:T.green, fontWeight:700, minWidth:22, textAlign:'right' }}>+{pts}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
+          {/* ── Negative factors ──────────────────────────────────────── */}
+          {negativeFactors.length > 0 && (
+            <div style={{ marginBottom:10 }}>
+              <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', fontWeight:700, marginBottom:6 }}>NEGATIVE FACTORS</div>
+              {negativeFactors.map((f, i) => (
+                <div key={i} style={{ display:'flex', alignItems:'center', gap:8, marginBottom:5,
+                  padding:'5px 8px', borderRadius:6,
+                  background:'rgba(239,68,68,0.04)', border:'1px solid rgba(239,68,68,0.12)' }}>
+                  <span style={{ color:T.red, fontSize:11, flexShrink:0, lineHeight:1 }}>✕</span>
+                  <span style={{ fontSize:10, color:T.txtSec, flex:1 }}>{f.label}</span>
+                  <span style={{ fontSize:9.5, fontFamily:T.mono, color:T.red, fontWeight:700, flexShrink:0 }}>{f.points}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* ── Divider ───────────────────────────────────────────────── */}
+          <div style={{ borderTop:`1px solid ${T.border}`, margin:'10px 0' }} />
+
+          {/* ── Long vs Short score bars ───────────────────────────────── */}
+          <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em', fontWeight:700, marginBottom:8 }}>FINAL SCORE</div>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8, marginBottom:10 }}>
+            {(['long', 'short'] as const).map(dir => {
+              const sc        = dir === 'long' ? longScore : shortScore;
+              const isWinner  = direction.toLowerCase() === dir;
+              const col       = dir === 'long' ? T.green : T.red;
+              const barPct    = Math.min(100, Math.round(sc / 110 * 100));
+              return (
+                <div key={dir} style={{ padding:'8px 10px', borderRadius:8,
+                  background: isWinner ? `${col}10` : 'rgba(255,255,255,0.025)',
+                  border:`1px solid ${isWinner ? `${col}35` : T.border}`,
+                  borderTop:`2px solid ${isWinner ? col : T.border}` }}>
+                  <div style={{ fontSize:9, color:col, letterSpacing:'0.08em', fontWeight:700, marginBottom:4 }}>
+                    {dir.toUpperCase()}
+                  </div>
+                  <div style={{ fontSize:20, fontFamily:T.mono, fontWeight:800, color: isWinner ? col : T.txtSec, marginBottom:6, lineHeight:1 }}>
+                    {sc}
+                  </div>
+                  <div style={{ height:3, background:'rgba(255,255,255,0.07)', borderRadius:2 }}>
+                    <div style={{ height:'100%', width:`${barPct}%`, background:col, borderRadius:2,
+                      opacity: isWinner ? 1 : 0.35, transition:'width 0.4s ease' }} />
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+
+          {/* ── Winner ────────────────────────────────────────────────── */}
+          <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between',
+            padding:'8px 12px', borderRadius:8,
+            background:`${winnerCol}09`, border:`1px solid ${winnerCol}25` }}>
+            <span style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.1em' }}>WINNER</span>
+            <span style={{ fontSize:12, fontWeight:800, color:winnerCol, letterSpacing:'0.08em' }}>
+              {winner}
+            </span>
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+};
+
 // ── Execution Status Panel ────────────────────────────────────────────────────
 const ExecutionPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const gw  = (p.execution_gateway ?? {}) as Record<string, unknown>;
@@ -9809,6 +9973,9 @@ export default function MainBrain() {
           <>
             <div style={{ marginBottom: 10 }}>
               <ArmControlPanel />
+            </div>
+            <div style={{ marginBottom: 10 }}>
+              <RecommendationCard p={p} />
             </div>
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
               <ExecutionPanel p={p} />
