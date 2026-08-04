@@ -10029,6 +10029,9 @@ export default function MainBrain() {
             <div style={{ marginBottom: 10 }}>
               <RecommendationCard p={p} />
             </div>
+            <div style={{ marginBottom: 10 }}>
+              <TradePlanPanel p={p} />
+            </div>
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
               <ExecutionPanel p={p} />
               <SystemHealthPanel p={p} />
