@@ -7616,11 +7616,14 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         return _learning_meta(direction)["adjusted"], breakdown
 
     # ── Score-aware conflict resolution (single source for the gate AND the
-    #    diagnostics block). `opposing_present` (above) = opposing structure on both
-    #    sides within the conflict window. In SCALP we only WAIT on a TRUE conflict —
-    #    the two directions are genuinely balanced (Edge gap <= CONFLICT_WAIT_GAP);
-    #    otherwise we commit to the dominant (higher-Edge) side. SWING keeps the
-    #    original always-WAIT-on-opposing behaviour (CONFLICT_SCORE_AWARE=False). ──
+    #    diagnostics block). `opposing_present` (above) = opposing BOS/CHOCH on both
+    #    sides within the conflict window. In SCALP we implement an
+    #    UNRESOLVED-CONFLICT rule: the opposing event only blocks when it is the
+    #    NEWER of the two reversals (i.e. it has not been superseded by a later
+    #    same-direction BOS/CHOCH from the candidate side). If the candidate's
+    #    reversal is newer the opposing event is OVERRIDDEN and must not restart the
+    #    conflict clock. SWING keeps the original always-WAIT behaviour
+    #    (CONFLICT_SCORE_AWARE=False → skips the refinement block entirely). ──
     long_score           = _edge_for("Long")[0]
     short_score          = _edge_for("Short")[0]
     conflict_gap         = abs(long_score - short_score)
@@ -7628,6 +7631,24 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                             else ("Long" if long_score > short_score else "Short"))
     score_aware_conflict = bool(cfg("CONFLICT_SCORE_AWARE"))
     conflict_wait_gap    = int(cfg("CONFLICT_WAIT_GAP"))
+
+    # Unresolved-conflict refinement — SCALP only (score_aware_conflict=True).
+    # Even when both sides have a recent BOS/CHOCH (opposing_present=True),
+    # the opposing event only remains a blocker when it is NEWER than the
+    # candidate's latest same-direction reversal.  If the candidate fired a
+    # later BOS/CHOCH, that supersedes the opposing event → set
+    # opposing_present=False so true_conflict stays False.
+    # Neutral dominant direction falls through to the conservative old path.
+    if opposing_present and score_aware_conflict and dominant_direction != "Neutral":
+        _cand_ts = long_struct_ts  if dominant_direction == "Long"  else short_struct_ts
+        _opp_ts  = short_struct_ts if dominant_direction == "Long"  else long_struct_ts
+        if _cand_ts is not None and _opp_ts is not None:
+            _cand_tz = _cand_ts if _cand_ts.tzinfo else _cand_ts.replace(tzinfo=timezone.utc)
+            _opp_tz  = _opp_ts  if _opp_ts.tzinfo  else _opp_ts.replace(tzinfo=timezone.utc)
+            if _cand_tz >= _opp_tz:
+                # Candidate's reversal is newer → opposing event overridden → no conflict
+                opposing_present = False
+
     if opposing_present and score_aware_conflict:
         true_conflict = conflict_gap <= conflict_wait_gap
     else:
