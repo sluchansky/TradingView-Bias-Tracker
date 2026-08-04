@@ -9531,7 +9531,7 @@ def _record_exec_attempt(record: dict):
 
 ARM_CONFIRM_PHRASE       = "ARM LIVE AUTO TRADING"   # exact, case-sensitive
 ARM_DEFAULT_DURATION_MIN = 30
-ARM_MAX_DURATION_MIN     = 120
+ARM_MAX_DURATION_MIN     = 1440   # 24 h ceiling; overnight arming is a supported workflow
 ARM_DEFAULT_MAX_TRADES   = 3
 ARM_DEFAULT_MAX_CONTRACTS = 1
 
@@ -62650,7 +62650,7 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     <div style="font-size:11px;color:#f59e0b;margin-bottom:8px;font-weight:700">⚠️ ARM SESSION CONFIG — You are about to enable live auto-execution</div>
     <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px">
       <label style="font-size:11px;color:#9ca3af">Duration (min)
-        <input id="arm-duration" type="number" min="1" max="120" value="30"
+        <input id="arm-duration" type="number" min="1" max="1440" value="30"
                style="width:100%;margin-top:3px;background:#1f2937;border:1px solid #374151;border-radius:4px;color:#e5e7eb;padding:4px;font-size:12px">
       </label>
       <label style="font-size:11px;color:#9ca3af">Max trades / session

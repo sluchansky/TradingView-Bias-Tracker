@@ -9617,11 +9617,63 @@ const ArmControlPanel: React.FC = () => {
                     borderColor: confirmPhrase === _ARM_CONFIRM_PHRASE ? T.green
                       : confirmPhrase.length > 0 ? T.red : T.border }} />
               </div>
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
-                <div>
-                  <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 3 }}>DURATION (min)</div>
-                  <input value={armDuration} type="number" min="5" max="480" onChange={e => setArmDuration(e.target.value)} style={inpStyle} />
+
+              {/* ── Duration quick-pick presets ── */}
+              <div>
+                <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 5 }}>DURATION</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 7 }}>
+                  {(() => {
+                    // Compute minutes until 9:30 AM ET next trading day
+                    const overnight = (() => {
+                      try {
+                        const etNow = new Date(new Date().toLocaleString('en-US', { timeZone: 'America/New_York' }));
+                        const t = new Date(etNow);
+                        t.setHours(9, 30, 0, 0);
+                        if (t.getTime() <= etNow.getTime()) t.setDate(t.getDate() + 1);
+                        while (t.getDay() === 0 || t.getDay() === 6) t.setDate(t.getDate() + 1);
+                        return Math.max(60, Math.ceil((t.getTime() - etNow.getTime()) / 60000));
+                      } catch { return 480; }
+                    })();
+                    const oH = Math.floor(overnight / 60);
+                    const oM = overnight % 60;
+                    const oLabel = `Overnight (~${oH}h${oM > 0 ? `${oM}m` : ''})`;
+                    const presets: Array<{ label: string; min: number }> = [
+                      { label: '30m',  min: 30  },
+                      { label: '1h',   min: 60  },
+                      { label: '2h',   min: 120 },
+                      { label: '4h',   min: 240 },
+                      { label: '8h',   min: 480 },
+                      { label: '12h',  min: 720 },
+                      { label: oLabel, min: overnight },
+                    ];
+                    return presets.map(({ label, min }) => {
+                      const sel = parseInt(armDuration) === min;
+                      return (
+                        <button key={label} type="button" onClick={() => setArmDuration(String(min))}
+                          style={{ background: sel ? `${T.cyan}18` : 'rgba(255,255,255,0.04)',
+                            border: `1px solid ${sel ? T.cyan : T.border}`,
+                            color: sel ? T.cyan : T.txtMuted, borderRadius: 4,
+                            padding: '4px 9px', fontSize: 9.5, cursor: 'pointer',
+                            fontWeight: sel ? 700 : 400, letterSpacing: '0.03em' }}>
+                          {label}
+                        </button>
+                      );
+                    });
+                  })()}
                 </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <input value={armDuration} type="number" min="5" max="1440"
+                    onChange={e => setArmDuration(e.target.value)} style={{ ...inpStyle, flex: 1 }} />
+                  <span style={{ fontSize: 9, color: T.txtMuted, flexShrink: 0 }}>min</span>
+                  {parseInt(armDuration) >= 60 && (
+                    <span style={{ fontSize: 9.5, color: T.txtSec, flexShrink: 0, fontFamily: T.mono }}>
+                      ({Math.floor(parseInt(armDuration) / 60)}h{parseInt(armDuration) % 60 > 0 ? ` ${parseInt(armDuration) % 60}m` : ''})
+                    </span>
+                  )}
+                </div>
+              </div>
+
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8 }}>
                 <div>
                   <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 600, marginBottom: 3 }}>MAX TRADES</div>
                   <input value={armMaxTrades} type="number" min="1" max="20" onChange={e => setArmMaxTrades(e.target.value)} style={inpStyle} />
