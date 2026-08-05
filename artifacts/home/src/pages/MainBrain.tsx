@@ -1533,6 +1533,285 @@ const ScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   );
 };
 
+// ── Consensus Panel ──────────────────────────────────────────────────────────
+// Replaces the 3-panel top row (Thesis + Verdict + Scanner) with a single
+// synthesised read: tallies weighted directional votes across all available
+// signals, surfaces the one best setup that matches the majority view, and
+// flags when the active trade plan is running against the consensus.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface ConsensusSignal { label: string; direction: 'LONG' | 'SHORT'; weight: number; }
+interface ConsensusResult {
+  direction: 'LONG' | 'SHORT' | 'DIVIDED';
+  longVotes: number; shortVotes: number; totalVotes: number;
+  confidence: number;
+  signals: ConsensusSignal[];
+}
+
+function computeConsensus(p: Record<string, unknown>): ConsensusResult {
+  const signals: ConsensusSignal[] = [];
+
+  // Left Brain direction — 1 vote
+  const lb = (p.left_brain ?? {}) as Record<string, unknown>;
+  const lbDir = safeStr(lb.direction, '').toUpperCase() as 'LONG' | 'SHORT' | string;
+  if (lbDir === 'LONG' || lbDir === 'SHORT')
+    signals.push({ label: 'Left Brain', direction: lbDir, weight: 1 });
+
+  // Verdict direction — 2 votes when actionable (it is the gate signal), 1 otherwise
+  const vrd = (p.verdict ?? {}) as Record<string, unknown>;
+  const vDir = safeStr(vrd.direction, '').toUpperCase() as 'LONG' | 'SHORT' | string;
+  if (vDir === 'LONG' || vDir === 'SHORT')
+    signals.push({ label: 'Gate Verdict', direction: vDir, weight: vrd.is_actionable === true ? 2 : 1 });
+
+  // Candidate preview direction — 1 vote (only if it differs from verdict to avoid double-counting)
+  const cp = (p.candidate_preview ?? {}) as Record<string, unknown>;
+  const cpDir = safeStr(cp.direction ?? '', '').toUpperCase() as 'LONG' | 'SHORT' | string;
+  if ((cpDir === 'LONG' || cpDir === 'SHORT') && cpDir !== vDir)
+    signals.push({ label: 'Best Candidate', direction: cpDir, weight: 1 });
+
+  // Each eligible strategy with a direction — 1 vote each
+  const sc = (p.strategy_scanner ?? {}) as Record<string, unknown>;
+  const strats = Array.isArray(sc.strategies) ? sc.strategies as Record<string, unknown>[] : [];
+  for (const s of strats) {
+    if (s.eligible === false) continue;
+    const sDir = safeStr(s.direction, '').toUpperCase() as 'LONG' | 'SHORT' | string;
+    if (sDir !== 'LONG' && sDir !== 'SHORT') continue;
+    const key  = safeStr(s.key ?? s.strategy_key, '');
+    const name = STRATEGY_LABELS[key] ?? safeStr(s.name, key || 'Strategy');
+    signals.push({ label: name, direction: sDir, weight: 1 });
+  }
+
+  let longVotes = 0, shortVotes = 0;
+  for (const sig of signals) {
+    if (sig.direction === 'LONG') longVotes += sig.weight;
+    else shortVotes += sig.weight;
+  }
+  const totalVotes = longVotes + shortVotes;
+  if (totalVotes === 0) return { direction: 'DIVIDED', longVotes: 0, shortVotes: 0, totalVotes: 0, confidence: 0, signals };
+  const maxV = Math.max(longVotes, shortVotes);
+  const confidence = Math.round((maxV / totalVotes) * 100);
+  const direction: 'LONG' | 'SHORT' | 'DIVIDED' =
+    longVotes === shortVotes ? 'DIVIDED' : longVotes > shortVotes ? 'LONG' : 'SHORT';
+  return { direction, longVotes, shortVotes, totalVotes, confidence, signals };
+}
+
+const ConsensusPanel: React.FC<{ p: Record<string, unknown>; consensus: ConsensusResult }> = ({ p, consensus }) => {
+  const [minorityOpen, setMinorityOpen] = useState(false);
+  const { direction: cDir, longVotes, shortVotes, totalVotes, confidence, signals } = consensus;
+
+  const sc     = (p.strategy_scanner ?? {}) as Record<string, unknown>;
+  const strats = Array.isArray(sc.strategies) ? sc.strategies as Record<string, unknown>[] : [];
+
+  const cColor  = cDir === 'LONG' ? T.green : cDir === 'SHORT' ? T.red : T.amber;
+  const confCol = confidence >= 75 ? T.green : confidence >= 55 ? T.amber : T.red;
+
+  // Best setup whose direction matches consensus
+  const eligibles = strats.filter(s => s.eligible !== false);
+  const matching  = cDir !== 'DIVIDED'
+    ? eligibles.filter(s => safeStr(s.direction, '').toUpperCase() === cDir)
+    : eligibles;
+  const bestMatch = matching.reduce<Record<string, unknown> | null>((acc, s) => {
+    const aComp = safeNum(acc?.completeness) ?? 0;
+    const sComp = safeNum(s.completeness)   ?? 0;
+    return sComp > aComp ? s : acc;
+  }, null);
+
+  // Minority signals
+  const minority = cDir !== 'DIVIDED' ? signals.filter(s => s.direction !== cDir) : [];
+
+  // Vote bar percentages
+  const longPct  = totalVotes > 0 ? Math.round((longVotes  / totalVotes) * 100) : 50;
+  const shortPct = 100 - longPct;
+
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{
+        background: T.panel, borderRadius: 10, padding: '16px 18px',
+        border: `1px solid ${cColor}35`,
+        boxShadow: `0 0 32px ${cColor}10, inset 0 0 0 1px rgba(255,255,255,0.03)`,
+      }}>
+
+        {/* ── Header ─────────────────────────────────────────────────────── */}
+        <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:14 }}>
+          <span style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.12em', fontWeight:700 }}>
+            MARKET CONSENSUS
+          </span>
+          <span style={{ marginLeft:'auto', fontSize:9, color:T.txtMuted, fontFamily:T.mono }}>
+            {totalVotes > 0 ? `${totalVotes} weighted signal${totalVotes !== 1 ? 's' : ''}` : 'No signals yet'}
+          </span>
+        </div>
+
+        {/* ── Main 3-column body ─────────────────────────────────────────── */}
+        <div style={{ display:'grid', gridTemplateColumns:'1.1fr 1.3fr 1fr', gap:16, alignItems:'start' }}
+             className="mb-grid-3">
+
+          {/* Column 1 — Direction hero + vote bars */}
+          <div style={{ display:'flex', flexDirection:'column', gap:10 }}>
+            {/* Big direction label + confidence */}
+            <div style={{ display:'flex', alignItems:'baseline', gap:10, flexWrap:'wrap' }}>
+              <span style={{
+                fontSize: 36, fontWeight: 900, letterSpacing: '-0.03em',
+                color: cColor, lineHeight: 1, fontFamily: "'Inter', system-ui, sans-serif",
+              }}>
+                {cDir === 'DIVIDED' ? '—' : cDir}
+              </span>
+              {totalVotes > 0 && (
+                <span style={{ fontSize: 15, fontWeight: 700, color: confCol, letterSpacing: '-0.01em' }}>
+                  {confidence}%
+                </span>
+              )}
+            </div>
+
+            {/* Flavour text */}
+            <div style={{ fontSize: 10, color: T.txtMuted, lineHeight: 1.45 }}>
+              {cDir === 'DIVIDED'
+                ? 'Signals are split — no clear bias yet'
+                : cDir === 'LONG'
+                  ? `${longVotes} of ${totalVotes} signal points favour Long`
+                  : `${shortVotes} of ${totalVotes} signal points favour Short`
+              }
+            </div>
+
+            {/* LONG / SHORT vote bars */}
+            {totalVotes > 0 && (
+              <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
+                {([['LONG', T.green, longPct, longVotes], ['SHORT', T.red, shortPct, shortVotes]] as [string, string, number, number][]).map(([lbl, col, pct, v]) => (
+                  <div key={lbl} style={{ display:'flex', alignItems:'center', gap:7 }}>
+                    <span style={{ fontSize:8.5, color:col, width:36, textAlign:'right', flexShrink:0, letterSpacing:'0.06em', fontWeight:700 }}>{lbl}</span>
+                    <div style={{ flex:1, height:5, background:'rgba(255,255,255,0.07)', borderRadius:3 }}>
+                      <div style={{ height:'100%', width:`${pct}%`, background:col, borderRadius:3, transition:'width 0.5s ease' }} />
+                    </div>
+                    <span style={{ fontSize:9, color:col, fontFamily:T.mono, fontWeight:700, minWidth:16, flexShrink:0 }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Column 2 — Best matching setup */}
+          <div>
+            <div style={{ fontSize:9, color:cColor, letterSpacing:'0.09em', marginBottom:8, fontWeight:700 }}>
+              {cDir === 'DIVIDED' ? 'HIGHEST COMPLETENESS' : `BEST ${cDir} SETUP`}
+            </div>
+            {bestMatch ? (
+              <div style={{
+                background:`${cColor}09`, border:`1px solid ${cColor}28`,
+                borderRadius:9, padding:'11px 13px',
+              }}>
+                <div style={{ fontWeight:700, fontSize:12.5, color:T.txtPri, marginBottom:9, lineHeight:1.25 }}>
+                  {STRATEGY_LABELS[safeStr(bestMatch.key ?? bestMatch.strategy_key, '')] ?? safeStr(bestMatch.name, '—')}
+                </div>
+                {/* Completeness bar */}
+                <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
+                  <div style={{ flex:1, height:6, background:'rgba(255,255,255,0.07)', borderRadius:3 }}>
+                    <div style={{
+                      height:'100%', width:`${safeNum(bestMatch.completeness) ?? 0}%`,
+                      background:cColor, borderRadius:3, transition:'width 0.5s ease',
+                    }} />
+                  </div>
+                  <span style={{ fontSize:11, color:cColor, fontFamily:T.mono, fontWeight:700, flexShrink:0 }}>
+                    {safeNum(bestMatch.completeness) ?? 0}%
+                  </span>
+                </div>
+                {/* Badges row */}
+                <div style={{ display:'flex', gap:5, flexWrap:'wrap', alignItems:'center' }}>
+                  <Badge label={safeStr(bestMatch.readiness, 'WAIT')} color={readinessColor(safeStr(bestMatch.readiness, ''))} />
+                  {bestMatch.direction && (
+                    <Badge label={safeStr(bestMatch.direction, '').toUpperCase()} color={dirColor(safeStr(bestMatch.direction, ''))} />
+                  )}
+                  {safeStr(bestMatch.skip_reason, '') && (
+                    <span style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.04em' }}>
+                      {safeStr(bestMatch.skip_reason, '').replace(/_/g,' ')}
+                    </span>
+                  )}
+                </div>
+                {/* Hint */}
+                {safeNum(bestMatch.completeness) !== 100 && (
+                  <div style={{ marginTop:7, fontSize:9, color:T.txtMuted, lineHeight:1.4 }}>
+                    {completenessHint(safeNum(bestMatch.completeness) ?? 0, safeStr(bestMatch.skip_reason, ''))}
+                  </div>
+                )}
+              </div>
+            ) : (
+              <div style={{ fontSize:10, color:T.txtMuted, padding:'10px 0' }}>
+                No {cDir !== 'DIVIDED' ? cDir.toLowerCase() + ' ' : ''}strategies available yet
+              </div>
+            )}
+          </div>
+
+          {/* Column 3 — Signal tally */}
+          <div>
+            <div style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.09em', marginBottom:8, fontWeight:700 }}>
+              SIGNALS
+            </div>
+            {signals.length === 0 ? (
+              <span style={{ fontSize:10, color:T.txtMuted }}>Waiting for signals…</span>
+            ) : (
+              <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
+                {signals.map((sig, i) => {
+                  const col       = sig.direction === 'LONG' ? T.green : T.red;
+                  const isAligned = cDir === 'DIVIDED' || sig.direction === cDir;
+                  return (
+                    <div key={i} style={{
+                      display:'flex', alignItems:'center', gap:6,
+                      opacity: isAligned ? 1 : 0.38,
+                      padding:'3px 0',
+                    }}>
+                      <span style={{ fontSize:8, color:col, flexShrink:0, lineHeight:1 }}>
+                        {sig.direction === 'LONG' ? '▲' : '▼'}
+                      </span>
+                      <span style={{ fontSize:10, color:isAligned ? T.txtPri : T.txtMuted, flex:1,
+                                     overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap', lineHeight:1.3 }}>
+                        {sig.label}
+                      </span>
+                      {sig.weight > 1 && (
+                        <span style={{ fontSize:8, color:T.txtMuted, flexShrink:0 }}>×{sig.weight}</span>
+                      )}
+                    </div>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* ── Minority view ──────────────────────────────────────────────── */}
+        {minority.length > 0 && (
+          <div style={{ marginTop:12, borderTop:`1px solid ${T.border}`, paddingTop:10 }}>
+            <button
+              onClick={() => setMinorityOpen(o => !o)}
+              style={{ background:'none', border:'none', cursor:'pointer', padding:0,
+                       display:'flex', alignItems:'center', gap:6 }}
+            >
+              <span style={{ fontSize:9, color:T.txtMuted }}>{minorityOpen ? '▾' : '▸'}</span>
+              <span style={{ fontSize:9.5, color:T.txtMuted }}>
+                {minority.length} signal{minority.length !== 1 ? 's' : ''}{' '}
+                {cDir === 'LONG' ? 'see SHORT' : 'see LONG'}
+                {!minorityOpen ? ' — tap to see' : ''}
+              </span>
+            </button>
+            {minorityOpen && (
+              <div style={{ marginTop:8, display:'flex', flexWrap:'wrap', gap:5 }}>
+                {minority.map((sig, i) => {
+                  const col = sig.direction === 'LONG' ? T.green : T.red;
+                  return (
+                    <span key={i} style={{
+                      fontSize:9.5, color:col, background:`${col}10`,
+                      border:`1px solid ${col}25`, borderRadius:4, padding:'3px 8px',
+                    }}>
+                      {sig.direction === 'LONG' ? '▲' : '▼'} {sig.label}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+};
+
 // ── Trade Plan Panel ──────────────────────────────────────────────────────────
 // ── Cleanest Trade Available ──────────────────────────────────────────────────
 
@@ -10403,17 +10682,39 @@ export default function MainBrain() {
             <SystemHealthPanel p={p} />
           </div>
         );
-      default:
-        // Root overview or unknown section → full 4-row grid
+      default: {
+        // Root overview — Consensus strip replaces Thesis + Verdict + Scanner top row
+        const _con = computeConsensus(p);
+        const _vrdDir   = safeStr((p.verdict as Record<string,unknown>)?.direction ?? '', '').toUpperCase();
+        const _planConflict = _con.direction !== 'DIVIDED'
+          && _vrdDir !== ''
+          && _vrdDir !== _con.direction
+          && (p.verdict as Record<string,unknown>)?.is_actionable === true;
         return (
           <>
+            {/* ── Consensus strip ──────────────────────────────────────────── */}
+            <ConsensusPanel p={p} consensus={_con} />
+
+            {/* ── Trade Plan row — dim TradePlanPanel when direction conflicts ─ */}
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-3">
-              <ThesisPanel p={p} />
-              <VerdictPanel p={p} />
-              <ScannerPanel p={p} />
-            </div>
-            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-3">
-              <TradePlanPanel p={p} />
+              <div style={{
+                opacity: _planConflict ? 0.28 : 1,
+                transition: 'opacity 0.4s ease',
+                position: 'relative',
+              }}>
+                {_planConflict && (
+                  <div style={{
+                    position:'absolute', top:0, left:0, right:0, zIndex:1,
+                    background:`${T.amber}20`, borderBottom:`1px solid ${T.amber}35`,
+                    borderRadius:'8px 8px 0 0',
+                    padding:'4px 10px', fontSize:9, color:T.amber,
+                    letterSpacing:'0.06em', textAlign:'center',
+                  }}>
+                    ⚠ Plan is {_vrdDir} — consensus is {_con.direction}
+                  </div>
+                )}
+                <TradePlanPanel p={p} />
+              </div>
               <ActiveTradesPanel p={p} />
               <ExecutionPanel p={p} />
             </div>
@@ -10428,6 +10729,7 @@ export default function MainBrain() {
             </div>
           </>
         );
+      }  // end default block
     }
   };
 
