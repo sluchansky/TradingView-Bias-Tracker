@@ -10267,11 +10267,48 @@ export default function MainBrain() {
     const verdict = (p.verdict ?? {}) as Record<string, unknown>;
     const sc      = (p.strategy_scanner ?? {}) as Record<string, unknown>;
 
-    const isActionable  = verdict.is_actionable === true;
-    const isConnected   = fetchState === 'loaded' || fetchState === 'stale' || fetchState === 'refreshing';
+    const isActionable   = verdict.is_actionable === true;
+    const isConnected    = fetchState === 'loaded' || fetchState === 'stale' || fetchState === 'refreshing';
     const isDisconnected = fetchState === 'error';
 
-    // READY_TO_TRADE — fires only on NOT_READY → READY transition.
+    // Collect the single highest-priority toast to show this cycle.
+    // React batches synchronous setState calls inside a useEffect — only the
+    // LAST call wins.  We therefore compute all events first, then call
+    // setBellToast exactly once with the highest-priority result.
+    // Priority order: READY_TO_TRADE > SYSTEM_OFFLINE > SYSTEM_ONLINE > SCAN_FOUND
+    let nextToast: BellToastData | null = null;
+
+    // SCAN_FOUND — lowest priority: fires when a new strategy is selected.
+    const scannerKey = String(sc.selected_strategy ?? '');
+    if (scannerKey && scannerKey !== prevScannerKeyRef.current) {
+      audioManager.play(SoundEvent.SCAN_FOUND);
+      const inst = safeStr((p.market as Record<string, unknown>)?.instrument, '');
+      nextToast = {
+        key:      Date.now(),
+        icon:     '🔍',
+        label:    'New setup found',
+        sublabel: [inst, scannerKey].filter(Boolean).join('  ·  '),
+        color:    T.cyan,
+      };
+    }
+    prevScannerKeyRef.current = scannerKey;
+
+    // SYSTEM_ONLINE — fires on disconnected/initial → connected transition.
+    if (isConnected && !prevFetchOkRef.current) {
+      audioManager.play(SoundEvent.SYSTEM_ONLINE);
+      nextToast = { key: Date.now(), icon: '✓', label: 'System connected',
+                    sublabel: '', color: T.green };
+    }
+    // SYSTEM_OFFLINE — fires on connected → error transition.
+    if (isDisconnected && prevFetchOkRef.current) {
+      audioManager.play(SoundEvent.SYSTEM_OFFLINE);
+      nextToast = { key: Date.now(), icon: '⚠', label: 'Feed disconnected',
+                    sublabel: 'Retrying automatically…', color: T.amber };
+    }
+    if (isConnected)    prevFetchOkRef.current = true;
+    if (isDisconnected) prevFetchOkRef.current = false;
+
+    // READY_TO_TRADE — highest priority: fires only on NOT_READY → READY transition.
     // prevActionableRef starts null so the very first READY payload also fires.
     if (isActionable && prevActionableRef.current !== true) {
       audioManager.play(SoundEvent.READY_TO_TRADE);
@@ -10282,46 +10319,18 @@ export default function MainBrain() {
       const score = safeNum(eb.score ?? eb.total_score);
       const strat = safeStr(sc.selected_strategy, '');
       const parts = ([dir, score != null ? `Edge ${score}` : null, strat || null] as (string|null)[]).filter(Boolean);
-      setBellToast({
+      nextToast = {
         key:      Date.now(),
         icon:     '🔔',
         label:    `${inst ? inst + '  ' : ''}READY TO TRADE`,
         sublabel: parts.join('  ·  '),
         color:    T.green,
-      });
+      };
     }
     prevActionableRef.current = isActionable;
 
-    // SYSTEM_ONLINE — fires when we transition from disconnected/initial → connected.
-    if (isConnected && !prevFetchOkRef.current) {
-      audioManager.play(SoundEvent.SYSTEM_ONLINE);
-      setBellToast({ key: Date.now(), icon: '✓', label: 'System connected',
-                     sublabel: '', color: T.green });
-    }
-    // SYSTEM_OFFLINE — fires when we transition from connected → error.
-    if (isDisconnected && prevFetchOkRef.current) {
-      audioManager.play(SoundEvent.SYSTEM_OFFLINE);
-      setBellToast({ key: Date.now(), icon: '⚠', label: 'Feed disconnected',
-                     sublabel: 'Retrying automatically…', color: T.amber });
-    }
-    if (isConnected) prevFetchOkRef.current = true;
-    if (isDisconnected) prevFetchOkRef.current = false;
-
-    // SCAN_FOUND — fires when a different (or new) strategy gets selected by
-    // the scanner, signalling a newly discovered opportunity.
-    const scannerKey = String(sc.selected_strategy ?? '');
-    if (scannerKey && scannerKey !== prevScannerKeyRef.current) {
-      audioManager.play(SoundEvent.SCAN_FOUND);
-      const inst = safeStr((p.market as Record<string, unknown>)?.instrument, '');
-      setBellToast({
-        key:      Date.now(),
-        icon:     '🔍',
-        label:    'New setup found',
-        sublabel: [inst, scannerKey].filter(Boolean).join('  ·  '),
-        color:    T.cyan,
-      });
-    }
-    prevScannerKeyRef.current = scannerKey;
+    // Single setState call — whichever event won the priority race above.
+    if (nextToast) setBellToast(nextToast);
 
   }, [payload, fetchState]); // eslint-disable-line react-hooks/exhaustive-deps
 
