@@ -24844,13 +24844,21 @@ def build_coach_interface(result, instrument=None, mode=None):
 _MB_MAIN_ENGINE_KEYS = frozenset({
     "OPENING_DRIVE", "LIQUIDITY_SWEEP_REVERSAL", "VWAP_TREND_CONTINUATION",
     "RANGE_EXPANSION_BREAKOUT", "OPENING_RANGE_BREAKOUT",
+    # Research-library graduates:
+    "COMPRESSION_BREAKOUT", "VWAP_PULLBACK_CONTINUATION",
+    "ORDER_BLOCK_REJECTION", "VWAP_RECLAIM_FAIL",
 })
 _MB_STRATEGY_LABELS = {
-    "OPENING_DRIVE":            "Opening Drive",
-    "LIQUIDITY_SWEEP_REVERSAL": "Liquidity Sweep Reversal",
-    "VWAP_TREND_CONTINUATION":  "VWAP Trend Continuation",
-    "RANGE_EXPANSION_BREAKOUT": "Range Expansion Breakout",
-    "OPENING_RANGE_BREAKOUT":   "Opening Range Breakout",
+    "OPENING_DRIVE":              "Opening Drive",
+    "LIQUIDITY_SWEEP_REVERSAL":   "Liquidity Sweep Reversal",
+    "VWAP_TREND_CONTINUATION":    "VWAP Trend Continuation",
+    "RANGE_EXPANSION_BREAKOUT":   "Range Expansion Breakout",
+    "OPENING_RANGE_BREAKOUT":     "Opening Range Breakout",
+    # Research-library graduates:
+    "COMPRESSION_BREAKOUT":       "Compression Breakout",
+    "VWAP_PULLBACK_CONTINUATION": "VWAP Pullback Continuation",
+    "ORDER_BLOCK_REJECTION":      "Order Block Rejection",
+    "VWAP_RECLAIM_FAIL":          "VWAP Reclaim/Fail",
 }
 
 
@@ -54379,6 +54387,11 @@ def _build_status_payload(_tk):
         "swing_strategy_filter": a.get("swing_strategy_filter"),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
+        "strategy_scanner":    dict(
+            STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER.get(
+                instrument_of(a.get("active_ticker") or "")
+            ) or {"available": False, "strategies": []}
+        ),
         "market_intelligence": a.get("market_intelligence"),
         "breakout_mode":       a.get("breakout_mode"),
         "swing_v2":            a.get("swing_v2"),
