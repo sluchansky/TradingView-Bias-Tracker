@@ -1421,11 +1421,22 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
 // ── Strategy Scanner Panel ────────────────────────────────────────────────────
 const STRATEGY_LABELS: Record<string, string> = {
+  // ── Live engine (STRATEGY_PRIORITY) ─────────────────────────────────
   OPENING_DRIVE:            'Opening Drive',
   LIQUIDITY_SWEEP_REVERSAL: 'Liquidity Sweep',
   VWAP_TREND_CONTINUATION:  'VWAP Continuation',
   RANGE_EXPANSION_BREAKOUT: 'Range Expansion',
   OPENING_RANGE_BREAKOUT:   'ORB',
+  // ── Research-library graduates — scanner emits UPPERCASE, advisory lowercase ──
+  COMPRESSION_BREAKOUT:         'Compression Breakout',
+  VWAP_PULLBACK_CONTINUATION:   'VWAP Pullback',
+  ORDER_BLOCK_REJECTION:        'OB Rejection',
+  VWAP_RECLAIM_FAIL:            'VWAP Reclaim/Fail',
+  // lowercase aliases (advisory votes; kept for parity while sim data accumulates)
+  compression_breakout:         'Compression Breakout',
+  vwap_pullback_continuation:   'VWAP Pullback',
+  order_block_rejection:        'OB Rejection',
+  vwap_reclaim_fail:            'VWAP Reclaim/Fail',
 };
 
 function completenessHint(pct: number, skipReason: string): string {
@@ -1579,6 +1590,34 @@ function computeConsensus(p: Record<string, unknown>): ConsensusResult {
     const key  = safeStr(s.key ?? s.strategy_key, '');
     const name = STRATEGY_LABELS[key] ?? safeStr(s.name, key || 'Strategy');
     signals.push({ label: name, direction: sDir, weight: 1 });
+  }
+
+  // Research advisory votes — now graduated to live engine (STRATEGY_PRIORITY), so
+  // they already vote via sc.strategies above. Advisory votes kept as a tiebreaker
+  // ONLY when the live scanner hasn't fired them (different threshold — advisory fires
+  // on any lctx pass; scanner requires fully_met). To avoid double-counting, skip any
+  // key whose UPPERCASE equivalent already voted in the scanner loop above.
+  const scannedKeys = new Set(signals.map(s => s.label));
+  const RESEARCH_VOTERS = new Set([
+    'compression_breakout',
+    'vwap_pullback_continuation',
+    'order_block_rejection',
+    'vwap_reclaim_fail',
+  ]);
+  const adv   = (p.scalp_strategy_advisory ?? {}) as Record<string, unknown>;
+  const votes = Array.isArray(adv.votes) ? adv.votes as Record<string, unknown>[] : [];
+  for (const v of votes) {
+    const key = safeStr(v.strategy_key, '');
+    if (!RESEARCH_VOTERS.has(key)) continue;
+    if (!v.passed) continue;
+    const raw  = safeStr(v.direction, '');
+    const vDir = (raw.toUpperCase() === 'LONG' || raw === 'Long') ? 'LONG'
+               : (raw.toUpperCase() === 'SHORT' || raw === 'Short') ? 'SHORT'
+               : null;
+    if (!vDir) continue;
+    const label = STRATEGY_LABELS[key] ?? safeStr(v.name, key);
+    if (scannedKeys.has(label)) continue;  // live scanner already voted this strategy
+    signals.push({ label, direction: vDir, weight: 1 });
   }
 
   let longVotes = 0, shortVotes = 0;
@@ -9437,6 +9476,154 @@ const SystemHealthPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   );
 };
 
+// ── Quick Trade Bar ───────────────────────────────────────────────────────────
+// Operator-override entry / exit buttons that bypass the signal gate.
+//   LONG / SHORT → POST /api/manual-order  (requires MANUAL_ORDER_ENABLED=1 server-side)
+//   EXIT          → POST /api/quick-exit   (broker flatten + local tracking clear)
+const QuickTradeBar: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  const instrument       = safeStr((p.market as Record<string, unknown>)?.instrument ?? '', '');
+  const manualEnabled    = p.manual_order_enabled === true;
+  const activeTrades     = Array.isArray(p.active_trades) ? p.active_trades as Record<string, unknown>[] : [];
+  const hasActiveTrade   = activeTrades.length > 0;
+
+  type LoadingKey = 'none' | 'long' | 'short' | 'exit';
+  const [loading,  setLoading]  = useState<LoadingKey>('none');
+  const [toast,    setToast]    = useState<{ text: string; ok: boolean } | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = (text: string, ok: boolean) => {
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    setToast({ text, ok });
+    toastTimer.current = setTimeout(() => setToast(null), 3500);
+  };
+
+  const handleEnter = async (direction: 'Long' | 'Short') => {
+    if (!instrument || loading !== 'none') return;
+    setLoading(direction === 'Long' ? 'long' : 'short');
+    try {
+      const r = await fetch('/api/manual-order', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+        body: JSON.stringify({ ticker: instrument, direction, contracts: 1 }),
+      });
+      const j = await r.json() as Record<string, unknown>;
+      if (r.ok && (j.status === 'sent' || j.status === 'simulated' || j.status === 'manual_required')) {
+        showToast(`${direction} ${String(j.status)} — ${instrument}`, true);
+      } else {
+        showToast(safeStr(j.reason ?? j.error ?? '', 'Gateway rejected').slice(0, 70), false);
+      }
+    } catch {
+      showToast('Network error — verify at broker', false);
+    } finally {
+      setLoading('none');
+    }
+  };
+
+  const handleExit = async () => {
+    if (!instrument || loading !== 'none') return;
+    setLoading('exit');
+    try {
+      const r = await fetch('/api/quick-exit', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+        body: JSON.stringify({ ticker: instrument }),
+      });
+      const j = await r.json() as Record<string, unknown>;
+      if (r.ok && (j.status === 'sent' || j.status === 'simulated')) {
+        const pnl = j.pnl_dollars != null ? ` · $${Number(j.pnl_dollars) >= 0 ? '+' : ''}${Number(j.pnl_dollars).toFixed(0)}` : '';
+        showToast(`Exited ${instrument}${pnl}`, true);
+      } else {
+        showToast(safeStr(j.reason ?? j.error ?? '', 'Exit failed').slice(0, 70), false);
+      }
+    } catch {
+      showToast('Network error — verify at broker', false);
+    } finally {
+      setLoading('none');
+    }
+  };
+
+  const base: React.CSSProperties = {
+    flex: 1, padding: '9px 0', borderRadius: 7, cursor: 'pointer',
+    fontSize: 11, fontWeight: 700, letterSpacing: '0.07em',
+    transition: 'opacity 0.15s, background 0.15s',
+  };
+  const dim: React.CSSProperties = { opacity: 0.35, cursor: 'not-allowed' };
+
+  return (
+    <div style={{ marginBottom: 12 }}>
+      {toast && (
+        <div style={{
+          marginBottom: 6, padding: '6px 12px', borderRadius: 6, fontSize: 10.5,
+          background: toast.ok ? 'rgba(34,197,94,0.10)' : 'rgba(239,68,68,0.10)',
+          border:     `1px solid ${toast.ok ? 'rgba(34,197,94,0.32)' : 'rgba(239,68,68,0.32)'}`,
+          color:      toast.ok ? T.green : T.red,
+          display: 'flex', alignItems: 'center', gap: 6,
+        }}>
+          <span>{toast.ok ? '✓' : '✗'}</span><span>{toast.text}</span>
+        </div>
+      )}
+      <div style={{ display: 'flex', gap: 6 }}>
+        {/* LONG */}
+        <button
+          onClick={() => handleEnter('Long')}
+          disabled={!manualEnabled || loading !== 'none' || !instrument}
+          title={!manualEnabled ? 'Set MANUAL_ORDER_ENABLED=1 to enable quick entry' : `Enter Long ${instrument}`}
+          style={{
+            ...base,
+            background: 'rgba(34,197,94,0.10)', border: `1px solid rgba(34,197,94,0.45)`,
+            color: T.green,
+            ...(!manualEnabled || loading !== 'none' || !instrument ? dim : {}),
+          }}
+          onMouseEnter={e => { if (manualEnabled && loading === 'none') (e.currentTarget as HTMLButtonElement).style.background = 'rgba(34,197,94,0.20)'; }}
+          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(34,197,94,0.10)'; }}
+        >
+          {loading === 'long' ? '…' : '▲ LONG'}
+        </button>
+
+        {/* SHORT */}
+        <button
+          onClick={() => handleEnter('Short')}
+          disabled={!manualEnabled || loading !== 'none' || !instrument}
+          title={!manualEnabled ? 'Set MANUAL_ORDER_ENABLED=1 to enable quick entry' : `Enter Short ${instrument}`}
+          style={{
+            ...base,
+            background: 'rgba(239,68,68,0.10)', border: `1px solid rgba(239,68,68,0.45)`,
+            color: T.red,
+            ...(!manualEnabled || loading !== 'none' || !instrument ? dim : {}),
+          }}
+          onMouseEnter={e => { if (manualEnabled && loading === 'none') (e.currentTarget as HTMLButtonElement).style.background = 'rgba(239,68,68,0.20)'; }}
+          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(239,68,68,0.10)'; }}
+        >
+          {loading === 'short' ? '…' : '▼ SHORT'}
+        </button>
+
+        {/* EXIT */}
+        <button
+          onClick={handleExit}
+          disabled={!hasActiveTrade || loading !== 'none' || !instrument}
+          title={!hasActiveTrade ? 'No active trade to exit' : `Flatten ${instrument} at market`}
+          style={{
+            ...base, flex: 0.7,
+            background: 'rgba(245,158,11,0.10)', border: `1px solid rgba(245,158,11,0.45)`,
+            color: T.amber,
+            ...(!hasActiveTrade || loading !== 'none' || !instrument ? dim : {}),
+          }}
+          onMouseEnter={e => { if (hasActiveTrade && loading === 'none') (e.currentTarget as HTMLButtonElement).style.background = 'rgba(245,158,11,0.20)'; }}
+          onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = 'rgba(245,158,11,0.10)'; }}
+        >
+          {loading === 'exit' ? '…' : '✕ EXIT'}
+        </button>
+      </div>
+
+      {!manualEnabled && (
+        <div style={{ marginTop: 4, fontSize: 9, color: T.txtMuted, textAlign: 'center' }}>
+          Quick entry off — set <span style={{ fontFamily: T.mono, color: T.txtSec }}>MANUAL_ORDER_ENABLED=1</span> env to enable
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── Ask AI message bubble ─────────────────────────────────────────────────────
 function MbBubble({ msg }: { msg: MbMsg }) {
   const isBrain = msg.role === 'brain';
@@ -10785,6 +10972,9 @@ export default function MainBrain() {
                 onScan={handleScanCleanest}
                 setOpen={() => setCleanestOpen(true)}
               />
+
+              {/* ── Quick Trade Bar ──────────────────────────────────────── */}
+              <QuickTradeBar p={p} />
 
               {/* Section breadcrumb — visible on sub-section pages */}
               {section !== '' && KNOWN_SECTIONS.includes(section) && (

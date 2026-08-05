@@ -10322,10 +10322,30 @@ STRATEGY_DEFS = {
         "label": "Opening Range Breakout", "target_r": 4.0, "max_grade": "A",
         "regimes": {"TRENDING", "VOLATILE", "BALANCED"},
     },
+    # ── Research-library graduates (Phase 7Q) ──────────────────────────────
+    "COMPRESSION_BREAKOUT": {
+        "label": "Compression Breakout", "target_r": 2.0, "max_grade": "A+",
+        "regimes": {"TRENDING", "RANGING", "BALANCED"},
+    },
+    "VWAP_PULLBACK_CONTINUATION": {
+        "label": "VWAP Pullback Continuation", "target_r": 1.8, "max_grade": "A+",
+        "regimes": {"TRENDING", "BALANCED"},
+    },
+    "ORDER_BLOCK_REJECTION": {
+        "label": "Order Block Rejection", "target_r": 2.0, "max_grade": "A",
+        "regimes": {"VOLATILE", "BALANCED", "RANGING"},
+    },
+    "VWAP_RECLAIM_FAIL": {
+        "label": "VWAP Reclaim / Fail", "target_r": 1.8, "max_grade": "A",
+        "regimes": {"VOLATILE", "TRENDING", "BALANCED"},
+    },
 }
 STRATEGY_PRIORITY = [
     "OPENING_DRIVE", "LIQUIDITY_SWEEP_REVERSAL", "VWAP_TREND_CONTINUATION",
     "RANGE_EXPANSION_BREAKOUT", "OPENING_RANGE_BREAKOUT",
+    # Research-library graduates:
+    "COMPRESSION_BREAKOUT", "VWAP_PULLBACK_CONTINUATION",
+    "ORDER_BLOCK_REJECTION", "VWAP_RECLAIM_FAIL",
 ]
 
 
@@ -10804,12 +10824,134 @@ def _score_opening_range_breakout(ctx):
     return {"direction": direction, "conditions": conditions, "target_r": 4.0}
 
 
+def _score_compression_breakout(ctx):
+    """Volatility coil + volume expansion breakout. Direction driven by which range
+    edge price exits. Proxy: range_tight + broke_range_high/low + volume_ok."""
+    if ctx["broke_range_high"]:
+        direction = "Long"
+    elif ctx["broke_range_low"]:
+        direction = "Short"
+    else:
+        direction = None
+    if direction == "Long":
+        conditions = [
+            ("ATR contraction / tight coil",  ctx["atr_contraction"] or ctx["range_tight"]),
+            ("Tight consolidation range",      ctx["range_tight"]),
+            ("Break above coil",               ctx["broke_range_high"]),
+            ("Volume on breakout",             ctx["volume_ok"]),
+            ("Bullish breakout close",         ctx["has_bull_confirm"]),
+        ]
+    elif direction == "Short":
+        conditions = [
+            ("ATR contraction / tight coil",  ctx["atr_contraction"] or ctx["range_tight"]),
+            ("Tight consolidation range",      ctx["range_tight"]),
+            ("Breakdown below coil",           ctx["broke_range_low"]),
+            ("Volume on breakdown",            ctx["volume_ok"]),
+            ("Bearish breakdown close",        ctx["has_bear_confirm"]),
+        ]
+    else:
+        conditions = [("Range break in progress", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 2.0}
+
+
+def _score_vwap_pullback_continuation(ctx):
+    """Established trend pulls back to VWAP then resumes. Direction from VWAP side.
+    Distinct from VWAP_TREND_CONTINUATION — this requires the near_vwap pullback
+    touch whereas VTC measures the broader trend + any bar."""
+    if ctx["price_above_vwap"]:
+        direction = "Long"
+    elif ctx["price_below_vwap"]:
+        direction = "Short"
+    else:
+        direction = None
+    if direction == "Long":
+        conditions = [
+            ("Uptrend structure (BOS/CHOCH)", ctx["structure_long"]),
+            ("Price above VWAP",              ctx["price_above_vwap"]),
+            ("Pullback near VWAP",            ctx["near_vwap"]),
+            ("Continuation candle",           ctx["has_bull_confirm"]),
+            ("Volume expansion",              ctx["volume_ok"]),
+        ]
+    elif direction == "Short":
+        conditions = [
+            ("Downtrend structure (BOS/CHOCH)", ctx["structure_short"]),
+            ("Price below VWAP",               ctx["price_below_vwap"]),
+            ("Pullback near VWAP",             ctx["near_vwap"]),
+            ("Continuation candle",            ctx["has_bear_confirm"]),
+            ("Volume expansion",               ctx["volume_ok"]),
+        ]
+    else:
+        conditions = [("Price on one side of VWAP", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 1.8}
+
+
+def _score_order_block_rejection(ctx):
+    """Price taps a supply/demand order-block and rejects. Proxy: most-recent CHOCH
+    or BOS acting as the zone marker; direction from which zone is freshest."""
+    if ctx["has_choch_supply"] or ctx["has_bos_supply"]:
+        direction = "Short"
+    elif ctx["has_choch_demand"] or ctx["has_bos_demand"]:
+        direction = "Long"
+    else:
+        direction = None
+    if direction == "Short":
+        conditions = [
+            ("Supply zone present (CHOCH/BOS)", ctx["has_choch_supply"] or ctx["has_bos_supply"]),
+            ("Price on supply side of VWAP",    ctx["price_below_vwap"] or ctx["structure_short"]),
+            ("Rejection candle at zone",        ctx["has_bear_confirm"]),
+            ("Volume confirms rejection",       ctx["volume_ok"]),
+        ]
+    elif direction == "Long":
+        conditions = [
+            ("Demand zone present (CHOCH/BOS)", ctx["has_choch_demand"] or ctx["has_bos_demand"]),
+            ("Price on demand side of VWAP",    ctx["price_above_vwap"] or ctx["structure_long"]),
+            ("Rejection candle at zone",        ctx["has_bull_confirm"]),
+            ("Volume confirms rejection",       ctx["volume_ok"]),
+        ]
+    else:
+        conditions = [("Order-block zone present", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 2.0}
+
+
+def _score_vwap_reclaim_fail(ctx):
+    """Price crosses back through VWAP after trading on the other side.
+    Proxy: fresh CHOCH back across VWAP + volume confirms the cross."""
+    if ctx["has_choch_demand"] and ctx["price_above_vwap"]:
+        direction = "Long"
+    elif ctx["has_choch_supply"] and ctx["price_below_vwap"]:
+        direction = "Short"
+    else:
+        direction = None
+    if direction == "Long":
+        conditions = [
+            ("VWAP data available",           ctx["vwap_ok"]),
+            ("Bullish CHOCH (reclaim proxy)", ctx["has_choch_demand"]),
+            ("Price reclaimed above VWAP",    ctx["price_above_vwap"]),
+            ("Volume on reclaim",             ctx["volume_ok"]),
+        ]
+    elif direction == "Short":
+        conditions = [
+            ("VWAP data available",        ctx["vwap_ok"]),
+            ("Bearish CHOCH (fail proxy)", ctx["has_choch_supply"]),
+            ("Price lost VWAP",            ctx["price_below_vwap"]),
+            ("Volume on failure",          ctx["volume_ok"]),
+        ]
+    else:
+        conditions = [("CHOCH across VWAP required", False)]
+    return {"direction": direction, "conditions": conditions, "target_r": 1.8}
+
+
 STRATEGY_SCORERS = {
-    "OPENING_DRIVE":            _score_opening_drive,
-    "LIQUIDITY_SWEEP_REVERSAL": _score_liquidity_sweep_reversal,
-    "VWAP_TREND_CONTINUATION":  _score_vwap_trend_continuation,
-    "RANGE_EXPANSION_BREAKOUT": _score_range_expansion_breakout,
-    "OPENING_RANGE_BREAKOUT":   _score_opening_range_breakout,
+    "OPENING_DRIVE":              _score_opening_drive,
+    "LIQUIDITY_SWEEP_REVERSAL":   _score_liquidity_sweep_reversal,
+    "VWAP_TREND_CONTINUATION":    _score_vwap_trend_continuation,
+    "RANGE_EXPANSION_BREAKOUT":   _score_range_expansion_breakout,
+    "OPENING_RANGE_BREAKOUT":     _score_opening_range_breakout,
+    # Research-library graduates:
+    "COMPRESSION_BREAKOUT":       _score_compression_breakout,
+    "VWAP_PULLBACK_CONTINUATION": _score_vwap_pullback_continuation,
+    "ORDER_BLOCK_REJECTION":      _score_order_block_rejection,
+    "VWAP_RECLAIM_FAIL":          _score_vwap_reclaim_fail,
 }
 
 
@@ -10991,6 +11133,58 @@ _ELIGIBILITY_PROFILES = {
             "H1-2026: Long +56R PF 1.11 vs Short \u2212173R PF 0.68; "
             "08\u201310h ET cost \u2212144R; best hours 12\u201313h +60R combined; "
             "monotonic WR decline Jan\u2192Jun"
+        ),
+    },
+    # ── Research-library graduates (Phase 7Q) — live sim accumulating data ──
+    "COMPRESSION_BREAKOUT": {
+        "label":                  "Compression Breakout",
+        "preferred_session":      "New York",
+        "weak_session":           "Asia / Off-hours",
+        "preferred_volatility":   "TRENDING / RANGING",
+        "weak_volatility":        "VOLATILE",
+        "preferred_direction":    "\u2014",
+        "historical_note": (
+            "Theoretical: tight coil + volume expansion. Best in TRENDING/RANGING NY; "
+            "avoid VOLATILE (fakeout risk). Live sim accumulating data."
+        ),
+    },
+    "VWAP_PULLBACK_CONTINUATION": {
+        "label":                  "VWAP Pullback Continuation",
+        "preferred_session":      "New York / London",
+        "weak_session":           "Asia (18:00\u201302:00 ET)",
+        "preferred_volatility":   "TRENDING",
+        "weak_volatility":        "BALANCED",
+        "preferred_direction":    "Long",
+        "historical_note": (
+            "Theoretical: trend pullback to VWAP + confirmed continuation. "
+            "Asia VWAP drift overshoots; NY/London structure cleaner. "
+            "Live sim accumulating data."
+        ),
+    },
+    "ORDER_BLOCK_REJECTION": {
+        "label":                  "Order Block Rejection",
+        "preferred_session":      "New York",
+        "weak_session":           "Asia",
+        "preferred_volatility":   "VOLATILE / BALANCED",
+        "weak_volatility":        "RANGING",
+        "preferred_direction":    "\u2014",
+        "historical_note": (
+            "Theoretical: rejection candle at supply/demand zone (CHOCH/BOS proxy). "
+            "Smart-money zones most respected in NY volume; Asia zones often revisited. "
+            "Live sim accumulating data."
+        ),
+    },
+    "VWAP_RECLAIM_FAIL": {
+        "label":                  "VWAP Reclaim / Fail",
+        "preferred_session":      "New York / London",
+        "weak_session":           "Asia",
+        "preferred_volatility":   "VOLATILE / TRENDING",
+        "weak_volatility":        "RANGING",
+        "preferred_direction":    "\u2014",
+        "historical_note": (
+            "Theoretical: CHOCH back across VWAP on volume. High signal frequency; "
+            "RANGING regimes produce repeated whipsaw VWAP crosses. "
+            "Live sim accumulating data."
         ),
     },
 }
@@ -11187,12 +11381,148 @@ def _elig_score_opening_range_breakout(session, et_hour, regime, direction, ctx)
     return score, reasons, warnings
 
 
+def _elig_score_compression_breakout(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    if regime in ("TRENDING", "RANGING"):
+        score += 20
+        reasons.append(f"{regime} regime — coil + expansion setup applicable")
+    elif regime == "VOLATILE":
+        score -= 15
+        warnings.append("Volatile regime — compression breakouts risk fakeout in choppy tape")
+    else:
+        score -= 5
+        warnings.append(f"{regime} regime — balanced conditions; modest compression edge")
+    if session == "New York":
+        score += 20
+        reasons.append("New York session — highest volume for genuine expansions")
+    elif session == "London":
+        score += 10
+        reasons.append("London session — moderate compression-breakout frequency")
+    elif session == "Asia":
+        score -= 15
+        warnings.append("Asia session — low volume; compression breakouts often fakeout")
+    if 9.5 <= et_hour < 16.0:
+        score += 10
+        reasons.append(f"Mid-session ({et_hour:.1f}h ET) — volume supports genuine expansions")
+    elif et_hour >= 18.0 or et_hour < 2.0:
+        score -= 10
+        warnings.append("Overnight / Asia hours — thin tape; compression entries unreliable")
+    return score, reasons, warnings
+
+
+def _elig_score_vwap_pullback_continuation(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    if regime == "TRENDING":
+        score += 25
+        reasons.append("Trending regime — VWAP pullback continuation in established direction")
+    elif regime == "VOLATILE":
+        score += 5
+        reasons.append("Volatile regime — pullback possible but VWAP may not hold")
+    else:
+        score -= 10
+        warnings.append(f"{regime} regime — no clear trend; pullbacks may not continue")
+    if session == "New York":
+        score += 15
+        reasons.append("New York session — strong VWAP adherence on NY trend days")
+    elif session == "London":
+        score += 10
+        reasons.append("London session — VWAP pullbacks reliable during London trend moves")
+    elif session == "Asia":
+        score -= 20
+        warnings.append("Asia session — VWAP drifts overnight; pullbacks tend to overshoot")
+    if 2.0 <= et_hour < 8.0:
+        score += 5
+        reasons.append("London hours — VWAP continuation valid in London drive")
+    elif 8.0 <= et_hour < 12.0:
+        score += 5
+        reasons.append("NY morning — high-quality VWAP pullback window")
+    elif et_hour >= 18.0 or et_hour < 2.0:
+        score -= 10
+        warnings.append("Asia open / overnight — low-quality VWAP pullback window")
+    if direction == "Long":
+        score += 5
+        reasons.append("Long direction — bullish VWAP pullbacks historically cleaner")
+    elif direction == "Short":
+        score -= 5
+        warnings.append("Short direction — VWAP pullback shorts more prone to squeezes")
+    return score, reasons, warnings
+
+
+def _elig_score_order_block_rejection(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    if regime == "VOLATILE":
+        score += 20
+        reasons.append("Volatile regime — genuine zone reactions; smart-money active")
+    elif regime == "BALANCED":
+        score += 10
+        reasons.append("Balanced regime — zone rejections frequent and well-defined")
+    elif regime == "RANGING":
+        score -= 5
+        warnings.append("Ranging regime — zones revisited repeatedly; rejection may fail")
+    else:
+        score -= 10
+        warnings.append(f"{regime} regime — strong trend can run through zones")
+    if session == "New York":
+        score += 20
+        reasons.append("New York session — highest institutional activity at zones")
+    elif session == "London":
+        score += 10
+        reasons.append("London session — decent zone respect during European open")
+    elif session == "Asia":
+        score -= 20
+        warnings.append("Asia session — zones often violated overnight with thin participation")
+    if 8.0 <= et_hour < 12.0:
+        score += 10
+        reasons.append(f"NY morning ({et_hour:.1f}h ET) — zone tests most decisive")
+    elif et_hour >= 18.0 or et_hour < 2.0:
+        score -= 10
+        warnings.append("Overnight hours — zone rejections unreliable without volume")
+    return score, reasons, warnings
+
+
+def _elig_score_vwap_reclaim_fail(session, et_hour, regime, direction, _ctx):
+    score, reasons, warnings = 40, [], []
+    if regime == "VOLATILE":
+        score += 20
+        reasons.append("Volatile regime — VWAP reclaims/fails decisive on high-range days")
+    elif regime == "TRENDING":
+        score += 15
+        reasons.append("Trending regime — VWAP reclaims confirm trend continuation")
+    elif regime == "RANGING":
+        score -= 20
+        warnings.append("Ranging regime — repeated VWAP crosses produce whipsaw; avoid")
+    else:
+        score += 5
+        reasons.append(f"{regime} regime — VWAP cross usable signal")
+    if session == "New York":
+        score += 15
+        reasons.append("New York session — volume-backed VWAP reclaims most reliable")
+    elif session == "London":
+        score += 10
+        reasons.append("London session — VWAP cross on London open can be high-quality")
+    elif session == "Asia":
+        score -= 15
+        warnings.append("Asia session — VWAP drift creates false reclaim signals")
+    if 8.0 <= et_hour < 12.0:
+        score += 10
+        reasons.append(f"NY morning ({et_hour:.1f}h ET) — VWAP reclaims/fails most impactful")
+    elif et_hour >= 18.0 or et_hour < 2.0:
+        score -= 10
+        warnings.append("Overnight hours — VWAP reclaims lack institutional follow-through")
+    return score, reasons, warnings
+
+
 _ELIGIBILITY_SCORERS = {
-    "OPENING_DRIVE":            _elig_score_opening_drive,
-    "LIQUIDITY_SWEEP_REVERSAL": _elig_score_liquidity_sweep_reversal,
-    "VWAP_TREND_CONTINUATION":  _elig_score_vwap_trend_continuation,
-    "RANGE_EXPANSION_BREAKOUT": _elig_score_range_expansion_breakout,
-    "OPENING_RANGE_BREAKOUT":   _elig_score_opening_range_breakout,
+    "OPENING_DRIVE":              _elig_score_opening_drive,
+    "LIQUIDITY_SWEEP_REVERSAL":   _elig_score_liquidity_sweep_reversal,
+    "VWAP_TREND_CONTINUATION":    _elig_score_vwap_trend_continuation,
+    "RANGE_EXPANSION_BREAKOUT":   _elig_score_range_expansion_breakout,
+    "OPENING_RANGE_BREAKOUT":     _elig_score_opening_range_breakout,
+    # Research-library graduates:
+    "COMPRESSION_BREAKOUT":       _elig_score_compression_breakout,
+    "VWAP_PULLBACK_CONTINUATION": _elig_score_vwap_pullback_continuation,
+    "ORDER_BLOCK_REJECTION":      _elig_score_order_block_rejection,
+    "VWAP_RECLAIM_FAIL":          _elig_score_vwap_reclaim_fail,
 }
 
 
@@ -54044,6 +54374,10 @@ def _build_status_payload(_tk):
         # Manual pre-READY "TAKE THIS TRADE" preview path — gates the dashboard button
         # (default OFF => key is False => button hidden => today's UI byte-identical).
         "user_preview_enabled":     _user_preview_take_enabled(),
+        # Quick-entry desk flag (MANUAL_ORDER_ENABLED). Exposed so the dashboard
+        # can show the LONG/SHORT buttons as enabled vs greyed-out without a round-
+        # trip to /manual-order. Never a gate condition — display-only.
+        "manual_order_enabled":     MANUAL_ORDER_ENABLED,
         "execution_rejections":     _recent_exec_rejections(),
         "broker_send_log":          _recent_broker_sends(),
         # Trade-management analytics (MFE/MAE booleans + commission + oversized-loss);
@@ -59347,6 +59681,103 @@ def close_trade():
         pass
     logger.info("Trade closed manually.")
     return jsonify({"status": "closed", "trade": closed}), 200
+
+
+@app.route("/quick-exit", methods=["POST"])
+def quick_exit():
+    """Owner-only. Send an immediate EXIT (full flatten) to the configured broker
+    gateway for the active tracked position on an instrument, then clear local
+    tracking. Uses TradersPost action='exit' — a NON-REVERSING flatten that can
+    never open a reverse position — through the SAME audited _send_broker_order
+    sink as all other live orders.
+
+    On paper / manual_only mode: skips the broker POST and clears tracking only
+    (paper simulate). On execution_mode='disabled': rejects with 409.
+
+    Fail-closed: requires an actively-tracked position; empty or ambiguous ticker
+    returns 400 without touching any broker. Owner-only (auth enforced at the
+    Express /api edge; NOT in dashboard-auth OPEN_PATHS)."""
+    data = request.get_json(force=True, silent=True) or {}
+    _inst, _at, _err = _resolve_active_trade(data.get("ticker"))
+    if _err:
+        return jsonify({"status": "error", "reason": _err}), 400
+    if not _at:
+        return jsonify({"status": "error",
+                        "reason": "No active trade to exit."}), 400
+
+    mode = resolve_execution_mode()
+    if mode == "disabled":
+        return jsonify({"status": "error",
+                        "reason": "Execution is disabled (EXECUTION_MODE=disabled)."}), 409
+
+    provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
+    tp_symbol      = TRADERSPOST_TICKER.get(_inst, _inst)
+    payload        = adapt_traderspost_reduce(tp_symbol)   # {ticker, action:"exit", signal}
+
+    exec_status = "simulated"
+    exec_msg    = f"Paper/manual mode — no broker order sent ({mode})."
+
+    if execution_is_live(mode):
+        send_url = TRADERSPOST_WEBHOOK_URL if mode == "traderspost" else EXECUTION_WEBHOOK_URL
+        if not send_url:
+            return jsonify({"status": "error",
+                            "reason": f"No webhook URL configured for {mode}."}), 409
+        err_res, err_code = _send_broker_order(mode, provider_label, _inst, payload,
+                                               send_url, order_kind="quick_exit")
+        if err_res is not None:
+            return jsonify(err_res), err_code
+        exec_status = "sent"
+        exec_msg    = f"{provider_label} exit confirmed."
+
+    # ── Clear local tracking + PnL ────────────────────────────────────────────
+    exit_price, _ = display_price_for(_inst)
+    dollar_pnl = pts_pnl = None
+    if exit_price is not None:
+        try:
+            dollar_pnl, pts_pnl = compute_pnl(_at, exit_price)
+        except Exception:
+            pass
+
+    pnl_str = (
+        f"+${dollar_pnl:,.0f}" if dollar_pnl is not None and dollar_pnl >= 0
+        else (f"-${abs(dollar_pnl):,.0f}" if dollar_pnl is not None else "—")
+    )
+
+    closed = dict(_at)
+    clear_active_trade(_inst, opened_at=_at.get("opened_at"))
+
+    outcome_str = (
+        f"Win — Quick Exit {pnl_str} ✅" if dollar_pnl is not None and dollar_pnl >= 0
+        else (f"Loss — Quick Exit {pnl_str} ❌" if dollar_pnl is not None
+              else "Closed via Quick Exit")
+    )
+    _update_journal_outcome(outcome_str, pnl_dollars=dollar_pnl, symbol=_inst)
+
+    # ── Discord notification ──────────────────────────────────────────────────
+    try:
+        _url = _discord_url(closed.get("profile", ""))
+        if _url:
+            ep = f"`{exit_price:.2f}`" if exit_price is not None else "market"
+            content = (
+                f"\U0001f6aa **QUICK EXIT** — {_inst} "
+                f"{str(_at.get('direction', '')).upper()}\n"
+                f"Entry `{_at.get('entry_price', '—')}` · Exit {ep} · PnL **{pnl_str}**"
+            )
+            requests.post(_url, json={"content": content}, timeout=5)
+    except Exception:
+        pass
+
+    logger.info("Quick exit %s — %s", _inst, exec_status)
+    return jsonify({
+        "status":         exec_status,
+        "execution_mode": mode,
+        "message":        exec_msg,
+        "instrument":     _inst,
+        "direction":      _at.get("direction"),
+        "pnl_dollars":    dollar_pnl,
+        "pnl_pts":        pts_pnl,
+        "trade":          closed,
+    }), 200
 
 
 @app.route("/stop-managing", methods=["POST"])

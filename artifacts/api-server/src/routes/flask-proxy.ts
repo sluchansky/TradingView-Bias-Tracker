@@ -95,6 +95,10 @@ export const BOT1_ROUTES = [
   "/notify-test",
   "/breakeven",
   "/close",
+  // Quick Exit: owner-only broker flatten (action='exit', non-reversing) + local-
+  // tracking clear. Sends a real order on live modes; paper/manual_only only clears
+  // tracking. NOT in dashboard-auth OPEN_PATHS.
+  "/quick-exit",
   // Stop-managing: owner-only local-tracking flush. Clears a stale tracked /
   // managed / monitored position so the bot stops showing a trade the user
   // already closed elsewhere. TRACKING-ONLY — never sends a broker order (NOT in
