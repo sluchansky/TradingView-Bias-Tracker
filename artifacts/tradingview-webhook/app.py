@@ -1864,7 +1864,9 @@ DISCORD_ALERT_MENTION       = os.environ.get("DISCORD_ALERT_MENTION", "@everyone
 # connected broker (Tradovate for Apex/Tradeify). Unset = feature OFF (the dashboard
 # hides the button and the route returns a 400). This is the ONLY broker-bound
 # request in the app — every other requests.post targets Discord.
-TRADERSPOST_WEBHOOK_URL = os.environ.get("TRADERSPOST_WEBHOOK_URL", "").strip()
+TRADERSPOST_WEBHOOK_URL = (
+    os.environ.get("TRADERSPOST_WEBHOOK_URL") or os.environ.get("Traderspost") or ""
+).strip()
 # The webhook "ticker" must match what the TradersPost subscription expects. Default
 # to the root symbol (MGC / MNQ); override per instrument if the broker symbol differs
 # (e.g. a dated/continuous contract) via TRADERSPOST_TICKER_MGC / TRADERSPOST_TICKER_MNQ.
@@ -10265,6 +10267,7 @@ OPENING_DRIVE_WINDOW_END_ET = 10.0   # Opening Drive is only eligible 08:00–10
 # Detection thresholds (FAIL-OPEN; tuned conservatively).
 STRAT_VWAP_PULLBACK_ATR  = 0.6     # price within 0.6*ATR of VWAP == "pullback into VWAP"
 STRAT_RANGE_TIGHT_ATR    = 1.5     # consolidation width <= 1.5*ATR == "tight range"
+STRAT_OB_ZONE_PROXIMITY_ATR = 1.0  # within 1 ATR of supply/demand == "price at order-block zone"
 STRAT_MOVE_THRESH_PCT    = 0.0015  # +/-0.15% session move == directional session bias
 RANGE_LOOKBACK_MIN       = 30      # rolling window for the consolidation range
 BREAKOUT_RECENT_SEC      = 180     # exclude the last 3 min so a breakout tick isn't in its own range
@@ -10619,6 +10622,27 @@ def build_strategy_context(ticker, current_price, vwap_value, vwap_status, volat
         rvol_ok = False
     volume_ok = bool(snap["volume_spike_fresh"] or rvol_ok)
 
+    # ── Real zone proximity (Order-Block Rejection uses these) ───────────────
+    try:
+        _, _all_sup, _all_dem = get_price_context(ticker)
+        _ns, _nd = get_nearest_levels(price, _all_sup, _all_dem)
+    except Exception:
+        _ns = _nd = None
+    def _zone_dist_atr(zone_price, is_supply):
+        """ATR-normalised distance from current price to the zone.
+        Supply zones are above price; demand zones are below."""
+        if zone_price is None or price is None or not atr_pts:
+            return None
+        try:
+            raw = (zone_price - price) if is_supply else (price - zone_price)
+            return raw / atr_pts
+        except (TypeError, ZeroDivisionError):
+            return None
+    _sup_dist_atr = _zone_dist_atr(_ns, is_supply=True)
+    _dem_dist_atr = _zone_dist_atr(_nd, is_supply=False)
+    _at_supply = bool(_sup_dist_atr is not None and 0 <= _sup_dist_atr <= STRAT_OB_ZONE_PROXIMITY_ATR)
+    _at_demand = bool(_dem_dist_atr is not None and 0 <= _dem_dist_atr <= STRAT_OB_ZONE_PROXIMITY_ATR)
+
     cvd = CVD_BY_TICKER.get(inst) or {}
     ctx = {
         "inst": inst, "price": price,
@@ -10633,6 +10657,13 @@ def build_strategy_context(ticker, current_price, vwap_value, vwap_status, volat
         "broke_range_high": broke_range_high, "broke_range_low": broke_range_low,
         "in_opening_window": in_opening_window, "et_hour": et_hour,
         "volume_ok": volume_ok,
+        # Zone-proximity data for Order-Block Rejection scorer
+        "nearest_supply":       _ns,
+        "nearest_demand":       _nd,
+        "zone_dist_supply_atr": _sup_dist_atr,
+        "zone_dist_demand_atr": _dem_dist_atr,
+        "at_supply_zone":       _at_supply,
+        "at_demand_zone":       _at_demand,
     }
     ctx.update(snap)
     return ctx
@@ -10886,30 +10917,64 @@ def _score_vwap_pullback_continuation(ctx):
 
 
 def _score_order_block_rejection(ctx):
-    """Price taps a supply/demand order-block and rejects. Proxy: most-recent CHOCH
-    or BOS acting as the zone marker; direction from which zone is freshest."""
-    if ctx["has_choch_supply"] or ctx["has_bos_supply"]:
+    """Price taps a supply/demand order-block zone and rejects.
+    Primary signal: price is within STRAT_OB_ZONE_PROXIMITY_ATR of the nearest
+    supply (for shorts) or demand (for longs) level — sourced from get_nearest_levels(),
+    the same authoritative zone data used by the main analysis engine.
+    CHOCH/BOS presence is kept as a tiebreaker for direction when price is
+    simultaneously close to both zones, but it is NOT the primary gate."""
+    at_supply = ctx.get("at_supply_zone", False)
+    at_demand = ctx.get("at_demand_zone", False)
+    has_supply_struct = ctx["has_choch_supply"] or ctx["has_bos_supply"]
+    has_demand_struct = ctx["has_choch_demand"] or ctx["has_bos_demand"]
+
+    sup_dist = ctx.get("zone_dist_supply_atr")
+    dem_dist = ctx.get("zone_dist_demand_atr")
+    nearest_supply = ctx.get("nearest_supply")
+    nearest_demand = ctx.get("nearest_demand")
+
+    # Direction: prefer zone actually touched; use structure as tiebreaker
+    if at_supply and at_demand:
+        # Both zones close — use structural signals as tiebreaker
+        direction = "Short" if has_supply_struct else ("Long" if has_demand_struct else "Short")
+    elif at_supply:
         direction = "Short"
-    elif ctx["has_choch_demand"] or ctx["has_bos_demand"]:
+    elif at_demand:
+        direction = "Long"
+    elif has_supply_struct and not has_demand_struct:
+        direction = "Short"   # fallback: structure only, no zone proximity
+    elif has_demand_struct and not has_supply_struct:
         direction = "Long"
     else:
         direction = None
+
+    sup_label = (f"Supply zone at {nearest_supply:.1f}"
+                 if nearest_supply is not None else "Supply zone present")
+    dem_label = (f"Demand zone at {nearest_demand:.1f}"
+                 if nearest_demand is not None else "Demand zone present")
+    sup_dist_label = (f" ({sup_dist:.2f} ATR away)" if sup_dist is not None else "")
+    dem_dist_label = (f" ({dem_dist:.2f} ATR away)" if dem_dist is not None else "")
+
     if direction == "Short":
         conditions = [
-            ("Supply zone present (CHOCH/BOS)", ctx["has_choch_supply"] or ctx["has_bos_supply"]),
-            ("Price on supply side of VWAP",    ctx["price_below_vwap"] or ctx["structure_short"]),
-            ("Rejection candle at zone",        ctx["has_bear_confirm"]),
-            ("Volume confirms rejection",       ctx["volume_ok"]),
+            (f"Price at supply zone{sup_dist_label}",       at_supply),
+            ("Supply zone present (fallback)",              not at_supply and has_supply_struct),
+            (sup_label,                                     nearest_supply is not None),
+            ("Price on supply side of VWAP",                ctx["price_below_vwap"] or ctx["structure_short"]),
+            ("Rejection candle at zone",                    ctx["has_bear_confirm"]),
+            ("Volume confirms rejection",                   ctx["volume_ok"]),
         ]
     elif direction == "Long":
         conditions = [
-            ("Demand zone present (CHOCH/BOS)", ctx["has_choch_demand"] or ctx["has_bos_demand"]),
-            ("Price on demand side of VWAP",    ctx["price_above_vwap"] or ctx["structure_long"]),
-            ("Rejection candle at zone",        ctx["has_bull_confirm"]),
-            ("Volume confirms rejection",       ctx["volume_ok"]),
+            (f"Price at demand zone{dem_dist_label}",       at_demand),
+            ("Demand zone present (fallback)",               not at_demand and has_demand_struct),
+            (dem_label,                                      nearest_demand is not None),
+            ("Price on demand side of VWAP",                ctx["price_above_vwap"] or ctx["structure_long"]),
+            ("Rejection candle at zone",                    ctx["has_bull_confirm"]),
+            ("Volume confirms rejection",                   ctx["volume_ok"]),
         ]
     else:
-        conditions = [("Order-block zone present", False)]
+        conditions = [("Price within 1 ATR of supply or demand zone", False)]
     return {"direction": direction, "conditions": conditions, "target_r": 2.0}
 
 
@@ -25629,7 +25694,7 @@ def _mb_system_status(result, errors):
             "learning_ready":         l_ready,
             "active_trades_db_ready": bool(ACTIVE_TRADES_DB_READY),
             "broker_url_configured":  bool(
-                os.environ.get("TRADERSPOST_WEBHOOK_URL", "").strip()),
+                (os.environ.get("TRADERSPOST_WEBHOOK_URL") or os.environ.get("Traderspost") or "").strip()),
             "price_fresh": (
                 bool(db_feed.get("price_fresh"))
                 if "price_fresh" in db_feed
@@ -25641,7 +25706,7 @@ def _mb_system_status(result, errors):
             "db_ready":         bool(LEARNING_DB_ENABLED),
             "databento_ready":  databento_on,
             "broker_ready":     bool(
-                os.environ.get("TRADERSPOST_WEBHOOK_URL", "").strip()),
+                (os.environ.get("TRADERSPOST_WEBHOOK_URL") or os.environ.get("Traderspost") or "").strip()),
             "learning_ready":   l_ready,
         }
     except Exception as _exc:
