@@ -53741,8 +53741,6 @@ function render(){
     html += '<div class="btns">'
          + '<button class="save" onclick="saveInst(&quot;' + esc(i) + '&quot;)">&#128190; Save limits</button>'
          + '<button onclick="resetInst(&quot;' + esc(i) + '&quot;)">Reset to defaults</button>'
-         + '<button class="arm" onclick="toggleArm(&quot;' + esc(i) + '&quot;,' + (sn.armed?'false':'true') + ')">' + (sn.armed?'Disarm AUTO':'Arm AUTO') + '</button>'
-         + '<button class="danger" onclick="toggleKill(&quot;' + esc(i) + '&quot;,' + (sn.emergencyDisabled?'false':'true') + ')">' + (sn.emergencyDisabled?'Clear kill switch':'KILL SWITCH') + '</button>'
          + '</div><div class="msg" id="msg-' + esc(i) + '"></div></div>';
   });
   document.getElementById('cards').innerHTML = html;
@@ -53752,7 +53750,7 @@ function render(){
   if(!STATE.db_ready) warn.push('Settings database unavailable - changes apply immediately but will NOT survive a restart.');
   var b = document.getElementById('banner');
   if(warn.length){ b.style.display='block'; b.textContent = warn.join(' '); } else { b.style.display='none'; }
-  document.getElementById('note').innerHTML = 'Blank field = use the default shown in grey. Type <b>none</b> for unlimited (open trades / daily loss only). Limits apply to AUTO execution through the audited gateway. Arming always resets OFF after a restart or republish (by design - re-arm here or on the dashboard). Execution mode: <b>' + esc(STATE.execution_mode) + '</b>' + (STATE.is_live_instance?' &middot; LIVE instance':' &middot; dev instance') + ' &middot; contract ceiling ' + esc(STATE.contracts_ceiling);
+  document.getElementById('note').innerHTML = 'Blank field = use the default shown in grey. Type <b>none</b> for unlimited (open trades / daily loss only). Limits apply to AUTO execution through the audited gateway. To ARM / DISARM auto-trading, use the <b>Execution</b> section in the main app. Execution mode: <b>' + esc(STATE.execution_mode) + '</b>' + (STATE.is_live_instance?' &middot; LIVE instance':' &middot; dev instance') + ' &middot; contract ceiling ' + esc(STATE.contracts_ceiling);
   document.getElementById('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
 }
 function parseField(k, txt){
@@ -53793,16 +53791,6 @@ function postSettings(i, ov){
     else { setMsg(i, 'Saved - active now and survives restarts', false); }
   })
   .catch(function(){ setMsg(i, 'network error', true); });
-}
-function toggleArm(i, v){
-  fetch('/api/auto-trade', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({inst:i, enabled:v})})
-  .then(function(){ loadState(); }).catch(function(){ setMsg(i, 'network error', true); });
-}
-function toggleKill(i, v){
-  if(v && !confirm('KILL SWITCH for ' + i + ': blocks ALL new auto-trades for this instrument and persists across restarts. Continue?')) return;
-  if(!v && !confirm('Clear the kill switch for ' + i + '? Auto-trades can fire again once armed.')) return;
-  fetch('/api/auto-trade', {method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({inst:i, emergencyDisabled:v})})
-  .then(function(){ loadState(); }).catch(function(){ setMsg(i, 'network error', true); });
 }
 function clearFiredKeys(){
   if(!confirm('Clear auto-trade fired-key cache? READY setups that already fired today will be allowed to re-fire. Use after a redeploy when setups are being skipped.')) return;
@@ -63184,252 +63172,39 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <div id="lr-foot" style="font-size:10px;color:#6b7280;margin-top:8px"></div>
 </div>
 
-<!-- ════ EXECUTION ARM / DISARM CONTROL ════════════════════════════════════
-     Owner-only. Visible only when EXECUTION_MODE=traderspost/pickmytrade.
-     Live auto-trades require BOTH execution mode AND an active arm session.
-     Always starts DISARMED. Resets on every restart/deploy/crash.
+<!-- ════ EXECUTION CONTROL — managed from main app ══════════════════════════
+     Arm / Disarm, Enable / Disable, Kill Switch are all handled in the
+     Execution section of the main app. Use that as the single place for
+     auto-trading control. This panel is intentionally removed to avoid
+     having two places for the same settings.
      ════════════════════════════════════════════════════════════════════════ -->
 <div class="mod" id="mod-armctl" data-cat="advanced">
-  <div class="mod-h">🔐 Live Execution Control
-    <span id="arm-eff-badge" style="font-size:10px;padding:2px 8px;border-radius:8px;background:#374151;color:#9ca3af;margin-left:6px;font-weight:700;letter-spacing:1px">—</span>
-    <span style="font-size:10px;letter-spacing:1px;color:#6b7280;margin-left:auto">ARM / DISARM</span>
+  <div class="mod-h">🔐 Execution Control
     <span class="mod-cat cat-advanced">ADVANCED</span>
   </div>
-
-  <!-- State strip -->
-  <div id="arm-state-strip" style="display:flex;gap:8px;flex-wrap:wrap;margin-bottom:10px;font-size:11px;color:#9ca3af">
-    <span>Session: <span id="arm-session-id" style="color:#e5e7eb">—</span></span>
-    <span>Expires: <span id="arm-expires" style="color:#e5e7eb">—</span></span>
-    <span>Trades: <span id="arm-trades-used" style="color:#e5e7eb">—</span></span>
-    <span>Mode: <span id="arm-mode" style="color:#e5e7eb">—</span></span>
-  </div>
-
-  <!-- ARM form (shown when disarmed) -->
-  <div id="arm-form" style="display:none;border:1px solid #374151;border-radius:8px;padding:10px;margin-bottom:10px;background:#111827">
-    <div style="font-size:11px;color:#f59e0b;margin-bottom:8px;font-weight:700">⚠️ ARM SESSION CONFIG — You are about to enable live auto-execution</div>
-    <div style="display:grid;grid-template-columns:1fr 1fr;gap:6px;margin-bottom:8px">
-      <label style="font-size:11px;color:#9ca3af">Duration (min)
-        <input id="arm-duration" type="number" min="1" max="1440" value="30"
-               style="width:100%;margin-top:3px;background:#1f2937;border:1px solid #374151;border-radius:4px;color:#e5e7eb;padding:4px;font-size:12px">
-      </label>
-      <label style="font-size:11px;color:#9ca3af">Max trades / session
-        <input id="arm-max-trades" type="number" min="1" max="20" value="3"
-               style="width:100%;margin-top:3px;background:#1f2937;border:1px solid #374151;border-radius:4px;color:#e5e7eb;padding:4px;font-size:12px">
-      </label>
+  <div style="background:#0d1a2e;border:1px solid #1e3a5f;border-radius:8px;padding:14px 16px;display:flex;flex-direction:column;gap:10px">
+    <div style="font-size:12px;color:#93c5fd;font-weight:700;letter-spacing:0.05em">Managed from the main app</div>
+    <div style="font-size:11px;color:#6b7280;line-height:1.6">
+      ARM / DISARM, Enable / Disable, Kill Switch, and session limits are all
+      controlled from the <strong style="color:#93c5fd">Execution</strong> section
+      in the main app. That is the single place for auto-trading settings.
     </div>
-    <label style="font-size:11px;color:#9ca3af;display:block;margin-bottom:8px">
-      Max session loss ($ — leave blank for unlimited)
-      <input id="arm-max-loss" type="number" min="0" step="50" placeholder="e.g. 500"
-             style="width:100%;margin-top:3px;background:#1f2937;border:1px solid #374151;border-radius:4px;color:#e5e7eb;padding:4px;font-size:12px">
-    </label>
-    <label style="font-size:11px;color:#9ca3af;display:block;margin-bottom:10px">
-      Type exact phrase to confirm: <span style="color:#fbbf24;font-weight:700">ARM LIVE AUTO TRADING</span>
-      <input id="arm-confirm-input" type="text" autocomplete="off" spellcheck="false"
-             placeholder="Type the phrase exactly…"
-             style="width:100%;margin-top:3px;background:#1f2937;border:1px solid #374151;border-radius:4px;color:#e5e7eb;padding:4px;font-size:12px">
-    </label>
-    <div style="display:flex;gap:8px">
-      <button onclick="armExecution()" id="arm-submit-btn"
-              style="flex:1;background:#15803d;color:#fff;border:none;border-radius:6px;padding:8px;font-weight:700;font-size:12px;cursor:pointer">
-        🔐 ARM LIVE EXECUTION
-      </button>
-      <button onclick="document.getElementById('arm-form').style.display='none'"
-              style="background:#374151;color:#9ca3af;border:none;border-radius:6px;padding:8px 12px;font-size:12px;cursor:pointer">
-        Cancel
-      </button>
-    </div>
-    <div id="arm-error" style="font-size:11px;color:#f87171;margin-top:6px;display:none"></div>
-  </div>
-
-  <!-- Action buttons -->
-  <div style="display:flex;gap:8px;flex-wrap:wrap">
-    <button id="btn-arm" onclick="showArmForm()"
-            style="flex:1;min-width:120px;background:#064e3b;color:#6ee7b7;border:1px solid #065f46;border-radius:6px;padding:8px;font-weight:700;font-size:12px;cursor:pointer">
-      🔐 ARM
-    </button>
-    <button id="btn-disarm" onclick="doDisarm()"
-            style="flex:1;min-width:120px;background:#374151;color:#d1d5db;border:1px solid #4b5563;border-radius:6px;padding:8px;font-weight:700;font-size:12px;cursor:pointer">
-      🔓 DISARM
-    </button>
-    <button id="btn-kill" onclick="doKillSwitch()"
-            style="flex:1;min-width:120px;background:#7f1d1d;color:#fca5a5;border:1px solid #991b1b;border-radius:6px;padding:8px;font-weight:700;font-size:12px;cursor:pointer">
-      🛑 KILL SWITCH
-    </button>
-    <button id="btn-reset-lock" onclick="doResetSafetyLock()" style="display:none;flex:1;min-width:120px;background:#1f2937;color:#f59e0b;border:1px solid #b45309;border-radius:6px;padding:8px;font-weight:700;font-size:12px;cursor:pointer">
-      🔓 RESET LOCK
-    </button>
-  </div>
-  <div id="arm-status-msg" style="font-size:11px;color:#9ca3af;margin-top:8px;min-height:16px"></div>
-  <div style="font-size:10px;color:#4b5563;margin-top:6px;line-height:1.5">
-    DISARM stops new entries only — existing protective stops remain active.
-    KILL SWITCH locks the system until explicitly reset. Resets DISARMED on every restart.
+    <a href="/" target="_blank"
+       style="display:inline-block;background:#064e3b;color:#6ee7b7;border:1px solid #065f46;border-radius:6px;padding:8px 14px;font-size:12px;font-weight:700;text-decoration:none;text-align:center;letter-spacing:0.05em">
+      → Open Main App → Execution
+    </a>
   </div>
 </div>
 
 <script>
-/* ── Execution Arm / Disarm Control ─────────────────────────────────────────── */
-function _armCtlBaseUrl() {
-  const base = (typeof window !== 'undefined' && window.API_BASE_URL) ? window.API_BASE_URL : '/api';
-  return base;
-}
-
-function _armBadgeColor(eff) {
-  if (eff === 'live_armed')               return {bg:'#064e3b',fg:'#6ee7b7'};
-  if (eff === 'safety_locked')            return {bg:'#7f1d1d',fg:'#fca5a5'};
-  if (eff === 'live_available_disarmed')  return {bg:'#1e3a5f',fg:'#93c5fd'};
-  if (eff === 'paper')                    return {bg:'#1c1917',fg:'#a3a3a3'};
-  return {bg:'#374151',fg:'#9ca3af'};
-}
-
-function _armEffLabel(eff) {
-  if (eff === 'live_armed')               return 'ARMED 🟢';
-  if (eff === 'live_available_disarmed')  return 'DISARMED';
-  if (eff === 'safety_locked')            return 'LOCKED 🔴';
-  if (eff === 'paper')                    return 'PAPER';
-  return (eff || '—').toUpperCase();
-}
-
-async function refreshArmState() {
-  try {
-    const r = await fetch(_armCtlBaseUrl() + '/execution/state', {credentials:'same-origin'});
-    if (!r.ok) return;
-    const d = await r.json();
-    const eff  = d.effective_state || '—';
-    const badge = document.getElementById('arm-eff-badge');
-    const bclr  = _armBadgeColor(eff);
-    if (badge) {
-      badge.textContent  = _armEffLabel(eff);
-      badge.style.background = bclr.bg;
-      badge.style.color      = bclr.fg;
-    }
-    // State strip
-    const sid = document.getElementById('arm-session-id');
-    if (sid) sid.textContent = d.arm_session_id || '—';
-    const exp = document.getElementById('arm-expires');
-    if (exp) {
-      if (d.time_remaining_sec != null && d.time_remaining_sec > 0) {
-        const m = Math.floor(d.time_remaining_sec / 60), s = Math.round(d.time_remaining_sec % 60);
-        exp.textContent = m + 'm ' + s + 's';
-      } else {
-        exp.textContent = d.expires_at ? 'expired' : '—';
-      }
-    }
-    const tu = document.getElementById('arm-trades-used');
-    if (tu) tu.textContent = (d.trades_used != null ? d.trades_used : '—') + ' / ' + (d.max_trades != null ? d.max_trades : '—');
-    const mde = document.getElementById('arm-mode');
-    if (mde) mde.textContent = d.effective_mode || d.configured_mode || '—';
-    // Show/hide buttons based on state
-    const btnArm  = document.getElementById('btn-arm');
-    const btnDis  = document.getElementById('btn-disarm');
-    const btnKill = document.getElementById('btn-kill');
-    const btnReset= document.getElementById('btn-reset-lock');
-    const mod     = document.getElementById('mod-armctl');
-    // Only show this panel when mode is live-capable
-    const isLive  = ['traderspost','pickmytrade'].includes(d.effective_mode);
-    if (mod) mod.style.display = isLive ? '' : 'none';
-    if (btnArm)   btnArm.style.display  = (!d.armed && !d.safety_locked) ? '' : 'none';
-    if (btnDis)   btnDis.style.display  = d.armed ? '' : 'none';
-    if (btnKill)  btnKill.style.display = !d.safety_locked ? '' : 'none';
-    if (btnReset) btnReset.style.display= d.safety_locked  ? '' : 'none';
-  } catch(e) {}
-}
-
-function showArmForm() {
-  document.getElementById('arm-form').style.display = '';
-  document.getElementById('arm-error').style.display = 'none';
-  document.getElementById('arm-confirm-input').value = '';
-  document.getElementById('arm-confirm-input').focus();
-}
-
-async function armExecution() {
-  const phrase = (document.getElementById('arm-confirm-input').value || '').trim();
-  const dur    = parseInt(document.getElementById('arm-duration').value) || 30;
-  const maxT   = parseInt(document.getElementById('arm-max-trades').value) || 3;
-  const maxL   = document.getElementById('arm-max-loss').value.trim();
-  const errEl  = document.getElementById('arm-error');
-  errEl.style.display = 'none';
-  const btn = document.getElementById('arm-submit-btn');
-  btn.disabled = true;
-  btn.textContent = 'Arming…';
-  try {
-    const body = {
-      confirm_phrase: phrase,
-      duration_min: dur,
-      max_trades: maxT,
-      instruments: ['MGC','MNQ','MES','MYM'],
-      max_contracts: {MGC:1,MNQ:1,MES:1,MYM:1},
-    };
-    if (maxL) body.max_session_loss = parseFloat(maxL);
-    const r = await fetch(_armCtlBaseUrl() + '/execution/arm', {
-      method:'POST', credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify(body)
-    });
-    const d = await r.json();
-    if (r.ok && d.status === 'armed') {
-      document.getElementById('arm-form').style.display = 'none';
-      document.getElementById('arm-status-msg').textContent = 'Armed ✓ Session: ' + d.arm_session_id;
-      await refreshArmState();
-    } else {
-      errEl.textContent = d.reason || (d.errors || []).join('; ') || 'Arm failed';
-      errEl.style.display = '';
-    }
-  } catch(e) {
-    errEl.textContent = 'Network error: ' + e.message;
-    errEl.style.display = '';
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '🔐 ARM LIVE EXECUTION';
-  }
-}
-
-async function doDisarm() {
-  if (!confirm('Disarm live auto-execution? Existing positions are NOT affected.')) return;
-  try {
-    const r = await fetch(_armCtlBaseUrl() + '/execution/disarm', {
-      method:'POST', credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({reason:'operator_manual',by:'dashboard'})
-    });
-    const d = await r.json();
-    document.getElementById('arm-status-msg').textContent = 'Disarmed ✓ (' + (d.disarm_reason||'manual') + ')';
-    await refreshArmState();
-  } catch(e) {}
-}
-
-async function doKillSwitch() {
-  if (!confirm('Activate KILL SWITCH?\\n\\nAll new live auto-execution will be blocked until you explicitly reset the safety lock. Existing protective stops are NOT cancelled.')) return;
-  try {
-    const r = await fetch(_armCtlBaseUrl() + '/execution/kill-switch', {
-      method:'POST', credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({reason:'emergency_kill_switch',by:'dashboard'})
-    });
-    const d = await r.json();
-    document.getElementById('arm-status-msg').textContent = 'KILL SWITCH activated — system locked';
-    await refreshArmState();
-  } catch(e) {}
-}
-
-async function doResetSafetyLock() {
-  if (!confirm('Reset the safety lock?\\n\\nThis allows the system to be armed again. Only do this after you have verified all positions are reconciled.')) return;
-  try {
-    const r = await fetch(_armCtlBaseUrl() + '/execution/reset-safety-lock', {
-      method:'POST', credentials:'same-origin',
-      headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({by:'dashboard'})
-    });
-    const d = await r.json();
-    document.getElementById('arm-status-msg').textContent = 'Safety lock reset ✓';
-    await refreshArmState();
-  } catch(e) {}
-}
-
-// Poll arm state every 30 s alongside other dashboard polls
-(function _armPollLoop() {
-  refreshArmState();
-  setInterval(refreshArmState, 30000);
-})();
+/* ── Execution control stubs — ARM/DISARM moved to main app Execution section */
+/* All these functions are no-ops; the panel is now a redirect card only.     */
+function refreshArmState() {}
+function showArmForm() {}
+function armExecution() {}
+function doDisarm() {}
+function doKillSwitch() {}
+function doResetSafetyLock() {}
 </script>
 
 <!-- AUTO EARLY-EXIT — the bot acts on its own Active Trade Management advice.

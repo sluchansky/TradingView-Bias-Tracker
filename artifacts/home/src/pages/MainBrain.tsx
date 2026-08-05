@@ -9481,7 +9481,9 @@ const SystemHealthPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 //   LONG / SHORT → POST /api/manual-order  (requires MANUAL_ORDER_ENABLED=1 server-side)
 //   EXIT          → POST /api/quick-exit   (broker flatten + local tracking clear)
 const QuickTradeBar: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
-  const instrument       = safeStr((p.market as Record<string, unknown>)?.instrument ?? '', '');
+  // p.active_ticker is the canonical instrument string (e.g. "MNQ"); p.market is
+  // null until a price tick arrives, so always prefer active_ticker.
+  const instrument       = safeStr(p.active_ticker ?? (p.market as Record<string, unknown>)?.instrument ?? '', '');
   const manualEnabled    = p.manual_order_enabled === true;
   const activeTrades     = Array.isArray(p.active_trades) ? p.active_trades as Record<string, unknown>[] : [];
   const hasActiveTrade   = activeTrades.length > 0;
