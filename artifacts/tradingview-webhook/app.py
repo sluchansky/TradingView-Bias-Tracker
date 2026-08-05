@@ -7486,18 +7486,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     full_ready_threshold = cfg("EDGE_FULL_READY_THRESHOLD")   # full-READY floor
     strong_threshold     = cfg("EDGE_STRONG_THRESHOLD")       # label-only "Strong" upgrade
     setup_building_threshold = cfg("EDGE_SETUP_BUILDING_THRESHOLD")  # informational band floor (None=off)
-    # All four SCALP instruments require a floor of 75 so that BOS or CHOCH MUST
-    # contribute to the Edge Score to reach READY.  The maximum non-structure score
-    # is VWAP(15)+Sweep(15)+Vol(15)+CVD(15)+Session(10)=70, which is below this
-    # floor.  This prevents a single Databento burst (sweep+volume+CVD aligning on
-    # one 1m bar) from spiking to READY without real market structure; when the burst
-    # fades or price crosses VWAP the score collapses back near-zero because there is
-    # no BOS/CHOCH base.  With BOS/CHOCH (+20) the stable base keeps the score above
-    # zero even if one or two components fall off after entry.  Env override via the
-    # cfg() system still works for per-instrument tuning if needed.
-    if inst in ("MYM", "MES", "MGC", "MNQ"):
-        ready_threshold      = max(int(ready_threshold      or 0), 75)
-        full_ready_threshold = max(int(full_ready_threshold or 0), 75)
+    # NOTE: a prior hard floor of 75 was removed here. Structure is already a hard
+    # gate (require_structure=True), so a pure Databento burst (max 70 without
+    # BOS/CHOCH) cannot reach READY regardless. The floor was preventing every
+    # EARLY-tier trade (60-74) from firing. The SCALP config thresholds (60 EARLY /
+    # 70 FULL) are now used directly.
     require_vwap      = bool(cfg("GATE_REQUIRE_VWAP"))
     require_structure = bool(cfg("GATE_REQUIRE_STRUCTURE"))
     require_zone      = bool(cfg("GATE_REQUIRE_ZONE"))
