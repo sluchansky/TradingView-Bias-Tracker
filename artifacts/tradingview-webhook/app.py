@@ -31522,6 +31522,19 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
     _send_outcome_update(mt)
     _apply_outcome_to_journal(mt)
 
+    # Sync the live dashboard: clear the ACTIVE_TRADES slot so the trade no longer
+    # shows as "open" after a managed-watcher-detected stop or TP.  The webhook
+    # STOP_HIT path also calls clear_active_trade — whichever fires first wins; the
+    # second call is a safe no-op (returns None on an already-empty slot).
+    # compare-and-clear (opened_at) is intentionally skipped: the managed trade dict
+    # does not carry opened_at, and the broker position is definitively flat once the
+    # managed trade closes, so clearing any same-instrument active slot is correct.
+    # Simulated-paper trades have no ACTIVE_TRADES slot → always a no-op there.
+    try:
+        clear_active_trade(mt.get("instrument"))
+    except Exception as _cmt_exc:
+        logger.debug("clear_active_trade after managed close fail-open: %s", _cmt_exc)
+
     # Adaptive-learning: persist AFTER the user-facing outcome card + journal so a
     # slow DB can never delay the notification. Idempotent + FAIL-OPEN (architect
     # note B); mt already carries closed_at/outcome/r_multiple at this point.
@@ -31708,6 +31721,22 @@ def _apply_outcome_to_journal(mt):
         target["pnl_dollars"] = mt.get("pnl_dollars")
     logger.info("Journal #%s management outcome → %s (%sR)",
                 target.get("id"), mt.get("outcome"), mt.get("r_multiple"))
+    # Mirror terminal outcome to the native journal (Phase A).  This path fires
+    # when the managed-trade watcher detects the stop/TP via Databento bars; the
+    # webhook STOP_HIT path calls _nj_close_by_instrument via _update_journal_outcome.
+    # Whichever runs first wins; the second call is a no-op (idempotency guard in
+    # _nj_set_outcome). Only mirror terminal states — skip Pending / T1-partial.
+    _nj_outcome = mt.get("outcome") or ""
+    if _nj_outcome in ("Win", "Loss", "Breakeven"):
+        try:
+            _nj_close_by_instrument(
+                instrument  = mt.get("instrument") or "",
+                direction   = mt.get("direction"),
+                exit_reason = mt.get("result_label") or _nj_outcome,
+                pnl_dollars = mt.get("pnl_dollars"),
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
