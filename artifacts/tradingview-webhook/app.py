@@ -70496,38 +70496,101 @@ function renderAnalysisGroups(d) {
 }
 
 // renderJournalGroups: fills the 5 journal sections in mod-journal-groups.
-// DISPLAY-ONLY. Reads today's equity, trade history, and learning stats from /status.
+// DISPLAY-ONLY. Today / Trade History / Performance read from the native journal DB
+// (restart-safe). Learning + Dual Sim read from /status (in-memory).
 function renderJournalGroups(d) {
   if (!document.getElementById('mod-journal-groups')) return;
-  // Today
-  var eq=(d&&d.today_equity)||(d&&d.equity_curve)||(d&&d.session_equity)||{};
-  var h1='';
-  if(eq.net_r!=null){ var nr=Number(eq.net_r); h1+=_grpRow('Net R',(nr>=0?'+':'')+nr.toFixed(2)+'R',nr>0?'#22c55e':nr<0?'#ef4444':'#6b7280'); }
-  if(eq.trade_count!=null||eq.count!=null) h1+=_grpRow('Trades Today',eq.trade_count||eq.count);
-  if(eq.wins!=null) h1+=_grpRow('Wins / Losses',(eq.wins||0)+' / '+(eq.losses||0));
-  var at=(d&&d.active_trade)||(d&&d.open_trade)||{};
-  if(at.instrument||at.direction) h1+=_grpRow('Open Trade',_adcEsc((at.instrument||'?')+' \u00b7 '+(at.direction||'?')),at.direction==='Long'?'#22c55e':at.direction==='Short'?'#ef4444':null);
-  if(!h1) h1='<div class="grp-note">No trades recorded today.</div>';
-  _grpBadge('jg-today-badge',eq.trade_count||eq.count||'0',(eq.trade_count||eq.count)?'ok':'neu');
-  document.getElementById('jg-today-body').innerHTML=h1;
-  // Trade History
-  var trades=(d&&d.recent_trades)||(d&&d.trade_history)||[],h2='';
-  if(trades.length){
-    trades.slice(0,5).forEach(function(t){ var r=t.r_multiple!=null?t.r_multiple:t.r,isWin=t.outcome==='WIN'||t.outcome==='win'||(r!=null&&r>0); h2+='<div class="grp-row"><span class="grp-k">'+_adcEsc((t.instrument||t.symbol||'?')+' '+(t.strategy||''))+'</span><span class="grp-v"><span style="color:'+(isWin?'#22c55e':'#ef4444')+'">'+(isWin?'WIN':'LOSS')+'</span>'+(r!=null?' '+(r>=0?'+':'')+Number(r).toFixed(1)+'R':'')+'</span></div>'; });
-  } else { h2='<div class="grp-note">No recent trade history.</div>'; }
-  _grpBadge('jg-hist-badge',trades.length?trades.length+' trades':'—','neu');
-  document.getElementById('jg-hist-body').innerHTML=h2;
-  // Performance
-  var la=(d&&d.learning_analytics)||(d&&d.performance_stats)||(d&&d.stats)||{},total=la.total_trades||la.total||la.count,h3='';
-  if(total!=null&&Number(total)>=25){
-    if(la.win_rate!=null){ var wr=Number(la.win_rate); h3+=_grpRow('Win Rate',Math.round(wr*(wr<=1?100:1))+'%',wr>=0.55?'#22c55e':wr>=0.45?'#f59e0b':'#ef4444'); }
-    if(la.avg_r!=null||la.average_r!=null){ var ar=la.avg_r!=null?la.avg_r:la.average_r; h3+=_grpRow('Avg R',(ar>=0?'+':'')+Number(ar).toFixed(2)+'R'); }
-    if(la.profit_factor!=null) h3+=_grpRow('Profit Factor',Number(la.profit_factor).toFixed(2));
-    h3+=_grpRow('Trades',total);
-  } else { var needed=total!=null?Math.max(0,25-Number(total)):25; h3='<div class="grp-note">Performance statistics will appear after enough completed trades are recorded.'+(total!=null?' ('+needed+' more needed)':'')+'</div>'; }
-  _grpBadge('jg-perf-badge',total!=null&&Number(total)>=25?total+' trades':'Building',total!=null&&Number(total)>=25?'ok':'neu');
-  document.getElementById('jg-perf-body').innerHTML=h3;
-  // Learning
+
+  // ── Today — active trade from /status (in-memory); trade count from native journal DB ──
+  (function(){
+    var at=(d&&d.active_trade)||(d&&d.open_trade)||{};
+    var imH='';
+    var eq=(d&&d.today_equity)||(d&&d.equity_curve)||(d&&d.session_equity)||{};
+    if(eq.net_r!=null){ var nr=Number(eq.net_r); imH+=_grpRow('Net R',(nr>=0?'+':'')+nr.toFixed(2)+'R',nr>0?'#22c55e':nr<0?'#ef4444':'#6b7280'); }
+    if(eq.wins!=null) imH+=_grpRow('Wins / Losses',(eq.wins||0)+' / '+(eq.losses||0));
+    if(at.instrument||at.direction) imH+=_grpRow('Open Trade',_adcEsc((at.instrument||'?')+' \u00b7 '+(at.direction||'?')),at.direction==='Long'?'#22c55e':at.direction==='Short'?'#ef4444':null);
+    var body=document.getElementById('jg-today-body');
+    if(body&&imH) body.innerHTML=imH;
+
+    // Async: fetch today's count from native journal DB (restart-safe)
+    var pad=function(n){return n<10?'0'+n:String(n);};
+    var now=new Date();
+    // Approximate ET by subtracting UTC offset then applying ET offset
+    var etMs=now.getTime()-(now.getTimezoneOffset()*60000)-5*3600000;
+    var etD=new Date(etMs);
+    var todayStr=etD.getUTCFullYear()+'-'+pad(etD.getUTCMonth()+1)+'-'+pad(etD.getUTCDate());
+    api('/journal/native-trades?limit=1&date_from='+todayStr).then(function(r){
+      if(!r||!r.ok) return;
+      var cnt=r.total||0;
+      _grpBadge('jg-today-badge',String(cnt),cnt>0?'ok':'neu');
+      var b=document.getElementById('jg-today-body');
+      if(!b) return;
+      var dbRow=_grpRow('Trades Today',cnt,cnt>0?'#22c55e':null);
+      // Prepend DB count; keep any in-memory rows (active trade, equity) after
+      b.innerHTML=dbRow+(imH||'');
+      if(!imH&&!cnt) b.innerHTML='<div class="grp-note">No trades recorded today.</div>';
+    }).catch(function(){
+      if(!imH){ var b=document.getElementById('jg-today-body'); if(b) b.innerHTML='<div class="grp-note">No trades recorded today.</div>'; }
+      _grpBadge('jg-today-badge','0','neu');
+    });
+  })();
+
+  // ── Trade History — async from native journal DB (restart-safe) ──
+  (function(){
+    var hBody=document.getElementById('jg-hist-body'),hBadge=document.getElementById('jg-hist-badge');
+    if(!hBody) return;
+    api('/journal/native-trades?limit=8').then(function(r){
+      var trades=(r&&r.trades)||[], hh='';
+      if(trades.length){
+        trades.forEach(function(t){
+          var lc=(t.lifecycle_status||'').toUpperCase();
+          var lcCol=lc==='CLOSED'?'#22c55e':lc==='SUBMITTED'?'#f59e0b':lc==='OPEN'?'#3b82f6':'#6b7280';
+          var dir=(t.direction||'').toUpperCase();
+          var dirCol=dir==='LONG'?'#22c55e':dir==='SHORT'?'#ef4444':'#6b7280';
+          var strat=(t.strategy_display_name||t.canonical_strategy_key||'').replace(/_/g,' ');
+          if(strat.length>22) strat=strat.slice(0,22)+'\u2026';
+          var eStr=t.edge_score!=null?' E'+Math.round(t.edge_score):'';
+          hh+='<div class="grp-row">'
+             +'<span class="grp-k">'+_adcEsc(t.instrument||'?')
+             +' <span style="color:'+dirCol+'">'+_adcEsc(dir)+'</span>'
+             +' <span style="color:#6b7280;font-size:10px">'+_adcEsc(strat)+'</span></span>'
+             +'<span class="grp-v" style="font-size:10px">'
+             +'<span style="color:'+lcCol+'">'+_adcEsc(lc)+'</span>'
+             +(eStr?'<span style="color:#6b7280"> ·'+_adcEsc(eStr)+'</span>':'')
+             +'</span></div>';
+        });
+        if(hBadge){ hBadge.className='grp-badge ok'; hBadge.textContent=(r.total||trades.length)+' total'; }
+      } else {
+        hh='<div class="grp-note">No trade history in journal yet.</div>';
+        if(hBadge){ hBadge.className='grp-badge neu'; hBadge.textContent='\u2014'; }
+      }
+      hBody.innerHTML=hh;
+    }).catch(function(){ hBody.innerHTML='<div class="grp-note">Trade history unavailable.</div>'; });
+  })();
+
+  // ── Performance — async from journal analytics endpoint ──
+  (function(){
+    var pBody=document.getElementById('jg-perf-body'),pBadge=document.getElementById('jg-perf-badge');
+    if(!pBody) return;
+    api('/journal/analytics').then(function(r){
+      var sys=r&&r.system, ph='';
+      var tot=(sys&&sys.n)||0;
+      if(tot>=10){
+        if(sys.win_pct!=null){ var wp=sys.win_pct; ph+=_grpRow('Win Rate',wp.toFixed(1)+'%',wp>=55?'#22c55e':wp>=45?'#f59e0b':'#ef4444'); }
+        if(sys.avg_r!=null){ var avr=sys.avg_r; ph+=_grpRow('Avg R',(avr>=0?'+':'')+avr.toFixed(2)+'R'); }
+        if(sys.profit_factor!=null) ph+=_grpRow('Profit Factor',sys.profit_factor.toFixed(2));
+        ph+=_grpRow('Completed Trades',tot);
+        if(pBadge){ pBadge.className='grp-badge ok'; pBadge.textContent=tot+' trades'; }
+      } else {
+        var need=Math.max(0,10-tot);
+        ph='<div class="grp-note">Performance stats appear after 10 completed trades.'+(tot>0?' ('+need+' more needed)':'')+'</div>';
+        if(pBadge){ pBadge.className='grp-badge neu'; pBadge.textContent='Building'; }
+      }
+      pBody.innerHTML=ph;
+    }).catch(function(){ pBody.innerHTML='<div class="grp-note">Performance data unavailable.</div>'; });
+  })();
+
+  // ── Learning — in-memory from /status ──
   var le=(d&&d.learning_engine)||(d&&d.adaptive_learning)||(d&&d.learning_influence)||{},h4='';
   if(le.recent_insight||le.insight) h4+='<div class="grp-note">'+_adcEsc(le.recent_insight||le.insight)+'</div>';
   if(le.score_adjustment!=null||le.adjustment!=null){ var adj=le.score_adjustment!=null?le.score_adjustment:le.adjustment; h4+=_grpRow('Score Adj',(adj>=0?'+':'')+adj,adj>0?'#22c55e':adj<0?'#ef4444':'#6b7280'); }
@@ -70535,7 +70598,8 @@ function renderJournalGroups(d) {
   if(le.best_setup) h4+=_grpRow('Best Setup',le.best_setup);
   if(!h4) h4='<div class="grp-note">Learning insights appear after enough completed trades.</div>';
   document.getElementById('jg-learn-body').innerHTML=h4;
-  // Simulated & Ghost
+
+  // ── Simulated & Ghost — from /status ──
   var ds=(d&&d.dual_sim)||{},h5='';
   if(ds.scalp_verdict||ds.swing_verdict){
     h5+='<div class="grp-note" style="margin-bottom:4px">Shadow sim \u2014 not real trades</div>';
@@ -70545,7 +70609,8 @@ function renderJournalGroups(d) {
   } else { h5='<div class="grp-note">No simulation activity.</div>'; }
   document.getElementById('jg-sim-body').innerHTML=h5;
   document.getElementById('jg-sim-det').style.display=(ds.scalp_verdict||ds.swing_verdict)?'':'none';
-  // TradeZella imports section — fetch async, populate independently
+
+  // ── TradeZella imports section — fetch async, populate independently ──
   var tzBody=document.getElementById('jg-tz-body'),tzBadge=document.getElementById('jg-tz-badge');
   if(tzBody){
     api('/tradezella/analysis').then(function(tz){
