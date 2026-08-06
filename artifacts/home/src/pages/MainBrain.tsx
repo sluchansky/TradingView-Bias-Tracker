@@ -10208,6 +10208,11 @@ const Header: React.FC<{
             onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.28)'}>
             ENGINE ↗
           </a>
+          <a href="https://trading-research-lab.replit.app" target="_blank" rel="noreferrer" style={{ fontSize:9.5, fontFamily:T.mono, color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em', transition:'color 0.15s' }}
+            onMouseEnter={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.70)'}
+            onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.28)'}>
+            RESEARCH ↗
+          </a>
         </div>
       </div>
     </header>

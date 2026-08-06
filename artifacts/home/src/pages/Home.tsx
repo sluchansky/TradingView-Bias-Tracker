@@ -3197,6 +3197,9 @@ export default function Home() {
             <a href="/api/dashboard" target="_blank" rel="noreferrer" style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em' }}
               onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.65)'}
               onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.28)'}>ENGINE ↗</a>
+            <a href="https://trading-research-lab.replit.app" target="_blank" rel="noreferrer" style={{ fontSize:9.5, fontFamily:'monospace', color:'rgba(255,255,255,0.28)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em' }}
+              onMouseEnter={e => e.currentTarget.style.color='rgba(255,255,255,0.65)'}
+              onMouseLeave={e => e.currentTarget.style.color='rgba(255,255,255,0.28)'}>RESEARCH ↗</a>
           </div>
           {/* Restore hidden panels pill */}
           {hiddenPanels.size > 0 && (
