@@ -25126,12 +25126,23 @@ def _mb_left_brain(inst, result, errors):
             "thesis_is_mi_fallback": False,
         }
 
+    # ── Volatility Intelligence (DISPLAY-ONLY, OBSERVE-ONLY) ─────────────────
+    # Flag-gated. Adds VIX regime/direction/risk-tone context to Left Brain.
+    # Never touches gate, scoring, sizing, or execution. Fail-open.
+    _vi_block = {}
+    try:
+        import volatility_intelligence as _vi  # noqa: PLC0415
+        _vi_block = _vi.get_left_brain_block(inst)
+    except Exception as _vi_exc:
+        logger.debug("_mb_left_brain vol-intel: %s", _vi_exc)
+
     return {
-        "thesis":             thesis_out,
-        "intelligence":       mi_out,
-        "observations_count": obs_count,
-        "available":          available,
-        "diagnosis":          diagnosis,
+        "thesis":                  thesis_out,
+        "intelligence":            mi_out,
+        "observations_count":      obs_count,
+        "available":               available,
+        "diagnosis":               diagnosis,
+        "volatility_intelligence": _vi_block if _vi_block else None,
     }
 
 
@@ -27678,6 +27689,18 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "market_intelligence": _lb_mi,
             "thesis":              _LB_THESIS_BY_INST.get(_lb_inst),
         }
+
+    # ── Volatility Intelligence (DISPLAY-ONLY, OBSERVE-ONLY — Phase VI-B) ────
+    # Flag-gated. Attaches VIX regime/direction/risk-tone to the result for
+    # dashboard display.  NEVER touches gate, scoring, sizing, or execution.
+    # Key absent when disabled → goldens byte-identical.  Fail-open.
+    try:
+        import volatility_intelligence as _vi_mod  # noqa: PLC0415
+        _vi_snap = _vi_mod.get_snapshot()
+        if _vi_snap.get("enabled"):
+            result["volatility_intelligence"] = _vi_snap
+    except Exception as _vi_fa_exc:
+        logger.debug("full_analysis vol-intel seam: %s", _vi_fa_exc)
 
     # V1 Manager and Coach Interface objects — additive, read-only status objects.
     # Builders read existing runtime state and carry _version = "v1".
@@ -75324,6 +75347,32 @@ def swing_analysis_v2():
     return jsonify(sv2), 200
 
 
+@app.route("/volatility-intelligence", methods=["GET"])
+def volatility_intelligence_endpoint():
+    """Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY).
+    Returns the latest VIX regime/direction/risk-tone analysis block.
+    Auth + CSRF via the Express proxy; NOT in OPEN_PATHS.
+    Flag OFF → enabled=False in response body.
+    Never touches gate, scoring, sizing, or execution."""
+    try:
+        import volatility_intelligence as _vi  # noqa: PLC0415
+        snap    = _vi.get_snapshot()
+        history = _vi.get_history_summary()
+        return jsonify({
+            "snapshot":         snap,
+            "history_summary":  history,
+            "provider_status":  snap.get("provider_health", {}),
+        }), 200
+    except Exception as _vi_exc:
+        logger.warning("/volatility-intelligence error: %s", _vi_exc)
+        return jsonify({
+            "snapshot":        {"enabled": False, "data_status": "ERROR",
+                                "error": str(_vi_exc)},
+            "history_summary": {},
+            "provider_status": {"status": "ERROR"},
+        }), 200
+
+
 @app.route("/swing-strategy", methods=["GET", "POST"])
 def swing_strategy_select():
     """Read or set the per-instrument LIVE SWING strategy selection (MGC / MNQ / …).
@@ -77992,6 +78041,22 @@ if __name__ == "__main__":
             "DatabentoBrain: DATABENTO_ENABLED=0 — feed OFF (byte-identical mode); "
             "set DATABENTO_ENABLED=1 + DATABENTO_API_KEY to activate"
         )
+    # ── Volatility Intelligence — background VIX provider ────────────────────
+    # Flag-gated (VOL_INTELLIGENCE_ENABLED). Default OFF → byte-identical.
+    # Starts a daemon thread that fetches VIX from Alpha Vantage every
+    # ALPHA_VANTAGE_FETCH_INTERVAL_SEC (default 300 s). Display-only; observe-only.
+    # Never touches the gate, scoring, sizing, or execution.
+    try:
+        import volatility_intelligence as _vi_boot  # noqa: PLC0415
+        if _vi_boot.VOL_INTELLIGENCE_ENABLED:
+            _vi_boot.start()
+        else:
+            logger.info(
+                "VolatilityIntelligence: disabled (VOL_INTELLIGENCE_ENABLED=0) — "
+                "set VOL_INTELLIGENCE_ENABLED=1 to activate VIX context layer"
+            )
+    except Exception as _vi_boot_exc:
+        logger.error("VolatilityIntelligence: failed to start — %s", _vi_boot_exc)
     threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
     threading.Timer(0, _micro_ghost_watch_loop).start()  # MICRO SCALP ghost watcher — started UNCONDITIONALLY; the loop self-gates on MICRO_GHOST_DB_READY + DISCORD_LIVE_ENABLED inside, so a lazy DB-ready flip (POST /micro-scalp) still gets its ghosts resolved without a restart. Resolves ghost rows only — never the money path.
     if EVAL_HEARTBEAT_ENABLED:

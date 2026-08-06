@@ -164,6 +164,10 @@ export const BOT1_ROUTES = [
   // SWING setups are taken; never creates a trade or loosens the gate.
   "/swing-strategy",
   "/swing-analysis",
+  // Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY; NOT in
+  // dashboard-auth OPEN_PATHS). Returns VIX regime/direction/risk-tone block.
+  // Never touches gate, scoring, sizing, or execution.
+  "/volatility-intelligence",
   "/advisor",
   "/pro-review",
   "/trade-debate",

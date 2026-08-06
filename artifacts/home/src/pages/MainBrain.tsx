@@ -693,6 +693,169 @@ export function fmtEventDetail(v: unknown): string {
 //
 // NEVER shows "NEUTRAL" as a silent fallback — NEUTRAL is only shown when the
 // diagnosis.status is AVAILABLE and the market is genuinely contested.
+// ── Volatility Intelligence Panel (Phase VI-E — DISPLAY-ONLY) ────────────────
+// Shows VIX regime, direction, risk tone, and per-instrument context.
+// Data from p.volatility_intelligence (injected at full_analysis seam).
+// Flag-gated: panel is hidden when enabled=false or key absent.
+const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  const vi = (p.volatility_intelligence ?? {}) as Record<string, unknown>;
+  const enabled = Boolean(vi.enabled);
+  if (!enabled) return null;
+
+  const vix        = (vi.vix ?? {}) as Record<string, unknown>;
+  const price      = safeNum(vix.price);
+  const changePct  = safeNum(vix.change_pct);
+  const regime     = safeStr(vi.regime, 'UNKNOWN');
+  const direction  = safeStr(vi.direction, 'UNKNOWN');
+  const velocity   = safeStr(vi.velocity, 'UNKNOWN');
+  const riskTone   = safeStr(vi.risk_tone, 'UNKNOWN');
+  const eqContext  = safeStr(vi.equity_context, 'UNKNOWN');
+  const confidence = safeNum(vi.confidence) ?? 0;
+  const dataStatus = safeStr(vi.data_status, 'UNAVAILABLE');
+  const warnings   = (vi.warnings ?? []) as string[];
+  const reasons    = (vi.reasons  ?? []) as string[];
+  const instCtx    = (vi.instrument_context ?? {}) as Record<string, Record<string, unknown>>;
+
+  const regimeColor: Record<string, string> = {
+    CALM:     '#34d399',
+    NORMAL:   '#60a5fa',
+    ELEVATED: '#fbbf24',
+    EXTREME:  '#ef4444',
+    UNKNOWN:  '#6b7280',
+  };
+  const toneColor: Record<string, string> = {
+    RISK_ON:            '#34d399',
+    NEUTRAL:            '#60a5fa',
+    RISK_OFF_PRESSURE:  '#fbbf24',
+    RISK_OFF_SHOCK:     '#ef4444',
+    UNKNOWN:            '#6b7280',
+  };
+  const dirIcon: Record<string, string> = {
+    RISING: '↑', FALLING: '↓', FLAT: '→', UNKNOWN: '?',
+  };
+  const statusBg = dataStatus === 'ERROR' || dataStatus === 'UNAVAILABLE'
+    ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.03)';
+
+  const activeInst = safeStr(p.instrument, '') || safeStr(p.ticker, '');
+  const thisInst   = instCtx[activeInst] as Record<string, unknown> | undefined;
+  const relevance  = thisInst ? safeStr(thisInst.relevance, '') : '';
+  const instNote   = thisInst ? safeStr(thisInst.note, '') : '';
+  const instConf   = thisInst ? (safeNum(thisInst.confidence) ?? 0) : 0;
+
+  return (
+    <div className="mod" id="vol-intelligence-panel" style={{ background: statusBg }}>
+      <div className="mod-h" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 11, color: '#9ca3af', fontWeight: 700, letterSpacing: '0.06em', textTransform: 'uppercase' }}>
+          VIX · Volatility Intelligence
+        </span>
+        <span style={{
+          marginLeft: 'auto', fontSize: 10, padding: '1px 6px',
+          borderRadius: 4, fontWeight: 700, letterSpacing: '0.05em',
+          background: `${regimeColor[regime] ?? '#6b7280'}22`,
+          color: regimeColor[regime] ?? '#6b7280',
+          border: `1px solid ${regimeColor[regime] ?? '#6b7280'}44`,
+        }}>
+          {regime}
+        </span>
+        <span style={{
+          fontSize: 10, padding: '1px 6px', borderRadius: 4,
+          color: '#6b7280', border: '1px solid rgba(255,255,255,0.08)',
+        }}>
+          {dataStatus}
+        </span>
+      </div>
+
+      {/* Main VIX reading */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 8 }}>
+        <div>
+          <div style={{ fontSize: 24, fontWeight: 800, color: regimeColor[regime] ?? '#9ca3af', lineHeight: 1 }}>
+            {price != null ? price.toFixed(2) : '—'}
+          </div>
+          <div style={{ fontSize: 10, color: '#6b7280', marginTop: 2 }}>VIX · delayed</div>
+        </div>
+        <div style={{ flex: 1 }}>
+          <div style={{ display: 'flex', gap: 6, flexWrap: 'wrap' }}>
+            <span style={{
+              fontSize: 11, padding: '2px 7px', borderRadius: 4, fontWeight: 600,
+              background: 'rgba(255,255,255,0.05)', color: '#d1d5db',
+            }}>
+              {dirIcon[direction] ?? '?'} {direction}
+              {velocity !== 'UNKNOWN' ? ` · ${velocity}` : ''}
+            </span>
+            <span style={{
+              fontSize: 11, padding: '2px 7px', borderRadius: 4, fontWeight: 600,
+              background: `${toneColor[riskTone] ?? '#6b7280'}18`,
+              color: toneColor[riskTone] ?? '#6b7280',
+            }}>
+              {riskTone.replace(/_/g, ' ')}
+            </span>
+            {changePct != null && (
+              <span style={{
+                fontSize: 11, padding: '2px 7px', borderRadius: 4,
+                color: changePct > 0 ? '#f87171' : '#34d399',
+                background: changePct > 0 ? 'rgba(248,113,113,0.1)' : 'rgba(52,211,153,0.1)',
+                fontWeight: 600,
+              }}>
+                {changePct > 0 ? '+' : ''}{changePct.toFixed(2)}%
+              </span>
+            )}
+          </div>
+          {/* Equity context */}
+          {eqContext !== 'UNKNOWN' && (
+            <div style={{ fontSize: 10, color: '#6b7280', marginTop: 4 }}>
+              {eqContext.replace(/_/g, ' ')}
+            </div>
+          )}
+        </div>
+        {/* Confidence */}
+        <div style={{ textAlign: 'center' }}>
+          <div style={{ fontSize: 14, fontWeight: 700, color: confidence >= 70 ? '#60a5fa' : '#6b7280' }}>
+            {confidence}%
+          </div>
+          <div style={{ fontSize: 9, color: '#6b7280' }}>conf</div>
+        </div>
+      </div>
+
+      {/* Per-instrument context for the active instrument */}
+      {thisInst && relevance && (
+        <div style={{
+          marginTop: 8, padding: '5px 8px', borderRadius: 5,
+          background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+          fontSize: 10, color: '#9ca3af',
+        }}>
+          <span style={{ fontWeight: 700, color: '#d1d5db' }}>{activeInst}</span>
+          {' '}{relevance.replace(/_/g, ' ')} relevance
+          {instConf > 0 ? ` · ${instConf}% conf` : ''}
+          {instNote ? <div style={{ marginTop: 3, fontStyle: 'italic', color: '#6b7280' }}>{instNote}</div> : null}
+        </div>
+      )}
+
+      {/* Reasons */}
+      {reasons.length > 0 && (
+        <div style={{ marginTop: 6 }}>
+          {reasons.map((r, i) => (
+            <div key={i} style={{ fontSize: 10, color: '#6b7280', padding: '1px 0' }}>· {r}</div>
+          ))}
+        </div>
+      )}
+
+      {/* Warnings */}
+      {warnings.length > 0 && (
+        <div style={{ marginTop: 5 }}>
+          {warnings.map((w, i) => (
+            <div key={i} style={{
+              fontSize: 10, color: '#fbbf24',
+              padding: '2px 6px', borderRadius: 3,
+              background: 'rgba(251,191,36,0.08)', marginBottom: 2,
+            }}>⚠ {w}</div>
+          ))}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// ─────────────────────────────────────────────────────────────────────────────
 const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const lb    = (p.left_brain ?? {}) as Record<string, unknown>;
   const diag  = (lb.diagnosis ?? {}) as Record<string, unknown>;
@@ -10845,6 +11008,9 @@ export default function MainBrain() {
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
               <ThesisPanel p={p} />
               <VerdictPanel p={p} />
+            </div>
+            <div style={{ marginTop: 10 }}>
+              <VolatilityIntelligencePanel p={p} />
             </div>
           </>
         );

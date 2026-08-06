@@ -1,5 +1,7 @@
 # Memory Index
 
+- [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
+
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
 - [Main Brain population wiring](main-brain-population-wiring.md) — normalizeMainBrainPayload() is the single bridge; 29 schema mismatches; voice=dict extract narration; active_trades/alerts are bare lists; coach.weight_updated is boolean.
 - [Left Brain thesis staleness & key mismatch](lb-thesis-staleness.md) — MGC gets ~1 bar/overnight (vs 127 MNQ); key bug lastUpdatedAt vs last_updated_at; diagnosis block added; ThesisPanel shows 4 states.
