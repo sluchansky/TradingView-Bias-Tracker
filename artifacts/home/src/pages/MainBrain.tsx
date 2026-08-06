@@ -9484,9 +9484,9 @@ const QuickTradeBar: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   // p.active_ticker is the canonical instrument string (e.g. "MNQ"); p.market is
   // null until a price tick arrives, so always prefer active_ticker.
   const instrument       = safeStr(p.active_ticker ?? (p.market as Record<string, unknown>)?.instrument ?? '', '');
-  // Fail-open: show enabled unless the backend explicitly returns false.
-  // The /manual-order gateway enforces the real gate server-side.
-  const manualEnabled    = p.manual_order_enabled !== false;
+  // Always enabled on the frontend — the /manual-order gateway enforces
+  // the real gate server-side and will return an error if the flag is off.
+  const manualEnabled    = true;
   const activeTrades     = Array.isArray(p.active_trades) ? p.active_trades as Record<string, unknown>[] : [];
   const hasActiveTrade   = activeTrades.length > 0;
 
