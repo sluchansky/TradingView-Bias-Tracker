@@ -3389,8 +3389,11 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const scoreEnabled   = ld.influence_enabled === true;
   const isApplied      = ld.applied_to_live_score === true;
   const samplePct      = Math.min(100, Math.round(sampleCount / minSamples * 100));
-  const isCollecting   = weightStatus === 'INSUFFICIENT_SAMPLES' || weightStatus === 'NOT_ELIGIBLE';
-  const isActive       = weightStatus === 'UPDATED' || weightStatus === 'NO_CHANGE';
+  const isCollecting         = weightStatus === 'INSUFFICIENT_SAMPLES' || weightStatus === 'NOT_ELIGIBLE';
+  const isActive             = weightStatus === 'UPDATED' || weightStatus === 'NO_CHANGE';
+  // Task #41 — session lesson counters
+  const recomputesThisSession = safeNum(ld.recomputes_this_session) ?? 0;
+  const weightsChangedLast    = safeNum(ld.weights_changed_last_run) ?? 0;
 
   return (
     <Panel title="Coach" badge={<Badge label="LEARNING" color={T.purple} />}>
@@ -3461,6 +3464,26 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             </div>
           )}
 
+          {/* ── Session lesson counters (Task #41) ──────────────────────── */}
+          {recomputesThisSession > 0 && (
+            <div style={{ marginBottom:8, padding:'5px 10px', borderRadius:6,
+              background: weightsChangedLast > 0 ? 'rgba(99,102,241,0.06)' : 'rgba(255,255,255,0.03)',
+              border:`1px solid ${weightsChangedLast > 0 ? 'rgba(99,102,241,0.2)' : T.border}` }}>
+              <div style={{ fontSize:9, color: weightsChangedLast > 0 ? T.purple : T.txtMuted,
+                letterSpacing:'0.07em', fontWeight:700, marginBottom:3 }}>
+                SESSION LEARNING
+              </div>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'2px 10px', fontSize:9.5 }}>
+                <span style={{ color:T.txtMuted }}>Recomputes</span>
+                <span style={{ fontFamily:T.mono, color:T.txtSec }}>{recomputesThisSession}</span>
+                <span style={{ color:T.txtMuted }}>Weights updated</span>
+                <span style={{ fontFamily:T.mono, color: weightsChangedLast > 0 ? T.purple : T.txtSec }}>
+                  {weightsChangedLast}
+                </span>
+              </div>
+            </div>
+          )}
+
           <KV label="Thesis Resolved" value={
             <span title="Whether a thesis was resolved in this session — not a measure of learning readiness">
               {coach.thesis_resolved ? 'YES' : 'NO'}
@@ -3487,7 +3510,7 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
           <div style={{ marginTop:8, fontSize:8.5, color:T.txtMuted, lineHeight:1.5 }}>
             <span style={{ color:T.amber }}>ℹ</span>{' '}
-            Influence = 0 until {minSamples} samples. "Weight Updated" = recompute ran, not that weight changed.
+            Influence = 0 until {minSamples} samples. "Weights updated" shows actual weight changes, not just that recompute ran.
           </div>
         </>
       )}

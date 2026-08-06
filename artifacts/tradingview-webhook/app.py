@@ -9420,6 +9420,11 @@ LEARNING_SAMPLE_BY_KEY = {}                         # "{mode}::{strategy_key}" �
 STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER: dict = {}      # ticker → last-scan snapshot (display-only, bounded, one entry per ticker)
 PER_MODE_STATS         = {}                         # mode key → per-mode aggregate stats (win_rate/avg_r/n/top_setup)
 LEARNING_ANALYTICS     = {"enabled": LEARNING_DB_ENABLED, "ready": False, "total_trades": 0}
+# Session-scoped counters — both reset to 0 at boot (never persisted/restored).
+# _LEARNING_SESSION_RECOMPUTES: how many times _recompute_learning() completed OK this session.
+# _LEARNING_LAST_CHANGED_COUNT: number of strategy weights that actually changed in the last run.
+_LEARNING_SESSION_RECOMPUTES  = 0   # int; incremented in _recompute_learning() after successful swap
+_LEARNING_LAST_CHANGED_COUNT  = 0   # int; set to changed-weight count in _recompute_learning()
 # ── Right Brain — proactive execution engine (training-mode-gated) ────────────
 # Additive alongside the existing webhook/auto-trade path. Training mode (PF <
 # RIGHT_BRAIN_MIN_PF) only logs what it WOULD trade — zero gateway calls. When
@@ -14408,14 +14413,29 @@ def _recompute_learning():
             logger.warning("learning_eligibility recompute skip: %s", _le_exc)
 
         with LEARNING_LOCK:
+            # Count weight changes BEFORE the swap for session tracking (Task #41).
+            # Weight is "changed" when it differs from the current store by >0.001
+            # (ignores floating-point noise while catching real adjustments).
+            _prev_weights = dict(STRATEGY_WEIGHTS)
             STRATEGY_WEIGHTS.clear();        STRATEGY_WEIGHTS.update(new_weights)
             LEARNING_SAMPLE_BY_KEY.clear();  LEARNING_SAMPLE_BY_KEY.update(new_samples)
             LEARNING_ANALYTICS = analytics
             GOVERNOR_STATS = governor_stats
             MEMORY_TRADES[:] = mem_cache
             PER_MODE_STATS.clear();          PER_MODE_STATS.update(new_per_mode)
-        logger.info("learning analytics recomputed: %s trades across %s strategies",
-                    total, len(ranking))
+        # Compute changes outside lock (reads only local copies; safe).
+        _changed = sum(
+            1 for k, w in new_weights.items()
+            if abs(float(w) - float(_prev_weights.get(k, 1.0))) > 0.001
+        )
+        global _LEARNING_SESSION_RECOMPUTES, _LEARNING_LAST_CHANGED_COUNT
+        _LEARNING_SESSION_RECOMPUTES += 1
+        _LEARNING_LAST_CHANGED_COUNT  = _changed
+        logger.info(
+            "learning analytics recomputed: %s trades across %s strategies "
+            "(session recompute #%d; %d weight(s) changed)",
+            total, len(ranking), _LEARNING_SESSION_RECOMPUTES, _changed,
+        )
     except Exception as exc:
         logger.warning("recompute_learning failed: %s", exc)
     finally:
@@ -24750,8 +24770,10 @@ def build_coach_interface(result, instrument=None, mode=None):
             elif not _recompute_ran:
                 _weight_status, _blocked = "NOT_ELIGIBLE",         "NOT_ELIGIBLE"
                 _applied = False
-            elif _active_key and _lookup_status == "NOT_FOUND":
-                # We know what key to look for but it isn't in the cache.
+            elif _active_key and _lookup_status == "NOT_FOUND" and _canon_status == "NOT_FOUND":
+                # Key format is genuinely unrecognised — not in any known strategy list.
+                # (Valid strategies with 0 trades return CANONICAL via _strategy_weight_for
+                # step 4, so they fall through to INSUFFICIENT_SAMPLES below.)
                 _weight_status, _blocked = "KEY_NOT_FOUND",        "KEY_NOT_FOUND"
                 _applied = False
             elif _dn < LEARNING_MIN_SAMPLE:
@@ -24793,6 +24815,9 @@ def build_coach_interface(result, instrument=None, mode=None):
                 "aggregate_win_count":       int(_agg_wins),
                 "aggregate_loss_count":      int(_agg_losses),
                 "aggregate_win_rate":        _agg_wr,
+                # Task #41 — session lesson counters (reset to 0 on restart; display-only)
+                "recomputes_this_session":   _LEARNING_SESSION_RECOMPUTES,
+                "weights_changed_last_run":  _LEARNING_LAST_CHANGED_COUNT,
             }
         except Exception as _ld_exc:
             logger.debug("build_coach_interface diagnostics fail-open: %s", _ld_exc)
@@ -34420,6 +34445,8 @@ THESIS_TRACKER_DB_READY = False
 # resolved in this session.  build_coach_interface() reads this to surface
 # thesis_resolved=True after a real trade-close resolution event.
 _THESIS_LAST_RESOLVED_AT = None   # UTC datetime | None
+# INTENTIONALLY NOT PERSISTED: resets to None on every restart. Confirmed by Task #40.
+# No DB write or restore path exists for this variable — module-level init IS the reset.
 
 
 def _check_thesis_tracker_db_ready():
