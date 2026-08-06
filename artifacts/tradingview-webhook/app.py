@@ -40927,7 +40927,7 @@ _SSE_TOKEN_TTL      = 45    # seconds before an unused token expires
 _SSE_MAX_PER_OWNER  = 6     # max simultaneous streams per authenticated owner
 _SSE_MAX_TOTAL      = 20    # max simultaneous streams across all owners
 _SSE_QUEUE_DEPTH    = 300   # per-subscriber queue capacity
-_SSE_HEARTBEAT_S    = 15    # heartbeat interval (keeps proxies alive)
+_SSE_HEARTBEAT_S    = 2     # heartbeat every 2s — proxy has ~3s idle timeout
 
 # Token store: {token_str: {inst, expires_mono, expires_iso, connection_started}}
 # Populated by POST /tick-stream-token; cleaned up by background daemon.
@@ -41137,29 +41137,38 @@ def get_main_brain_tick_stream():
 
     # 4. Connection limits + stale-subscriber eviction
     #
-    # Problem: behind a buffering reverse-proxy (Express → Flask) the browser's
-    # EventSource.close() does not propagate a TCP RST to Flask, so the old
-    # generator never receives GeneratorExit and the subscriber stays in
-    # _TICK_SUBSCRIBERS indefinitely.  After 6 reconnects the per-owner limit
-    # is hit and every subsequent attempt gets a permanent 429.
+    # Design constraint: behind Replit's reverse-proxy the browser's
+    # EventSource.close() does NOT propagate a TCP RST to Flask, so old
+    # generators never receive GeneratorExit and stay in _TICK_SUBSCRIBERS
+    # indefinitely — causing a subscriber leak and eventual 429.
     #
-    # Fix: when a new connection arrives for instrument X, atomically evict ALL
-    # existing subscribers for X and register the new one.  Old generators are
-    # signalled via a None sentinel so they exit cleanly; if they somehow miss
-    # the sentinel their finally block sees ValueError on remove() (already
-    # evicted) and does NOT double-decrement _SSE_TOTAL_CONNS.
+    # Previous approach (evict ALL on new connect) caused a death spiral:
+    #   new connection → evicts existing → existing fires onerror → browser
+    #   reconnects in 2 s → evicts the new one → loop forever.
+    #
+    # New approach: allow up to _SSE_MAX_PER_INST simultaneous subscribers
+    # for the same instrument.  Only evict the OLDEST one(s) when the limit
+    # would be exceeded.  This breaks the spiral because a fresh reconnect
+    # no longer immediately kills its predecessor — both coexist briefly
+    # until the truly stale generator eventually exits via the heartbeat
+    # timeout or the next eviction cycle.
+    _SSE_MAX_PER_INST = 2   # tolerate brief overlap during reconnects
     _evicted_subs: list = []
     with _TICK_SUBS_LOCK:
         global _SSE_TOTAL_CONNS
         if _SSE_TOTAL_CONNS >= _SSE_MAX_TOTAL:
             return jsonify({"ok": False, "reason": "SSE_CONNECTION_LIMIT_TOTAL",
                             "limit": _SSE_MAX_TOTAL}), 429
-        # Evict stale same-instrument subscribers
-        _evicted_subs = _TICK_SUBSCRIBERS[inst][:]
+        # Evict oldest subscriber(s) for this instrument only when over the
+        # per-instrument cap — not unconditionally on every new connection.
+        subs = _TICK_SUBSCRIBERS[inst]
+        while len(subs) >= _SSE_MAX_PER_INST:
+            _old = subs.pop(0)   # oldest first
+            _evicted_subs.append(_old)
+            _SSE_TOTAL_CONNS = max(0, _SSE_TOTAL_CONNS - 1)
         if _evicted_subs:
-            _TICK_SUBSCRIBERS[inst].clear()
-            _SSE_TOTAL_CONNS = max(0, _SSE_TOTAL_CONNS - len(_evicted_subs))
-            logger.debug("SSE evicted %d stale subscriber(s) for %s", len(_evicted_subs), inst)
+            logger.debug("SSE evicted %d oldest subscriber(s) for %s (cap=%d)",
+                         len(_evicted_subs), inst, _SSE_MAX_PER_INST)
 
     # Signal evicted generators to exit (sentinel bypasses queue.Full by replace)
     for _old in _evicted_subs:
@@ -41197,6 +41206,10 @@ def get_main_brain_tick_stream():
             "sub_id":         _sub_id,
         })
         yield f"event: status\ndata: {_status_data}\n\n"
+        # Immediate heartbeat so the proxy never sees a silent gap on connect.
+        # Without this the proxy's idle timer starts after the status event and
+        # kills the stream before the first scheduled heartbeat arrives.
+        yield "event: heartbeat\ndata: {}\n\n"
 
         try:
             while True:
@@ -78020,7 +78033,7 @@ if __name__ == "__main__":
         )
     logger.info("[prod-boot] Flask app.run() starting on port %d", port)
     try:
-        app.run(host="0.0.0.0", port=port, debug=False)
+        app.run(host="0.0.0.0", port=port, debug=False, threaded=True)
     except Exception as _boot_exc:
         logger.critical("[prod-boot] Flask app.run() raised: %s", _boot_exc, exc_info=True)
     finally:

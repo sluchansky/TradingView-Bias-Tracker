@@ -385,11 +385,11 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     let es: EventSource | null = null;
     let timer:    ReturnType<typeof setTimeout> | null = null;
     let watchdog: ReturnType<typeof setTimeout> | null = null;
-    // MGC/MNQ must be the most responsive pairs — keep backoff tight.
-    // 2 s initial, cap at 8 s (was 5 s → 30 s which left the chart frozen for
-    // 30 s between attempts after a few failures).
-    let delay = 2_000;
-    const MAX_DELAY = 8_000;
+    // Initial delay 5 s — long enough to avoid the eviction death-spiral where
+    // a rapid reconnect immediately displaces its predecessor, which fires
+    // onerror, which reconnects again in a tight loop.  Cap at 15 s.
+    let delay = 5_000;
+    const MAX_DELAY = 15_000;
     // Watchdog: if no tick OR heartbeat arrives within 25 s (server sends
     // heartbeats every 15 s), the proxy has silently dropped the connection.
     // Proactively close and reconnect — onerror alone is unreliable for proxied
