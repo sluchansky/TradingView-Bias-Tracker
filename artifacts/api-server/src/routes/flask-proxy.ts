@@ -50,10 +50,43 @@ export function createFlaskProxy({ port, routes }: FlaskProxyOptions): Router {
       res.status(proxyRes.statusCode ?? 200);
       const ct = proxyRes.headers["content-type"];
       if (ct) res.set("content-type", ct);
+
+      // ── SSE / streaming response handling ───────────────────────────────
+      // When Flask returns text/event-stream we must:
+      //   1. Kill any upstream proxy buffering (Replit's nginx layer respects
+      //      X-Accel-Buffering: no; generic CDNs respect this too).
+      //   2. Flush headers to the browser immediately so EventSource sees the
+      //      200 + content-type and arms its reconnect logic from second 0.
+      //   3. Disable the Node socket read-timeout (default is 0 = no timeout,
+      //      but express / http module can set one; make it explicit).
+      //   4. Tear down the upstream Flask connection when the browser tab closes
+      //      so Flask's generator loop exits cleanly.
+      const isSse = typeof ct === "string" && ct.includes("text/event-stream");
+      if (isSse) {
+        res.set("Cache-Control", "no-cache");
+        res.set("Connection",    "keep-alive");
+        // Disable nginx / Replit proxy response buffering for this stream.
+        res.set("X-Accel-Buffering", "no");
+        // Flush status + headers to the browser right away — without this,
+        // Express may hold the response until the first chunk arrives (which
+        // for a silent market can be 15 s), causing EventSource to time out
+        // before it ever sees the 200.
+        res.flushHeaders();
+        // Remove any socket read-timeout on the upstream connection.
+        proxyReq.setTimeout(0);
+        proxyRes.socket?.setTimeout(0);
+        // When the browser closes the tab / navigates away, destroy the
+        // upstream pipe so Flask's generator exits instead of leaking forever.
+        const onClose = () => { proxyRes.destroy(); };
+        res.on("close", onClose);
+        proxyRes.on("end", () => res.off("close", onClose));
+      }
+
       // Forward Flask's caching directives. The /dashboard route serves inline JS
       // that changes on every deploy and must be served no-store, otherwise the
       // browser can run a stale cached dashboard and appear "frozen" on toggles.
       for (const h of ["cache-control", "pragma", "expires"]) {
+        if (isSse) continue; // SSE headers already set above — don't overwrite
         const v = proxyRes.headers[h];
         if (v) res.set(h, Array.isArray(v) ? v.join(", ") : v);
       }
@@ -61,7 +94,9 @@ export function createFlaskProxy({ port, routes }: FlaskProxyOptions): Router {
     });
 
     proxyReq.on("error", () => {
-      res.status(502).json({ error: "Webhook server unreachable" });
+      if (!res.headersSent) {
+        res.status(502).json({ error: "Webhook server unreachable" });
+      }
     });
 
     if (bodyBuf.length > 0) {

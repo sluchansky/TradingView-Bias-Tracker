@@ -21,7 +21,7 @@ if (Number.isNaN(port) || port <= 0) {
 // A failed migration exits the process so the platform restarts cleanly.
 runMigrations()
   .then(() => {
-    app.listen(port, (err) => {
+    const server = app.listen(port, (err) => {
       if (err) {
         logger.error({ err }, "Error listening on port");
         process.exit(1);
@@ -29,6 +29,15 @@ runMigrations()
 
       logger.info({ port }, "Server listening");
     });
+
+    // SSE / long-lived connections: disable the server-level keep-alive
+    // timeout so the Replit reverse-proxy cannot silently close idle SSE
+    // streams (the default Node.js keep-alive timeout of 5 s is shorter than
+    // most upstream proxy idle-connection timers and kills SSE within seconds).
+    // headersTimeout must also be 0 — it fires if no request headers arrive
+    // before the timeout and can terminate a keep-alive connection prematurely.
+    server.keepAliveTimeout = 0;
+    server.headersTimeout   = 0;
   })
   .catch((err) => {
     logger.error({ err }, "Database migration failed — aborting startup");
