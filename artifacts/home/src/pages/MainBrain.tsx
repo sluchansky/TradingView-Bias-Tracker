@@ -1629,8 +1629,12 @@ function computeConsensus(p: Record<string, unknown>): ConsensusResult {
   if (totalVotes === 0) return { direction: 'DIVIDED', longVotes: 0, shortVotes: 0, totalVotes: 0, confidence: 0, signals };
   const maxV = Math.max(longVotes, shortVotes);
   const confidence = Math.round((maxV / totalVotes) * 100);
+  // 60% threshold: a direction must hold a clear supermajority or we call it
+  // DIVIDED. This stops a single signal flip in a tight vote (3 vs 2) from
+  // toggling the display.
   const direction: 'LONG' | 'SHORT' | 'DIVIDED' =
-    longVotes === shortVotes ? 'DIVIDED' : longVotes > shortVotes ? 'LONG' : 'SHORT';
+    confidence < 60 ? 'DIVIDED'
+    : longVotes > shortVotes ? 'LONG' : 'SHORT';
   return { direction, longVotes, shortVotes, totalVotes, confidence, signals };
 }
 
@@ -10646,6 +10650,14 @@ export default function MainBrain() {
   // started (e.g. a second click before the first settled), the stale result
   // is silently discarded instead of overwriting the newer one.
   const scanGenRef = useRef(0);
+
+  // Consensus direction stability (2-poll hysteresis).
+  // _prevConDirRef  = the direction returned by computeConsensus on the LAST render.
+  // _stableConDirRef = the direction we actually DISPLAY — only updated when the
+  //   computed direction matches on two consecutive renders (i.e. two consecutive polls).
+  const _prevConDirRef   = useRef<string>('DIVIDED');
+  const _stableConDirRef = useRef<string>('DIVIDED');
+
   const [cleanestOpen,     setCleanestOpen]     = useState(false);
   const [cleanestScanning, setCleanestScanning] = useState(false);
   const [cleanestScan,     setCleanestScan]     = useState<CleanestScanResult | null>(null);
@@ -10875,7 +10887,15 @@ export default function MainBrain() {
         );
       default: {
         // Root overview — Consensus strip replaces Thesis + Verdict + Scanner top row
-        const _con = computeConsensus(p);
+        const _rawCon = computeConsensus(p);
+        // 2-poll hysteresis: commit a direction only when it matches the previous poll.
+        // This means a flip must appear on two consecutive renders before the display
+        // switches — single-poll noise that immediately reverts goes unnoticed.
+        if (_rawCon.direction === _prevConDirRef.current) {
+          _stableConDirRef.current = _rawCon.direction;
+        }
+        _prevConDirRef.current = _rawCon.direction;
+        const _con = { ..._rawCon, direction: _stableConDirRef.current as 'LONG' | 'SHORT' | 'DIVIDED' };
         const _vrdDir   = safeStr((p.verdict as Record<string,unknown>)?.direction ?? '', '').toUpperCase();
         const _planConflict = _con.direction !== 'DIVIDED'
           && _vrdDir !== ''
