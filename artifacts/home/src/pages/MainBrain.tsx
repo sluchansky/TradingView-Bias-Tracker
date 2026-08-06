@@ -10822,10 +10822,31 @@ export default function MainBrain() {
     switch (section) {
       case 'analysis':
         return (
-          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
-            <ThesisPanel p={p} />
-            <VerdictPanel p={p} />
-          </div>
+          <>
+            <div style={{ marginBottom:10 }}>
+              <a
+                href="https://8819ee03-cc7e-4519-a76f-888c52cd0aae-00-210gq63b44k5r.worf.replit.dev"
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  display: 'flex', alignItems: 'center', gap: 8,
+                  padding: '10px 14px', borderRadius: 8,
+                  background: 'rgba(99,102,241,0.08)',
+                  border: '1px solid rgba(99,102,241,0.25)',
+                  color: '#818cf8', fontSize: 13, fontWeight: 600,
+                  textDecoration: 'none', letterSpacing: '0.02em',
+                }}
+              >
+                <span style={{ fontSize: 15 }}>🔗</span>
+                Open Analysis Tool
+                <span style={{ marginLeft: 'auto', fontSize: 10, opacity: 0.6 }}>↗</span>
+              </a>
+            </div>
+            <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
+              <ThesisPanel p={p} />
+              <VerdictPanel p={p} />
+            </div>
+          </>
         );
       case 'scanner':
         return (
