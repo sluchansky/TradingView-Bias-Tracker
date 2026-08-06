@@ -1,0 +1,1795 @@
+FULL REPLIT IMPLEMENTATION INSTRUCTIONS
+
+Upgrade the Existing 9:30 Breakout Dashboard Panel Into a Four-Instrument Algorithmic ORB System
+
+This task applies only to the existing production trading application.
+
+Do not create a separate project.
+
+Do not create a Research Lab.
+
+Do not create a crawler.
+
+Do not create a second 9:30 Breakout panel.
+
+The application already contains an existing 9:30 Breakout dashboard panel. Inspect that panel and upgrade it in place so it becomes the control, monitoring, diagnostic, paper-trading, and live-execution interface for a complete algorithmic Opening Range Breakout strategy.
+
+The algorithm must independently analyze and potentially trade:
+
+* MGC
+* MNQ
+* MES
+* MYM
+
+Each instrument must run its own ORB process.
+
+A valid breakout in one instrument must not prevent another instrument from being analyzed or traded.
+
+MNQ, MES, and MYM correlation may reduce or divide their combined risk allocation, but correlation must not create a winner-takes-all selection rule.
+
+Leave the completed feature in SHADOW mode.
+
+Do not automatically publish, arm, or activate live algorithmic trading.
+
+⸻
+
+1. Primary objective
+
+Upgrade the existing 9:30 Breakout panel from its current informational, diagnostic, scanning, or manual state into a functioning algorithmic strategy controller.
+
+The completed system must:
+
+1. Build an independent opening range for MGC, MNQ, MES, and MYM.
+2. Analyze every instrument independently.
+3. Detect independent long and short breakouts.
+4. Apply independent confirmation rules.
+5. Calculate independent stops and targets.
+6. Request independent position sizing through the existing canonical risk engine.
+7. Allow two, three, or all four instruments to trade when each qualifies and portfolio risk permits.
+8. Manage every position independently.
+9. Journal every instrument independently.
+10. Display all four instruments simultaneously in the existing dashboard panel.
+11. Route live trades through the existing protected production execution chain.
+12. Survive restarts without changing locked ranges or duplicating entries.
+13. Support DISABLED, SHADOW, PAPER, and LIVE_ALGORITHMIC modes.
+14. Preserve the existing Databento architecture and safety controls.
+
+⸻
+
+2. Non-negotiable boundaries
+
+Do not modify or bypass the canonical owners of:
+
+* Databento ingestion
+* Databento normalization
+* Instrument mapping
+* Active-contract resolution
+* Tick size
+* Tick value
+* Market-session state
+* VWAP
+* ATR
+* Volume
+* Cumulative delta
+* Order flow
+* Strategy registration
+* Risk calculation
+* Contract sizing
+* Prop-firm rules
+* Daily-loss limits
+* Drawdown limits
+* Position limits
+* Duplicate-order protection
+* Execution mode
+* Arm state
+* Safety lock
+* Emergency stop
+* Final pre-transmission validation
+* Order gateway
+* TradersPost integration
+* Trade journal
+* Active-position management
+* Learning and performance records
+
+Do not create:
+
+* A second Databento feed
+* A second execution gateway
+* A direct TradersPost call from the panel
+* A direct broker call from the strategy
+* Frontend-owned position sizing
+* A duplicate ORB strategy when a canonical implementation already exists
+* A single-winner index-ranking system
+* One shared opening range for all instruments
+* One shared trade record for all instruments
+
+Every live order must pass through the existing execution chain.
+
+Every uncertain condition must fail closed.
+
+⸻
+
+3. Inspect before editing
+
+Before changing code, inspect and report:
+
+* Existing 9:30 Breakout frontend component
+* Existing route
+* Existing navigation owner
+* Existing backend endpoint
+* Existing polling or streaming mechanism
+* Existing ORB calculation
+* Existing ORB strategy registration
+* Existing ORB state storage
+* Existing opening-range persistence
+* Existing Databento market-data owner
+* Existing bar-building owner
+* Existing signal-generation owner
+* Existing stop and target logic
+* Existing risk and sizing owner
+* Existing prop-rule owner
+* Existing daily-loss owner
+* Existing duplicate-order owner
+* Existing arm-state owner
+* Existing safety-lock owner
+* Existing final transmission check
+* Existing order gateway
+* Existing position-management owner
+* Existing journal owner
+* Existing learning or performance owner
+* Existing restart-recovery behavior
+
+State clearly whether the current panel is:
+
+* Display only
+* Diagnostic only
+* Scanner only
+* Signal capable
+* Shadow capable
+* Paper capable
+* Partially connected to execution
+* Fully connected but not algorithmically controlled
+
+Also identify every current assumption involving:
+
+* Only one instrument
+* Only one index position
+* One winning candidate
+* Shared signal state
+* Shared range state
+* Shared stop or target
+* Shared daily trade count
+* Shared journal record
+
+Reuse working components.
+
+Implement the smallest compatible change set.
+
+Do not stop after inspection or planning.
+
+⸻
+
+4. Actual 9:30 ORB algorithm
+
+The default strategy is a 10-minute Opening Range Breakout.
+
+Use:
+
+Time zone: America/New_York
+Opening-range start: 09:30:00
+Opening-range end: 09:40:00
+Opening-range bars included: 09:30 through 09:39
+Range-lock time: 09:40:00
+Entry-window start: 09:40:00
+Entry-window end: 10:30:00
+
+At exactly 9:40 AM, independently lock the opening range for:
+
+* MGC
+* MNQ
+* MES
+* MYM
+
+For each instrument calculate:
+
+ORB_HIGH = highest completed canonical one-minute bar high from 09:30 through 09:39
+ORB_LOW = lowest completed canonical one-minute bar low from 09:30 through 09:39
+ORB_MIDPOINT = (ORB_HIGH + ORB_LOW) / 2
+ORB_WIDTH = ORB_HIGH - ORB_LOW
+
+Do not include the 9:40 one-minute bar in the opening-range calculation.
+
+The 9:40 bar may become the first breakout-confirmation bar.
+
+Do not allow entries before the selected opening range is locked.
+
+Do not modify a locked range later in the session.
+
+⸻
+
+5. Configurable opening-range duration
+
+Add a dashboard setting:
+
+Opening Range Duration
+
+Supported values:
+
+* 5 minutes
+* 10 minutes
+* 15 minutes
+* 30 minutes
+
+Default:
+
+10 minutes
+
+Derived behavior:
+
+5-minute range:
+Include bars 09:30 through 09:34
+Lock at 09:35
+10-minute range:
+Include bars 09:30 through 09:39
+Lock at 09:40
+15-minute range:
+Include bars 09:30 through 09:44
+Lock at 09:45
+30-minute range:
+Include bars 09:30 through 09:59
+Lock at 10:00
+
+The entry window must begin at the selected range-lock time.
+
+The default entry-window end is:
+
+10:30:00 America/New_York
+
+Keep the entry-window end configurable.
+
+Do not hardcode all ORB operation to 10:00 AM.
+
+Persist the selected duration in the configuration version used for every trade.
+
+Changing the duration during an active or completed opening range must not alter the current session’s range. Apply the change to the next eligible session.
+
+⸻
+
+6. Independent state machine per instrument
+
+Create a separate ORB state machine for:
+
+* MGC
+* MNQ
+* MES
+* MYM
+
+Required unique key:
+
+trading_date
++ instrument
++ strategy_version
++ configuration_version
+
+Each instrument must own its own:
+
+* Range high
+* Range low
+* Range midpoint
+* Range width
+* Range validity
+* Long breakout level
+* Short breakout level
+* Breakout direction
+* Confirmation status
+* Risk status
+* Position size
+* Entry request
+* Order result
+* Position state
+* Stop
+* Targets
+* Daily trade count
+* Journal record
+* Final result
+
+Required states:
+
+DISABLED
+WAITING_FOR_SESSION
+WAITING_FOR_RANGE
+BUILDING_RANGE
+RANGE_LOCKED
+WATCHING_BREAKOUT
+BREAKOUT_DETECTED
+CONFIRMATION_PENDING
+QUALIFIED
+BREAKOUT_MISSED
+RISK_PENDING
+RISK_RESERVED
+BLOCKED_BY_DATA
+BLOCKED_BY_RANGE_WIDTH
+BLOCKED_BY_CONFIRMATION
+BLOCKED_BY_MAXIMUM_CHASE
+BLOCKED_BY_INSTRUMENT_RISK
+BLOCKED_BY_GROUP_RISK
+BLOCKED_BY_PORTFOLIO_RISK
+BLOCKED_BY_PROP_RULE
+BLOCKED_BY_DAILY_LOSS
+BLOCKED_BY_POSITION_LIMIT
+BLOCKED_BY_DUPLICATE_GUARD
+BLOCKED_BY_EXECUTION_MODE
+BLOCKED_BY_ARM_STATE
+BLOCKED_BY_SAFETY_LOCK
+ENTRY_REQUESTED
+ORDER_ACCEPTED
+ORDER_REJECTED
+POSITION_ACTIVE
+POSITION_MANAGING
+COMPLETED
+EXPIRED
+DATA_INVALID
+RECOVERY_REQUIRED
+
+Record every state transition with:
+
+* Previous state
+* New state
+* Timestamp
+* Instrument
+* Reason
+* Relevant values
+* Configuration version
+
+Do not overwrite state history.
+
+⸻
+
+7. Independent market analysis
+
+For every instrument independently retrieve or calculate:
+
+* Current price
+* Completed one-minute OHLC bars
+* Opening-range high
+* Opening-range low
+* Opening-range midpoint
+* Range width in points
+* Range width in ticks
+* Range width relative to ATR
+* Session VWAP
+* ATR
+* Relative volume
+* Market structure
+* BOS
+* CHOCH
+* Cumulative delta
+* Bid/ask imbalance when available
+* Spread
+* Estimated slippage
+* Session status
+* Data freshness
+* Tick size
+* Tick value
+* Contract metadata
+* Active contract
+* Halt status
+* News-risk state when available
+
+Do not infer one instrument’s values from another.
+
+Prohibited examples:
+
+* MNQ VWAP used for MES
+* MES ATR used for MYM
+* MYM opening range used for MNQ
+* MGC substituted when an index mapping fails
+* MNQ state copied into MES
+* One shared breakout direction for all four
+
+Each diagnostic must expose:
+
+VALUE
+PASS
+FAIL
+UNAVAILABLE
+STALE
+NOT_REQUIRED
+
+A failure in one instrument should normally block only that instrument.
+
+A shared Databento system failure may block all affected instruments.
+
+⸻
+
+8. Opening-range validation
+
+Store per instrument:
+
+* Trading date
+* Instrument
+* Active contract
+* Strategy version
+* Configuration version
+* Range duration
+* Range start
+* Range end
+* First observation timestamp
+* Last observation timestamp
+* Number of observations
+* Expected coverage
+* Actual coverage
+* Missing intervals
+* Range high
+* Range low
+* Range midpoint
+* Width in points
+* Width in ticks
+* Width in ATR
+* Data-quality status
+* Range-lock timestamp
+* Market-data schema version
+* Contract-mapping version
+
+Block an instrument when:
+
+* Required data is missing
+* Data is stale
+* A material portion of the range is absent
+* Contract mapping is unresolved
+* Tick size is missing
+* Tick value is missing
+* Session state is invalid
+* High is lower than low
+* Range width is zero
+* Range width is malformed
+* Range violates configured minimum or maximum width
+* Persisted and recalculated range values conflict
+
+A locked range must be immutable for that session except through an explicit audited recovery procedure.
+
+⸻
+
+9. Opening-range width filter
+
+Use the existing canonical ATR owner.
+
+Initial defaults:
+
+Minimum ORB width = 0.20 × ATR reference
+Maximum ORB width = 1.50 × ATR reference
+
+When the range is too narrow:
+
+State = BLOCKED_BY_RANGE_WIDTH
+Reason = RANGE_TOO_NARROW
+
+When the range is too wide:
+
+State = BLOCKED_BY_RANGE_WIDTH
+Reason = RANGE_TOO_WIDE
+
+Make both thresholds configurable globally and per instrument.
+
+Do not create a competing ATR calculation.
+
+⸻
+
+10. Breakout levels
+
+Use canonical tick sizes from the existing contract-metadata owner.
+
+Initial breakout-buffer defaults:
+
+MGC: 2 ticks
+MNQ: 4 ticks
+MES: 2 ticks
+MYM: 4 ticks
+
+Calculate independently for every instrument:
+
+LONG_BREAKOUT_LEVEL = ORB_HIGH + breakout buffer
+SHORT_BREAKOUT_LEVEL = ORB_LOW - breakout buffer
+
+The buffer must be configurable globally and per instrument.
+
+Do not hardcode raw price increments separately from canonical tick-size ownership.
+
+⸻
+
+11. Default confirmation mode
+
+Support:
+
+TOUCH
+CLOSE_OUTSIDE
+CLOSE_AND_RETEST
+
+Default:
+
+CLOSE_OUTSIDE
+
+TOUCH
+
+Price reaches the configured breakout level after the range is locked.
+
+This may create a candidate intrabar, subject to all safety, data, chase, and risk checks.
+
+CLOSE_OUTSIDE
+
+A completed canonical one-minute candle closes outside the buffered breakout level.
+
+An unfinished candle must not qualify.
+
+CLOSE_AND_RETEST
+
+A completed candle closes outside the buffered breakout level, price returns to the breakout boundary within the configured tolerance, and the retest holds within the configured confirmation window.
+
+Allow global defaults and per-instrument overrides.
+
+⸻
+
+12. Long entry algorithm
+
+Create a long candidate when all conditions are true:
+
+1. The instrument is enabled.
+2. The selected opening range is valid and locked.
+3. Current time is inside the configured entry window.
+4. A completed one-minute candle closes at or above LONG_BREAKOUT_LEVEL, unless TOUCH mode is selected.
+5. The prior completed candle did not already close above the same level.
+6. The confirmation candle is bullish or closes in the upper 50% of its range.
+7. Price has not exceeded the maximum chase distance.
+8. The instrument has not used its allowed ORB trade for the day.
+9. The instrument has no conflicting active ORB position.
+10. Required data is fresh.
+11. Required filters pass.
+12. Stop calculation is valid.
+13. Position sizing is valid.
+14. Instrument risk passes.
+15. Group risk passes.
+16. Portfolio risk passes.
+17. All existing production execution guards pass.
+
+Default entry price:
+
+Next available executable price after the confirmation condition is satisfied
+
+In Shadow and Paper modes, apply configured latency and slippage.
+
+In Live Algorithmic mode, route the request through the existing execution gateway.
+
+⸻
+
+13. Short entry algorithm
+
+Create a short candidate when all conditions are true:
+
+1. The instrument is enabled.
+2. The selected opening range is valid and locked.
+3. Current time is inside the configured entry window.
+4. A completed one-minute candle closes at or below SHORT_BREAKOUT_LEVEL, unless TOUCH mode is selected.
+5. The prior completed candle did not already close below the same level.
+6. The confirmation candle is bearish or closes in the lower 50% of its range.
+7. Price has not exceeded the maximum chase distance.
+8. The instrument has not used its allowed ORB trade for the day.
+9. The instrument has no conflicting active ORB position.
+10. Required data is fresh.
+11. Required filters pass.
+12. Stop calculation is valid.
+13. Position sizing is valid.
+14. Instrument risk passes.
+15. Group risk passes.
+16. Portfolio risk passes.
+17. All existing production execution guards pass.
+
+Default entry price:
+
+Next available executable price after the confirmation condition is satisfied
+
+⸻
+
+14. Maximum chase rule
+
+Do not enter after price has moved too far beyond the range.
+
+Initial default:
+
+Maximum chase distance = 25% of ORB width
+
+For a long:
+
+Maximum permitted entry =
+ORB_HIGH + (ORB_WIDTH × 0.25)
+
+For a short:
+
+Minimum permitted entry =
+ORB_LOW - (ORB_WIDTH × 0.25)
+
+When price exceeds the maximum chase distance:
+
+State = BREAKOUT_MISSED
+Reason = PRICE_EXCEEDED_MAXIMUM_CHASE
+
+Do not chase the move at market.
+
+When CLOSE_AND_RETEST is enabled, continue monitoring for a permitted retest.
+
+Make the maximum chase percentage configurable globally and per instrument.
+
+⸻
+
+15. Breakout failure before entry
+
+When price trades outside the range but does not satisfy the configured confirmation:
+
+* Do not enter.
+* Record the failed breakout.
+* Return to WATCHING_BREAKOUT.
+* Continue monitoring until the entry window expires.
+
+When both sides of the range are broken before a valid entry:
+
+Event = TWO_SIDED_RANGE_SWEEP
+
+Initial default behavior:
+
+* Continue monitoring.
+* Require a new valid confirmation outside one side.
+* Do not enter from the earlier unconfirmed touch.
+
+Make this behavior configurable later, but use the safe default above.
+
+⸻
+
+16. Required and informational filters
+
+Required by default
+
+* Opening range valid
+* Databento data fresh
+* Current time inside entry window
+* Selected confirmation mode passed
+* Maximum chase not exceeded
+* Valid tick size
+* Valid tick value
+* Valid stop distance
+* Valid position size
+* Daily trade limit available
+* Existing execution and safety gates pass
+
+Informational by default
+
+Display and record, but do not initially require:
+
+* VWAP alignment
+* Relative volume
+* Cumulative delta
+* BOS
+* CHOCH
+* Bid/ask imbalance
+* Structure alignment
+* News-risk state when unavailable
+
+Add dashboard controls so each optional filter can be set to:
+
+OFF
+INFORMATIONAL
+REQUIRED
+
+Do not silently make optional filters required.
+
+Do not silently ignore a filter marked REQUIRED.
+
+Every filter must display:
+
+* Enabled mode
+* Current value
+* Required value
+* PASS
+* FAIL
+* UNAVAILABLE
+* NOT_REQUIRED
+* Explanation
+
+⸻
+
+17. Stops
+
+Reuse canonical ORB stop logic where available.
+
+Default stop model:
+
+OPPOSITE_RANGE_SIDE
+
+For a long:
+
+STOP = ORB_LOW - stop buffer
+
+For a short:
+
+STOP = ORB_HIGH + stop buffer
+
+Initial stop-buffer defaults:
+
+MGC: 2 ticks
+MNQ: 4 ticks
+MES: 2 ticks
+MYM: 4 ticks
+
+Also support:
+
+BREAKOUT_CANDLE_INVALIDATION
+ATR_BASED
+STRUCTURE_BASED
+CUSTOM_TICKS
+
+Allow global defaults and per-instrument overrides.
+
+Each instrument must have its own stop.
+
+Validate:
+
+* Stop is on the correct side of entry.
+* Stop distance is positive.
+* Stop aligns with tick size.
+* Stop does not exceed permitted risk.
+* Required stop inputs are available.
+* Final position size is valid.
+
+Reject invalid stops.
+
+⸻
+
+18. Targets and management
+
+Reuse canonical approved trade-management logic where available.
+
+Default target model:
+
+TP1_AND_RUNNER
+
+Initial defaults:
+
+TP1 = 1R
+TP2 = 2R
+
+Where:
+
+1R = absolute distance between entry and stop
+
+Default management:
+
+* Exit 50% at TP1 when contract quantity permits.
+* Hold the remaining quantity for TP2.
+* Do not automatically move the stop to breakeven during initial Shadow evaluation.
+* Record the hypothetical breakeven result as a counterfactual metric.
+* Exit the full position at the stop when invalidated.
+* Exit the remaining position at TP2.
+* Apply existing approved end-of-session management rules.
+
+When only one contract is permitted:
+
+Single full-position target = 1.5R
+
+Do not attempt an impossible partial exit.
+
+Also support:
+
+FIXED_R
+OPENING_RANGE_PROJECTION
+STRUCTURE_TARGET
+CUSTOM_TICKS
+
+Every instrument must own its own:
+
+* TP1
+* TP2
+* Partial quantity
+* Runner quantity
+* Breakeven state
+* Trailing state
+* Time exit
+* Stop modifications
+* Exit reason
+* MFE
+* MAE
+* Final R
+* Final dollar result
+
+One trade’s TP1 must not alter another instrument’s position.
+
+⸻
+
+19. Position sizing
+
+All sizing must use the existing canonical risk engine.
+
+The frontend may display size but must not calculate or approve it.
+
+For each candidate, send the proposed entry and stop to the risk engine.
+
+Store:
+
+* Instrument
+* Account profile
+* Risk profile
+* Allowed risk dollars
+* Allowed risk percentage
+* Entry price
+* Stop price
+* Stop distance
+* Tick size
+* Tick value
+* Risk per contract
+* Proposed contracts
+* Approved contracts
+* Group-risk contribution
+* Portfolio-risk contribution
+* Rounding result
+* Rejection reason
+
+Always round down.
+
+Reject:
+
+* Zero quantity
+* Negative quantity
+* Missing tick size
+* Missing tick value
+* Invalid stop distance
+* Instrument risk exceeded
+* Group risk exceeded
+* Portfolio risk exceeded
+* Prop position limit exceeded
+
+⸻
+
+20. Independent trading of all four instruments
+
+The required behavior is:
+
+MGC qualifies:
+Evaluate and potentially trade MGC.
+MNQ qualifies:
+Evaluate and potentially trade MNQ.
+MES qualifies:
+Evaluate and potentially trade MES.
+MYM qualifies:
+Evaluate and potentially trade MYM.
+
+All four may hold ORB positions simultaneously when each qualifies and risk permits.
+
+Do not implement:
+
+* Strongest instrument only
+* Strongest index only
+* First candidate only
+* One equity-index position only
+* Automatic correlation rejection
+* Winner-takes-all selection
+* One combined four-instrument trade
+
+A signal in one instrument must not stop analysis of the other three.
+
+⸻
+
+21. Correlation and portfolio risk
+
+Treat:
+
+MNQ
+MES
+MYM
+
+as the equity-index group.
+
+Treat:
+
+MGC
+
+as the metals group.
+
+Correlation affects total risk allocation, not strategy eligibility.
+
+Support:
+
+FULL_RISK_EACH
+SHARED_GROUP_BUDGET
+FIXED_FRACTION_EACH
+DYNAMIC_REMAINING_BUDGET
+
+Default:
+
+SHARED_GROUP_BUDGET
+
+Under the default mode:
+
+* MNQ, MES, and MYM may all trade.
+* They share one configured index-group risk budget.
+* The risk engine calculates final permitted size per trade.
+* Contract quantities round down.
+* A candidate is blocked only when its minimum permitted position would exceed remaining risk or another authoritative control.
+
+Example:
+
+Index-group risk budget: $300
+MNQ approved risk: $100
+MES approved risk: $100
+MYM approved risk: $100
+
+Actual allocations may vary based on:
+
+* Stop distance
+* Tick value
+* Minimum contract size
+* Remaining risk
+* Account profile
+* Prop rules
+* Existing open positions
+
+MGC uses a separate metals-group budget but still counts toward overall ORB portfolio risk.
+
+⸻
+
+22. Risk configuration
+
+Add configuration support for:
+
+MAX_ORB_TOTAL_RISK_DOLLARS
+MAX_ORB_TOTAL_RISK_PERCENT
+MAX_INDEX_GROUP_RISK_DOLLARS
+MAX_INDEX_GROUP_RISK_PERCENT
+MAX_METALS_GROUP_RISK_DOLLARS
+MAX_METALS_GROUP_RISK_PERCENT
+MAX_RISK_PER_INSTRUMENT_DOLLARS
+MAX_RISK_PER_INSTRUMENT_PERCENT
+MAX_SIMULTANEOUS_ORB_POSITIONS
+MAX_SIMULTANEOUS_INDEX_POSITIONS
+MAX_SIMULTANEOUS_METALS_POSITIONS
+MAX_TRADES_PER_INSTRUMENT
+ALLOW_REENTRY_AFTER_STOP
+CORRELATED_RISK_ALLOCATION_MODE
+
+Initial defaults:
+
+Maximum trades per instrument per day: 1
+Maximum total simultaneous ORB positions: 4
+Maximum simultaneous index positions: 3
+Maximum simultaneous metals positions: 1
+Re-entry after stop: false
+Correlation mode: SHARED_GROUP_BUDGET
+
+Do not hardcode dollar values when the existing risk profile already owns them.
+
+The canonical risk engine remains authoritative.
+
+The system may therefore take as many as four ORB trades per day:
+
+* One MGC trade
+* One MNQ trade
+* One MES trade
+* One MYM trade
+
+⸻
+
+23. Atomic risk reservation
+
+Multiple instruments may qualify at nearly the same moment.
+
+Implement atomic portfolio-risk reservation.
+
+Before transmitting or creating a Paper position:
+
+1. Calculate proposed instrument risk.
+2. Calculate group exposure.
+3. Calculate total ORB exposure.
+4. Atomically reserve risk.
+5. Recheck limits while the reservation is held.
+6. Run all execution safety checks.
+7. Submit only after reservation succeeds.
+8. Convert the reservation to active risk after accepted execution.
+9. Release the reservation after rejection or failure.
+10. Persist every reservation transition.
+
+Reservation states:
+
+PENDING
+RESERVED
+CONVERTED_TO_ACTIVE
+RELEASED
+EXPIRED
+RECONCILIATION_REQUIRED
+
+Do not allow separate workers to calculate against the same stale available-risk value.
+
+After restart:
+
+* Restore reservations.
+* Reconcile with actual orders and positions.
+* Release only when safely confirmed stale.
+* Fail closed when uncertain.
+
+⸻
+
+24. Simultaneous candidate processing
+
+If multiple instruments confirm during the same event cycle:
+
+1. Preserve every candidate.
+2. Create separate candidate IDs.
+3. Run separate instrument validations.
+4. Calculate separate stops.
+5. Calculate separate position sizes.
+6. Atomically reserve group and portfolio risk.
+7. Return separate outcomes.
+8. Do not lose a candidate because another was processed first.
+
+Example:
+
+MGC: SHADOW_ENTRY_CREATED
+MNQ: SHADOW_ENTRY_CREATED
+MES: BLOCKED_BY_GROUP_RISK
+MYM: SHADOW_ENTRY_CREATED
+
+One instrument’s failure must not silently cancel another valid instrument.
+
+⸻
+
+25. Strategy modes
+
+Support:
+
+DISABLED
+SHADOW
+PAPER
+LIVE_ALGORITHMIC
+
+DISABLED
+
+* No algorithmic entry evaluation.
+* Panel may continue displaying range and market information.
+
+SHADOW
+
+* Evaluate the complete strategy.
+* Generate hypothetical entries.
+* Apply hypothetical latency, spread, slippage, and commissions.
+* Manage hypothetical positions.
+* Record hypothetical results.
+* Never call the transmission layer.
+
+PAPER
+
+* Create persisted simulated orders and positions.
+* Apply simulated latency, spread, slippage, and commissions.
+* Manage paper positions.
+* Never call the live transmission layer.
+
+LIVE_ALGORITHMIC
+
+* Route every approved entry through the existing production execution chain.
+* Require explicit operator authorization.
+* Require valid arm state.
+* Require all safety controls.
+* Require the final pre-transmission check.
+
+Deployment default:
+
+SHADOW
+
+A page refresh must not alter mode.
+
+A restart must not upgrade mode.
+
+The global mode is the maximum permitted mode.
+
+Each instrument may be set to the same or a safer mode.
+
+Example:
+
+Global mode: LIVE_ALGORITHMIC
+MGC: LIVE_ALGORITHMIC
+MNQ: PAPER
+MES: LIVE_ALGORITHMIC
+MYM: DISABLED
+
+If global mode is PAPER, no instrument may transmit live.
+
+⸻
+
+26. Execution chain
+
+Every LIVE_ALGORITHMIC request must follow:
+
+Instrument ORB candidate
+→ strategy validation
+→ data-quality validation
+→ breakout confirmation
+→ instrument risk calculation
+→ group-risk calculation
+→ portfolio-risk calculation
+→ atomic risk reservation
+→ prop guard
+→ daily-loss guard
+→ drawdown guard
+→ position-limit guard
+→ duplicate-order guard
+→ execution-mode validation
+→ arm-state validation
+→ safety-lock validation
+→ final pre-transmission validation
+→ existing order gateway
+→ order result
+→ journal
+
+Do not create a shortcut.
+
+Do not transmit directly from the panel.
+
+Do not transmit directly from the ORB strategy.
+
+Return a separate result for each instrument.
+
+Example:
+
+MGC: ACCEPTED
+MNQ: ACCEPTED
+MES: BLOCKED — remaining group risk insufficient
+MYM: BLOCKED — stale data
+
+⸻
+
+27. Existing dashboard panel upgrade
+
+Keep the current route and panel identity.
+
+Preserve useful existing content.
+
+Upgrade the panel to show all four instruments simultaneously:
+
+MGC
+MNQ
+MES
+MYM
+
+Each instrument section must display:
+
+* Enabled status
+* Algorithm mode
+* Current ORB state
+* Active contract
+* Data freshness
+* Selected range duration
+* Range-lock time
+* Opening-range high
+* Opening-range low
+* Range midpoint
+* Range width
+* Range width relative to ATR
+* Long breakout level
+* Short breakout level
+* Current price
+* Last completed one-minute candle close
+* Distance from range high
+* Distance from range low
+* Long breakout status
+* Short breakout status
+* Confirmation mode
+* Confirmation status
+* Maximum chase boundary
+* VWAP status
+* Relative-volume status
+* Structure status
+* Delta status
+* Spread
+* Estimated slippage
+* Proposed entry
+* Proposed stop
+* TP1
+* TP2
+* Proposed contracts
+* Approved contracts
+* Instrument risk
+* Group-risk contribution
+* Portfolio-risk contribution
+* Position status
+* Block reason
+* Last update
+* Daily result
+
+The operator must be able to see exactly which algorithm condition is preventing an entry.
+
+⸻
+
+28. Portfolio summary
+
+Add a shared portfolio section displaying:
+
+* Global algorithm mode
+* Arm state
+* Safety-lock state
+* Databento health
+* Active ORB positions
+* Maximum ORB positions
+* Active index positions
+* Maximum index positions
+* Active metals positions
+* Total active ORB risk
+* Total reserved ORB risk
+* Remaining ORB risk
+* Index-group active risk
+* Index-group reserved risk
+* Remaining index-group risk
+* Metals-group active risk
+* Metals-group reserved risk
+* Remaining metals-group risk
+* Daily ORB P&L
+* Daily ORB R
+* Daily ORB trade count
+
+Example:
+
+Active positions: 3 of 4
+Total ORB risk: $286 of $450
+Reserved risk: $0
+Index risk: $192 of $300
+Metals risk: $94 of $150
+Remaining total risk: $164
+
+⸻
+
+29. Operator controls
+
+Add controls to the existing panel:
+
+* Save configuration
+* Enable algorithm
+* Disable algorithm
+* Set global mode
+* Set per-instrument mode
+* Enable or disable each instrument
+* Select 5-, 10-, 15-, or 30-minute range
+* Configure entry-window end
+* Set global direction
+* Set per-instrument direction
+* Set confirmation mode
+* Configure breakout buffers
+* Configure maximum chase
+* Configure range-width filters
+* Configure optional filters
+* Configure stop model
+* Configure target model
+* Configure risk-allocation mode
+* Arm for next session
+* Disarm
+* Emergency stop
+
+Use the existing arm-state and emergency-stop owners.
+
+Do not create competing safety controls.
+
+A dashboard refresh must not:
+
+* Enable the strategy
+* Change mode
+* Arm execution
+* Reset trade counts
+* Rebuild ranges
+* Duplicate positions
+
+Live mode must require the existing explicit production authorization flow.
+
+⸻
+
+30. Live session timeline
+
+Add a timestamped event stream.
+
+Examples:
+
+09:28:00 — MGC waiting for range
+09:30:00 — MGC 10-minute opening-range collection started
+09:30:00 — MNQ 10-minute opening-range collection started
+09:39:00 — MES final range bar opened
+09:40:00 — MGC range locked
+09:40:00 — MNQ range locked
+09:40:00 — MES range locked
+09:40:00 — MYM blocked: incomplete range
+09:40:22 — MNQ touched long breakout level
+09:41:00 — MNQ 9:40 candle closed above breakout level
+09:41:00 — MNQ long candidate created
+09:41:01 — MNQ risk reserved
+09:41:02 — MNQ shadow entry recorded
+09:43:00 — MES breakout rejected: maximum chase exceeded
+
+The timeline must show why each blocked trade was rejected.
+
+Allow filtering by instrument and event type.
+
+⸻
+
+31. Persistence
+
+Persist:
+
+* Global ORB configuration
+* Per-instrument overrides
+* Configuration versions
+* Strategy versions
+* Selected range duration
+* Entry-window settings
+* Daily opening ranges
+* Observation coverage
+* Per-instrument state
+* State transitions
+* Breakout candidates
+* Confirmation results
+* Filter results
+* Risk calculations
+* Risk reservations
+* Trade counts
+* Algorithm modes
+* Arm-state references
+* Orders
+* Paper positions
+* Shadow positions
+* Live positions
+* Position-management events
+* Audit records
+* Final trade results
+* Daily portfolio summary
+
+Every trade must reference the exact configuration and strategy version used.
+
+⸻
+
+32. Restart recovery
+
+After restart:
+
+* Do not rebuild a different locked range.
+* Do not duplicate a candidate.
+* Do not duplicate an order.
+* Do not duplicate a journal record.
+* Restore active shadow positions.
+* Restore active paper positions.
+* Reconcile live positions through existing production owners.
+* Restore trade counts.
+* Restore risk reservations.
+* Restore instrument state.
+* Restore configuration versions.
+* Restore selected range duration.
+* Fail closed when persisted and external state conflict.
+
+Set affected instruments to:
+
+RECOVERY_REQUIRED
+
+when safe automatic reconciliation is impossible.
+
+⸻
+
+33. Journal integration
+
+Create a separate journal record for every instrument trade.
+
+Required labels:
+
+Strategy: OPENING_RANGE_BREAKOUT
+Execution source: ALGORITHMIC
+Mode: SHADOW, PAPER, or LIVE_ALGORITHMIC
+
+Store:
+
+* Instrument
+* Trading date
+* Active contract
+* Direction
+* Strategy version
+* Configuration version
+* Range duration
+* Range high
+* Range low
+* Range width
+* Breakout level
+* Breakout time
+* Confirmation mode
+* Confirmation result
+* Maximum chase result
+* Filter results
+* Entry
+* Stop
+* Targets
+* Approved contracts
+* Instrument risk
+* Group-risk contribution
+* Portfolio-risk contribution
+* Entry timestamp
+* Order identifier
+* Fill information
+* Exit timestamp
+* Exit reason
+* MFE
+* MAE
+* Final R
+* Final dollar result
+* Shadow, Paper, or Live designation
+* Every block and approval reason
+
+Do not combine multiple instruments into one journal record.
+
+⸻
+
+34. Performance reporting
+
+Track separately:
+
+* MGC ORB
+* MNQ ORB
+* MES ORB
+* MYM ORB
+
+Also track combined ORB portfolio performance.
+
+Display:
+
+* Trades
+* Wins
+* Losses
+* Win rate
+* Average win
+* Average loss
+* Expectancy
+* Profit factor
+* Net R
+* Net dollars
+* Maximum drawdown
+* Consecutive losses
+* Average MFE
+* Average MAE
+* Long performance
+* Short performance
+* Performance by weekday
+* Performance by selected range duration
+* Performance by range width
+* Performance by confirmation mode
+* Performance by instrument
+* Performance when multiple instruments trigger
+* Correlated losses
+* Group-risk usage
+* Blocked trades and reasons
+* Counterfactual breakeven result after TP1
+
+Do not merge all four instruments into one undifferentiated result.
+
+⸻
+
+35. API behavior
+
+Inspect and extend the existing 9:30 Breakout endpoints rather than creating conflicting duplicates.
+
+The dashboard requires backend support for:
+
+* Read global ORB configuration
+* Save global ORB configuration
+* Read per-instrument configuration
+* Save per-instrument overrides
+* Read current state for all four instruments
+* Read today’s opening ranges
+* Read breakout candidates
+* Read confirmation results
+* Read filter diagnostics
+* Read risk calculations
+* Read risk reservations
+* Read active positions
+* Read portfolio summary
+* Read timeline events
+* Read historical ORB sessions
+* Read performance metrics
+* Enable or disable strategy
+* Enable or disable each instrument
+* Set selected range duration
+* Set SHADOW mode
+* Set PAPER mode
+* Request LIVE_ALGORITHMIC mode
+* Arm through the existing arm-state owner
+* Disarm through the existing arm-state owner
+* Trigger emergency stop through the existing safety owner
+
+Do not expose a direct order-transmission endpoint.
+
+⸻
+
+36. Required tests
+
+Add deterministic tests proving:
+
+Existing panel and routing
+
+1. Existing 9:30 Breakout route still loads.
+2. Existing panel remains in place.
+3. All four instruments appear.
+4. Existing useful diagnostics remain available.
+5. A page refresh does not arm or change mode.
+
+Range duration
+
+6. Five-minute mode includes 9:30 through 9:34.
+7. Five-minute mode locks at 9:35.
+8. Ten-minute mode includes 9:30 through 9:39.
+9. Ten-minute mode locks at 9:40.
+10. The 9:40 bar is excluded from a ten-minute range.
+11. Fifteen-minute mode includes 9:30 through 9:44.
+12. Fifteen-minute mode locks at 9:45.
+13. Thirty-minute mode includes 9:30 through 9:59.
+14. Thirty-minute mode locks at 10:00.
+15. A duration change does not alter a current locked range.
+16. Restart preserves the selected duration and locked range.
+
+Independent ranges
+
+17. MGC builds its own range.
+18. MNQ builds its own range.
+19. MES builds its own range.
+20. MYM builds its own range.
+21. One invalid range does not block valid instruments.
+22. Missing data blocks only the affected instrument.
+23. Shared stale feed health blocks all affected instruments.
+24. Invalid mapping never defaults to MGC.
+
+Breakout algorithm
+
+25. No entry occurs before the selected range-lock time.
+26. The first post-range bar may confirm a breakout.
+27. A completed close above the buffered high creates a long candidate.
+28. A completed close below the buffered low creates a short candidate.
+29. An intrabar touch does not satisfy CLOSE_OUTSIDE.
+30. TOUCH mode may create an intrabar candidate after range lock.
+31. The prior candle already outside the level does not create duplicate signals.
+32. Maximum chase blocks late entries.
+33. Narrow ranges are blocked.
+34. Wide ranges are blocked.
+35. Failed unconfirmed breakouts return to watching.
+36. A two-sided sweep is logged.
+37. Entries after the configured entry-window end are blocked.
+
+Independent instruments
+
+38. MGC long breakout works independently.
+39. MGC short breakout works independently.
+40. MNQ long breakout works independently.
+41. MNQ short breakout works independently.
+42. MES long breakout works independently.
+43. MES short breakout works independently.
+44. MYM long breakout works independently.
+45. MYM short breakout works independently.
+46. All four may qualify at the same timestamp.
+47. All four candidates are preserved.
+48. One index entry does not automatically reject another.
+49. One instrument’s active trade does not stop analysis of the others.
+
+Stops and targets
+
+50. Long stop is below the opening-range low.
+51. Short stop is above the opening-range high.
+52. Stops align with canonical tick size.
+53. TP1 equals 1R.
+54. TP2 equals 2R.
+55. One-contract trades use the configured single target.
+56. One trade’s TP1 does not alter another trade.
+
+Risk
+
+57. Each instrument receives a separate risk calculation.
+58. Each instrument receives a separate contract calculation.
+59. Index-group risk is enforced.
+60. Metals-group risk is enforced.
+61. Total portfolio risk is enforced.
+62. Contract quantities round down.
+63. Minimum contract size may block only the affected trade.
+64. Atomic reservation prevents over-allocation.
+65. Failed orders release reservations.
+66. Accepted orders convert reservations to active risk.
+67. Restart restores reservations safely.
+68. Uncertain reservation state fails closed.
+
+Execution modes
+
+69. DISABLED mode does not evaluate entries.
+70. SHADOW mode never transmits.
+71. PAPER mode never transmits.
+72. LIVE_ALGORITHMIC uses the existing execution chain.
+73. Global mode caps per-instrument mode.
+74. Per-instrument disable works.
+75. Restart does not upgrade mode.
+76. Dashboard refresh does not upgrade mode.
+
+Safety
+
+77. Prop guard remains authoritative.
+78. Daily-loss guard remains authoritative.
+79. Drawdown guard remains authoritative.
+80. Position-limit guard remains authoritative.
+81. Duplicate guard remains authoritative.
+82. Execution-mode guard remains authoritative.
+83. Arm-state guard remains authoritative.
+84. Safety lock remains authoritative.
+85. Final pre-transmission check remains authoritative.
+86. Emergency stop remains globally authoritative.
+
+Position management and persistence
+
+87. Every instrument has an independent position.
+88. Every instrument has an independent stop.
+89. Every instrument has independent targets.
+90. One instrument stopping out does not close another.
+91. Four Paper positions may coexist when risk permits.
+92. Four Shadow positions may coexist.
+93. Each Live request is sent independently.
+94. Each trade has a separate journal record.
+95. Restart does not duplicate ranges.
+96. Restart does not duplicate candidates.
+97. Restart does not duplicate orders.
+98. Restart does not duplicate journal records.
+99. Active Paper positions restore correctly.
+100. Active Shadow positions restore correctly.
+101. Conflicting Live state becomes RECOVERY_REQUIRED.
+
+Regression
+
+102. Existing Databento parity tests pass.
+103. Existing strategy golden tests pass.
+104. Existing execution safety tests pass.
+105. Existing dashboard tests pass.
+106. Existing journal tests pass.
+107. Complete regression suite passes.
+
+⸻
+
+37. Implementation workflow
+
+Follow this sequence.
+
+Step 1 — Inspect
+
+Report:
+
+* Current panel location
+* Current panel capabilities
+* Current backend owners
+* Existing ORB logic
+* Existing execution connection
+* Existing persistence
+* Existing safety chain
+* Existing single-instrument or single-winner assumptions
+* Components that will be reused
+* Exact gaps preventing full algorithmic operation
+
+Step 2 — Design the smallest compatible upgrade
+
+Provide:
+
+* State model
+* Configuration model
+* Persistence changes
+* API changes
+* Dashboard changes
+* Risk-reservation design
+* Restart-recovery design
+* Test plan
+
+Do not stop after planning.
+
+Step 3 — Implement
+
+Upgrade the existing panel and backend.
+
+Do not create a parallel feature.
+
+Do not create a second strategy owner.
+
+Step 4 — Validate
+
+Run:
+
+* Syntax checks
+* New ORB tests
+* Existing ORB tests
+* Databento parity tests
+* Strategy golden tests
+* Execution safety tests
+* Risk tests
+* Journal tests
+* Dashboard tests
+* Complete regression suite
+* Application startup smoke test
+
+Step 5 — Demonstrate
+
+Capture evidence showing:
+
+* Existing panel upgraded
+* Four instruments displayed
+* Default 10-minute range
+* Configurable 5-, 10-, 15-, and 30-minute durations
+* Four independent ranges
+* Four independent states
+* First post-range breakout handling
+* Simultaneous candidates preserved
+* Separate risk calculations
+* Shared group-risk summary
+* Shadow orders created
+* Paper orders created
+* Live mode blocked without authorization
+* Safety lock blocking execution
+* Restart recovery
+* Separate journal records
+
+Step 6 — Final report
+
+Return:
+
+* Existing components reused
+* Files changed
+* New files created
+* Database changes
+* API changes
+* Dashboard changes
+* State-machine changes
+* Actual algorithm logic added
+* Risk-reservation implementation
+* Safety-chain confirmation
+* Exact test counts
+* Exact failures, if any
+* Screenshots
+* Known limitations
+* Commit hash
+* Deployment status
+
+Do not publish automatically.
+
+Do not activate LIVE_ALGORITHMIC.
+
+Leave the completed system in:
+
+SHADOW
+
+⸻
+
+Final required behavior
+
+The finished existing dashboard panel must run this complete sequence independently for MGC, MNQ, MES, and MYM:
+
+Build selected opening range beginning at 9:30
+→ Default: lock 10-minute range at 9:40
+→ Watch each instrument independently
+→ Detect buffered long or short breakout
+→ Apply selected confirmation mode
+→ Reject excessive chase
+→ Validate range width
+→ Calculate independent stop
+→ Calculate 1R and 2R targets
+→ Calculate contracts through canonical risk engine
+→ Reserve correlated-group and portfolio risk
+→ Pass the existing execution safety chain
+→ Create Shadow, Paper, or Live order
+→ Manage every position independently
+→ Journal every result independently
+
+The default setup after implementation must be:
+
+Opening-range duration: 10 minutes
+Range build: 9:30 through 9:39
+Range lock: 9:40
+Entry window: 9:40 through 10:30
+Confirmation: CLOSE_OUTSIDE
+Maximum chase: 25% of ORB width
+Stop: opposite side of range plus instrument buffer
+TP1: 1R
+TP2: 2R
+Maximum trades: one per instrument per day
+Mode: SHADOW
+
+Do not mark the task complete unless the actual trading algorithm, dashboard controls, independent four-instrument behavior, risk handling, execution integration, persistence, and tests are all implemented.
