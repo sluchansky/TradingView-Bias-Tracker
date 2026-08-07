@@ -23,7 +23,6 @@ import os
 import time
 import logging
 import threading
-import requests
 from abc import ABC, abstractmethod
 from collections import deque
 from datetime import datetime, timezone, timedelta
@@ -59,11 +58,10 @@ def _assert_observe_only(context: str = "") -> None:
 
 # ── Configuration ──────────────────────────────────────────────────────────────
 
-_AV_SYMBOL          = "^VIX"
-_AV_BASE_URL        = "https://www.alphavantage.co/query"
-_FETCH_INTERVAL_SEC = int(os.environ.get("ALPHA_VANTAGE_FETCH_INTERVAL_SEC", "3600"))  # 1 hr default — AV free tier = 25 calls/day
-_HIST_INTERVAL_SEC  = int(os.environ.get("ALPHA_VANTAGE_HIST_INTERVAL_SEC",  "900"))  # 15 min default
-_FRESHNESS_SEC      = int(os.environ.get("VOL_INTELLIGENCE_FRESHNESS_SEC",    "600"))  # 10 min
+_VIX_SYMBOL         = "^VIX"
+_FETCH_INTERVAL_SEC = int(os.environ.get("VIX_FETCH_INTERVAL_SEC", "300"))   # 5 min default — yfinance has no rate limit
+_HIST_INTERVAL_SEC  = int(os.environ.get("VIX_HIST_INTERVAL_SEC",  "300"))   # 5 min
+_FRESHNESS_SEC      = int(os.environ.get("VOL_INTELLIGENCE_FRESHNESS_SEC",   "600"))  # 10 min
 _MAX_OBS            = 500   # bounded in-memory observation buffer
 _MAX_CONSEC_ERRORS  = 10    # suppress repeated log spam
 
@@ -78,7 +76,7 @@ _ELEVATED_MAX= float(os.environ.get("VIX_ELEVATED_MAX", "30"))
 def _null_vix_record(status: str = "UNAVAILABLE", error: Optional[str] = None) -> Dict[str, Any]:
     return {
         "symbol":         "VIX",
-        "source":         "alpha_vantage",
+        "source":         "yfinance",
         "price":          None,
         "previous_close": None,
         "change":         None,
@@ -146,18 +144,16 @@ class VolatilityDataProvider(ABC):
     def get_provider_status(self) -> Dict[str, Any]:
         """Return provider health info."""
 
-# ── Alpha Vantage provider ────────────────────────────────────────────────────
+# ── yfinance provider ─────────────────────────────────────────────────────────
 
-class AlphaVantageProvider(VolatilityDataProvider):
+class YFinanceProvider(VolatilityDataProvider):
     """
-    Fetches VIX from Alpha Vantage.
-    Data is ~15-min delayed during market hours and is always labeled DELAYED.
-    Fetch interval defaults to 5 min (ALPHA_VANTAGE_FETCH_INTERVAL_SEC).
-    Free-tier users (25 req/day) should set the interval to 1200+ seconds.
+    Fetches ^VIX from Yahoo Finance via yfinance.
+    No API key required. No daily call limits.
+    Quote data is ~15-min delayed during market hours.
     """
 
     def __init__(self) -> None:
-        self._api_key: str = os.environ.get("ALPHA_VANTAGE_API_KEY", "")
         self._latest:  Dict[str, Any] = _null_vix_record("UNAVAILABLE", "Not yet fetched")
         self._history: List[Dict[str, Any]] = []
         self._lock = threading.Lock()
@@ -166,7 +162,6 @@ class AlphaVantageProvider(VolatilityDataProvider):
         self._consecutive_errors: int = 0
         self._total_errors:  int = 0
         self._reconnect_cnt: int = 0
-        self._stale_cnt:     int = 0
         self._last_error:    Optional[str] = None
         self._last_ok_utc:   Optional[str] = None
 
@@ -183,18 +178,17 @@ class AlphaVantageProvider(VolatilityDataProvider):
     def get_provider_status(self) -> Dict[str, Any]:
         with self._lock:
             return {
-                "provider":           "AlphaVantage",
-                "symbol":             _AV_SYMBOL,
+                "provider":           "YFinance",
+                "symbol":             _VIX_SYMBOL,
                 "connected":          self._consecutive_errors == 0 and self._last_ok_utc is not None,
                 "last_ok_utc":        self._last_ok_utc,
                 "last_error":         self._last_error,
                 "consecutive_errors": self._consecutive_errors,
                 "total_errors":       self._total_errors,
                 "reconnect_count":    self._reconnect_cnt,
-                "stale_count":        self._stale_cnt,
                 "fetch_interval_sec": _FETCH_INTERVAL_SEC,
                 "hist_interval_sec":  _HIST_INTERVAL_SEC,
-                "api_key_present":    bool(self._api_key),
+                "api_key_present":    True,  # no key needed
                 "is_delayed":         True,
             }
 
@@ -203,10 +197,6 @@ class AlphaVantageProvider(VolatilityDataProvider):
     def maybe_refresh(self) -> None:
         """Called by the background thread; fetches only when intervals have elapsed."""
         now = time.time()
-        if not self._api_key:
-            with self._lock:
-                self._latest = _null_vix_record("UNAVAILABLE", "ALPHA_VANTAGE_API_KEY not set")
-            return
         if now - self._last_quote_fetch >= _FETCH_INTERVAL_SEC:
             self._fetch_quote()
             self._last_quote_fetch = now
@@ -216,33 +206,27 @@ class AlphaVantageProvider(VolatilityDataProvider):
 
     def _fetch_quote(self) -> None:
         try:
-            resp = requests.get(
-                _AV_BASE_URL,
-                params={"function": "GLOBAL_QUOTE", "symbol": _AV_SYMBOL, "apikey": self._api_key},
-                timeout=10,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            gq = data.get("Global Quote", {})
-            if not gq or "05. price" not in gq:
-                note = data.get("Note") or data.get("Information") or "Empty response"
-                self._record_error(f"GLOBAL_QUOTE empty — {note[:120]}")
-                return
+            import yfinance as yf  # noqa: PLC0415
+            ticker = yf.Ticker(_VIX_SYMBOL)
+            info   = ticker.fast_info
 
-            price         = _safe_float(gq.get("05. price"))
-            prev_close    = _safe_float(gq.get("08. previous close") or gq.get("07. previous close"))
-            change        = _safe_float(gq.get("09. change") or gq.get("08. change"))
-            change_pct_s  = (gq.get("10. change percent") or gq.get("09. change percent") or "").replace("%", "")
-            change_pct    = _safe_float(change_pct_s)
-            s_open        = _safe_float(gq.get("02. open"))
-            s_high        = _safe_float(gq.get("03. high"))
-            s_low         = _safe_float(gq.get("04. low"))
-            latest_day    = gq.get("07. latest trading day") or gq.get("06. latest trading day")
+            price      = _safe_float(getattr(info, "last_price",      None))
+            prev_close = _safe_float(getattr(info, "previous_close",  None))
+            s_open     = _safe_float(getattr(info, "open",            None))
+            s_high     = _safe_float(getattr(info, "day_high",        None))
+            s_low      = _safe_float(getattr(info, "day_low",         None))
+
+            change     = (price - prev_close) if price is not None and prev_close else None
+            change_pct = ((change / prev_close) * 100) if change is not None and prev_close else None
+
+            if price is None:
+                self._record_error("yfinance returned no price for ^VIX (market may be closed)")
+                return
 
             now_utc_s = datetime.now(timezone.utc).isoformat()
             rec = {
                 "symbol":         "VIX",
-                "source":         "alpha_vantage",
+                "source":         "yfinance",
                 "price":          price,
                 "previous_close": prev_close,
                 "change":         change,
@@ -254,43 +238,32 @@ class AlphaVantageProvider(VolatilityDataProvider):
                 "age_seconds":    0.0,
                 "is_fresh":       True,
                 "is_delayed":     True,
-                "status":         "DELAYED" if price is not None else "ERROR",
+                "status":         "DELAYED",
                 "error":          None,
-                "latest_trading_day": latest_day,
             }
             with self._lock:
                 self._latest = rec
                 self._consecutive_errors = 0
                 self._last_ok_utc = now_utc_s
-            logger.debug("VIX quote fetched: %.2f (%.2f%%)", price or 0, change_pct or 0)
+            logger.info("VIX quote fetched via yfinance: %.2f (%.2f%%)", price, change_pct or 0)
         except Exception as exc:
             self._record_error(str(exc))
 
     def _fetch_history(self) -> None:
         try:
-            resp = requests.get(
-                _AV_BASE_URL,
-                params={
-                    "function":   "TIME_SERIES_INTRADAY",
-                    "symbol":     _AV_SYMBOL,
-                    "interval":   "5min",
-                    "outputsize": "compact",
-                    "apikey":     self._api_key,
-                },
-                timeout=15,
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            ts_key = "Time Series (5min)"
-            series = data.get(ts_key, {})
-            if not series:
-                return  # quota note or empty — quote fetch handles the error log
+            import yfinance as yf  # noqa: PLC0415
+            df = yf.download(_VIX_SYMBOL, period="1d", interval="5m", progress=False, auto_adjust=True)
+            if df is None or df.empty:
+                return
             obs = []
-            for ts_str, bar in sorted(series.items(), reverse=True)[:36]:  # last 3 hours
-                price = _safe_float(bar.get("4. close"))
+            close_col = "Close"
+            if close_col not in df.columns:
+                return
+            for ts, row in df.iterrows():
+                price = _safe_float(row[close_col])
                 if price is not None:
-                    obs.append({"price": price, "timestamp_str": ts_str})
-            obs.reverse()  # chronological
+                    obs.append({"price": price, "timestamp_str": str(ts)})
+            obs = obs[-36:]  # last 3 hours of 5-min bars
             with self._lock:
                 self._history = obs
         except Exception as exc:
@@ -302,7 +275,6 @@ class AlphaVantageProvider(VolatilityDataProvider):
             self._total_errors += 1
             self._last_error = msg
             self._latest = _null_vix_record("ERROR", msg[:200])
-        # Rate-limited logging — only log first + every 5th consecutive error
         if self._consecutive_errors == 1 or self._consecutive_errors % 5 == 0:
             logger.warning("VIX provider error #%d: %s", self._consecutive_errors, msg[:120])
         if self._consecutive_errors > 1:
@@ -311,7 +283,7 @@ class AlphaVantageProvider(VolatilityDataProvider):
 
 # ── Background thread ─────────────────────────────────────────────────────────
 
-_provider: Optional[AlphaVantageProvider] = None
+_provider: Optional[YFinanceProvider] = None
 _bg_thread: Optional[threading.Thread] = None
 _obs_buffer: deque = deque(maxlen=_MAX_OBS)  # timestamped snapshots
 _obs_lock = threading.Lock()
@@ -325,7 +297,7 @@ def start(provider: Optional[VolatilityDataProvider] = None) -> None:
         logger.info("VolatilityIntelligence: disabled (VOL_INTELLIGENCE_ENABLED=0)")
         return
     _assert_observe_only("start()")
-    _provider = provider or AlphaVantageProvider()
+    _provider = provider or YFinanceProvider()
     _bg_thread = threading.Thread(target=_bg_loop, daemon=True, name="vol-intelligence-bg")
     _bg_thread.start()
     _MODULE_STARTED = True
@@ -339,7 +311,7 @@ def _bg_loop() -> None:
     """Daemon loop: refresh provider data, snapshot analysis into buffer."""
     while True:
         try:
-            if isinstance(_provider, AlphaVantageProvider):
+            if _provider is not None:
                 _provider.maybe_refresh()
             snap = _build_snapshot()
             with _obs_lock:
@@ -603,7 +575,7 @@ def get_left_brain_block(inst: str = "") -> Dict[str, Any]:
     return {
         "enabled":           snap.get("enabled", False),
         "observe_only":      snap.get("observe_only", True),
-        "source":            "alpha_vantage",
+        "source":            "yfinance",
         "source_timestamp":  snap.get("vix", {}).get("timestamp_utc"),
         "analysis_timestamp":snap.get("timestamp_utc"),
         "freshness":         snap.get("vix", {}).get("status", "UNAVAILABLE"),
