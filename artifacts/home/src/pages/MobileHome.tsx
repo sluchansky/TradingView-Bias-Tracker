@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { AlertToastOverlay } from '../components/AlertToastOverlay';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const BULL  = '#22c55e';
@@ -2043,6 +2044,7 @@ export default function MobileHome() {
 
       {/* ── Bottom nav ── */}
       <BottomNav active={tab} onChange={setTab} />
+      <AlertToastOverlay ticker={ticker} />
     </div>
   );
 }
