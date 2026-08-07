@@ -38,8 +38,13 @@ from typing import Any
 logger = logging.getLogger(__name__)
 
 # ── Instrument ↔ Databento continuous-contract symbol ────────────────────────
+# MGC rolls earlier than the calendar front-month: TradingView MGC1! typically
+# moves to the next active month (c.1) several weeks before Databento's c.0
+# catches up.  Set DATABENTO_MGC_SYMBOL=MGC.c.0 to revert once Databento's
+# continuous contract has rolled past the current delivery month.
+_DB_MGC_SYMBOL = os.environ.get("DATABENTO_MGC_SYMBOL", "MGC.c.1")
 DB_SYMBOLS: dict[str, str] = {
-    "MGC": "MGC.c.0",
+    "MGC": _DB_MGC_SYMBOL,
     "MNQ": "MNQ.c.0",
     "MES": "MES.c.0",
     "MYM": "MYM.c.0",
