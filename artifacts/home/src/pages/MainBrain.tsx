@@ -701,10 +701,10 @@ const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({
   // Show whenever the key is present (module enabled in backend); hide only when key is absent.
   if (!('volatility_intelligence' in p)) return null;
   const vi = (p.volatility_intelligence ?? {}) as Record<string, unknown>;
-  const hasData = Boolean(vi.enabled) && price != null;
 
   const vix        = (vi.vix ?? {}) as Record<string, unknown>;
   const price      = safeNum(vix.price);
+  const hasData    = Boolean(vi.enabled) && price != null;
   const changePct  = safeNum(vix.change_pct);
   const regime     = safeStr(vi.regime, 'UNKNOWN');
   const direction  = safeStr(vi.direction, 'UNKNOWN');
