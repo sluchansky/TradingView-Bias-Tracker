@@ -4360,15 +4360,43 @@ export default function Home() {
             </SatPanel>
 
             {/* VOLATILITY */}
-            <SatPanel label="Volatility" style={{ flex:'1 1 0', minWidth:0 }}>
+            <SatPanel label="Volatility &amp; Risk" style={{ flex:'1 1 0', minWidth:0 }}>
               {(() => {
-                const vr = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
-                const col = /extreme/.test(vr) ? BEAR : /high|elev/.test(vr) ? '#f97316' : /low|quiet/.test(vr) ? MUTED : AMB;
-                const lbl = /extreme/.test(vr) ? 'EXTREME' : /high|elev/.test(vr) ? 'ELEVATED' : /low|quiet/.test(vr) ? 'QUIET' : isOpen ? 'NORMAL' : '—';
+                // ATR regime
+                const vr  = String(ad.volatility_regime || data?.vol_regime || '').toLowerCase();
+                const atrCol = /extreme/.test(vr) ? BEAR : /high|elev/.test(vr) ? '#f97316' : /low|quiet/.test(vr) ? MUTED : AMB;
+                const atrLbl = /extreme/.test(vr) ? 'EXTREME' : /high|elev/.test(vr) ? 'ELEVATED' : /low|quiet/.test(vr) ? 'QUIET' : isOpen ? 'NORMAL' : '—';
+                // VIX from volatility_intelligence
+                const vi   = (data?.volatility_intelligence ?? {}) as Record<string, any>;
+                const vix  = (vi.vix ?? {}) as Record<string, any>;
+                const vixPrice  = typeof vix.price === 'number' ? vix.price : null;
+                const vixRegime = String(vi.regime || '').toUpperCase();
+                const vixDir    = String(vi.direction || '').toLowerCase();
+                const vixDirArrow = vixDir === 'rising' ? '↑' : vixDir === 'falling' ? '↓' : '→';
+                const vixCol = /EXTREME/.test(vixRegime) ? BEAR
+                  : /HIGH/.test(vixRegime) ? '#f97316'
+                  : /ELEVATED/.test(vixRegime) ? '#fbbf24'
+                  : /LOW/.test(vixRegime) ? BULL
+                  : AMB;
                 return (
                   <>
-                    <div style={{ fontSize:13, fontWeight:800, color:col, fontFamily:'monospace', letterSpacing:'0.02em' }}>{lbl}</div>
-                    <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:2 }}>ATR REGIME</div>
+                    <div style={{ fontSize:13, fontWeight:800, color:atrCol, fontFamily:'monospace', letterSpacing:'0.02em' }}>{atrLbl}</div>
+                    <div style={{ fontSize:8.5, color:MUTED, fontFamily:'monospace', marginTop:1 }}>ATR REGIME</div>
+                    {vixPrice !== null && (
+                      <div style={{ marginTop:5, borderTop:'1px solid rgba(255,255,255,0.06)', paddingTop:4 }}>
+                        <div style={{ display:'flex', alignItems:'baseline', gap:4 }}>
+                          <span style={{ fontSize:12, fontWeight:800, color:vixCol, fontFamily:'monospace' }}>
+                            VIX {vixPrice.toFixed(2)}
+                          </span>
+                          <span style={{ fontSize:10, color:vixCol, fontFamily:'monospace' }}>{vixDirArrow}</span>
+                        </div>
+                        {vixRegime && (
+                          <div style={{ fontSize:8, color:MUTED, fontFamily:'monospace', marginTop:1, letterSpacing:'0.06em' }}>
+                            {vixRegime} · delayed
+                          </div>
+                        )}
+                      </div>
+                    )}
                   </>
                 );
               })()}

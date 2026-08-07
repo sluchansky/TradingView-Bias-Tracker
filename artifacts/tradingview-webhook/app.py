@@ -54445,6 +54445,7 @@ def _build_status_payload(_tk):
         ),
         "market_intelligence": a.get("market_intelligence"),
         "breakout_mode":       a.get("breakout_mode"),
+        "volatility_intelligence": a.get("volatility_intelligence"),
         "swing_v2":            a.get("swing_v2"),
         "decision_pipeline_v2": a.get("decision_pipeline_v2"),
         "equity_curve_today":  a.get("equity_curve_today"),
