@@ -701,7 +701,7 @@ const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({
   // Show whenever the key is present (module enabled in backend); hide only when key is absent.
   if (!('volatility_intelligence' in p)) return null;
   const vi = (p.volatility_intelligence ?? {}) as Record<string, unknown>;
-  const hasData = Boolean(vi.enabled);
+  const hasData = Boolean(vi.enabled) && price != null;
 
   const vix        = (vi.vix ?? {}) as Record<string, unknown>;
   const price      = safeNum(vix.price);
@@ -766,14 +766,18 @@ const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({
         </span>
       </div>
 
-      {/* No-data state — module active but market closed / first fetch pending */}
+      {/* No-data state — module active but no price yet */}
       {!hasData && (
         <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 6, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
           <div style={{ fontSize: 11, color: '#6b7280', fontFamily: 'monospace' }}>
-            📡 VIX module active — waiting for market open
+            {dataStatus === 'ERROR'
+              ? '⚠ VIX fetch failed — market may be closed or API limit reached'
+              : '📡 VIX module active — waiting for first fetch'}
           </div>
           <div style={{ fontSize: 10, color: '#4b5563', marginTop: 3 }}>
-            Alpha Vantage fetches live data during US session hours
+            {dataStatus === 'ERROR'
+              ? 'Data will resume automatically when US session opens (9:30 AM ET)'
+              : 'Alpha Vantage fetches VIX every hour during US session'}
           </div>
         </div>
       )}

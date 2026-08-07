@@ -61,7 +61,7 @@ def _assert_observe_only(context: str = "") -> None:
 
 _AV_SYMBOL          = "^VIX"
 _AV_BASE_URL        = "https://www.alphavantage.co/query"
-_FETCH_INTERVAL_SEC = int(os.environ.get("ALPHA_VANTAGE_FETCH_INTERVAL_SEC", "300"))  # 5 min default
+_FETCH_INTERVAL_SEC = int(os.environ.get("ALPHA_VANTAGE_FETCH_INTERVAL_SEC", "3600"))  # 1 hr default — AV free tier = 25 calls/day
 _HIST_INTERVAL_SEC  = int(os.environ.get("ALPHA_VANTAGE_HIST_INTERVAL_SEC",  "900"))  # 15 min default
 _FRESHNESS_SEC      = int(os.environ.get("VOL_INTELLIGENCE_FRESHNESS_SEC",    "600"))  # 10 min
 _MAX_OBS            = 500   # bounded in-memory observation buffer
