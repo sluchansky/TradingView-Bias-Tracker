@@ -25909,6 +25909,7 @@ def build_main_brain_payload(result, instrument=None):
         "system_status":     system_status,
         "candidate_preview": candidate_preview,
         "prop_firm":         prop_firm_snap,
+        "volatility_intelligence": (result or {}).get("volatility_intelligence"),
         "availability":      availability,
         "errors":            errors,
     }

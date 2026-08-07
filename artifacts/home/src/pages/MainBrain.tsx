@@ -698,9 +698,10 @@ export function fmtEventDetail(v: unknown): string {
 // Data from p.volatility_intelligence (injected at full_analysis seam).
 // Flag-gated: panel is hidden when enabled=false or key absent.
 const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  // Show whenever the key is present (module enabled in backend); hide only when key is absent.
+  if (!('volatility_intelligence' in p)) return null;
   const vi = (p.volatility_intelligence ?? {}) as Record<string, unknown>;
-  const enabled = Boolean(vi.enabled);
-  if (!enabled) return null;
+  const hasData = Boolean(vi.enabled);
 
   const vix        = (vi.vix ?? {}) as Record<string, unknown>;
   const price      = safeNum(vix.price);
@@ -765,8 +766,20 @@ const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({
         </span>
       </div>
 
+      {/* No-data state — module active but market closed / first fetch pending */}
+      {!hasData && (
+        <div style={{ marginTop: 8, padding: '8px 10px', borderRadius: 6, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.06)' }}>
+          <div style={{ fontSize: 11, color: '#6b7280', fontFamily: 'monospace' }}>
+            📡 VIX module active — waiting for market open
+          </div>
+          <div style={{ fontSize: 10, color: '#4b5563', marginTop: 3 }}>
+            Alpha Vantage fetches live data during US session hours
+          </div>
+        </div>
+      )}
+
       {/* Main VIX reading */}
-      <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 8 }}>
+      {hasData && <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginTop: 8 }}>
         <div>
           <div style={{ fontSize: 24, fontWeight: 800, color: regimeColor[regime] ?? '#9ca3af', lineHeight: 1 }}>
             {price != null ? price.toFixed(2) : '—'}
@@ -814,10 +827,10 @@ const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({
           </div>
           <div style={{ fontSize: 9, color: '#6b7280' }}>conf</div>
         </div>
-      </div>
+      </div>}
 
       {/* Per-instrument context for the active instrument */}
-      {thisInst && relevance && (
+      {hasData && thisInst && relevance && (
         <div style={{
           marginTop: 8, padding: '5px 8px', borderRadius: 5,
           background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
