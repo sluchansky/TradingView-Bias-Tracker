@@ -11016,7 +11016,7 @@ export default function MainBrain() {
           <>
             <div style={{ marginBottom:10 }}>
               <a
-                href="https://8819ee03-cc7e-4519-a76f-888c52cd0aae-00-210gq63b44k5r.worf.replit.dev"
+                href="https://trading-research-lab.replit.app"
                 target="_blank"
                 rel="noopener noreferrer"
                 style={{
