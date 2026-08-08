@@ -1,0 +1,602 @@
+TRADING SYSTEM PROFITABILITY AUDIT — PHASE 0
+
+READ-ONLY DISCOVERY — DO NOT IMPLEMENT YET
+
+We are changing the development priority of this trading platform.
+
+The primary objective is now:
+
+PROVE PROFITABLE EDGE → VALIDATE IT → PROMOTE IT → MONITOR IT → DEMOTE IT IF THE EDGE DISAPPEARS
+
+We are NOT adding another strategy, indicator, scoring model, AI trading concept, or execution feature in this phase.
+
+This phase is an audit of the EXISTING system.
+
+ABSOLUTE SAFETY RULES
+
+Do NOT:
+
+* modify Databento ingestion
+* replace or alter Databento as the primary market-data source
+* modify live execution behavior
+* modify TradersPost/execution routing
+* modify prop-firm protections
+* modify existing strategy logic
+* modify stops or targets
+* modify signal thresholds
+* modify edge/confidence scoring
+* modify Left Brain or Right Brain behavior
+* enable additional live trading
+* disable existing safety systems
+* create database migrations
+* refactor unrelated code
+* optimize strategies
+* tune strategies based on historical results
+* write production code yet
+
+This is READ-ONLY discovery.
+
+Do not make assumptions about what already exists.
+
+Inspect the repository and tell me exactly what is already implemented.
+
+⸻
+
+1. MAP THE COMPLETE TRADING PIPELINE
+
+Trace the actual production path from:
+
+Databento market data
+
+→ normalized market state
+
+→ strategy evaluation
+
+→ candidate/setup generation
+
+→ scoring/gating
+
+→ trade decision
+
+→ risk/prop checks
+
+→ execution routing
+
+→ broker/TradersPost
+
+→ trade lifecycle
+
+→ close
+
+→ journal/performance/learning
+
+For every stage identify:
+
+1. file
+2. class/function
+3. input
+4. output
+5. database model/table involved
+6. whether it affects live execution
+7. whether it can operate in simulation/ghost mode
+
+Produce an ASCII architecture diagram of the current pipeline.
+
+Do not redesign it yet.
+
+⸻
+
+2. INVENTORY EVERY STRATEGY
+
+Find EVERY trading strategy in the repository.
+
+Do not rely on dashboard labels.
+
+Search actual code, registries, enums, configuration, backtesting systems, research systems, scalp systems, swing systems, legacy systems, and execution systems.
+
+Produce a canonical strategy inventory.
+
+For each strategy report:
+
+* canonical strategy ID
+* display name
+* implementation file
+* implementation function/class
+* markets it supports
+* sessions/time restrictions
+* LONG support
+* SHORT support
+* live eligible?
+* ghost/paper eligible?
+* backtest eligible?
+* currently enabled?
+* which engine owns it
+* whether duplicate implementations exist
+* whether the strategy shown in the UI matches the actual executable strategy
+
+I want to know exactly how many strategies truly exist.
+
+⸻
+
+3. INVENTORY GHOST/PAPER/SIMULATION INFRASTRUCTURE
+
+Search for everything resembling:
+
+* ghost trade
+* shadow trade
+* hypothetical trade
+* simulated trade
+* paper trade
+* research trade
+* candidate trade
+* backtest trade
+* virtual position
+* synthetic position
+* suggestion-only trade
+
+Determine whether the existing system can already do:
+
+SIGNAL → FROZEN ENTRY/STOP/TARGET → MARKET PLAYS OUT → RESULT RECORDED
+
+For every existing mechanism report:
+
+* where it lives
+* what creates the record
+* what fields are frozen at signal time
+* how entry is determined
+* how stop is determined
+* how targets are determined
+* how the trade is marked closed
+* whether actual Databento prices are used
+* whether commissions are modeled
+* whether slippage is modeled
+* whether MAE is recorded
+* whether MFE is recorded
+* whether R result is recorded
+* whether strategy ID is recorded
+* whether instrument is recorded
+* whether session is recorded
+* whether market regime/context is recorded
+
+Most importantly:
+
+Can ghost trades continue running even when live risk controls prevent an actual order?
+
+We need research observations independent of whether the live account was permitted to trade.
+
+⸻
+
+4. AUDIT TRADE IMMUTABILITY
+
+Determine whether a historical ghost/simulated trade can accidentally change after it begins.
+
+We eventually need the original:
+
+* strategy
+* direction
+* signal timestamp
+* entry
+* stop
+* targets
+* risk
+* strategy parameters
+* relevant market context
+
+frozen at decision time.
+
+Inspect whether later strategy/configuration changes can retroactively alter historical results.
+
+Report any look-ahead bias or mutation risk.
+
+DO NOT FIX IT YET.
+
+⸻
+
+5. AUDIT PERFORMANCE MEASUREMENT
+
+Find every existing performance/analytics/learning system.
+
+Determine whether the platform currently calculates:
+
+* trade count
+* wins
+* losses
+* breakevens
+* win rate
+* average winner
+* average loser
+* average R
+* expectancy in R
+* profit factor
+* cumulative R
+* maximum drawdown in R
+* consecutive losses
+* MAE
+* MFE
+* commissions
+* slippage
+* net P&L
+
+Determine whether those metrics can be grouped by:
+
+strategy × instrument
+
+and whether they can additionally be segmented by:
+
+* session
+* time of day
+* LONG/SHORT
+* volatility
+* market regime
+* trend/range state
+* day of week
+
+Do not create a new analytics engine if one already exists.
+
+Tell me exactly what we can reuse.
+
+⸻
+
+6. FIND EXISTING PROMOTION/DEMOTION LOGIC
+
+Search for anything resembling:
+
+* strategy promotion
+* probation
+* research-only
+* paper-only
+* live eligible
+* strategy weight
+* strategy disable
+* quarantine
+* demotion
+* minimum sample size
+* rolling expectancy
+* performance threshold
+* learning weight
+* strategy ranking
+
+Determine whether we already have anything approximating:
+
+RESEARCH
+↓
+PROBATION
+↓
+LIVE
+
+with the ability to return to:
+
+PROBATION
+or
+RESEARCH/DEMOTED
+
+Do NOT implement a new lifecycle yet.
+
+Map what already exists.
+
+⸻
+
+7. AUDIT IN-SAMPLE VS OUT-OF-SAMPLE CAPABILITY
+
+We must avoid proving a strategy using the same trades used to optimize it.
+
+Determine whether the existing system supports:
+
+* training/discovery periods
+* validation periods
+* holdout samples
+* walk-forward testing
+* strategy versioning
+* parameter versioning
+* configuration snapshots
+
+Identify whether we can freeze a strategy version and evaluate subsequent unseen trades without modifying its rules.
+
+Flag every place where optimization and validation currently contaminate each other.
+
+⸻
+
+8. AUDIT LIVE VS GHOST COMPARISON
+
+Determine whether the system can currently compare:
+
+THEORETICAL/GHOST TRADE
+
+against
+
+ACTUAL EXECUTED TRADE
+
+for the same setup.
+
+We eventually need to answer:
+
+Strategy expected: +X R
+
+Actual execution: +Y R
+
+Execution drag: X - Y
+
+Investigate whether trades currently contain enough IDs/timestamps/strategy metadata to pair them reliably.
+
+Check whether we can measure:
+
+* intended entry vs actual fill
+* intended exit vs actual exit
+* slippage
+* commissions
+* execution latency
+* missed trades
+* rejected trades
+* prop-rule blocked trades
+* risk-gate blocked trades
+* duplicate-gate blocked trades
+* position-sizing differences
+* partial-exit differences
+
+Do not implement it yet.
+
+⸻
+
+9. AUDIT MARKET CONTEXT SNAPSHOTS
+
+Determine what market context is already captured when a setup occurs.
+
+Look specifically for:
+
+* ATR
+* realized volatility
+* VWAP relationship
+* trend state
+* range state
+* structure
+* BOS/CHOCH
+* volume
+* delta/CVD
+* liquidity state
+* session
+* time of day
+* news state if available
+
+We DO NOT want to blindly add hundreds of features.
+
+Identify the smallest set of context variables already available that could later answer:
+
+WHEN does this strategy make money?
+
+⸻
+
+10. DETERMINE THE TRUE EXPERIMENT UNIT
+
+We do NOT want to assume an entire strategy is universally profitable.
+
+Evaluate whether the existing data architecture can measure:
+
+STRATEGY × INSTRUMENT
+
+and eventually:
+
+STRATEGY × INSTRUMENT × SESSION/REGIME
+
+Example:
+
+ORB × MNQ may be profitable.
+
+ORB × MGC may be unprofitable.
+
+Those must be treated as separate experiments.
+
+Determine what changes, if any, would eventually be required to support this cleanly.
+
+⸻
+
+11. AUDIT FOR FALSE PROFITABILITY
+
+Act like a hostile auditor.
+
+Look for anything capable of making results look better than reality.
+
+Specifically inspect for:
+
+* look-ahead bias
+* future candle leakage
+* using final candle values before candle close
+* unrealistic fills
+* fills through stops
+* ignoring bid/ask
+* missing commissions
+* missing slippage
+* survivorship bias
+* duplicate signals counted selectively
+* losing trades disappearing
+* unresolved trades excluded from statistics
+* changing stops/targets after entry
+* strategy parameters changing during evaluation
+* cherry-picked time windows
+* backtest/live data differences
+* timestamp/timezone mistakes
+* session-boundary mistakes
+* contract-roll problems
+* stale market data
+* incorrect futures tick values
+* incorrect contract multipliers
+
+Rank every discovered issue:
+
+CRITICAL
+HIGH
+MEDIUM
+LOW
+
+A CRITICAL issue means we cannot trust profitability numbers until it is fixed.
+
+⸻
+
+12. DO NOT LET AI OPINION BECOME PROFITABILITY EVIDENCE
+
+Audit whether AI/LLM-generated:
+
+* confidence
+* thesis
+* narrative
+* score
+* conviction
+* recommendation
+
+is currently mixed into performance measurement.
+
+AI may eventually help identify context.
+
+But profitability must ultimately be established from actual trade outcomes.
+
+Identify where subjective AI output and objective trade evidence are currently mixed.
+
+⸻
+
+13. DETERMINE OUR MINIMUM VIABLE EDGE LEDGER
+
+After inspecting everything that already exists, specify the SMALLEST possible canonical record necessary to prove edge.
+
+Conceptually we need something like:
+
+experiment_id
+strategy_id
+strategy_version
+instrument
+direction
+signal_time
+entry
+stop
+targets
+session
+context_snapshot
+MFE
+MAE
+gross_R
+cost_R
+net_R
+status
+source
+live_trade_id_if_any
+
+But DO NOT blindly implement this schema.
+
+First map every proposed field to existing tables/models.
+
+For every field classify:
+
+REUSE EXISTING
+EXTEND EXISTING
+NEW FIELD REQUIRED
+NOT NECESSARY
+
+Avoid duplicate databases and duplicate sources of truth.
+
+⸻
+
+14. DEFINE A POSSIBLE PROMOTION MODEL — DESIGN ONLY
+
+Based on the existing architecture, propose how we could eventually support:
+
+RESEARCH
+→ PROBATION
+→ LIVE
+→ DEMOTION
+
+Do not hard-code arbitrary profitability thresholds yet.
+
+A sample-size minimum alone is NOT proof of edge.
+
+The eventual system should consider:
+
+* sample size
+* net expectancy
+* uncertainty/confidence around expectancy
+* profit factor
+* drawdown
+* stability through time
+* out-of-sample results
+* transaction costs
+* recent degradation
+
+Describe the statistical approach you recommend.
+
+Do not implement it.
+
+⸻
+
+15. DEFINE CONTINUOUS SHADOW VALIDATION
+
+Even after something becomes LIVE, determine how the architecture could continue generating the corresponding ghost/shadow outcome.
+
+We want:
+
+SIGNAL
+├── SHADOW RESULT
+└── ACTUAL EXECUTION RESULT
+
+This allows us to separate:
+
+STRATEGY EDGE
+
+from
+
+EXECUTION QUALITY
+
+Explain how this can be added with the least possible change to the current execution system.
+
+Again: DESIGN ONLY.
+
+⸻
+
+16. DELIVERABLE
+
+Create:
+
+PROFITABILITY_AUDIT_PHASE_0.md
+
+The document must contain:
+
+1. Executive summary
+2. Current end-to-end architecture
+3. Complete strategy inventory
+4. Existing ghost/paper/simulation infrastructure
+5. Existing performance infrastructure
+6. Existing learning/promotion infrastructure
+7. Databento/data-path findings
+8. Trade immutability findings
+9. Look-ahead/data-leakage findings
+10. Cost/slippage realism findings
+11. Strategy × instrument measurement capability
+12. Session/regime measurement capability
+13. Out-of-sample capability
+14. Live-vs-shadow comparison capability
+15. Critical profitability-trust defects
+16. Reusable components
+17. Missing components
+18. Minimum viable Edge Ledger design
+19. Proposed promotion/demotion architecture
+20. Recommended implementation sequence
+
+Finish the report with a table:
+
+Capability	Exists	Partial	Missing	Trustworthy Today?	Recommended Action
+
+Then provide:
+
+TOP 10 PROFITABILITY BLOCKERS
+
+Rank the ten biggest reasons we currently cannot prove that this system has a durable positive expectancy.
+
+Then:
+
+MINIMUM BUILD
+
+Give me the smallest implementation plan necessary to go from the current system to:
+
+Every valid setup → ghost observation → immutable outcome → net R → grouped expectancy → out-of-sample validation → promotion eligibility → continuous shadow monitoring.
+
+Do not implement that plan.
+
+STOP after producing the audit.
+
+I want to review the findings before any code changes are made.
