@@ -25911,6 +25911,7 @@ def build_main_brain_payload(result, instrument=None):
         "prop_firm":         prop_firm_snap,
         "volatility_intelligence": (result or {}).get("volatility_intelligence"),
         "fvg_summary":       (result or {}).get("fvg_summary"),
+        "fvg_sequences":     (result or {}).get("fvg_sequences"),
         "availability":      availability,
         "errors":            errors,
     }
@@ -27740,6 +27741,15 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     except Exception as _fvg_fa_exc:
         logger.debug("full_analysis FVG seam: %s", _fvg_fa_exc)
 
+    # FVG/IFVG sequence engine seam — shadow/display-only sequence state per instrument.
+    # Key absent when engine not yet initialised → goldens byte-identical. Fail-open.
+    # NEVER modifies gate, edge score, sizing, or execution.
+    try:
+        import fvg_sequence_engine as _fse_mod  # noqa: PLC0415
+        result["fvg_sequences"] = _fse_mod.get_all_summary()
+    except Exception as _fse_fa_exc:
+        logger.debug("full_analysis FVG sequence seam: %s", _fse_fa_exc)
+
     # V1 Manager and Coach Interface objects — additive, read-only status objects.
     # Builders read existing runtime state and carry _version = "v1".
     # No gate, scoring, or execution logic is touched.
@@ -28902,15 +28912,27 @@ def _dominant_direction(outlook: dict) -> str:
 
 
 def _fvg_bar_close(inst: str, price: float) -> None:
-    """Feed the FVG Engine on every Databento 1m bar close.
+    """Feed the FVG Engine and Sequence Engine on every Databento 1m bar close.
     Shadow/display-only — NEVER touches gate, scoring, sizing, or execution."""
     def _run():
         try:
-            import fvg_engine as _fvg                          # noqa: PLC0415
+            import fvg_engine as _fvg                           # noqa: PLC0415
+            import fvg_sequence_engine as _fse                  # noqa: PLC0415
             from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
             bars = list(DATABENTO_BARS_BY_INST.get(inst, []))
             if len(bars) >= 3:
                 _fvg.process_bar_close(inst, bars)
+                zones = _fvg.get_zones(inst, include_terminal=True)
+                # Safe reads — CVD_BY_TICKER and ALERT_HISTORY are module globals;
+                # list() snapshot of ALERT_HISTORY is atomic under the GIL.
+                try:
+                    cvd_snap    = CVD_BY_TICKER.get(inst)
+                    alerts_snap = list(ALERT_HISTORY)
+                except Exception:
+                    cvd_snap    = None
+                    alerts_snap = []
+                _fse.process_bar_close(inst, bars, zones,
+                                       cvd=cvd_snap, alert_history=alerts_snap)
         except Exception as _fvg_exc:
             logger.debug("FVG bar-close (%s): %s", inst, _fvg_exc)
     threading.Thread(target=_run, daemon=True, name=f"fvg-scan-{inst}").start()
@@ -41579,6 +41601,7 @@ def get_main_brain_chart():
         "active_trade":    active_trade_data,
         "left_brain":      lb_meta,
         "fvg_zones":       _fvg_chart_zones_safe(inst),
+        "fvg_sequences":   _fvg_seq_chart_data_safe(inst),
         "telemetry":       DATABENTO_STATUS.get("instruments", {}).get(inst, {}),
     })
 
@@ -75413,6 +75436,16 @@ def _fvg_chart_zones_safe(inst: str) -> list:
         return []
 
 
+def _fvg_seq_chart_data_safe(inst: str) -> list:
+    """Return FVG/IFVG sequence chart-overlay data for one instrument. Fail-open → [].
+    SHADOW/DISPLAY-ONLY — used only for chart annotation, never gates or execution."""
+    try:
+        import fvg_sequence_engine as _fse  # noqa: PLC0415
+        return _fse.get_chart_data(inst)
+    except Exception:
+        return []
+
+
 @app.route("/fvg/zones", methods=["GET"])
 def fvg_zones_endpoint():
     """FVG / IFVG zone list for one instrument (SHADOW/DISPLAY-ONLY).
@@ -75453,6 +75486,39 @@ def fvg_summary_endpoint():
         return jsonify({"ok": True, **_fvg.get_summary()}), 200
     except Exception as exc:
         logger.warning("/fvg/summary error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
+@app.route("/fvg/sequences", methods=["GET"])
+def fvg_sequences_endpoint():
+    """FVG/IFVG shadow sequence states per instrument (SHADOW/DISPLAY-ONLY).
+    Query params: inst (optional — omit for all instruments),
+                  include_terminal (0/1, default 0).
+    Auth handled by Express proxy (route in BOT1_ROUTES, NOT in OPEN_PATHS).
+    NEVER touches gate, edge score, sizing, or execution.
+    No @_owner_required because the decorator is defined later in the file;
+    Express proxy authentication is sufficient (same pattern as /volatility-intelligence)."""
+    inst             = (request.args.get("inst") or request.args.get("ticker") or "").upper().strip()
+    include_terminal = request.args.get("include_terminal", "0") not in ("0", "false", "no")
+    try:
+        import fvg_sequence_engine as _fse  # noqa: PLC0415
+        if inst:
+            if inst not in INSTRUMENT_SPECS:
+                return jsonify({"ok": False, "error": f"Unknown instrument: {inst}"}), 400
+            sequences = _fse.get_sequences(inst, include_terminal=include_terminal)
+            summary   = _fse.get_summary(inst)
+        else:
+            sequences = {i: _fse.get_sequences(i, include_terminal=include_terminal)
+                         for i in INSTRUMENT_SPECS}
+            summary   = _fse.get_all_summary()
+        return jsonify({
+            "ok":        True,
+            "instrument": inst or "ALL",
+            "sequences": sequences,
+            "summary":   summary,
+        }), 200
+    except Exception as exc:
+        logger.warning("/fvg/sequences error: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 200
 
 
@@ -78115,6 +78181,14 @@ if __name__ == "__main__":
             _fvg_boot.check_fvg_db_ready()
         except Exception as _fvg_boot_exc:
             logger.warning("FVG Engine boot probe failed: %s", _fvg_boot_exc)
+        # FVG Sequence Engine boot probe — fvg_shadow_sequences table created via DB tool.
+        # SHADOW/DISPLAY-ONLY. FAIL-OPEN: if the table is missing, sequences are tracked
+        # in-memory only. Never touches gate, scoring, sizing, or execution.
+        try:
+            import fvg_sequence_engine as _fse_boot  # noqa: PLC0415
+            _fse_boot.check_fvg_seq_db_ready()
+        except Exception as _fse_boot_exc:
+            logger.warning("FVG Sequence Engine boot probe failed: %s", _fse_boot_exc)
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     if LEARNING_DB_ENABLED:

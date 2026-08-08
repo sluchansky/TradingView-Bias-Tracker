@@ -78,6 +78,27 @@ interface ChartConnection {
   error: string | null;
 }
 
+interface FvgZoneOverlay {
+  fvg_id:       string;
+  direction:    "BULLISH" | "BEARISH";
+  lower:        number;
+  upper:        number;
+  status:       string;
+  is_ifvg?:     boolean;
+  rank_score?:  number;
+}
+
+interface FvgSequenceOverlay {
+  fvg_id:        string;
+  direction:     "BULLISH" | "BEARISH";
+  setup_family:  string;
+  current_state: string;
+  zone_lower:    number;
+  zone_upper:    number;
+  is_primary?:   boolean;
+  entry_window_label?: string;
+}
+
 interface ChartResponse {
   ok: boolean;
   enabled: boolean;
@@ -94,6 +115,8 @@ interface ChartResponse {
   structure_events?: StructureEvent[];
   active_trade?: ActiveTrade | null;
   left_brain?: LeftBrainMeta | null;
+  fvg_zones?:      FvgZoneOverlay[];
+  fvg_sequences?:  FvgSequenceOverlay[];
   telemetry?: Record<string, unknown>;
 }
 
@@ -282,6 +305,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   const [showVwap,      setShowVwap]      = useState(true);
   const [showTrade,     setShowTrade]     = useState(true);
   const [showStructure, setShowStructure] = useState(true);
+  const [showFvg,       setShowFvg]       = useState(false);
   const [sseConnected,  setSseConnected]  = useState(false);
 
   // Derived chart height — tall mode used by Trade Desk section
@@ -302,9 +326,10 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   const volSeriesRef    = useRef<ISeriesApi<"Histogram"> | null>(null);
   const markersApiRef   = useRef<ISeriesMarkersPluginApi<Time> | null>(null);
 
-  // Price lines for active trade levels
+  // Price lines for active trade levels and FVG zone overlay
   type PriceLine = ReturnType<ISeriesApi<"Candlestick">["createPriceLine"]>;
   const tradeLinesRef   = useRef<PriceLine[]>([]);
+  const fvgLinesRef     = useRef<PriceLine[]>([]);
 
   const lastBarsRef     = useRef<ChartBar[]>([]);
   const inFlightRef     = useRef(false);
@@ -322,7 +347,8 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
     showVwap: boolean;
     showStructure: boolean;
     showTrade: boolean;
-  }>({ data: null, showVwap: true, showStructure: true, showTrade: true });
+    showFvg: boolean;
+  }>({ data: null, showVwap: true, showStructure: true, showTrade: true, showFvg: false });
   // True while an SSE connection is alive — suppresses the poll-driven partial
   // bar update (SSE has already rendered it tick-by-tick).
   const sseActiveRef    = useRef(false);
@@ -692,6 +718,69 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
         if (at.target2 != null) addLine(at.target2, "#86efac", "TP2");
       }
     }
+
+    // ── FVG / IFVG zone price-band overlay ──────────────────────────────────
+    // Shadow-only annotation — never affects gate or execution.
+    // Draws dashed horizontal price lines for upper and lower bounds of each
+    // active FVG/IFVG zone.  Only rendered when the FVG toggle is ON.
+    if (candleSeriesRef.current) {
+      // Always clear previous FVG lines first
+      for (const pl of fvgLinesRef.current) {
+        try { candleSeriesRef.current.removePriceLine(pl); } catch { /* gone */ }
+      }
+      fvgLinesRef.current = [];
+
+      const { showFvg: sf } = latestDisplayRef.current;
+      if (sf) {
+        const zones     = d.fvg_zones     ?? [];
+        const seqZones  = d.fvg_sequences ?? [];
+
+        // Build a set of fvg_ids that have a sequence in SHADOW_READY
+        const shadowReady = new Set(
+          seqZones.filter(s => s.current_state === "SHADOW_READY").map(s => s.fvg_id),
+        );
+
+        const addFvgLine = (
+          price: number,
+          color: string,
+          title: string,
+          style: number,
+        ) => {
+          if (!isFinite(price)) return;
+          try {
+            const pl = candleSeriesRef.current!.createPriceLine({
+              price,
+              color,
+              lineWidth: 1,
+              lineStyle: style,
+              axisLabelVisible: false,
+              title,
+            });
+            fvgLinesRef.current.push(pl);
+          } catch { /* ignore */ }
+        };
+
+        for (const z of zones) {
+          const isBull   = z.direction === "BULLISH";
+          const isIfvg   = !!z.is_ifvg;
+          const isReady  = shadowReady.has(z.fvg_id);
+          // Color: shadow-ready → green/red vivid; IFVG → pink; normal → indigo/rose
+          const baseColor = isReady
+            ? (isBull ? "#22c55e" : "#ef4444")
+            : isIfvg
+            ? "#ec4899"
+            : (isBull ? "#6366f1" : "#f43f5e");
+          // Opacity suffix in hex: ready=cc (~80%), others=66 (~40%)
+          const opacity   = isReady ? "cc" : "66";
+          const color     = `${baseColor}${opacity}`;
+          // Line style: ready → solid (0), ifvg → large-dashed (2), normal → dashed (1)
+          const style = isReady ? 0 : isIfvg ? 2 : 1;
+          const prefix = isReady ? "★" : isIfvg ? "⟳" : "";
+          addFvgLine(z.upper, color, `${prefix}${z.fvg_id.slice(-4)}U`, style);
+          addFvgLine(z.lower, color, `${prefix}${z.fvg_id.slice(-4)}L`, style);
+        }
+      }
+    }
   }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   // ── Create / destroy chart ────────────────────────────────────────────────
@@ -776,6 +865,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       volSeriesRef.current    = null;
       markersApiRef.current   = null;
       tradeLinesRef.current   = [];
+      fvgLinesRef.current     = [];
       lastBarsRef.current     = [];
     };
   }, [collapsed, chartH, applyDataToChart]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -784,9 +874,9 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   useEffect(() => {
     // Keep the ref current so applyDataToChart (called from createChart effect)
     // always has the latest values without needing to be re-created.
-    latestDisplayRef.current = { data, showVwap, showStructure, showTrade };
+    latestDisplayRef.current = { data, showVwap, showStructure, showTrade, showFvg };
     applyDataToChart();
-  }, [data, showVwap, showStructure, showTrade, applyDataToChart]);
+  }, [data, showVwap, showStructure, showTrade, showFvg, applyDataToChart]);
 
   // Clear stale chart data whenever the instrument changes so applyDataToChart
   // never renders the previous instrument's bars on top of the new feed.
@@ -905,6 +995,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
               <OverlayToggle label="VWAP"      active={showVwap}      onClick={() => setShowVwap(v => !v)} />
               <OverlayToggle label="TRADE"     active={showTrade}     onClick={() => setShowTrade(v => !v)} />
               <OverlayToggle label="STRUCTURE" active={showStructure} onClick={() => setShowStructure(v => !v)} />
+              <OverlayToggle label="FVG"       active={showFvg}       onClick={() => setShowFvg(v => !v)} />
             </div>
 
             {/* Actions */}

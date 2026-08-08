@@ -695,12 +695,211 @@ export function fmtEventDetail(v: unknown): string {
 // diagnosis.status is AVAILABLE and the market is genuinely contested.
 // ── FVG Scanner Panel (Step A — SHADOW/DISPLAY-ONLY) ─────────────────────────
 // Shows active Fair Value Gap / Inverse FVG zones per instrument.
-// Data from p.fvg_summary (injected at full_analysis seam via fvg_engine.py).
+// ── FVG/IFVG Scanner + Sequence Panel ─────────────────────────────────────────
+// Shows FVG zone summary (Step A) and live sequence state machine (Step B).
+// SHADOW/DISPLAY-ONLY. NEVER touches gate, scoring, sizing, or execution.
+
+const SEQ_STATE_COLOR: Record<string, string> = {
+  RETURN_PENDING:   '#64748b',
+  TOUCHED:          '#f59e0b',
+  HOLD_PENDING:     '#f59e0b',
+  HOLD_CONFIRMED:   '#10b981',
+  STRUCTURE_PENDING:'#6366f1',
+  MOMENTUM_PENDING: '#8b5cf6',
+  ENTRY_WINDOW:     '#06b6d4',
+  SHADOW_READY:     '#22c55e',
+  INVERTED:         '#ec4899',
+  RETEST_PENDING:   '#f59e0b',
+  RETESTED:         '#06b6d4',
+  EXPIRED:          '#374151',
+  INVALIDATED:      '#ef4444',
+};
+
+const SEQ_STATE_LABEL: Record<string, string> = {
+  RETURN_PENDING:   'Waiting for price to return',
+  TOUCHED:          'Zone touched',
+  HOLD_PENDING:     'Hold forming…',
+  HOLD_CONFIRMED:   'Hold confirmed ✓',
+  STRUCTURE_PENDING:'Awaiting structure signal',
+  MOMENTUM_PENDING: 'Awaiting momentum',
+  ENTRY_WINDOW:     'Entry window open',
+  SHADOW_READY:     '✦ SHADOW READY',
+  INVERTED:         'FVG inverted (IFVG)',
+  RETEST_PENDING:   'Awaiting IFVG retest',
+  RETESTED:         'Retest confirmed ✓',
+  EXPIRED:          'Expired',
+  INVALIDATED:      'Invalidated',
+};
+
+const SEQUENCE_STEPS_CONT = [
+  'RETURN_PENDING', 'TOUCHED', 'HOLD_CONFIRMED',
+  'STRUCTURE_PENDING', 'MOMENTUM_PENDING', 'ENTRY_WINDOW', 'SHADOW_READY',
+];
+const SEQUENCE_STEPS_REV = [
+  'INVERTED', 'RETEST_PENDING', 'RETESTED', 'HOLD_CONFIRMED',
+  'STRUCTURE_PENDING', 'MOMENTUM_PENDING', 'ENTRY_WINDOW', 'SHADOW_READY',
+];
+
+const EW_COLOR: Record<string, string> = {
+  ENTRY_AVAILABLE: '#22c55e',
+  ENTRY_LATE:      '#f59e0b',
+  ENTRY_CHASING:   '#ef4444',
+  ENTRY_EXPIRED:   '#6b7280',
+};
+
+type SeqRec = Record<string, unknown>;
+
+function SeqCard({ seq }: { seq: SeqRec }) {
+  const dir      = seq['direction'] as string;
+  const family   = seq['setup_family'] as string;
+  const state    = seq['current_state'] as string;
+  const isPrimary = !!seq['is_primary'];
+  const isShadow  = state === 'SHADOW_READY';
+  const isReversal= family === 'IFVG_REVERSAL';
+  const dirColor  = dir === 'BULLISH' ? '#10b981' : '#ef4444';
+  const dirArrow  = dir === 'BULLISH' ? '▲' : '▼';
+  const sColor    = SEQ_STATE_COLOR[state] ?? '#6b7280';
+  const steps     = isReversal ? SEQUENCE_STEPS_REV : SEQUENCE_STEPS_CONT;
+  const stateIdx  = steps.indexOf(state);
+
+  const lower     = typeof seq['zone_lower']  === 'number' ? (seq['zone_lower']  as number).toFixed(2) : '—';
+  const upper     = typeof seq['zone_upper']  === 'number' ? (seq['zone_upper']  as number).toFixed(2) : '—';
+  const nextEvt   = seq['next_required_event'] as string | undefined;
+  const momCount  = seq['momentum_checks_passed'] as number | undefined;
+  const momTotal  = seq['momentum_checks_total']  as number | undefined;
+  const ewLabel   = seq['entry_window_label']  as string | undefined;
+  const ew        = seq['entry_window']        as SeqRec | undefined;
+
+  const exWhy    = (seq['explain_why'] ?? {}) as SeqRec;
+  const plan     = seq['shadow_plan'] as SeqRec | undefined;
+
+  const [showDetail, setShowDetail] = React.useState(false);
+
+  return (
+    <div style={{
+      borderRadius: 7, padding: '10px 12px',
+      background: isShadow ? 'rgba(34,197,94,0.06)' : 'rgba(255,255,255,0.04)',
+      border: `1px solid ${sColor}${isPrimary ? '80' : '30'}`,
+      marginBottom: 8,
+    }}>
+      {/* Header row */}
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, color: dirColor }}>{dirArrow}</span>
+        <span style={{ fontSize: 11, fontWeight: 700, color: '#c4cfe4' }}>
+          {dir === 'BULLISH' ? 'LONG' : 'SHORT'}
+        </span>
+        {isReversal && (
+          <span style={{ fontSize: 9, color: '#ec4899', fontWeight: 700, letterSpacing: '0.05em' }}>
+            IFVG
+          </span>
+        )}
+        {isPrimary && (
+          <span style={{ fontSize: 9, color: '#6366f1', fontWeight: 700, letterSpacing: '0.04em' }}>
+            PRIMARY
+          </span>
+        )}
+        <span style={{ marginLeft: 'auto', fontSize: 10, color: sColor, fontWeight: 700 }}>
+          {isShadow ? '✦ SHADOW READY' : (SEQ_STATE_LABEL[state] ?? state)}
+        </span>
+      </div>
+
+      {/* Zone bounds */}
+      <div style={{ fontSize: 11, color: '#94a3b8', marginBottom: 6, fontVariantNumeric: 'tabular-nums' }}>
+        Zone {lower} – {upper}
+      </div>
+
+      {/* Step progress bar */}
+      <div style={{ display: 'flex', gap: 3, marginBottom: 8, flexWrap: 'wrap' }}>
+        {steps.map((step, i) => {
+          const done    = stateIdx > i;
+          const current = stateIdx === i;
+          const sc      = SEQ_STATE_COLOR[step] ?? '#64748b';
+          return (
+            <div key={step} title={SEQ_STATE_LABEL[step] ?? step} style={{
+              height: 5, flex: 1, minWidth: 12,
+              borderRadius: 3,
+              background: done    ? sc :
+                          current ? `${sc}cc` :
+                          'rgba(255,255,255,0.08)',
+              transition: 'background 0.3s',
+            }} />
+          );
+        })}
+      </div>
+
+      {/* Momentum count */}
+      {momCount !== undefined && momTotal !== undefined && (
+        <div style={{ fontSize: 10, color: '#64748b', marginBottom: 4 }}>
+          Momentum: {momCount}/{momTotal} checks passed
+        </div>
+      )}
+
+      {/* Entry window */}
+      {ewLabel && (
+        <div style={{ fontSize: 10, color: EW_COLOR[ewLabel] ?? '#64748b', marginBottom: 4, fontWeight: 600 }}>
+          Entry: {ewLabel.replace('ENTRY_', '')}
+          {ew && typeof ew['seconds_open'] === 'number' && (
+            <span style={{ fontWeight: 400, color: '#475569', marginLeft: 6 }}>
+              {Math.round(ew['seconds_open'] as number)}s open
+            </span>
+          )}
+        </div>
+      )}
+
+      {/* Next required event */}
+      {nextEvt && !isShadow && (
+        <div style={{ fontSize: 10, color: '#475569', marginBottom: 4 }}>
+          Next: <span style={{ color: '#94a3b8' }}>{nextEvt}</span>
+        </div>
+      )}
+
+      {/* Shadow plan snippet */}
+      {isShadow && plan && (
+        <div style={{ marginTop: 6, padding: '6px 8px', borderRadius: 5,
+          background: 'rgba(34,197,94,0.08)', border: '1px solid rgba(34,197,94,0.25)',
+          fontSize: 10, color: '#86efac' }}>
+          <div style={{ fontWeight: 700, marginBottom: 3, color: '#22c55e' }}>Shadow Plan</div>
+          <div style={{ fontVariantNumeric: 'tabular-nums', color: '#94a3b8' }}>
+            Entry {typeof plan['entry'] === 'number' ? (plan['entry'] as number).toFixed(2) : '—'}
+            {' · Stop '}  {typeof plan['stop']   === 'number' ? (plan['stop']   as number).toFixed(2) : '—'}
+            {' · 1R '}    {typeof plan['target1'] === 'number' ? (plan['target1'] as number).toFixed(2) : '—'}
+          </div>
+          <div style={{ marginTop: 3, color: '#6b7280' }}>
+            Shadow-only · production_ready=false
+          </div>
+        </div>
+      )}
+
+      {/* Explain-why toggle */}
+      <div
+        style={{ marginTop: 6, fontSize: 10, color: '#475569', cursor: 'pointer',
+          textDecoration: 'underline', textUnderlineOffset: 2 }}
+        onClick={() => setShowDetail(v => !v)}
+      >
+        {showDetail ? '▲ hide analysis' : '▼ why?'}
+      </div>
+      {showDetail && (
+        <div style={{ marginTop: 6, fontSize: 10, color: '#64748b',
+          padding: '6px 8px', borderRadius: 5,
+          background: 'rgba(0,0,0,0.25)', border: '1px solid rgba(255,255,255,0.06)' }}>
+          {exWhy['why_ready']  && <div style={{ color: '#22c55e', marginBottom: 3 }}>✓ {String(exWhy['why_ready'])}</div>}
+          {exWhy['why_not_ready'] && <div style={{ color: '#f59e0b', marginBottom: 3 }}>⊘ {String(exWhy['why_not_ready'])}</div>}
+          {exWhy['why_exists'] && <div style={{ color: '#64748b' }}>ℹ {String(exWhy['why_exists'])}</div>}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// Data from p.fvg_summary (Step A) + p.fvg_sequences (Step B).
 // Panel hidden when key absent (engine disabled). NEVER touches gate or execution.
 const FVGScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   if (!('fvg_summary' in p)) return null;
   const summary = (p.fvg_summary ?? {}) as Record<string, unknown>;
   if (!summary['enabled']) return null;
+
+  // Step B sequence data (optional — falls back gracefully when absent)
+  const seqData = (p.fvg_sequences ?? {}) as Record<string, unknown>;
 
   const STATUS_COLOR: Record<string, string> = {
     ACTIVE:    '#6366f1',
@@ -735,17 +934,24 @@ const FVGScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     <div className="mod" id="fvg-scanner-panel">
       <div className="mod-h" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
         <span style={{ fontSize: 11, opacity: 0.5 }}>◆</span>
-        <span>FVG / IFVG Scanner</span>
+        <span>FVG / IFVG Scanner + Sequences</span>
         <span style={{ marginLeft: 'auto', fontSize: 10, color: '#6366f1', letterSpacing: '0.05em' }}>SHADOW</span>
       </div>
-      <div style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+      <div style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 14 }}>
         {instruments.map(inst => {
-          const data = summary[inst] as Record<string, unknown>;
+          const data      = summary[inst] as Record<string, unknown>;
           const allActive = (data['all_active'] as unknown[]) ?? [];
           const fvgCount  = (data['active_fvg_count'] as number) ?? 0;
           const ifvgCount = (data['active_ifvg_count'] as number) ?? 0;
           const bestBull  = data['best_bullish'] as Record<string, unknown> | null;
           const bestBear  = data['best_bearish'] as Record<string, unknown> | null;
+
+          // Step B: sequences for this instrument
+          const instSeqData = (seqData[inst] ?? {}) as Record<string, unknown>;
+          const primarySeqs = (instSeqData['primary_sequences'] as SeqRec[]) ?? [];
+          const allSeqs     = (instSeqData['all_sequences']     as SeqRec[]) ?? [];
+          const nonPrimary  = allSeqs.filter(s => !s['is_primary']);
+          const hasShadowReady = primarySeqs.some(s => s['current_state'] === 'SHADOW_READY');
 
           const renderZoneCard = (zone: Record<string, unknown> | null, label: string) => {
             if (!zone) return (
@@ -798,7 +1004,8 @@ const FVGScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
           return (
             <div key={inst}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+              {/* Instrument header */}
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
                 <span style={{ fontSize: 11, fontWeight: 700, color: '#c4cfe4', letterSpacing: '0.04em' }}>
                   {inst}
                 </span>
@@ -809,14 +1016,38 @@ const FVGScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                 {!fvgCount && !ifvgCount && (
                   <span style={{ fontSize: 10, color: '#475569', fontStyle: 'italic' }}>no active zones</span>
                 )}
+                {hasShadowReady && (
+                  <span style={{ marginLeft: 'auto', fontSize: 10, color: '#22c55e', fontWeight: 700,
+                    letterSpacing: '0.04em' }}>✦ SHADOW READY</span>
+                )}
               </div>
-              <div style={{ display: 'flex', gap: 8 }}>
+
+              {/* Step A: zone cards */}
+              <div style={{ display: 'flex', gap: 8, marginBottom: primarySeqs.length ? 10 : 0 }}>
                 {renderZoneCard(bestBull, 'Best Long')}
                 {renderZoneCard(bestBear, 'Best Short')}
               </div>
-              {allActive.length > 2 && (
+              {allActive.length > 2 && !primarySeqs.length && (
                 <div style={{ marginTop: 6, fontSize: 10, color: '#475569', paddingLeft: 2 }}>
                   +{allActive.length - 2} more active zone{allActive.length - 2 !== 1 ? 's' : ''} by rank
+                </div>
+              )}
+
+              {/* Step B: primary sequence cards */}
+              {primarySeqs.length > 0 && (
+                <div style={{ marginTop: 8 }}>
+                  <div style={{ fontSize: 10, color: '#475569', fontWeight: 600,
+                    letterSpacing: '0.06em', textTransform: 'uppercase', marginBottom: 6 }}>
+                    Active Sequences
+                  </div>
+                  {primarySeqs.map((seq, i) => (
+                    <SeqCard key={(seq['sequence_id'] as string) ?? i} seq={seq} />
+                  ))}
+                  {nonPrimary.length > 0 && (
+                    <div style={{ fontSize: 10, color: '#374151', marginTop: 2 }}>
+                      +{nonPrimary.length} secondary sequence{nonPrimary.length !== 1 ? 's' : ''} tracked
+                    </div>
+                  )}
                 </div>
               )}
             </div>

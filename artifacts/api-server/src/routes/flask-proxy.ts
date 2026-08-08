@@ -175,6 +175,7 @@ export const BOT1_ROUTES = [
   // sizing, or execution — purely observational.
   "/fvg/zones",
   "/fvg/summary",
+  "/fvg/sequences",
   "/advisor",
   "/pro-review",
   "/trade-debate",
