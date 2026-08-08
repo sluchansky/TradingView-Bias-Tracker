@@ -70,6 +70,7 @@
 - [LIVE 2-contract runner + trade-mgmt suite](live-two-contract-runner.md) — flag-gated default-OFF; runner fires only after primary 2xx; RUNNER_MODE trail|be_2r; primary TP forced to 1R for be_2r; node --check the SERVED dashboard <script>.
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
+- [FVG Engine Step A](fvg-engine-step-a.md) — all-day FVG/IFVG scanner (shadow/display-only); 3 engine bugs documented; IFVG direction semantics; fixture ATR ratio trap; `@_owner_required` undefined before line 75400.
 - [Main Brain cognitive layer](main-brain-cognitive.md) — 7 display-only keys at full_analysis seam (mirror in closed-override); _mb_cached None→coerce neutral; heartbeat capture fail-open, never gates.
 - [Scalp strategy advisory ("potential trades")](scalp-strategy-advisory.md) — DISPLAY-ONLY Main-Brain layer ranking 16 research scalp strategies; votes come from scalp_live_sim.diagnose_strategies; NEVER a money path; flag-OFF byte-identical.
 - [Learning influences live scoring](learning-score-influence.md) — master-flag bounded ±15 Edge-Score adjust; MUST fold inside _analysis_edge_breakdown; ONLY when eb.score>0 (hard-block 0 must not resurrect); OFF byte-identical.

@@ -25910,6 +25910,7 @@ def build_main_brain_payload(result, instrument=None):
         "candidate_preview": candidate_preview,
         "prop_firm":         prop_firm_snap,
         "volatility_intelligence": (result or {}).get("volatility_intelligence"),
+        "fvg_summary":       (result or {}).get("fvg_summary"),
         "availability":      availability,
         "errors":            errors,
     }
@@ -27728,6 +27729,17 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     except Exception as _vi_fa_exc:
         logger.debug("full_analysis vol-intel seam: %s", _vi_fa_exc)
 
+    # ── FVG / IFVG scanner seam (Step A — SHADOW/DISPLAY-ONLY) ───────────────
+    # Attaches per-instrument FVG summary to the result for dashboard display.
+    # Key absent when engine disabled → goldens byte-identical. Fail-open.
+    # NEVER modifies gate, edge score, sizing, or execution.
+    try:
+        import fvg_engine as _fvg_mod  # noqa: PLC0415
+        if _fvg_mod.FVG_ENGINE_ENABLED:
+            result["fvg_summary"] = _fvg_mod.get_summary()
+    except Exception as _fvg_fa_exc:
+        logger.debug("full_analysis FVG seam: %s", _fvg_fa_exc)
+
     # V1 Manager and Coach Interface objects — additive, read-only status objects.
     # Builders read existing runtime state and carry _version = "v1".
     # No gate, scoring, or execution logic is touched.
@@ -28887,6 +28899,21 @@ def _dominant_direction(outlook: dict) -> str:
     if s_pts > l_pts and s_pts > n_pts:
         return "SHORT"
     return "NEUTRAL"
+
+
+def _fvg_bar_close(inst: str, price: float) -> None:
+    """Feed the FVG Engine on every Databento 1m bar close.
+    Shadow/display-only — NEVER touches gate, scoring, sizing, or execution."""
+    def _run():
+        try:
+            import fvg_engine as _fvg                          # noqa: PLC0415
+            from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
+            bars = list(DATABENTO_BARS_BY_INST.get(inst, []))
+            if len(bars) >= 3:
+                _fvg.process_bar_close(inst, bars)
+        except Exception as _fvg_exc:
+            logger.debug("FVG bar-close (%s): %s", inst, _fvg_exc)
+    threading.Thread(target=_run, daemon=True, name=f"fvg-scan-{inst}").start()
 
 
 def _databento_bar_scan(inst: str, price: float) -> None:
@@ -41551,6 +41578,7 @@ def get_main_brain_chart():
         "structure_events": structure_events,
         "active_trade":    active_trade_data,
         "left_brain":      lb_meta,
+        "fvg_zones":       _fvg_chart_zones_safe(inst),
         "telemetry":       DATABENTO_STATUS.get("instruments", {}).get(inst, {}),
     })
 
@@ -75376,6 +75404,58 @@ def swing_analysis_v2():
     return jsonify(sv2), 200
 
 
+def _fvg_chart_zones_safe(inst: str) -> list:
+    """Return FVG chart-overlay zones for one instrument. Fail-open → []."""
+    try:
+        import fvg_engine as _fvg  # noqa: PLC0415
+        return _fvg.get_chart_zones(inst)
+    except Exception:
+        return []
+
+
+@app.route("/fvg/zones", methods=["GET"])
+def fvg_zones_endpoint():
+    """FVG / IFVG zone list for one instrument (SHADOW/DISPLAY-ONLY).
+    Query params: inst (required), include_terminal (0/1, default 0).
+    Auth handled by Express proxy (route in BOT1_ROUTES, NOT in OPEN_PATHS).
+    NEVER touches gate, edge score, sizing, or execution."""
+    inst = (request.args.get("inst") or request.args.get("ticker") or "").upper().strip()
+    if inst and inst not in INSTRUMENT_SPECS:
+        return jsonify({"ok": False, "error": f"Unknown instrument: {inst}"}), 400
+    include_terminal = request.args.get("include_terminal", "0") not in ("0", "false", "no")
+    try:
+        import fvg_engine as _fvg  # noqa: PLC0415
+        if not inst:
+            # All instruments
+            zones = {i: _fvg.get_zones(i, include_terminal) for i in INSTRUMENT_SPECS}
+        else:
+            zones = _fvg.get_zones(inst, include_terminal)
+        return jsonify({
+            "ok":      True,
+            "instrument": inst or "ALL",
+            "zones":   zones,
+            "count":   len(zones) if isinstance(zones, list) else sum(len(v) for v in zones.values()),
+            "enabled": _fvg.FVG_ENGINE_ENABLED,
+        }), 200
+    except Exception as exc:
+        logger.warning("/fvg/zones error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
+@app.route("/fvg/summary", methods=["GET"])
+def fvg_summary_endpoint():
+    """FVG / IFVG per-instrument summary (SHADOW/DISPLAY-ONLY).
+    Returns best bullish/bearish zone per instrument + active counts.
+    Auth handled by Express proxy (route in BOT1_ROUTES, NOT in OPEN_PATHS).
+    NEVER touches gate, edge score, sizing, or execution."""
+    try:
+        import fvg_engine as _fvg  # noqa: PLC0415
+        return jsonify({"ok": True, **_fvg.get_summary()}), 200
+    except Exception as exc:
+        logger.warning("/fvg/summary error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
 @app.route("/volatility-intelligence", methods=["GET"])
 def volatility_intelligence_endpoint():
     """Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY).
@@ -78027,6 +78107,14 @@ if __name__ == "__main__":
         _restore_execution_enabled_from_db()       # restore execution_enabled from last enable/disable audit record (fail-open; safe default=False)
         _boot_snapshots_table()                    # probe internal_trade_snapshots (no DDL; created via DB tool/publish diff) — immutable send-time context for TradeZella matching
         _boot_native_journal_table()               # probe native_journal (no DDL; created via DB tool/publish diff) — canonical per-trade journal record (Phase A)
+        # FVG Engine boot probe — no DDL; fvg_zones table created via DB tool / publish schema-diff.
+        # SHADOW/DISPLAY-ONLY. FAIL-OPEN: if the table is missing, _DB_READY stays False and
+        # zones are tracked in-memory only (no persistence). Never touches gate or execution.
+        try:
+            import fvg_engine as _fvg_boot  # noqa: PLC0415
+            _fvg_boot.check_fvg_db_ready()
+        except Exception as _fvg_boot_exc:
+            logger.warning("FVG Engine boot probe failed: %s", _fvg_boot_exc)
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)
     _ensure_webhook_worker()                       # background webhook processor (fast ack to TradingView)
     if LEARNING_DB_ENABLED:
@@ -78062,6 +78150,7 @@ if __name__ == "__main__":
             _DATABENTO_BRAIN.register_bar_close_callback(_databento_bar_scan)
             _DATABENTO_BRAIN.register_structure_signal_callback(_databento_structure_trigger)
             _DATABENTO_BRAIN.register_tick_callback(_databento_tick_broadcast)
+            _DATABENTO_BRAIN.register_bar_close_callback(_fvg_bar_close)  # FVG engine (shadow/display-only)
             logger.info("DatabentoBrain: initialized and started")
         except Exception as _db_exc:
             logger.error("DatabentoBrain: failed to start — %s", _db_exc)

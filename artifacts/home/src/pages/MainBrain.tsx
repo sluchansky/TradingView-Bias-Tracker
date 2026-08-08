@@ -693,6 +693,140 @@ export function fmtEventDetail(v: unknown): string {
 //
 // NEVER shows "NEUTRAL" as a silent fallback — NEUTRAL is only shown when the
 // diagnosis.status is AVAILABLE and the market is genuinely contested.
+// ── FVG Scanner Panel (Step A — SHADOW/DISPLAY-ONLY) ─────────────────────────
+// Shows active Fair Value Gap / Inverse FVG zones per instrument.
+// Data from p.fvg_summary (injected at full_analysis seam via fvg_engine.py).
+// Panel hidden when key absent (engine disabled). NEVER touches gate or execution.
+const FVGScannerPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  if (!('fvg_summary' in p)) return null;
+  const summary = (p.fvg_summary ?? {}) as Record<string, unknown>;
+  if (!summary['enabled']) return null;
+
+  const STATUS_COLOR: Record<string, string> = {
+    ACTIVE:    '#6366f1',
+    TOUCHED:   '#f59e0b',
+    HOLDING:   '#10b981',
+    MITIGATED: '#8b5cf6',
+    INVERTED:  '#ec4899',
+    RETESTED:  '#06b6d4',
+    FAILED:    '#ef4444',
+    EXPIRED:   '#6b7280',
+  };
+  const STATUS_LABEL: Record<string, string> = {
+    ACTIVE:    'Active',
+    TOUCHED:   'Touched',
+    HOLDING:   'Holding ✓',
+    MITIGATED: '50% Fill',
+    INVERTED:  'Inverted (IFVG)',
+    RETESTED:  'Retested',
+    FAILED:    'Failed',
+    EXPIRED:   'Expired',
+  };
+
+  const instruments = Object.keys(summary).filter(k => k !== 'enabled' && k !== 'error');
+  if (!instruments.length) return (
+    <div className="mod" style={{ padding: '14px 16px', color: '#94a3b8', fontSize: 13 }}>
+      <strong style={{ color: '#c4cfe4', fontSize: 12, letterSpacing: '0.06em', textTransform: 'uppercase' }}>FVG Scanner</strong>
+      <div style={{ marginTop: 8 }}>No FVG zones detected yet — waiting for bar data</div>
+    </div>
+  );
+
+  return (
+    <div className="mod" id="fvg-scanner-panel">
+      <div className="mod-h" style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+        <span style={{ fontSize: 11, opacity: 0.5 }}>◆</span>
+        <span>FVG / IFVG Scanner</span>
+        <span style={{ marginLeft: 'auto', fontSize: 10, color: '#6366f1', letterSpacing: '0.05em' }}>SHADOW</span>
+      </div>
+      <div style={{ padding: '10px 14px', display: 'flex', flexDirection: 'column', gap: 12 }}>
+        {instruments.map(inst => {
+          const data = summary[inst] as Record<string, unknown>;
+          const allActive = (data['all_active'] as unknown[]) ?? [];
+          const fvgCount  = (data['active_fvg_count'] as number) ?? 0;
+          const ifvgCount = (data['active_ifvg_count'] as number) ?? 0;
+          const bestBull  = data['best_bullish'] as Record<string, unknown> | null;
+          const bestBear  = data['best_bearish'] as Record<string, unknown> | null;
+
+          const renderZoneCard = (zone: Record<string, unknown> | null, label: string) => {
+            if (!zone) return (
+              <div style={{ flex: 1, padding: '8px 10px', borderRadius: 6,
+                background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.07)',
+                color: '#475569', fontSize: 11 }}>
+                <div style={{ fontSize: 10, fontWeight: 600, marginBottom: 4, letterSpacing: '0.06em',
+                  textTransform: 'uppercase', color: '#475569' }}>{label}</div>
+                No zone
+              </div>
+            );
+            const dir   = (zone['ifvg_direction'] || zone['direction']) as string;
+            const lower = typeof zone['lower'] === 'number' ? zone['lower'].toFixed(2) : '—';
+            const upper = typeof zone['upper'] === 'number' ? zone['upper'].toFixed(2) : '—';
+            const mid   = typeof zone['midpoint'] === 'number' ? zone['midpoint'].toFixed(2) : '—';
+            const status= (zone['status'] as string) ?? 'ACTIVE';
+            const age   = (zone['bar_age'] as number) ?? 0;
+            const score = typeof zone['rank_score'] === 'number' ? zone['rank_score'].toFixed(0) : '—';
+            const isIfvg = !!zone['ifvg_direction'];
+            const sColor = STATUS_COLOR[status] ?? '#6b7280';
+            const dirColor = dir === 'BULLISH' ? '#10b981' : '#ef4444';
+            const dirArrow = dir === 'BULLISH' ? '▲' : '▼';
+            return (
+              <div style={{ flex: 1, padding: '8px 10px', borderRadius: 6,
+                background: 'rgba(255,255,255,0.04)',
+                border: `1px solid ${sColor}40` }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6, marginBottom: 5 }}>
+                  <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.06em',
+                    textTransform: 'uppercase', color: '#94a3b8' }}>{label}</span>
+                  {isIfvg && <span style={{ fontSize: 9, color: '#ec4899', fontWeight: 700,
+                    letterSpacing: '0.05em' }}>IFVG</span>}
+                  <span style={{ marginLeft: 'auto', fontSize: 10, color: dirColor,
+                    fontWeight: 700 }}>{dirArrow} {dir === 'BULLISH' ? 'LONG' : 'SHORT'}</span>
+                </div>
+                <div style={{ fontSize: 11, color: '#c4cfe4', marginBottom: 4, fontVariantNumeric: 'tabular-nums' }}>
+                  {lower} – {upper}
+                  <span style={{ color: '#64748b', marginLeft: 4 }}>mid {mid}</span>
+                </div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                  <span style={{ fontSize: 10, color: sColor, fontWeight: 600 }}>
+                    ● {STATUS_LABEL[status] ?? status}
+                  </span>
+                  <span style={{ fontSize: 10, color: '#475569', marginLeft: 'auto' }}>
+                    {age}b · {score}pts
+                  </span>
+                </div>
+              </div>
+            );
+          };
+
+          return (
+            <div key={inst}>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 6 }}>
+                <span style={{ fontSize: 11, fontWeight: 700, color: '#c4cfe4', letterSpacing: '0.04em' }}>
+                  {inst}
+                </span>
+                <span style={{ fontSize: 10, color: '#64748b' }}>
+                  {fvgCount} FVG{fvgCount !== 1 ? 's' : ''}
+                  {ifvgCount > 0 && ` · ${ifvgCount} IFVG`}
+                </span>
+                {!fvgCount && !ifvgCount && (
+                  <span style={{ fontSize: 10, color: '#475569', fontStyle: 'italic' }}>no active zones</span>
+                )}
+              </div>
+              <div style={{ display: 'flex', gap: 8 }}>
+                {renderZoneCard(bestBull, 'Best Long')}
+                {renderZoneCard(bestBear, 'Best Short')}
+              </div>
+              {allActive.length > 2 && (
+                <div style={{ marginTop: 6, fontSize: 10, color: '#475569', paddingLeft: 2 }}>
+                  +{allActive.length - 2} more active zone{allActive.length - 2 !== 1 ? 's' : ''} by rank
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+};
+
 // ── Volatility Intelligence Panel (Phase VI-E — DISPLAY-ONLY) ────────────────
 // Shows VIX regime, direction, risk tone, and per-instrument context.
 // Data from p.volatility_intelligence (injected at full_analysis seam).

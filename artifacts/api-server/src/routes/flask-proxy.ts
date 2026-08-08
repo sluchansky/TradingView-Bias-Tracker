@@ -168,6 +168,13 @@ export const BOT1_ROUTES = [
   // dashboard-auth OPEN_PATHS). Returns VIX regime/direction/risk-tone block.
   // Never touches gate, scoring, sizing, or execution.
   "/volatility-intelligence",
+  // FVG / IFVG Scanner (owner-only; SHADOW/DISPLAY-ONLY; NOT in dashboard-auth
+  // OPEN_PATHS). Runs the all-day FVG lifecycle engine on the Databento bar
+  // stream; surfaces zones, lifecycle states, and ranking scores for the Main
+  // Brain scanner panel and chart overlays. Never touches gate, edge score,
+  // sizing, or execution — purely observational.
+  "/fvg/zones",
+  "/fvg/summary",
   "/advisor",
   "/pro-review",
   "/trade-debate",

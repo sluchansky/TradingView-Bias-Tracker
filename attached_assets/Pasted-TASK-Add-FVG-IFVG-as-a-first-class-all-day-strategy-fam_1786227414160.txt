@@ -1,0 +1,698 @@
+TASK: Add FVG / IFVG as a first-class all-day strategy family inside the SCALP decision machine.
+
+CONTEXT
+
+The system currently relies heavily on structure, VWAP, liquidity, score components, and broad conflict logic.
+
+The operator wants more tradable all-day opportunities and believes Fair Value Gaps (FVG) and inverse FVGs (IFVG) are a better recurring setup family because they occur throughout the session.
+
+The goal is NOT to trade every FVG.
+
+The goal is to model a repeatable sequence:
+
+DISPLACEMENT
+→ FVG CREATED
+→ PRICE RETURNS
+→ HOLD OR FAILURE
+→ STRUCTURE/MOMENTUM CONFIRMATION
+→ ENTRY WINDOW
+→ READY
+
+For inverse FVG:
+
+FVG EXISTS
+→ PRICE INVALIDATES/CLOSES THROUGH
+→ FVG BECOMES IFVG
+→ RETEST FROM OPPOSITE SIDE
+→ HOLD
+→ STRUCTURE/MOMENTUM CONFIRMATION
+→ ENTRY WINDOW
+→ READY
+
+This should run all day across supported instruments.
+
+STRICT INITIAL SCOPE
+
+Begin in SHADOW / DIAGNOSTIC mode.
+
+Do not replace production decisions immediately.
+
+Do not modify:
+
+- Databento ingestion
+- bar construction
+- risk rules
+- TradersPost
+- execution gateway
+- learning formulas
+- Main Brain polling
+- authentication
+- active-trade management logic
+
+==================================================
+PART 1 — AUDIT CURRENT FVG SUPPORT
+==================================================
+
+Search the full codebase for:
+
+- FVG
+- fair value gap
+- imbalance
+- inverse FVG
+- IFVG
+- displacement
+- gap fill
+- mitigation
+- inversion
+- retest
+
+Report:
+
+- existing detector functions
+- existing strategy implementations
+- current score contribution
+- current UI fields
+- current historical storage
+- whether FVG is only a boolean or has zone geometry
+- whether inversion is already modeled
+
+Do not build duplicate detectors if canonical logic already exists.
+
+==================================================
+PART 2 — DEFINE CANONICAL FVG OBJECT
+==================================================
+
+Create or standardize one canonical FVG object.
+
+Suggested shape:
+
+{
+  "fvg_id": "...",
+  "instrument": "MNQ",
+  "direction": "BULLISH",
+  "created_at": "...",
+  "bar_index": 12345,
+  "lower": 24150.25,
+  "upper": 24157.75,
+  "midpoint": 24154.00,
+  "size_points": 7.50,
+  "size_atr": 0.38,
+  "source_timeframe": "1m",
+  "displacement_strength": 1.6,
+  "status": "ACTIVE",
+  "touch_count": 0,
+  "first_touch_at": null,
+  "mitigated_at": null,
+  "invalidated_at": null,
+  "inverted_at": null,
+  "parent_structure_id": null
+}
+
+Use actual project naming conventions.
+
+Do not fabricate unsupported fields.
+
+==================================================
+PART 3 — FVG DETECTION RULE
+==================================================
+
+Use the existing canonical definition if one exists.
+
+If no canonical definition exists, implement a deterministic three-candle imbalance detector.
+
+For bullish FVG:
+
+- candle 1 high < candle 3 low
+- middle candle demonstrates displacement
+- resulting zone = candle 1 high → candle 3 low
+
+For bearish FVG:
+
+- candle 1 low > candle 3 high
+- middle candle demonstrates displacement
+- resulting zone = candle 3 high → candle 1 low
+
+Add quality filters using existing data where appropriate:
+
+- minimum gap size
+- ATR-relative size
+- displacement strength
+- volume expansion
+- session relevance
+
+Do not tune numeric thresholds by intuition.
+
+Expose current values and make thresholds configurable.
+
+==================================================
+PART 4 — FVG LIFECYCLE
+==================================================
+
+Support:
+
+NEW
+ACTIVE
+TOUCHED
+MITIGATED
+HOLDING
+FAILED
+INVERTED
+RETESTED
+EXPIRED
+
+Definitions must be deterministic.
+
+Example:
+
+ACTIVE
+zone exists and has not been meaningfully revisited
+
+TOUCHED
+price enters the zone
+
+MITIGATED
+price trades sufficiently into the zone according to canonical rule
+
+HOLDING
+price interacts with the zone and rejects in original direction
+
+FAILED
+price closes through the invalidation boundary
+
+INVERTED
+failed FVG becomes valid opposite-direction IFVG candidate
+
+RETESTED
+price returns to the inverted zone from the opposite side
+
+EXPIRED
+zone aged out or became irrelevant
+
+Keep historical zones visible but separate from active trading state.
+
+==================================================
+PART 5 — FVG CONTINUATION SEQUENCE
+==================================================
+
+For bullish continuation:
+
+BULLISH DISPLACEMENT
+→ BULLISH FVG CREATED
+→ PRICE PULLS BACK INTO FVG
+→ FVG HOLDS
+→ BULLISH STRUCTURE CONFIRMS
+→ MOMENTUM RETURNS
+→ LONG ENTRY WINDOW
+
+Mirror for bearish.
+
+Canonical states:
+
+FVG_CREATED
+RETURN_PENDING
+FVG_TOUCHED
+HOLD_PENDING
+HOLD_CONFIRMED
+STRUCTURE_PENDING
+MOMENTUM_PENDING
+ENTRY_WINDOW
+READY
+EXPIRED
+INVALIDATED
+
+Do not allow an old structure event from before FVG creation to complete the sequence.
+
+Confirmation timestamps must occur after the FVG interaction.
+
+==================================================
+PART 6 — IFVG REVERSAL SEQUENCE
+==================================================
+
+For bullish IFVG:
+
+BEARISH FVG EXISTS
+→ PRICE CLOSES THROUGH / INVALIDATES IT UPWARD
+→ BEARISH FVG STATUS = INVERTED
+→ BULLISH IFVG CREATED
+→ PRICE RETESTS IFVG FROM ABOVE
+→ IFVG HOLDS
+→ BULLISH STRUCTURE CONFIRMS
+→ MOMENTUM CONFIRMS
+→ LONG ENTRY WINDOW
+
+Mirror for bearish.
+
+This is important:
+
+A failed FVG should not disappear.
+
+It should become historical evidence and, when rules are met, an opposite-direction IFVG candidate.
+
+==================================================
+PART 7 — INTEGRATE WITH THE 10-MINUTE CONFLICT SYSTEM
+==================================================
+
+FVG/IFVG evidence should help resolve stale opposing structure.
+
+Example:
+
+- bearish CHOCH occurred 7 minutes ago
+- bearish FVG then fails upward
+- price closes through it
+- bullish IFVG forms
+- bullish retest holds
+- bullish BOS confirms
+
+The old bearish structure should be eligible to transition:
+
+ACTIVE
+→ CHALLENGED
+→ OVERRIDDEN
+
+Do not automatically override solely because an IFVG exists.
+
+Require the canonical inversion + retest + confirmation sequence.
+
+Keep the 10-minute history window for explanation.
+
+Do not let overridden structure continue hard-blocking.
+
+==================================================
+PART 8 — ALIGNMENT AND CONTEXT
+==================================================
+
+For each FVG setup expose:
+
+- Left Brain thesis
+- structure direction
+- VWAP relation
+- order flow
+- selected level/range context
+- session
+- FVG direction
+- setup direction
+
+Classify:
+
+FULLY_ALIGNED
+MAJORITY_ALIGNED
+COUNTER_TREND
+CONFLICTED
+
+Counter-trend IFVG reversals may still qualify, but should require stronger confirmation than aligned continuation setups.
+
+Do not implement new production gates in the shadow phase.
+
+==================================================
+PART 9 — ENTRY WINDOW
+==================================================
+
+Do not enter simply because price touched an FVG.
+
+READY requires:
+
+- sequence complete
+- FVG/IFVG still valid
+- confirmation recent
+- momentum confirmed
+- price not chasing
+- stop valid
+- target not mostly consumed
+- data fresh
+- existing risk gates pass
+
+Track:
+
+- confirmation_price
+- current_price
+- entry_window_opened_at
+- age_seconds
+- distance_from_zone
+- distance_moved_since_confirmation
+- ATR distance
+- target_consumed_percent
+
+States:
+
+ENTRY_AVAILABLE
+ENTRY_LATE
+ENTRY_CHASING
+ENTRY_EXPIRED
+
+==================================================
+PART 10 — TARGET AND STOP CONTEXT
+==================================================
+
+Do not invent a new risk engine.
+
+Expose candidate locations based on canonical structure:
+
+Potential stop references:
+
+- opposite side of FVG
+- inversion boundary
+- sweep extreme
+- structural invalidation point
+
+Potential target references:
+
+- nearest opposing liquidity
+- prior swing
+- range boundary
+- next FVG
+- session high/low
+
+Use existing trade-plan/risk engine to choose final stop and targets.
+
+The FVG strategy only proposes structural context.
+
+==================================================
+PART 11 — ALL-DAY SCANNING
+==================================================
+
+Run the FVG/IFVG detector continuously during supported market sessions.
+
+Scan independently for:
+
+- MGC
+- MNQ
+- MES
+- MYM
+
+Track multiple historical FVGs, but limit active candidate ownership.
+
+Suggested policy:
+
+- keep multiple active zones
+- only one primary sequence per direction/instrument
+- select the most relevant zone using deterministic criteria
+- avoid duplicate candidates from overlapping zones
+
+Do not allow every FVG to create an alert.
+
+==================================================
+PART 12 — FVG RANKING
+==================================================
+
+Rank zones using contextual evidence, not arbitrary AI scoring.
+
+Possible factors:
+
+- gap size relative to ATR
+- displacement strength
+- freshness
+- first touch versus repeated touch
+- alignment with structure
+- alignment with thesis
+- VWAP relation
+- session relevance
+- liquidity location
+- distance from current price
+
+Expose the component values.
+
+Do not hide ranking behind a single unexplained confidence number.
+
+==================================================
+PART 13 — ALERT SEMANTICS
+==================================================
+
+Do not alert on every detected FVG.
+
+Use:
+
+INFORMATIONAL
+FVG CREATED
+
+DEVELOPING SETUP
+FVG RETURNING / IFVG FORMING
+
+ENTRY APPROACHING
+HOLD OR RETEST CONFIRMED
+
+READY TRADE
+ENTRY WINDOW OPEN + MOMENTUM CONFIRMED
+
+Each sequence/state should alert once.
+
+Duplicate ticks or bars must not re-alert unchanged state.
+
+==================================================
+PART 14 — MAIN BRAIN PANEL
+==================================================
+
+Add a section:
+
+FVG / IFVG SCANNER
+
+For each instrument show the best current setup.
+
+Example:
+
+MNQ
+
+BULLISH IFVG REVERSAL
+
+Original FVG:
+Bearish 24,160–24,168
+
+Invalidated:
+10:42:18
+
+IFVG:
+24,160–24,168
+
+Retest:
+CONFIRMED
+
+Structure:
+Bullish BOS ✓
+
+Momentum:
+PENDING
+
+STATE:
+MOMENTUM_PENDING
+
+ENTRY:
+NOT READY
+
+Or:
+
+STATE:
+ENTRY_WINDOW
+
+READY LONG
+
+Also show:
+
+- active FVG count
+- active IFVG count
+- nearest bullish FVG
+- nearest bearish FVG
+- zone age
+- touch count
+- current zone lifecycle
+
+==================================================
+PART 15 — CHART OVERLAYS
+==================================================
+
+Use the Databento live chart already in Main Brain.
+
+Add toggle:
+
+FVG / IFVG
+
+Display zones as price bands.
+
+Show:
+
+- bullish FVG
+- bearish FVG
+- inverted FVG
+- active
+- mitigated
+- expired
+
+Do not derive zones in React.
+
+Render canonical backend zones only.
+
+==================================================
+PART 16 — SHADOW PRACTICE
+==================================================
+
+Every detected sequence should be tracked in shadow mode.
+
+Persist:
+
+- fvg_id
+- setup family
+- direction
+- creation time
+- touch time
+- inversion time
+- retest time
+- confirmation time
+- hypothetical entry
+- stop
+- targets
+- MFE
+- MAE
+- hypothetical R
+- outcome
+- instrument
+- session
+- thesis alignment
+- regime
+
+Do not send orders.
+
+This becomes part of the 24/7 Strategy Practice Lab.
+
+==================================================
+PART 17 — STRATEGY STATUS
+==================================================
+
+Treat FVG strategies as separate playbooks:
+
+FVG_CONTINUATION
+IFVG_REVERSAL
+
+Initially:
+
+STATUS = SHADOW
+
+Future lifecycle:
+
+SHADOW
+→ PAPER
+→ RESTRICTED LIVE
+→ APPROVED LIVE
+
+Do not auto-promote based on a few samples.
+
+==================================================
+PART 18 — TESTS
+==================================================
+
+DETECTION
+
+1. Bullish FVG detected.
+2. Bearish FVG detected.
+3. No false FVG without gap.
+4. Gap boundaries correct.
+5. Duplicate bars do not duplicate FVG.
+
+LIFECYCLE
+
+6. Active FVG touched.
+7. Mitigation.
+8. Hold confirmed.
+9. Failure.
+10. Inversion.
+11. IFVG retest.
+12. Expiration.
+
+CONTINUATION
+
+13. Bullish continuation.
+14. Bearish continuation.
+15. Touch without hold remains pending.
+16. Momentum before touch does not count.
+
+IFVG
+
+17. Bullish IFVG reversal.
+18. Bearish IFVG reversal.
+19. Inversion without retest stays pending.
+20. Retest without momentum stays pending.
+
+CONFLICT
+
+21. Confirmed IFVG can override older opposing structure when full override contract passes.
+22. IFVG alone cannot erase unresolved conflict.
+23. Duplicate event does not restart conflict timer.
+
+ENTRY
+
+24. Entry window opens.
+25. Late entry rejected.
+26. Chasing rejected.
+27. Invalid zone rejected.
+
+ALL-DAY
+
+28. New independent FVG after prior setup completes.
+29. Multiple zones do not generate duplicate candidate.
+30. Different instrument isolated.
+
+SYMMETRY
+
+31. Long/Short mirrored behavior.
+32. Missing data has no directional default.
+
+REGRESSION
+
+33. Production READY logic unchanged in shadow phase.
+34. Existing strategy tests.
+35. Main Brain tests.
+36. Alert tests.
+37. Journal tests.
+38. Execution tests.
+39. TypeScript/build/diff.
+40. Parity and goldens.
+
+==================================================
+IMPLEMENTATION ORDER
+==================================================
+
+STEP A — AUDIT + DETECTOR + VISUALIZATION
+
+- audit existing FVG logic
+- canonical FVG object
+- lifecycle tracking
+- chart overlays
+- FVG/IFVG Scanner
+- no production decision changes
+
+STOP.
+
+STEP B — SHADOW SEQUENCE ENGINE
+
+- FVG continuation sequence
+- IFVG reversal sequence
+- hypothetical READY
+- practice outcomes
+- no trade alerts/orders
+
+STOP.
+
+STEP C — PAPER ONLY
+
+- allow FVG/IFVG strategy family to drive paper trades
+- existing risk/execution gateway remains unchanged
+
+STOP.
+
+STEP D — RESTRICTED LIVE
+
+Only after explicit approval and enough evidence.
+
+==================================================
+FINAL RESPONSE FOR STEP A
+==================================================
+
+Provide:
+
+1. Existing FVG implementation found
+2. Canonical FVG definition
+3. IFVG inversion definition
+4. Lifecycle states
+5. Files changed
+6. Chart overlay behavior
+7. Scanner panel
+8. Active FVG/IFVG counts
+9. Tests
+10. Confirmation production decisions and execution were unchanged
