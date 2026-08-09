@@ -45467,16 +45467,21 @@ def _get_mtf_snapshot_at_signal(inst):
                 "trend_alignment_at_signal": None}
 
 
-def _mtf_bar_close(instrument, bar):
+def _mtf_bar_close(instrument, _close_price):
     """Bar-close callback for Phase 8B.1 MTF Trend Alignment. DISPLAY-ONLY.
 
-    Feeds every completed Databento 1-minute bar into the trend_alignment
-    module so the 15M and 4H bar caches stay current.  FAIL-OPEN: any
-    exception is silently swallowed and never blocks the bar-close chain.
+    DatabentoBrain calls bar-close callbacks as _cb(inst, bars[-1]["close"]),
+    so the second argument is the close PRICE (float), not the full bar dict.
+    We retrieve the full bar from DATABENTO_BARS_BY_INST (updated before
+    callbacks fire) and pass it to trend_alignment.ingest_1m_bar.
+    FAIL-OPEN: any exception is silently swallowed.
     """
     try:
-        import trend_alignment as _ta   # noqa: PLC0415
-        _ta.ingest_1m_bar(instrument, bar)
+        from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
+        import trend_alignment as _ta                        # noqa: PLC0415
+        bars = DATABENTO_BARS_BY_INST.get(instrument)
+        if bars:
+            _ta.ingest_1m_bar(instrument, bars[-1])
     except Exception:
         pass
 

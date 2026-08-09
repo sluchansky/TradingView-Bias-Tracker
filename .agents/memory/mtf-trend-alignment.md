@@ -33,6 +33,12 @@ Computes whether MNQ (and other instruments) are trending BULLISH / BEARISH / NE
 ## DB migration
 `db_mtf_schema_patch.sql` adds the 6 columns (3 per table) with `ADD COLUMN IF NOT EXISTS TEXT`. Applied to dev DB. Needs re-publish for production.
 
+## Critical bug fixed: callback passes close price, not bar dict
+`DatabentoBrain._on_bar_close` calls `_cb(inst, bars[-1]["close"])` — the second argument is a **float** (close price), NOT the full bar dict. `_mtf_bar_close` must read the full bar from `DATABENTO_BARS_BY_INST[inst][-1]` instead of treating the float as a dict. Any future bar-close callback must account for this calling convention.
+
+## Cold-start problem
+Every server restart clears `DATABENTO_BARS_BY_INST` (in-memory deque). EMA(8) on 15M bars needs 8+ closed 15M bars = 2+ hours from boot before trend computes. The boot seed from `DATABENTO_BARS_BY_INST` is a no-op on a fresh restart because the deque is empty at that point. To fix: seed from Databento historical API at boot (fetch last 3–4h of 1m bars for each instrument).
+
 ## Why
 **Why:** Stale test fix — seeding 1440 bars starting 24h ago covers the last 24h; last bar ends at ~now → not stale. Tests must start bars at 48h ago (or earlier) so the 24h run ends 24h in the past, exceeding both STALE thresholds.
 
