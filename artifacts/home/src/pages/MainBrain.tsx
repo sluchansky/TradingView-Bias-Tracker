@@ -1237,6 +1237,110 @@ const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({
   );
 };
 
+// ── MTF Trend Alignment Panel (Phase 8B.1 — DISPLAY-ONLY) ───────────────────
+// Fetches 4H/15M Databento-derived trend states every 30 s.
+// Purely informational — no gate, no scoring, no execution.
+interface MTFTf { trend: string; strength?: string; last_closed_bar?: string | null; bar_count: number; stale?: boolean }
+interface MTFState {
+  instrument: string;
+  four_hour: MTFTf;
+  fifteen_minute: MTFTf;
+  alignment: string;
+  updated_at?: string | null;
+  error?: string;
+}
+const MTF_TREND_COLOR: Record<string, string> = {
+  BULLISH:     '#22c55e',
+  BEARISH:     '#ef4444',
+  NEUTRAL:     '#f59e0b',
+  STALE:       '#6b7280',
+  UNAVAILABLE: '#374151',
+};
+const MTF_ALIGN_STYLE: Record<string, { bg: string; color: string; label: string }> = {
+  ALIGNED_LONG:  { bg: 'rgba(34,197,94,0.12)',   color: '#22c55e', label: '✓ ALIGNED LONG'  },
+  ALIGNED_SHORT: { bg: 'rgba(239,68,68,0.12)',   color: '#ef4444', label: '✓ ALIGNED SHORT' },
+  CONFLICTING:   { bg: 'rgba(245,158,11,0.12)',  color: '#f59e0b', label: '⚠ CONFLICTING'   },
+  MIXED:         { bg: 'rgba(107,114,128,0.12)', color: '#9ca3af', label: '○ MIXED'         },
+  STALE:         { bg: 'rgba(107,114,128,0.10)', color: '#6b7280', label: '◈ STALE'         },
+};
+function mtfFmtTs(iso?: string | null): string {
+  if (!iso) return '';
+  try {
+    const d = new Date(iso);
+    return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }) + ' UTC';
+  } catch { return ''; }
+}
+
+const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
+  const [state, setState] = useState<MTFState | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = async () => {
+      try {
+        const r = await fetch(
+          `/api/market/trend-alignment?instrument=${encodeURIComponent(ticker || 'MNQ')}`,
+          { credentials: 'include', headers: getAuthHeader() },
+        );
+        if (!r.ok || cancelled) return;
+        const j = await r.json() as MTFState;
+        if (!cancelled) setState(j);
+      } catch { /* fail-open */ }
+    };
+    load();
+    const id = setInterval(load, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, [ticker]);
+
+  const fh  = state?.four_hour      ?? { trend: '—', bar_count: 0 };
+  const fm  = state?.fifteen_minute ?? { trend: '—', bar_count: 0 };
+  const aln = state?.alignment      ?? '—';
+  const alnStyle = MTF_ALIGN_STYLE[aln] ?? { bg: 'rgba(107,114,128,0.08)', color: '#4b5563', label: aln };
+
+  const TfRow: React.FC<{ label: string; tf: MTFTf }> = ({ label, tf }) => {
+    const arrow = tf.trend === 'BULLISH' ? '↑ ' : tf.trend === 'BEARISH' ? '↓ ' : tf.trend === 'NEUTRAL' ? '— ' : '';
+    const col   = MTF_TREND_COLOR[tf.trend] ?? '#6b7280';
+    const ts    = mtfFmtTs(tf.last_closed_bar);
+    return (
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
+        <span style={{ fontSize: 9, fontWeight: 700, color: T.txtMuted, letterSpacing: '0.06em', minWidth: 26 }}>{label}</span>
+        <span style={{ fontWeight: 700, fontSize: 13, color: col, fontFamily: T.mono }}>
+          {arrow}{tf.trend || '—'}
+        </span>
+        {tf.strength && (
+          <span style={{ fontSize: 9, color: '#9ca3af' }}>— {tf.strength}</span>
+        )}
+        <span style={{ marginLeft: 'auto', fontSize: 9, color: T.txtMuted }}>
+          {ts || (tf.bar_count != null ? `${tf.bar_count} bar${tf.bar_count !== 1 ? 's' : ''}` : '')}
+        </span>
+      </div>
+    );
+  };
+
+  return (
+    <div style={{
+      background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10,
+      padding: '10px 14px', marginBottom: 10,
+    }}>
+      <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
+        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', color: T.txtMuted, textTransform: 'uppercase' }}>
+          Multi-Timeframe Trend
+        </span>
+        <span style={{
+          marginLeft: 'auto', fontSize: 10, fontWeight: 700,
+          padding: '2px 9px', borderRadius: 999,
+          background: alnStyle.bg, color: alnStyle.color,
+          border: `1px solid ${alnStyle.color}33`,
+        }}>
+          {alnStyle.label}
+        </span>
+      </div>
+      <TfRow label="4H"  tf={fh} />
+      <TfRow label="15M" tf={fm} />
+    </div>
+  );
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const lb    = (p.left_brain ?? {}) as Record<string, unknown>;
@@ -11502,6 +11606,9 @@ export default function MainBrain() {
           <>
             {/* ── Consensus strip ──────────────────────────────────────────── */}
             <ConsensusPanel p={p} consensus={_con} />
+
+            {/* ── MTF Trend Alignment (Phase 8B.1 — DISPLAY-ONLY) ─────────── */}
+            <MTFTrendPanel ticker={ticker} />
 
             {/* ── Trade Plan row — dim TradePlanPanel when direction conflicts ─ */}
             <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:10, marginBottom:10 }} className="mb-grid-3">
