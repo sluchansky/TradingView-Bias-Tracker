@@ -87,7 +87,7 @@ def _null_vix_record(status: str = "UNAVAILABLE", error: Optional[str] = None) -
         "timestamp_utc":  None,
         "age_seconds":    None,
         "is_fresh":       False,
-        "is_delayed":     True,   # Alpha Vantage data carries a real-time delay
+        "is_delayed":     True,   # yfinance free feed carries a ~15-min exchange delay
         "status":         status,
         "error":          error,
     }
@@ -489,7 +489,7 @@ def _build_snapshot() -> Dict[str, Any]:
 
     warnings = []
     if data_status == "DELAYED":
-        warnings.append(f"VIX data is delayed (Alpha Vantage; age {int(age_sec or 0)}s)")
+        warnings.append(f"VIX data is delayed ~15 min by exchange (yfinance; age {int(age_sec or 0)}s)")
     if not VOL_INTELLIGENCE_OBSERVE_ONLY:
         warnings.append("OBSERVE_ONLY is OFF — check safety flags before activating execution influence")
 
