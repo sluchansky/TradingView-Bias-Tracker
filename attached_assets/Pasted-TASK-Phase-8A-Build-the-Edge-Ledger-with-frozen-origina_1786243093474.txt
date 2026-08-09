@@ -1,0 +1,604 @@
+TASK: Phase 8A — Build the Edge Ledger with frozen original-signal accounting.
+
+CONTEXT
+
+The profitability audit identified three CRITICAL trust gaps:
+
+1. Original signal parameters are not frozen.
+   Managed stop/target changes can contaminate ghost/paper R.
+
+2. The system does not cleanly separate:
+   - strategy signal quality
+   - trade-management quality
+
+3. Ghost/paper performance is gross and does not consistently deduct commissions, fees, or slippage.
+
+The goal of this phase is to create a trustworthy, immutable Edge Ledger that measures the original trade idea separately from what the execution manager later did.
+
+IMPORTANT
+
+This phase must NOT:
+
+- tune strategies
+- change Edge Score
+- change readiness thresholds
+- change learning weights
+- change live eligibility
+- change execution
+- change risk
+- send live orders
+
+This is accounting, evidence, and diagnostics only.
+
+==================================================
+PART 1 — AUDIT CURRENT OUTCOME SYSTEMS
+==================================================
+
+Trace every current system that evaluates or stores hypothetical, paper, ghost, or managed trade outcomes.
+
+At minimum audit:
+
+- managed paper path
+- scalp live-sim path
+- strategy_trades
+- internal_trade_snapshots
+- native_journal
+- ghost/paper result stores
+- learning eligibility
+- strategy weights
+- close/outcome helpers
+
+For each path document:
+
+- when the trade idea is created
+- when entry/stop/targets are captured
+- whether those values are later mutated
+- how R is calculated
+- whether commissions/fees/slippage are included
+- whether outcome is used by learning
+- whether the result is live, paper, ghost, or simulated
+
+Identify any paths that cannot be compared directly.
+
+==================================================
+PART 2 — CREATE THE EDGE LEDGER
+==================================================
+
+Create one canonical table:
+
+edge_ledger
+
+Purpose:
+
+Store immutable original signal terms plus independent signal-outcome and management-outcome accounting.
+
+Recommended identity fields:
+
+- id UUID primary key
+- edge_id TEXT or UUID unique
+- internal_trade_id UUID nullable
+- signal_id TEXT nullable
+- execution_fingerprint TEXT nullable
+- source TEXT
+- instrument TEXT
+- contract TEXT
+- mode TEXT
+- session TEXT
+- direction TEXT
+- strategy_key TEXT
+- strategy_version TEXT
+- config_version TEXT
+
+ORIGINAL SIGNAL — IMMUTABLE
+
+- signal_timestamp
+- market_data_timestamp
+- original_entry
+- original_stop
+- original_tp1
+- original_tp2
+- original_targets JSONB
+- original_risk_points
+- original_risk_dollars
+- original_contracts
+- original_rr
+- edge_score
+- long_score
+- short_score
+- decision_margin
+- grade
+- left_brain_thesis
+- thesis_alignment
+- readiness
+- confirmations JSONB
+- blockers JSONB
+- opposing_structure JSONB
+- risk_state JSONB
+- market_context JSONB
+
+SIGNAL OUTCOME
+
+- signal_outcome_status
+- signal_first_level_hit
+- signal_stop_hit_at
+- signal_tp1_hit_at
+- signal_tp2_hit_at
+- signal_mfe_points
+- signal_mae_points
+- signal_mfe_r
+- signal_mae_r
+- signal_gross_r
+- signal_net_r
+- signal_gross_pnl
+- signal_net_pnl
+- signal_commission_estimate
+- signal_fee_estimate
+- signal_slippage_estimate
+- signal_resolved_at
+
+MANAGED OUTCOME
+
+- managed_outcome_status
+- actual_entry
+- actual_exit
+- actual_quantity
+- managed_gross_r
+- managed_net_r
+- managed_gross_pnl
+- managed_net_pnl
+- actual_commissions
+- actual_fees
+- actual_slippage
+- managed_resolved_at
+
+COMPARISON
+
+- signal_vs_managed_delta_r
+- signal_vs_managed_delta_pnl
+- management_helped BOOLEAN nullable
+- comparison_complete BOOLEAN
+- comparison_reason TEXT
+
+VALIDATION
+
+- sample_partition TEXT
+- eligibility_state TEXT
+- data_complete BOOLEAN
+- blocked_reason TEXT
+- created_at
+- updated_at
+
+Use project conventions where equivalent fields already exist.
+
+Do not duplicate information unnecessarily when a stable foreign key can reference immutable snapshot data, but the original signal terms themselves must remain permanently recoverable.
+
+==================================================
+PART 3 — FREEZE ORIGINAL SIGNAL TERMS
+==================================================
+
+At the moment a candidate enters the evaluation population, freeze:
+
+- instrument
+- strategy
+- direction
+- entry
+- stop
+- TP1
+- TP2
+- contracts
+- planned risk
+- Edge Score
+- Long score
+- Short score
+- thesis
+- alignment
+- confirmations
+- blockers
+- timestamp
+- market context
+
+Determine the correct capture point from the current architecture.
+
+Preferred principle:
+
+Capture BEFORE any stop movement, break-even logic, trailing logic, partial exit logic, or active-trade management mutation.
+
+Once written:
+
+ORIGINAL SIGNAL FIELDS MUST NEVER UPDATE.
+
+Add database and test safeguards.
+
+==================================================
+PART 4 — DEFINE SIGNAL OUTCOME
+==================================================
+
+Signal Outcome answers:
+
+“Was the original trade call good?”
+
+It must ignore later management changes.
+
+For Long:
+
+- original stop remains original stop
+- TP1 remains original TP1
+- TP2 remains original TP2
+
+For Short:
+same principle mirrored.
+
+Using canonical Databento market data, determine:
+
+- whether entry was actually touched/traded
+- whether original stop or target was hit first
+- MFE
+- MAE
+- gross R
+- resolution time
+
+Do not assume a fill if price never traded through the entry.
+
+Do not use modified stop or target levels.
+
+==================================================
+PART 5 — DEFINE MANAGED OUTCOME
+==================================================
+
+Managed Outcome answers:
+
+“How well did execution/management handle the signal?”
+
+Use actual or canonical managed values:
+
+- actual entry
+- actual exits
+- stop moves
+- partial exits
+- break-even moves
+- trailing stops
+- commissions
+- fees
+- slippage
+- final P&L
+- final R
+
+Link to native_journal when possible.
+
+Do not overwrite Signal Outcome with Managed Outcome.
+
+==================================================
+PART 6 — COST MODEL
+==================================================
+
+Audit current commission, fee, and slippage sources.
+
+Define separate treatment for:
+
+ACTUAL LIVE/PAPER EXECUTION
+- use actual commission/fee/slippage when available
+
+GHOST/SHADOW OUTCOME
+- use a configured cost model
+- clearly label it ESTIMATED
+
+Required fields:
+
+- commission_estimate
+- fee_estimate
+- slippage_estimate
+- cost_model_version
+
+Do not silently use zero cost.
+
+If costs are unavailable:
+
+- store null
+- mark net result incomplete
+- do not call it net profitable
+
+==================================================
+PART 7 — SIGNAL VS MANAGEMENT COMPARISON
+==================================================
+
+For every resolved trade with both sides available calculate:
+
+signal_gross_r
+signal_net_r
+
+managed_gross_r
+managed_net_r
+
+delta_r =
+managed_net_r - signal_net_r
+
+Classify:
+
+MANAGEMENT_HELPED
+MANAGEMENT_HURT
+MANAGEMENT_NEUTRAL
+COMPARISON_UNAVAILABLE
+
+Example:
+
+Signal Net R: +2.0
+Managed Net R: +0.3
+
+Result:
+MANAGEMENT_HURT
+Delta: -1.7R
+
+Or:
+
+Signal Net R: -1.0
+Managed Net R: -0.25
+
+Result:
+MANAGEMENT_HELPED
+Delta: +0.75R
+
+==================================================
+PART 8 — DO NOT CHANGE LEARNING YET
+==================================================
+
+The learning engine must continue using its current production source during Phase 8A.
+
+Do not redirect strategy weights to edge_ledger yet.
+
+Do not change:
+
+- LEARNING_MIN_SAMPLE
+- LIVE_ELIGIBLE rules
+- strategy weights
+- score influence
+- promotion state
+
+Instead expose:
+
+edge_ledger_ready_for_learning = true/false
+
+This prepares the next phase.
+
+==================================================
+PART 9 — SAMPLE PARTITION FIELD
+==================================================
+
+Add sample_partition now so later out-of-sample validation does not require another schema redesign.
+
+Allowed values:
+
+- DEVELOPMENT
+- FORWARD_VALIDATION
+- SHADOW
+- PAPER
+- LIVE
+- HISTORICAL
+- UNKNOWN
+
+Do not automatically assign FORWARD_VALIDATION yet unless an existing deterministic rule already exists.
+
+Default existing records appropriately and document the rule.
+
+==================================================
+PART 10 — EDGE LEDGER DIAGNOSTICS
+==================================================
+
+Add read-only diagnostics.
+
+For each strategy show:
+
+- total ledger signals
+- unresolved
+- signal outcomes resolved
+- managed outcomes resolved
+- average signal gross R
+- average signal net R
+- average managed net R
+- management delta
+- cost completeness
+- sample partition counts
+- data completeness
+
+Do not call this profitability certification.
+
+Label it:
+
+EDGE LEDGER DIAGNOSTICS
+
+==================================================
+PART 11 — MAIN BRAIN / JOURNAL DISPLAY
+==================================================
+
+Add a read-only section in the native trade detail:
+
+EDGE ANALYSIS
+
+Show:
+
+ORIGINAL SIGNAL
+
+- Entry
+- Stop
+- TP1
+- TP2
+- Edge Score
+- Long Score
+- Short Score
+- Thesis
+- Alignment
+
+SIGNAL OUTCOME
+
+- Entry touched?
+- Stop/target first
+- MFE
+- MAE
+- Gross R
+- Estimated Costs
+- Net R
+
+MANAGED OUTCOME
+
+- Actual Entry
+- Actual Exit
+- Gross R
+- Costs
+- Net R
+
+MANAGEMENT IMPACT
+
+Example:
+
+Original Signal: +2.0R
+Managed Result: +0.4R
+Management Impact: -1.6R
+
+Do not add edit controls.
+
+==================================================
+PART 12 — BACKFILL POLICY
+==================================================
+
+Do not blindly backfill historical records.
+
+Classify existing historical data into:
+
+SAFE_TO_BACKFILL
+- original entry/stop/targets provably preserved
+
+PARTIAL_BACKFILL
+- some original terms known
+
+UNSAFE_TO_BACKFILL
+- management mutations make original signal unknowable
+
+Never reconstruct an original stop from the final moved stop.
+
+Report counts in each category.
+
+==================================================
+PART 13 — REQUIRED TESTS
+==================================================
+
+IMMUTABILITY
+
+1. Original entry cannot change.
+2. Original stop cannot change.
+3. Original TP1 cannot change.
+4. Original TP2 cannot change.
+5. Managed stop move leaves original stop unchanged.
+6. Break-even move leaves original stop unchanged.
+7. Partial exit leaves original targets unchanged.
+
+SIGNAL OUTCOME
+
+8. Long TP1 before stop.
+9. Long stop before TP1.
+10. Short TP1 before stop.
+11. Short stop before TP1.
+12. TP2 outcome.
+13. Entry never touched.
+14. MFE correct.
+15. MAE correct.
+16. Gross R correct.
+
+COSTS
+
+17. Actual commissions applied.
+18. Estimated ghost commission applied.
+19. Fees applied.
+20. Slippage applied.
+21. Missing cost remains null.
+22. Missing cost prevents complete net result.
+
+MANAGED OUTCOME
+
+23. Actual managed R stored separately.
+24. Managed result does not overwrite signal R.
+25. Partial exits handled.
+26. Multiple fills handled.
+
+COMPARISON
+
+27. Management helped.
+28. Management hurt.
+29. Management neutral.
+30. Comparison unavailable.
+
+LINKAGE
+
+31. internal_trade_id links correctly.
+32. Native journal links correctly.
+33. Duplicate edge_id prevented.
+34. Same-instrument simultaneous trades do not cross-link.
+
+PARTITIONS
+
+35. sample_partition persists.
+36. UNKNOWN handled safely.
+
+BACKFILL
+
+37. Safe backfill.
+38. Partial backfill.
+39. Unsafe record rejected from automatic backfill.
+
+REGRESSION
+
+40. Native journal tests remain green.
+41. Learning tests unchanged.
+42. Strategy engine unchanged.
+43. Databento unchanged.
+44. Execution unchanged.
+45. TypeScript/build/diff clean.
+46. Parity/goldens/smokes remain green.
+
+==================================================
+PART 14 — STOP CONDITIONS
+==================================================
+
+Stop and report if:
+
+- original signal terms cannot be captured before mutation
+- current ghost systems cannot be mapped without ambiguity
+- costs cannot be separated from gross result
+- existing learning would be changed
+- backfill would require guessing
+- signal outcome requires synthetic price data
+
+==================================================
+PART 15 — COMMIT BOUNDARY
+==================================================
+
+Create one clean commit:
+
+`Phase 8A: Add immutable Edge Ledger signal-vs-management accounting`
+
+Do not implement forward-validation promotion rules yet.
+
+Do not change live eligibility.
+
+==================================================
+FINAL RESPONSE REQUIRED
+==================================================
+
+Provide:
+
+1. Starting commit
+2. Final commit
+3. Files changed
+4. Existing evaluation systems audited
+5. Edge Ledger schema
+6. Exact freeze/capture point
+7. Signal Outcome definition
+8. Managed Outcome definition
+9. Cost model
+10. Signal-vs-management comparison
+11. Sample partition design
+12. Backfill classification
+13. UI/diagnostics added
+14. Test results
+15. Full TypeScript/build status
+16. Known limitations
+17. Confirmation that learning, scoring, strategy selection, risk, execution, Databento, and live eligibility were unchanged
+18. Recommended Phase 8B instructions, but do not implement them

@@ -403,6 +403,16 @@ export const BOT1_ROUTES = [
   "/execution/kill-switch",
   "/execution/reset-safety-lock",
   "/execution/audit-log",
+  // Profitability Engine Phase 1 — ghost observation ledger (RESEARCH/DISPLAY-ONLY;
+  // owner-only; NOT in dashboard-auth OPEN_PATHS). Aggregated stats + raw
+  // observation list. Never touches gate, scoring, sizing, or execution.
+  "/profitability/summary",
+  "/profitability/observations",
+  // Phase 8A: Edge Ledger diagnostics — signal-vs-management accounting
+  // (RESEARCH/DISPLAY-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS).
+  // Shows per-strategy signal outcome vs managed outcome comparison.
+  // Never touches gate, learning weights, scoring, or execution.
+  "/edge-ledger/diagnostics",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

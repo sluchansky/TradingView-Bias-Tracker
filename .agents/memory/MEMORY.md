@@ -71,6 +71,7 @@
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
 - [Profitability Engine Phase 1](profitability-engine-phase1.md) — ghost_observations table; ghost fires BEFORE _maybe_auto_execute; 69 tests; conservative stop-first resolution; net_r = gross_r − cost_r.
+- [Edge Ledger Phase 8A](edge-ledger-phase8a.md) — frozen-signal accounting; 5 integration points; EL_DB_READY flag; 55 tests; display-only, learning engine unchanged.
 - [FVG Engine Step A](fvg-engine-step-a.md) — all-day FVG/IFVG scanner (shadow/display-only); 3 engine bugs documented; IFVG direction semantics; fixture ATR ratio trap; `@_owner_required` undefined before line 75400.
 - [FVG Sequence Engine Step B](fvg-engine-step-b.md) — shadow state machine (55 tests); two families CONTINUATION/REVERSAL; CHASING fires before target-consumed; IFVG hold from bar data; `/fvg/sequences` route; FVG chart toggle.
 - [Main Brain cognitive layer](main-brain-cognitive.md) — 7 display-only keys at full_analysis seam (mirror in closed-override); _mb_cached None→coerce neutral; heartbeat capture fail-open, never gates.

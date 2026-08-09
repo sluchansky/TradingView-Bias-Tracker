@@ -36071,6 +36071,16 @@ def _nj_create_from_snapshot(snapshot):
             conn.close()
         except Exception:
             pass
+    # ── Phase 8A: link edge_ledger → native_journal (FAIL-OPEN) ─────────────
+    # Matches the most recent open edge_ledger row for (instrument, direction)
+    # within the last 10 minutes and records the internal_trade_id so the
+    # managed outcome can be linked when the trade closes.  Promotes the
+    # sample_partition from SHADOW → LIVE.  No-op when EL_DB_READY=False.
+    _el_try_link_to_journal(
+        iid=iid,
+        instrument=snapshot.get("instrument"),
+        direction=snapshot.get("direction"),
+    )
 
 
 def _nj_update_lifecycle(internal_trade_id, new_status,
@@ -36411,6 +36421,10 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
             ),
         )
         conn.commit()
+        # ── Phase 8A: propagate managed outcome to edge_ledger (FAIL-OPEN) ──
+        # `out` has actual_exit, net_pnl, realized_r computed above.
+        # EL helper opens its own connection; any exception is suppressed.
+        _el_update_managed_outcome(str(internal_trade_id), out)
         cur.close()
         logger.debug(
             "native_journal outcome set: %.8s exit_reason=%s pnl=%s",
@@ -44922,6 +44936,7 @@ MICRO_GHOST_WATCH_LOCK = threading.Lock()   # single-flight watcher cycles
 # is disabled/blocked. Never gates, sizes, or sends orders.
 # Table: ghost_observations (created via DB tool / publish schema-diff; no DDL).
 GHOST_OBS_DB_READY       = False
+EL_DB_READY              = False   # set by _check_edge_ledger_db_ready() — Phase 8A
 GHOST_OBS_WATCH_LOCK     = threading.Lock()   # single-flight watcher cycle
 GHOST_OBS_COOLDOWN_SECS  = max(60, int(os.environ.get("GHOST_OBS_COOLDOWN_SECS", "300")))
 _GHOST_OBS_COOLDOWN      = {}                  # (inst, direction, strategy_short) → monotonic ts
@@ -45039,6 +45054,308 @@ def _check_ghost_obs_db_ready():
             conn.close()
         except Exception:
             pass
+
+
+def _check_edge_ledger_db_ready():
+    """Probe edge_ledger (no DDL) and set EL_DB_READY.
+
+    Phase 8A — FAIL-OPEN: a missing table / unavailable DB disables
+    edge-ledger accounting only.  All existing behaviour (ghost_observations,
+    native_journal, execution, gate, learning) remains byte-identical when
+    EL_DB_READY is False.
+    """
+    global EL_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM edge_ledger LIMIT 1")
+            cur.fetchone()
+        EL_DB_READY = True
+        logger.info("EdgeLedger: edge_ledger table ready (Phase 8A)")
+    except Exception as exc:
+        logger.warning(
+            "EdgeLedger: edge_ledger table unavailable "
+            "(Phase 8A accounting disabled — apply db_edge_ledger_schema.sql): %s", exc
+        )
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Phase 8A: Edge Ledger helpers (FAIL-OPEN, DISPLAY/ACCOUNTING ONLY) ───────
+# These helpers never touch the gate, scoring, sizing, learning, or execution.
+# EL_DB_READY=False makes them byte-identical no-ops (fail-safe).
+
+def _el_create_entry(obs_key, result, inst, direction, strategy_key,
+                     entry, stop_px, target1, target2, risk_pts,
+                     cost_r_est, sess_name, edge_score, now_utc_ts):
+    """INSERT an edge_ledger row with frozen signal terms. FAIL-OPEN.
+
+    Called from _ghost_observe_setup immediately after the ghost_obs INSERT
+    succeeds — same dedup key (obs_key) ensures 1:1 correspondence.
+    Original signal columns are written ONCE and are protected by the
+    el_immutability_guard trigger in the DB schema.
+    """
+    if not EL_DB_READY or not LEARNING_DB_ENABLED:
+        return
+    try:
+        import edge_ledger as _el   # noqa: PLC0415
+        terms = _el.extract_frozen_signal_terms(result, inst, INSTRUMENT_SPECS)
+        if terms is None:
+            return
+        edge_id   = _el.build_edge_id(inst, direction, strategy_key, obs_key)
+        partition = _el.assign_sample_partition("databento_scan")
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO edge_ledger
+                           (edge_id, ghost_obs_key, source, instrument,
+                            mode, session, direction,
+                            strategy_key, strategy_version, sample_partition,
+                            signal_timestamp,
+                            original_entry, original_stop, original_tp1, original_tp2,
+                            original_targets, original_risk_points, original_risk_dollars,
+                            original_rr,
+                            edge_score, long_score, short_score, decision_margin,
+                            grade, readiness, left_brain_thesis, thesis_alignment,
+                            confirmations, blockers, opposing_structure, risk_state,
+                            market_context,
+                            signal_cost_r, cost_model_version,
+                            signal_outcome_status)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               %s,%s,%s,%s,%s)
+                       ON CONFLICT (edge_id) DO NOTHING""",
+                    (
+                        edge_id, obs_key, "live_shadow", inst,
+                        TRADING_MODE, sess_name, direction,
+                        strategy_key, STRATEGY_VERSION, partition,
+                        now_utc_ts,
+                        terms["original_entry"],   terms["original_stop"],
+                        terms["original_tp1"],     terms.get("original_tp2"),
+                        json.dumps(terms["original_targets"]),
+                        terms["original_risk_points"],
+                        terms.get("original_risk_dollars"),
+                        terms.get("original_rr"),
+                        terms.get("edge_score"),
+                        terms.get("long_score"),   terms.get("short_score"),
+                        terms.get("decision_margin"),
+                        terms.get("grade"),        terms.get("readiness"),
+                        terms.get("left_brain_thesis"),
+                        terms.get("thesis_alignment"),
+                        json.dumps(terms.get("confirmations") or []),
+                        json.dumps(terms.get("blockers") or []),
+                        terms.get("opposing_structure"),
+                        terms.get("risk_state"),
+                        json.dumps(terms.get("market_context") or {}),
+                        (round(cost_r_est, 4) if cost_r_est is not None else None),
+                        _el.COST_MODEL_VERSION,
+                        "open",
+                    ),
+                )
+                conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.debug(
+            "edge_ledger entry created: %s %s sk=%s edge_id=%s",
+            inst, direction, strategy_key[:40], edge_id[:40],
+        )
+    except Exception as exc:
+        logger.debug("_el_create_entry fail-open (%s %s): %s", inst, direction, exc)
+
+
+def _el_update_signal_outcome_conn(conn, obs_key, status, close_reason,
+                                   exit_px, gross_r, net_r, cost_r,
+                                   mfe_r, mae_r, now_ts):
+    """UPDATE edge_ledger signal outcome columns using an existing DB connection.
+
+    Called from _ghost_obs_watcher_cycle when a ghost observation is closed or
+    expired.  Uses original frozen terms already on the row — no mutation of
+    the immutable signal columns.  FAIL-OPEN.
+    """
+    if not EL_DB_READY:
+        return
+    try:
+        edge_id = f"el|{obs_key}"
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE edge_ledger
+                       SET signal_outcome_status  = %s,
+                           signal_first_level_hit = %s,
+                           signal_gross_r         = %s,
+                           signal_net_r           = %s,
+                           signal_cost_r          = COALESCE(signal_cost_r, %s),
+                           signal_mfe_r           = %s,
+                           signal_mae_r           = %s,
+                           signal_resolved_at     = %s,
+                           data_complete          = (
+                               %s IS NOT NULL
+                               AND COALESCE(signal_cost_r, %s) IS NOT NULL
+                           ),
+                           updated_at             = NOW()
+                   WHERE edge_id = %s
+                     AND signal_outcome_status = 'open'""",
+                (
+                    status, close_reason,
+                    (round(gross_r, 4) if gross_r is not None else None),
+                    (round(net_r,   4) if net_r   is not None else None),
+                    (round(cost_r,  4) if cost_r  is not None else None),
+                    (round(mfe_r,   4) if mfe_r   is not None else None),
+                    (round(mae_r,   4) if mae_r   is not None else None),
+                    now_ts,
+                    net_r,   # first reference for data_complete boolean
+                    (round(cost_r, 4) if cost_r is not None else None),  # second for COALESCE
+                    edge_id,
+                ),
+            )
+    except Exception as exc:
+        logger.debug("_el_update_signal_outcome_conn fail-open (obs=%s): %s", obs_key, exc)
+
+
+def _el_try_link_to_journal(iid, instrument, direction):
+    """Link the most recent open edge_ledger row to native_journal. FAIL-OPEN.
+
+    Called from _nj_create_from_snapshot after a confirmed send.
+    Matches by instrument + direction + signal_timestamp within the last
+    10 minutes so ghost_obs and NJ entries for the same setup are joined.
+    Also promotes sample_partition from SHADOW → LIVE (a trade actually fired).
+    """
+    if not EL_DB_READY or not iid:
+        return
+    try:
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                # Use a CTE to select the target row before updating (ORDER BY + LIMIT)
+                cur.execute(
+                    """WITH target AS (
+                           SELECT edge_id FROM edge_ledger
+                           WHERE instrument = %s
+                             AND direction  = %s
+                             AND internal_trade_id IS NULL
+                             AND signal_timestamp > NOW() - INTERVAL '10 minutes'
+                           ORDER BY signal_timestamp DESC
+                           LIMIT 1
+                       )
+                       UPDATE edge_ledger
+                           SET internal_trade_id = %s,
+                               sample_partition  = CASE
+                                   WHEN sample_partition = 'SHADOW' THEN 'LIVE'
+                                   ELSE sample_partition
+                               END,
+                               updated_at = NOW()
+                       WHERE edge_id = (SELECT edge_id FROM target)""",
+                    (instrument, direction, str(iid)),
+                )
+                conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.debug(
+            "edge_ledger linked to journal: iid=%.8s %s %s",
+            str(iid), instrument, direction,
+        )
+    except Exception as exc:
+        logger.debug(
+            "_el_try_link_to_journal fail-open (%.8s %s %s): %s",
+            str(iid), instrument, direction, exc,
+        )
+
+
+def _el_update_managed_outcome(internal_trade_id, outcome_dict):
+    """UPDATE edge_ledger managed outcome from native_journal close. FAIL-OPEN.
+
+    Called from _nj_set_outcome after the NJ row is committed to CLOSED.
+    Sets managed_* columns + triggers comparison computation (SQL-side).
+    Never overwrites original signal columns (enforced by DB trigger).
+    """
+    if not EL_DB_READY or not internal_trade_id:
+        return
+    try:
+        actual_exit = outcome_dict.get("actual_exit")
+        net_pnl     = outcome_dict.get("net_pnl")
+        realized_r  = outcome_dict.get("realized_r")
+        conn = _learning_conn()
+        if conn is None:
+            return
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """UPDATE edge_ledger
+                           SET managed_outcome_status = 'CLOSED',
+                               actual_exit     = %s,
+                               managed_net_pnl = %s,
+                               managed_net_r   = %s,
+                               managed_resolved_at = NOW(),
+                               updated_at = NOW()
+                       WHERE internal_trade_id = %s
+                         AND managed_outcome_status IS DISTINCT FROM 'CLOSED'""",
+                    (
+                        (float(actual_exit)    if actual_exit is not None else None),
+                        (round(float(net_pnl), 2)    if net_pnl is not None else None),
+                        (round(float(realized_r), 4) if realized_r is not None else None),
+                        str(internal_trade_id),
+                    ),
+                )
+                # Compute comparison in-DB when both sides are available
+                cur.execute(
+                    """UPDATE edge_ledger
+                           SET signal_vs_managed_delta_r = managed_net_r - signal_net_r,
+                               comparison_complete = (signal_net_r IS NOT NULL
+                                                      AND managed_net_r IS NOT NULL),
+                               comparison_reason = CASE
+                                   WHEN signal_net_r IS NULL OR managed_net_r IS NULL
+                                       THEN 'COMPARISON_UNAVAILABLE'
+                                   WHEN ABS(managed_net_r - signal_net_r) <= 0.05
+                                       THEN 'MANAGEMENT_NEUTRAL'
+                                   WHEN managed_net_r > signal_net_r
+                                       THEN 'MANAGEMENT_HELPED'
+                                   ELSE 'MANAGEMENT_HURT'
+                               END,
+                               management_helped = CASE
+                                   WHEN signal_net_r IS NULL OR managed_net_r IS NULL
+                                       THEN NULL
+                                   WHEN ABS(managed_net_r - signal_net_r) <= 0.05
+                                       THEN NULL
+                                   WHEN managed_net_r > signal_net_r THEN TRUE
+                                   ELSE FALSE
+                               END,
+                               updated_at = NOW()
+                       WHERE internal_trade_id = %s
+                         AND managed_net_r IS NOT NULL""",
+                    (str(internal_trade_id),),
+                )
+                conn.commit()
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        logger.debug(
+            "edge_ledger managed outcome: iid=%.8s exit=%s r=%s",
+            str(internal_trade_id), actual_exit, realized_r,
+        )
+    except Exception as exc:
+        logger.debug(
+            "_el_update_managed_outcome fail-open (%.8s): %s",
+            str(internal_trade_id), exc,
+        )
 
 
 def _ghost_observe_setup(result, inst, source="databento_scan"):
@@ -45162,6 +45479,17 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
             logger.info(
                 "ghost_obs opened: %s %s %s @ %.4f strategy=%s key=%s",
                 source, inst, direction, entry, strategy_short, obs_key,
+            )
+            # ── Phase 8A: create Edge Ledger entry with frozen signal terms ──
+            # FAIL-OPEN — EL_DB_READY=False or any exception is a no-op.
+            # Never touches gate, scoring, sizing, or execution.
+            _el_create_entry(
+                obs_key=obs_key, result=result, inst=inst,
+                direction=direction, strategy_key=strategy_key,
+                entry=entry, stop_px=stop_px, target1=target1, target2=target2,
+                risk_pts=risk_pts, cost_r_est=cost_r_est,
+                sess_name=sess_name, edge_score=edge_score,
+                now_utc_ts=now_utc(),
             )
         else:
             # ON CONFLICT — already exists; undo cooldown reservation
@@ -45351,6 +45679,16 @@ def _ghost_obs_watcher_cycle():
                     )
                 except Exception as exc:
                     logger.warning("ghost_obs UPDATE failed id=%d: %s", row["id"], exc)
+                # ── Phase 8A: update edge_ledger signal outcome ──────────────
+                # FAIL-OPEN — EL_DB_READY=False or any exception is a no-op.
+                # Uses same conn; _el_update_signal_outcome_conn is its own try/except.
+                _el_update_signal_outcome_conn(
+                    conn, obs_key=row["obs_key"],
+                    status=status, close_reason=close_reason,
+                    exit_px=exit_px, gross_r=gross_r, net_r=net_r,
+                    cost_r=cost_r, mfe_r=mfe_r, mae_r=mae_r,
+                    now_ts=now_ts,
+                )
 
             else:
                 # Still open — persist updated MFE/MAE and bars_held
@@ -76130,6 +76468,109 @@ def route_profitability_observations():
                     "total": int(total), "limit": limit, "offset": offset})
 
 
+@app.route("/edge-ledger/diagnostics", methods=["GET"])
+def route_edge_ledger_diagnostics():
+    """EDGE LEDGER DIAGNOSTICS — per-strategy signal-vs-management accounting.
+
+    Phase 8A — RESEARCH / DISPLAY-ONLY.
+    Shows: total signals, unresolved, signal outcomes resolved, managed outcomes
+    resolved, avg signal gross R, avg signal net R, avg managed net R,
+    management delta, cost completeness, sample partition counts.
+
+    NEVER touches gate, scoring, sizing, learning weights, or execution.
+    Auth handled by Express proxy (NOT in OPEN_PATHS).
+    """
+    if not EL_DB_READY or not LEARNING_DB_ENABLED:
+        return jsonify({
+            "ok":   False,
+            "error": "edge_ledger table not ready — apply db_edge_ledger_schema.sql",
+            "diagnostics": [],
+        }), 503
+    try:
+        import edge_ledger as _el   # noqa: PLC0415
+    except Exception as _el_exc:
+        return jsonify({"ok": False, "error": str(_el_exc), "diagnostics": []}), 500
+
+    inst_filter = (request.args.get("instrument", "").strip().upper() or None)
+    sk_filter   = (request.args.get("strategy_key", "").strip() or None)
+    part_filter = (request.args.get("sample_partition", "").strip().upper() or None)
+
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "DB unavailable", "diagnostics": []}), 503
+    try:
+        where_clauses: list = []
+        params: list = []
+        if inst_filter:
+            where_clauses.append("instrument = %s"); params.append(inst_filter)
+        if sk_filter:
+            where_clauses.append("strategy_key = %s"); params.append(sk_filter)
+        if part_filter:
+            where_clauses.append("sample_partition = %s"); params.append(part_filter)
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT strategy_key, instrument, sample_partition,
+                           signal_outcome_status, managed_outcome_status,
+                           signal_gross_r, signal_net_r, managed_net_r,
+                           signal_vs_managed_delta_r, signal_cost_r,
+                           comparison_complete, data_complete
+                    FROM edge_ledger
+                    {where_sql}
+                    ORDER BY signal_timestamp ASC""",
+                params,
+            )
+            cols = [
+                "strategy_key", "instrument", "sample_partition",
+                "signal_outcome_status", "managed_outcome_status",
+                "signal_gross_r", "signal_net_r", "managed_net_r",
+                "signal_vs_managed_delta_r", "signal_cost_r",
+                "comparison_complete", "data_complete",
+            ]
+            rows = []
+            for r in cur.fetchall():
+                d = dict(zip(cols, r))
+                for nk in ("signal_gross_r", "signal_net_r", "managed_net_r",
+                           "signal_vs_managed_delta_r", "signal_cost_r"):
+                    if d[nk] is not None:
+                        try:
+                            d[nk] = float(d[nk])
+                        except (TypeError, ValueError):
+                            d[nk] = None
+                rows.append(d)
+            cur.execute(f"SELECT count(*) FROM edge_ledger {where_sql}", params)
+            total = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM edge_ledger WHERE signal_outcome_status='open'")
+            open_count = int(cur.fetchone()[0])
+            cur.execute("SELECT count(*) FROM edge_ledger WHERE comparison_complete=TRUE")
+            compared_count = int(cur.fetchone()[0])
+    except Exception as exc:
+        logger.warning("/edge-ledger/diagnostics error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc), "diagnostics": []}), 200
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    diagnostics = _el.compute_el_diagnostics(rows)
+    return jsonify({
+        "ok":          True,
+        "diagnostics": diagnostics,
+        "total_signals": total,
+        "open_signals":  open_count,
+        "comparisons_complete": compared_count,
+        "el_db_ready":   EL_DB_READY,
+        "cost_model_version": _el.COST_MODEL_VERSION,
+        "note": (
+            "EDGE LEDGER DIAGNOSTICS — signal outcome uses original frozen terms; "
+            "managed outcome from native_journal actual fills. "
+            "Learning engine unchanged (Phase 8A display-only)."
+        ),
+    })
+
+
 @app.route("/volatility-intelligence", methods=["GET"])
 def volatility_intelligence_endpoint():
     """Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY).
@@ -78768,6 +79209,7 @@ if __name__ == "__main__":
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
         _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
         _check_ghost_obs_db_ready()                # probe ghost_observations (no DDL; created via DB tool/publish diff) — PROFITABILITY ENGINE PHASE 1, RESEARCH/DISPLAY-ONLY
+        _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
         _check_hysteresis_thesis_db_ready()        # probe hysteresis_thesis (no DDL; created via DB tool/publish diff) — THESIS PHASE 2 persistence
