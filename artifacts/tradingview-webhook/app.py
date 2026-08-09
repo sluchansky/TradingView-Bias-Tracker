@@ -40955,6 +40955,40 @@ def get_databento_status():
     })
 
 
+@app.route("/market/trend-alignment", methods=["GET"])
+def route_market_trend_alignment():
+    """Multi-Timeframe Trend Alignment — Phase 8B.1 (DISPLAY-ONLY, FAIL-OPEN).
+
+    GET /market/trend-alignment?instrument=MNQ
+
+    Returns 4H and 15M trend states derived from the Databento 1-minute bar
+    stream resampled into closed 4H/15M bars.  Trend is computed using EMA(8)
+    vs EMA(21) on closed bars.  The partial (currently-forming) bar is never
+    included.
+
+    Returns:
+      instrument, four_hour (trend/strength/last_closed_bar/bar_count/stale),
+      fifteen_minute (same shape), alignment, updated_at, source.
+
+    Auth: Express proxy (owner-only).  NOT in OPEN_PATHS.
+    NEVER touches gate, scoring, sizing, learning, or execution.
+    """
+    instrument = (request.args.get("instrument") or "MNQ").strip().upper()
+    try:
+        import trend_alignment as _ta   # noqa: PLC0415
+        state = _ta.get_mtf_state(instrument)
+        return jsonify(state)
+    except Exception as exc:
+        return jsonify({
+            "instrument": instrument,
+            "four_hour":      {"trend": "UNAVAILABLE", "stale": False, "last_closed_bar": None, "bar_count": 0},
+            "fifteen_minute": {"trend": "UNAVAILABLE", "stale": False, "last_closed_bar": None, "bar_count": 0},
+            "alignment": "UNAVAILABLE",
+            "updated_at": None,
+            "error": str(exc)[:80],
+        })
+
+
 def _aggregate_bars_tf(bars_1m: list, tf: str) -> list:
     """Aggregate completed 1m bars into 5m or 15m bars.
 
@@ -45088,13 +45122,59 @@ def _check_edge_ledger_db_ready():
             pass
 
 
+# ── Phase 8B: Research Events Ring Buffer (DISPLAY-ONLY) ─────────────────────
+# In-memory ring buffer powering the Operations Readiness panel.
+# NEVER touches gate, scoring, sizing, learning, or execution.
+# All writes are fail-open (bare try/except).
+
+_RESEARCH_EVENTS: deque = deque(maxlen=500)       # appendleft → newest-first
+_RESEARCH_EVENTS_LOCK = threading.Lock()
+_RESEARCH_BOOT_TS: str = datetime.utcnow().isoformat() + "Z"
+_RESEARCH_FIRST_OBS_KEY = None     # first ghost obs since last restart (str | None)
+_RESEARCH_ERROR_COUNT: int = 0                    # count of logged research-path errors
+
+
+def _re_event(event_type,       # str
+              *,
+              inst=None,        # str | None
+              strategy=None,    # str | None
+              verdict=None,     # str | None
+              obs_key=None,     # str | None
+              net_r=None,       # float | None
+              extra=None):      # dict | None
+    """Append a research event to the Operations Readiness ring buffer.
+
+    FAIL-OPEN — never raises, never blocks, never touches any money path.
+    Called from _ghost_observe_setup, _ghost_obs_watcher_cycle, and EL helpers.
+    """
+    global _RESEARCH_FIRST_OBS_KEY
+    try:
+        ev = {
+            "ts":         datetime.utcnow().isoformat() + "Z",
+            "event_type": event_type,
+            "instrument": inst,
+            "strategy":   (strategy[:40] if strategy else None),
+            "verdict":    verdict,
+            "obs_key":    (obs_key[:64]  if obs_key  else None),
+            "net_r":      (round(float(net_r), 4) if net_r is not None else None),
+            "extra":      extra or {},
+        }
+        with _RESEARCH_EVENTS_LOCK:
+            _RESEARCH_EVENTS.appendleft(ev)
+            if event_type == "ghost_created" and obs_key and _RESEARCH_FIRST_OBS_KEY is None:
+                _RESEARCH_FIRST_OBS_KEY = obs_key
+    except Exception:
+        pass
+
+
 # ── Phase 8A: Edge Ledger helpers (FAIL-OPEN, DISPLAY/ACCOUNTING ONLY) ───────
 # These helpers never touch the gate, scoring, sizing, learning, or execution.
 # EL_DB_READY=False makes them byte-identical no-ops (fail-safe).
 
 def _el_create_entry(obs_key, result, inst, direction, strategy_key,
                      entry, stop_px, target1, target2, risk_pts,
-                     cost_r_est, sess_name, edge_score, now_utc_ts):
+                     cost_r_est, sess_name, edge_score, now_utc_ts,
+                     mtf_snap=None):
     """INSERT an edge_ledger row with frozen signal terms. FAIL-OPEN.
 
     Called from _ghost_observe_setup immediately after the ghost_obs INSERT
@@ -45130,10 +45210,12 @@ def _el_create_entry(obs_key, result, inst, direction, strategy_key,
                             confirmations, blockers, opposing_structure, risk_state,
                             market_context,
                             signal_cost_r, cost_model_version,
-                            signal_outcome_status)
+                            signal_outcome_status,
+                            four_h_trend_at_signal, fifteen_m_trend_at_signal,
+                            trend_alignment_at_signal)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s,%s)
+                               %s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT (edge_id) DO NOTHING""",
                     (
                         edge_id, obs_key, "live_shadow", inst,
@@ -45160,6 +45242,9 @@ def _el_create_entry(obs_key, result, inst, direction, strategy_key,
                         (round(cost_r_est, 4) if cost_r_est is not None else None),
                         _el.COST_MODEL_VERSION,
                         "open",
+                        (mtf_snap or {}).get("four_h_trend_at_signal"),
+                        (mtf_snap or {}).get("fifteen_m_trend_at_signal"),
+                        (mtf_snap or {}).get("trend_alignment_at_signal"),
                     ),
                 )
                 conn.commit()
@@ -45172,6 +45257,9 @@ def _el_create_entry(obs_key, result, inst, direction, strategy_key,
             "edge_ledger entry created: %s %s sk=%s edge_id=%s",
             inst, direction, strategy_key[:40], edge_id[:40],
         )
+        # ── Phase 8B: emit research event (DISPLAY-ONLY) ────────────────────
+        _re_event("el_created", inst=inst, strategy=strategy_key,
+                  obs_key=obs_key, extra={"edge_id": edge_id[:40]})
     except Exception as exc:
         logger.debug("_el_create_entry fail-open (%s %s): %s", inst, direction, exc)
 
@@ -45271,6 +45359,9 @@ def _el_try_link_to_journal(iid, instrument, direction):
             "edge_ledger linked to journal: iid=%.8s %s %s",
             str(iid), instrument, direction,
         )
+        # ── Phase 8B: emit research event (DISPLAY-ONLY) ────────────────────
+        _re_event("journal_linked", inst=instrument,
+                  extra={"iid": str(iid)[:16], "direction": direction})
     except Exception as exc:
         logger.debug(
             "_el_try_link_to_journal fail-open (%.8s %s %s): %s",
@@ -45351,11 +45442,43 @@ def _el_update_managed_outcome(internal_trade_id, outcome_dict):
             "edge_ledger managed outcome: iid=%.8s exit=%s r=%s",
             str(internal_trade_id), actual_exit, realized_r,
         )
+        # ── Phase 8B: emit research event (DISPLAY-ONLY) ────────────────────
+        _re_event("managed_outcome_updated",
+                  net_r=(float(realized_r) if realized_r is not None else None),
+                  extra={"iid": str(internal_trade_id)[:16], "actual_exit": actual_exit})
     except Exception as exc:
         logger.debug(
             "_el_update_managed_outcome fail-open (%.8s): %s",
             str(internal_trade_id), exc,
         )
+
+
+def _get_mtf_snapshot_at_signal(inst):
+    """Return frozen MTF trend context at signal time. FAIL-OPEN (Phase 8B.1).
+    Returns dict with four_h_trend_at_signal / fifteen_m_trend_at_signal /
+    trend_alignment_at_signal — all strings or None.  Never raises.
+    """
+    try:
+        import trend_alignment as _ta   # noqa: PLC0415
+        return _ta.get_snapshot_for_signal(inst)
+    except Exception:
+        return {"four_h_trend_at_signal": None,
+                "fifteen_m_trend_at_signal": None,
+                "trend_alignment_at_signal": None}
+
+
+def _mtf_bar_close(instrument, bar):
+    """Bar-close callback for Phase 8B.1 MTF Trend Alignment. DISPLAY-ONLY.
+
+    Feeds every completed Databento 1-minute bar into the trend_alignment
+    module so the 15M and 4H bar caches stay current.  FAIL-OPEN: any
+    exception is silently swallowed and never blocks the bar-close chain.
+    """
+    try:
+        import trend_alignment as _ta   # noqa: PLC0415
+        _ta.ingest_1m_bar(instrument, bar)
+    except Exception:
+        pass
 
 
 def _ghost_observe_setup(result, inst, source="databento_scan"):
@@ -45440,6 +45563,9 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
         regime     = ctx.get("regime") or "UNKNOWN"
         edge_score = result.get("edge_score")
 
+        # Phase 8B.1: snapshot MTF trend context at signal time (DISPLAY-ONLY)
+        _mtf_snap = _get_mtf_snapshot_at_signal(inst)
+
         conn = _learning_conn()
         if conn is None:
             with _GHOST_OBS_COOLDOWN_LOCK:
@@ -45455,9 +45581,11 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                             original_target1, original_target2, risk_points,
                             session, trading_mode, source, atr_at_signal,
                             cvd_direction, vwap_side, regime, edge_score_at_signal,
-                            status, cost_r, holdout_period)
+                            status, cost_r, holdout_period,
+                            four_h_trend_at_signal, fifteen_m_trend_at_signal,
+                            trend_alignment_at_signal)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s,'open',%s,'training')
+                               %s,%s,%s,%s,'open',%s,'training',%s,%s,%s)
                        ON CONFLICT (obs_key) DO NOTHING
                        RETURNING id""",
                     (obs_key, strategy_key, STRATEGY_VERSION, inst,
@@ -45466,7 +45594,10 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                      sess_name, TRADING_MODE, source, atr_at_sig,
                      cvd_dir, vwap_side, regime,
                      (int(round(float(edge_score))) if edge_score is not None else None),
-                     cost_r_est),
+                     cost_r_est,
+                     _mtf_snap.get('four_h_trend_at_signal'),
+                     _mtf_snap.get('fifteen_m_trend_at_signal'),
+                     _mtf_snap.get('trend_alignment_at_signal')),
                 )
                 row = cur.fetchone()
                 inserted = row is not None
@@ -45490,7 +45621,14 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                 risk_pts=risk_pts, cost_r_est=cost_r_est,
                 sess_name=sess_name, edge_score=edge_score,
                 now_utc_ts=now_utc(),
+                mtf_snap=_mtf_snap,
             )
+            # ── Phase 8B: emit research event (DISPLAY-ONLY) ────────────────
+            _re_event("ghost_created", inst=inst, strategy=strategy_key,
+                      verdict=str(result.get("verdict", "")),
+                      obs_key=obs_key,
+                      extra={"entry": entry, "stop": stop_px,
+                             "edge_score": edge_score, "session": sess_name})
         else:
             # ON CONFLICT — already exists; undo cooldown reservation
             with _GHOST_OBS_COOLDOWN_LOCK:
@@ -45632,6 +45770,11 @@ def _ghost_obs_watcher_cycle():
                     logger.info(
                         "ghost_obs tp1_partial: id=%d %s %s TP1 hit @ %s, staying open for leg 2",
                         row["id"], inst, row["direction"], exit_px)
+                    # ── Phase 8B: emit research event (DISPLAY-ONLY) ──────
+                    _re_event("tp1_hit", inst=inst,
+                              strategy=row.get("strategy_key"),
+                              obs_key=row.get("obs_key"),
+                              extra={"exit_px": exit_px, "ghost_id": row["id"]})
                 except Exception as exc:
                     logger.warning("ghost_obs tp1_partial UPDATE id=%d: %s", row["id"], exc)
 
@@ -45689,6 +45832,13 @@ def _ghost_obs_watcher_cycle():
                     cost_r=cost_r, mfe_r=mfe_r, mae_r=mae_r,
                     now_ts=now_ts,
                 )
+                # ── Phase 8B: emit research event (DISPLAY-ONLY) ────────────
+                _re_event(status, inst=inst,
+                          strategy=row.get("strategy_key"),
+                          obs_key=row.get("obs_key"),
+                          net_r=net_r,
+                          extra={"close_reason": close_reason, "gross_r": gross_r,
+                                 "ghost_id": row["id"]})
 
             else:
                 # Still open — persist updated MFE/MAE and bars_held
@@ -62779,6 +62929,22 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
       </div><!-- /.brain-narr-side -->
     </div><!-- /.brain-surface -->
 
+
+    <!-- MTF Trend card Phase 8B.1 DISPLAY-ONLY -->
+    <div id="mb-mtf-trend" style="border:1px solid var(--border);border-radius:8px;padding:10px 14px;margin:8px 0 6px;background:var(--inset)">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--muted)">MULTI-TIMEFRAME TREND</span>
+        <span id="mtf-align-pill" style="font-size:10px;font-weight:700;padding:2px 8px;border-radius:999px;background:rgba(107,114,128,.15);color:var(--muted)">—</span>
+      </div>
+      <div style="display:grid;grid-template-columns:32px 1fr 1fr;gap:3px 8px;align-items:baseline">
+        <span style="color:var(--muted);font-size:10px;font-weight:600">4H</span>
+        <span id="mtf-4h-badge" style="font-size:13px;font-weight:700">—</span>
+        <span id="mtf-4h-ts" style="color:var(--muted);font-size:10px;text-align:right"></span>
+        <span style="color:var(--muted);font-size:10px;font-weight:600">15M</span>
+        <span id="mtf-15m-badge" style="font-size:13px;font-weight:700">—</span>
+        <span id="mtf-15m-ts" style="color:var(--muted);font-size:10px;text-align:right"></span>
+      </div>
+    </div>
     <!-- ═══════════════════════════════════════════════════════
          STORY ZONE — Context / setup conditions / bull & bear
          Rendered by renderMainBrain() from main_brain fields:
@@ -64501,6 +64667,84 @@ function doResetSafetyLock() {}
     </div>
     <div class="bt-msg" id="el-msg"></div>
     <div class="bt-scroll" id="el-table" style="overflow-x:auto"></div>
+  </div>
+
+  <div class="mod" id="mod-research-ops" data-cat="experimental">
+    <div class="mod-h">🟢 Research Engine Health <span class="bt-mini">Operations Readiness — Phase 8B</span><span class="mod-cat cat-experimental">RESEARCH ONLY</span></div>
+    <div class="bt-mini" style="margin-bottom:8px">
+      Live observability for ghost observations and edge ledger.
+      <b>Read-only — no write operations, never influences gate or execution.</b>
+    </div>
+    <!-- Operator Summary (Section 9) -->
+    <div id="reh-summary" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(130px,1fr));gap:8px;margin-bottom:12px"></div>
+    <!-- Health grid (Section 1) -->
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:10px">
+      <div>
+        <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">DATA</div>
+        <div id="reh-data" style="font-size:12px;line-height:1.9"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">GHOST ENGINE</div>
+        <div id="reh-ghost" style="font-size:12px;line-height:1.9"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">EDGE LEDGER</div>
+        <div id="reh-el" style="font-size:12px;line-height:1.9"></div>
+      </div>
+      <div>
+        <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">COUNTS</div>
+        <div id="reh-counts" style="font-size:12px;line-height:1.9"></div>
+      </div>
+    </div>
+    <!-- First-signal checklist (Section 5) -->
+    <div id="reh-checklist" style="margin-bottom:10px;display:none">
+      <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">FIRST SIGNAL CHECKLIST</div>
+      <div id="reh-checklist-body" style="font-size:12px"></div>
+    </div>
+    <!-- Timing metrics (Section 7) -->
+    <div id="reh-timing-wrap" style="margin-bottom:10px;display:none">
+      <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">TIMING METRICS (most recent closed)</div>
+      <div id="reh-timing" style="font-size:12px;line-height:1.9"></div>
+    </div>
+    <!-- Duplicate detection (Section 4) + Error panel (Section 8) -->
+    <div id="reh-dups" style="margin-bottom:10px;display:none">
+      <div style="font-size:11px;font-weight:600;color:#ff4d4d;margin-bottom:4px;letter-spacing:.04em">⚠ DUPLICATES DETECTED</div>
+      <div id="reh-dups-body" style="font-size:12px"></div>
+    </div>
+    <!-- Edge Ledger Monitor (Section 6) -->
+    <div style="margin-bottom:10px">
+      <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">EDGE LEDGER MONITOR</div>
+      <div id="reh-el-monitor" style="font-size:12px;line-height:1.9"></div>
+    </div>
+    <!-- Live Event Feed (Section 2) + Observation Inspector (Section 3) -->
+    <div style="font-size:11px;font-weight:600;color:var(--muted);margin-bottom:4px;letter-spacing:.04em">LIVE EVENT FEED</div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:6px;flex-wrap:wrap">
+      <button class="bt-btn alt" onclick="rehLoad()" style="font-size:11px;padding:2px 8px">↻ Refresh now</button>
+      <select id="rev-inst-filter" onchange="revLoad()" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:2px 5px;border-radius:3px;font-size:11px">
+        <option value="">All instruments</option>
+        <option>MNQ</option><option>MGC</option><option>MES</option><option>MYM</option>
+      </select>
+      <select id="rev-type-filter" onchange="revLoad()" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:2px 5px;border-radius:3px;font-size:11px">
+        <option value="">All events</option>
+        <option value="ghost_created">ghost_created</option>
+        <option value="el_created">el_created</option>
+        <option value="tp1_hit">tp1_hit</option>
+        <option value="closed">closed</option>
+        <option value="journal_linked">journal_linked</option>
+        <option value="managed_outcome_updated">managed_outcome</option>
+      </select>
+      <span class="bt-mini" id="rev-meta"></span>
+    </div>
+    <div class="bt-scroll" id="rev-feed" style="max-height:320px;overflow-y:auto"></div>
+    <!-- Observation Inspector (Section 3) -->
+    <div id="reh-inspector" style="display:none;margin-top:10px;padding:10px;background:var(--inset);border-radius:6px;font-size:12px">
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
+        <span style="font-weight:600;font-size:12px">Observation Inspector</span>
+        <button class="bt-btn alt" onclick="rehCloseInspector()" style="font-size:11px;padding:1px 6px">✕ Close</button>
+      </div>
+      <div id="reh-inspector-body"></div>
+    </div>
+    <div class="bt-msg" id="reh-msg" style="margin-top:6px"></div>
   </div>
 
   <div class="mod" id="mod-baseline" data-cat="experimental">
@@ -67231,6 +67475,68 @@ function renderMBQuickQ(status){
     btn.onclick = function(){ mbAsk(c.q); };
     wrap.appendChild(btn);
   });
+}
+function mtfTrendStyle(t){
+  if(t==='BULLISH') return 'color:#4ade80';
+  if(t==='BEARISH') return 'color:#f87171';
+  if(t==='NEUTRAL') return 'color:#facc15';
+  if(t==='STALE')   return 'color:#9ca3af;font-style:italic';
+  return 'color:#6b7280';
+}
+function mtfArrow(t){
+  if(t==='BULLISH') return '↑ ';
+  if(t==='BEARISH') return '↓ ';
+  if(t==='NEUTRAL') return '— ';
+  return '';
+}
+function mtfAlignStyle(a){
+  if(a==='ALIGNED_LONG')  return {bg:'rgba(74,222,128,.12)',color:'#4ade80',text:'✅ ALIGNED LONG'};
+  if(a==='ALIGNED_SHORT') return {bg:'rgba(248,113,113,.12)',color:'#f87171',text:'✅ ALIGNED SHORT'};
+  if(a==='CONFLICTING')   return {bg:'rgba(251,191,36,.12)',color:'#fbbf24',text:'⚠ CONFLICTING'};
+  if(a==='MIXED')         return {bg:'rgba(107,114,128,.12)',color:'#9ca3af',text:'○ MIXED'};
+  if(a==='STALE')         return {bg:'rgba(107,114,128,.1)', color:'#6b7280',text:'⧖ STALE'};
+  return {bg:'rgba(107,114,128,.08)',color:'#6b7280',text:'— '+(a||'NO DATA')};
+}
+function mtfFmtTs(iso){
+  if(!iso) return '';
+  try{
+    var d=new Date(iso);
+    return d.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit'});
+  }catch(e){return '';}
+}
+function mtfRender(j){
+  var b4   = document.getElementById('mtf-4h-badge');
+  var t4   = document.getElementById('mtf-4h-ts');
+  var b15  = document.getElementById('mtf-15m-badge');
+  var t15  = document.getElementById('mtf-15m-ts');
+  var pill = document.getElementById('mtf-align-pill');
+  if(!b4) return;
+  var fh  = (j&&j.four_hour)     || {};
+  var fm  = (j&&j.fifteen_minute)|| {};
+  var aln = (j&&j.alignment)     || 'UNAVAILABLE';
+  b4.style.cssText  = mtfTrendStyle(fh.trend);
+  var str4 = fh.strength ? ' — '+fh.strength : '';
+  b4.textContent = mtfArrow(fh.trend)+(fh.trend||'—')+str4;
+  if(t4) t4.textContent = fh.last_closed_bar ? 'updated '+mtfFmtTs(fh.last_closed_bar)+' UTC' : (fh.bar_count!=null?fh.bar_count+' bars':'');
+  b15.style.cssText = mtfTrendStyle(fm.trend);
+  var str15 = fm.strength ? ' — '+fm.strength : '';
+  b15.textContent = mtfArrow(fm.trend)+(fm.trend||'—')+str15;
+  if(t15) t15.textContent = fm.last_closed_bar ? 'updated '+mtfFmtTs(fm.last_closed_bar)+' UTC' : (fm.bar_count!=null?fm.bar_count+' bars':'');
+  if(pill){
+    var as = mtfAlignStyle(aln);
+    pill.style.background = as.bg;
+    pill.style.color = as.color;
+    pill.textContent = as.text;
+  }
+}
+var _mtfTimer=null;
+function mtfLoad(){
+  var inst = (typeof sym!=='undefined'?sym:null) || 'MNQ';
+  api('/market/trend-alignment?instrument='+encodeURIComponent(inst))
+    .then(mtfRender)
+    .catch(function(){});
+  clearTimeout(_mtfTimer);
+  _mtfTimer=setTimeout(mtfLoad,30000);
 }
 function renderMainBrain(d){
   const mod = document.getElementById('mod-brain');
@@ -73100,6 +73406,173 @@ function elRender(j){
   h+='</tbody></table>';
   if(table) table.innerHTML=h;
 }
+function rehStar(ok){return ok?'<span style="color:#4ade80">●</span>':'<span style="color:#ff4d4d">●</span>';}
+function rehFmt(ts){if(!ts)return'—';try{var d=new Date(ts);return d.toLocaleTimeString('en-US',{hour12:false,hour:'2-digit',minute:'2-digit',second:'2-digit'});}catch(e){return ts;}}
+function rehMs(ms){return ms!=null?ms+'ms':'—';}
+function rehRender(h,ev){
+  // Operator summary (Section 9)
+  var ge=h.ghost_engine||{},el=h.edge_ledger||{},cnt=ge.counts||{};
+  var ready=h.ready_for_market;
+  var todayOpen=cnt.open||0,todayClosed=cnt.closed||0;
+  var errCount=h.error_count||0,dupCount=h.duplicate_event_count||0;
+  var sum=document.getElementById('reh-summary');
+  if(sum) sum.innerHTML=[
+    ['Ghost Engine',ge.table_ready?'Running':'Offline',ge.table_ready],
+    ['Edge Ledger',el.table_ready?'Healthy':'Offline',el.table_ready],
+    ['Ghost Obs (open)',todayOpen,null],
+    ['Ghost Obs (closed)',todayClosed,null],
+    ['Errors',errCount,errCount===0],
+    ['Duplicates',dupCount,dupCount===0],
+    ['Ready For Market',ready?'YES':'NO',ready],
+  ].map(function(r){
+    var col=r[2]==null?'var(--text)':(r[2]?'#4ade80':'#ff4d4d');
+    return '<div style="background:var(--inset);border-radius:6px;padding:8px 10px">'
+      +'<div style="font-size:10px;color:var(--muted);margin-bottom:2px">'+r[0]+'</div>'
+      +'<div style="font-size:14px;font-weight:600;color:'+col+'">'+r[1]+'</div></div>';
+  }).join('');
+  // Health grid (Section 1)
+  var db=h.databento||{};
+  document.getElementById('reh-data').innerHTML=
+    rehStar(db.enabled)+' Databento '+( db.enabled?'enabled':'disabled')+'<br>'
+    +'<span style="color:var(--muted);font-size:11px">Boot: '+rehFmt(h.boot_ts)+'</span><br>'
+    +'Events captured: '+(h.event_count||0);
+  document.getElementById('reh-ghost').innerHTML=
+    rehStar(ge.table_ready)+' Table ready<br>'
+    +rehStar(ge.callback_registered)+' Callback registered<br>'
+    +'Open: <b>'+todayOpen+'</b>  Closed: <b>'+todayClosed+'</b><br>'
+    +'Last created: '+rehFmt(ge.last_created_at);
+  document.getElementById('reh-el').innerHTML=
+    rehStar(el.table_ready)+' Table ready<br>'
+    +'Rows: <b>'+(el.total_rows||0)+'</b><br>'
+    +'Last insert: '+rehFmt(el.last_created_at)+'<br>'
+    +'Last update: '+rehFmt(el.last_updated_at);
+  document.getElementById('reh-counts').innerHTML=
+    'Open ghost obs: <b>'+todayOpen+'</b><br>'
+    +'Closed ghost obs: <b>'+todayClosed+'</b><br>'
+    +'EL rows: <b>'+(el.total_rows||0)+'</b>';
+  // First-obs checklist (Section 5)
+  var chkWrap=document.getElementById('reh-checklist');
+  var chkBody=document.getElementById('reh-checklist-body');
+  var val=h.first_obs_validation;
+  if(val&&chkWrap&&chkBody){
+    chkWrap.style.display='';
+    var ok=val.status==='PASS';
+    var html=rehStar(ok)+' <b>'+(ok?'First observation validated.':'Validation FAILED')+'</b>';
+    html+='<br><span style="color:var(--muted);font-size:11px">obs_key: '+(val.obs_key||'—')+'</span>';
+    if(!ok&&val.failed_checks&&val.failed_checks.length){
+      html+='<br><span style="color:#ff4d4d">Failed: '+val.failed_checks.join(', ')+'</span>';
+    }
+    if(val.checks){val.checks.forEach(function(c){
+      html+='<br>'+rehStar(c.passed)+' '+c.check
+        +(c.value!=null?' = '+c.value:'');
+    });}
+    chkBody.innerHTML=html;
+  }
+  // Timing metrics (Section 7)
+  var tm=h.timing_metrics;
+  var tmWrap=document.getElementById('reh-timing-wrap');
+  if(tm&&!tm.error&&tmWrap){
+    tmWrap.style.display='';
+    document.getElementById('reh-timing').innerHTML=
+      'Signal → Ghost: '+rehMs(tm.signal_to_ghost_ms)+'<br>'
+      +'Signal → Ledger: '+rehMs(tm.signal_to_ledger_ms)+'<br>'
+      +'Signal → Resolved: '+rehMs(tm.signal_to_resolved_ms)+'<br>'
+      +'obs: <span style="color:var(--muted);font-size:11px">'+(tm.obs_key||'—')+'</span>';
+  }
+  // Duplicates (Section 4)
+  var dupWrap=document.getElementById('reh-dups');
+  var dupBody=document.getElementById('reh-dups-body');
+  if(dupWrap&&dupBody){
+    var allDups=[];
+    (ge.duplicate_obs_keys||[]).forEach(function(d){allDups.push('Ghost obs_key dup: '+d.obs_key+' (×'+d.count+')');});
+    (el.duplicate_edge_ids||[]).forEach(function(d){allDups.push('EL edge_id dup: '+d.edge_id+' (×'+d.count+')');});
+    (el.duplicate_ghost_obs_keys||[]).forEach(function(d){allDups.push('EL ghost_obs_key dup: '+d.obs_key+' (×'+d.count+')');});
+    (el.duplicate_journal_links||[]).forEach(function(d){allDups.push('EL journal link dup: '+d.iid+' (×'+d.count+')');});
+    dupWrap.style.display=allDups.length?'':'none';
+    dupBody.innerHTML=allDups.map(function(s){return '<div>'+s+'</div>';}).join('');
+  }
+  // EL monitor (Section 6)
+  var mon=document.getElementById('reh-el-monitor');
+  if(mon){
+    mon.innerHTML=
+      'Newest insert: '+rehFmt(el.last_created_at)+'<br>'
+      +'Newest update: '+rehFmt(el.last_updated_at)+'<br>'
+      +'Comparisons complete: '+((h.comparisons_complete||0));
+  }
+  // Event feed (Section 2)
+  revRenderEvents(ev);
+  document.getElementById('reh-msg').textContent='';
+}
+function revRenderEvents(events){
+  var feed=document.getElementById('rev-feed');
+  if(!feed)return;
+  var meta=document.getElementById('rev-meta');
+  if(!events||!events.length){feed.innerHTML='<div style="color:var(--muted);font-size:12px;padding:8px">No events yet since boot.</div>';if(meta)meta.textContent='';return;}
+  if(meta)meta.textContent=events.length+' events';
+  var EVENT_LABELS={'ghost_created':'👻 Ghost Created','el_created':'📒 EL Created',
+    'tp1_hit':'🎯 TP1 Hit','closed':'✅ Closed','expired':'⏰ Expired',
+    'stop_hit':'🛑 Stop Hit','journal_linked':'🔗 Journal Linked',
+    'managed_outcome_updated':'💰 Managed Outcome'};
+  feed.innerHTML=events.map(function(e){
+    var label=EVENT_LABELS[e.event_type]||e.event_type;
+    var netR=e.net_r!=null?(' <b style="color:'+(e.net_r>=0?'#4ade80':'#ff4d4d')+'">'+
+      (e.net_r>=0?'+':'')+e.net_r.toFixed(2)+'R</b>'):'';
+    var obsLink=e.obs_key?(' <span class="rev-obs-btn" data-ok="'+e.obs_key+'" title="Click to inspect" style="color:var(--muted);font-size:10px;cursor:pointer">🔍</span>'):'';
+    return '<div style="padding:5px 0;border-bottom:1px solid var(--border);font-size:12px">'
+      +'<span style="color:var(--muted);font-size:11px">'+rehFmt(e.ts)+'</span>'
+      +(e.instrument?' <b>'+e.instrument+'</b>':'')
+      +(e.strategy?' <span style="color:var(--muted);font-size:11px">'+e.strategy.split('|')[0]+'</span>':'')
+      +' '+label+netR+obsLink+'</div>';
+  }).join('');
+}
+function rehInspect(obsKey){
+  var insp=document.getElementById('reh-inspector');
+  var body=document.getElementById('reh-inspector-body');
+  if(!insp||!body)return;
+  insp.style.display='';
+  body.innerHTML='<div style="color:var(--muted)">Loading…</div>';
+  api('/profitability/observations?limit=1&obs_key='+encodeURIComponent(obsKey))
+    .then(function(j){
+      var obs=(j.observations||[])[0];
+      if(!obs){body.innerHTML='<span style="color:var(--muted)">Observation not found.</span>';return;}
+      var fields=[
+        ['Observation ID',obs.obs_key],['Strategy',obs.strategy_key],
+        ['Instrument',obs.instrument],['Direction',obs.direction],
+        ['Signal Time',obs.signal_time],
+        ['Frozen Entry',obs.original_entry],['Frozen Stop',obs.original_stop],
+        ['Frozen TP1',obs.original_target1],['Frozen TP2',obs.original_target2],
+        ['Risk Points',obs.risk_points],
+        ['Status',obs.status],['MFE R',obs.mfe_r],['MAE R',obs.mae_r],
+        ['Gross R',obs.gross_r],['Net R',obs.net_r],['Costs R',obs.cost_r],
+        ['Signal Outcome',obs.status],['Exit Reason',obs.close_reason],
+        ['Created',obs.created_at],['Closed',obs.closed_at],
+      ];
+      body.innerHTML=fields.map(function(f){
+        var val=f[1]!=null?String(f[1]):'—';
+        return '<div style="display:flex;gap:12px;border-bottom:1px solid var(--border);padding:3px 0">'
+          +'<span style="color:var(--muted);font-size:11px;width:120px;flex-shrink:0">'+f[0]+'</span>'
+          +'<span style="font-size:12px">'+val+'</span></div>';
+      }).join('');
+    }).catch(function(){body.innerHTML='<span style="color:#ff4d4d">Could not load observation.</span>';});
+}
+function rehCloseInspector(){
+  var el=document.getElementById('reh-inspector');
+  if(el)el.style.display='none';
+}
+var _rehTimer=null;
+function rehLoad(){
+  var msg=document.getElementById('reh-msg');
+  if(msg)msg.textContent='';
+  Promise.all([
+    api('/research-health'),
+    api('/research-events?limit=100&inst='+(document.getElementById('rev-inst-filter')||{value:''}).value
+      +'&event_type='+(document.getElementById('rev-type-filter')||{value:''}).value)
+  ]).then(function(r){rehRender(r[0],r[1].events||[]);})
+    .catch(function(e){if(msg){msg.className='bt-msg error';msg.textContent='Could not load research health.';}});
+  clearTimeout(_rehTimer);
+  _rehTimer=setTimeout(rehLoad,30000);
+}
+function revLoad(){rehLoad();}
 function elLoad(){
   var meta=document.getElementById('el-meta');
   var msg=document.getElementById('el-msg');
@@ -75911,6 +76384,7 @@ function loadDQ(){
     .catch(function(){});
 }
 (function(){ loadDQ(); setInterval(loadDQ,60000); })();
+(function(){ mtfLoad(); })(); // Phase 8B.1 MTF Trend — starts own 30s loop
 </script>
 
 </body>
@@ -76567,6 +77041,275 @@ def route_edge_ledger_diagnostics():
             "EDGE LEDGER DIAGNOSTICS — signal outcome uses original frozen terms; "
             "managed outcome from native_journal actual fills. "
             "Learning engine unchanged (Phase 8A display-only)."
+        ),
+    })
+
+
+@app.route("/research-health", methods=["GET"])
+def route_research_health():
+    """Operations Readiness health snapshot — Phase 8B (DISPLAY-ONLY).
+
+    Returns health status for ghost engine, edge ledger, Databento,
+    event counts, first-observation validation, duplicate detection,
+    and timing metrics.  Auth handled by Express proxy.  NOT in OPEN_PATHS.
+    NEVER touches gate, scoring, sizing, learning, or execution.
+    """
+    out: dict = {
+        "boot_ts":       _RESEARCH_BOOT_TS,
+        "first_obs_key": _RESEARCH_FIRST_OBS_KEY,
+        "error_count":   _RESEARCH_ERROR_COUNT,
+        "ghost_engine":  {
+            "table_ready":           GHOST_OBS_DB_READY,
+            "callback_registered":   GHOST_OBS_DB_READY,  # set at boot if table ready
+            "counts":                {"open": 0, "closed": 0, "total": 0},
+            "last_created_at":       None,
+            "duplicate_obs_keys":    [],
+        },
+        "edge_ledger": {
+            "table_ready":            EL_DB_READY,
+            "total_rows":             0,
+            "last_created_at":        None,
+            "last_updated_at":        None,
+            "duplicate_edge_ids":     [],
+            "duplicate_ghost_obs_keys": [],
+            "duplicate_journal_links":  [],
+        },
+        "databento": {
+            "enabled": DATABENTO_ENABLED,
+        },
+    }
+
+    if GHOST_OBS_DB_READY and LEARNING_DB_ENABLED:
+        conn = _learning_conn()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT status, count(*), max(created_at)
+                           FROM ghost_observations GROUP BY status"""
+                    )
+                    for row in cur.fetchall():
+                        st, cnt, last = row
+                        out["ghost_engine"]["counts"]["total"] += cnt
+                        if st == "open":
+                            out["ghost_engine"]["counts"]["open"] = cnt
+                        else:
+                            out["ghost_engine"]["counts"]["closed"] = (
+                                out["ghost_engine"]["counts"].get("closed", 0) + cnt
+                            )
+                        if last:
+                            prev = out["ghost_engine"]["last_created_at"]
+                            this = last.isoformat()
+                            if prev is None or this > prev:
+                                out["ghost_engine"]["last_created_at"] = this
+                    cur.execute(
+                        """SELECT obs_key, count(*) FROM ghost_observations
+                           GROUP BY obs_key HAVING count(*) > 1"""
+                    )
+                    out["ghost_engine"]["duplicate_obs_keys"] = [
+                        {"obs_key": r[0], "count": int(r[1])} for r in cur.fetchall()
+                    ]
+            except Exception as exc:
+                out["ghost_engine"]["db_error"] = str(exc)[:120]
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    if EL_DB_READY and LEARNING_DB_ENABLED:
+        conn = _learning_conn()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT count(*), max(created_at), max(updated_at) FROM edge_ledger"
+                    )
+                    r = cur.fetchone()
+                    if r:
+                        out["edge_ledger"]["total_rows"] = int(r[0])
+                        out["edge_ledger"]["last_created_at"] = (
+                            r[1].isoformat() if r[1] else None
+                        )
+                        out["edge_ledger"]["last_updated_at"] = (
+                            r[2].isoformat() if r[2] else None
+                        )
+                    for qname, field, col in [
+                        ("SELECT edge_id, count(*) FROM edge_ledger GROUP BY edge_id HAVING count(*)>1",
+                         "duplicate_edge_ids", "edge_id"),
+                        ("""SELECT ghost_obs_key, count(*) FROM edge_ledger
+                            WHERE ghost_obs_key IS NOT NULL
+                            GROUP BY ghost_obs_key HAVING count(*)>1""",
+                         "duplicate_ghost_obs_keys", "obs_key"),
+                        ("""SELECT internal_trade_id, count(*) FROM edge_ledger
+                            WHERE internal_trade_id IS NOT NULL
+                            GROUP BY internal_trade_id HAVING count(*)>1""",
+                         "duplicate_journal_links", "iid"),
+                    ]:
+                        cur.execute(qname)
+                        out["edge_ledger"][field] = [
+                            {col: r[0], "count": int(r[1])} for r in cur.fetchall()
+                        ]
+                    # Timing metrics — most recent closed observation
+                    cur.execute(
+                        """SELECT el.ghost_obs_key, el.instrument,
+                                  el.signal_timestamp, el.created_at,
+                                  el.signal_resolved_at, el.managed_resolved_at,
+                                  go.created_at
+                           FROM edge_ledger el
+                           LEFT JOIN ghost_observations go
+                                  ON go.obs_key = el.ghost_obs_key
+                           WHERE el.signal_resolved_at IS NOT NULL
+                           ORDER BY el.signal_resolved_at DESC LIMIT 1"""
+                    )
+                    tr = cur.fetchone()
+                    if tr:
+                        def _ms(a, b):
+                            if a and b:
+                                try:
+                                    return round((b - a).total_seconds() * 1000)
+                                except Exception:
+                                    return None
+                            return None
+                        out["timing_metrics"] = {
+                            "obs_key":                     tr[0],
+                            "instrument":                  tr[1],
+                            "signal_to_ghost_ms":          _ms(tr[2], tr[6]),
+                            "signal_to_ledger_ms":         _ms(tr[2], tr[3]),
+                            "signal_to_resolved_ms":       _ms(tr[2], tr[4]),
+                            "managed_resolved_at":         (tr[5].isoformat() if tr[5] else None),
+                        }
+            except Exception as exc:
+                out["edge_ledger"]["db_error"] = str(exc)[:120]
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # First-observation validation (Phase 8B Section 5)
+    first_key = _RESEARCH_FIRST_OBS_KEY
+    if first_key and GHOST_OBS_DB_READY and EL_DB_READY and LEARNING_DB_ENABLED:
+        val: dict = {"obs_key": first_key, "checks": []}
+        conn = _learning_conn()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """SELECT count(*), instrument, strategy_key,
+                                  direction, original_entry
+                           FROM ghost_observations WHERE obs_key=%s
+                           GROUP BY instrument, strategy_key, direction, original_entry""",
+                        (first_key,),
+                    )
+                    row = cur.fetchone()
+                    n_g = int(row[0]) if row else 0
+                    val["checks"].append(
+                        {"check": "exactly_one_obs", "passed": n_g == 1, "value": n_g}
+                    )
+                    if row and n_g == 1:
+                        val["instrument"] = row[1]
+                        val["strategy"]   = row[2]
+                        val["direction"]  = row[3]
+                        val["checks"].append({
+                            "check": "frozen_values_populated",
+                            "passed": row[4] is not None,
+                            "value": row[4],
+                        })
+                    cur.execute(
+                        """SELECT count(*), instrument, strategy_key
+                           FROM edge_ledger WHERE ghost_obs_key=%s
+                           GROUP BY instrument, strategy_key""",
+                        (first_key,),
+                    )
+                    el_row = cur.fetchone()
+                    n_el = int(el_row[0]) if el_row else 0
+                    val["checks"].append(
+                        {"check": "exactly_one_ledger_row", "passed": n_el == 1, "value": n_el}
+                    )
+                    if row and el_row and n_g == 1 and n_el == 1:
+                        val["checks"].append({
+                            "check": "matching_instrument",
+                            "passed": row[1] == el_row[1],
+                        })
+                        val["checks"].append({
+                            "check": "matching_strategy",
+                            "passed": row[2] == el_row[2],
+                        })
+                all_pass = all(c["passed"] for c in val["checks"])
+                val["status"]        = "PASS" if all_pass else "FAIL"
+                val["failed_checks"] = [c["check"] for c in val["checks"] if not c["passed"]]
+            except Exception as exc:
+                val["error"] = str(exc)[:120]
+                val["status"] = "ERROR"
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        out["first_obs_validation"] = val
+
+    # Event buffer summary
+    with _RESEARCH_EVENTS_LOCK:
+        ev_snap = list(_RESEARCH_EVENTS)
+    out["event_count"]          = len(ev_snap)
+    out["recent_events_sample"] = ev_snap[:5]
+
+    # Duplicate count for operator summary
+    dup_total = (
+        len(out["ghost_engine"].get("duplicate_obs_keys", []))
+        + len(out["edge_ledger"].get("duplicate_edge_ids", []))
+        + len(out["edge_ledger"].get("duplicate_ghost_obs_keys", []))
+        + len(out["edge_ledger"].get("duplicate_journal_links", []))
+    )
+    out["duplicate_event_count"] = dup_total
+
+    out["ready_for_market"] = (
+        GHOST_OBS_DB_READY
+        and EL_DB_READY
+        and _RESEARCH_ERROR_COUNT == 0
+        and dup_total == 0
+    )
+
+    return jsonify(out)
+
+
+@app.route("/research-events", methods=["GET"])
+def route_research_events():
+    """Operations Readiness event feed — Phase 8B (DISPLAY-ONLY).
+
+    Returns the newest-first ring-buffer of research events (max 500).
+    Query params: limit (1-500, default 100), inst (uppercase), event_type.
+    Auth handled by Express proxy.  NOT in OPEN_PATHS.
+    NEVER touches gate, scoring, sizing, learning, or execution.
+    """
+    try:
+        limit = min(500, max(1, int(request.args.get("limit", 100))))
+    except (TypeError, ValueError):
+        limit = 100
+    inst_f = (request.args.get("inst", "").strip().upper() or None)
+    type_f = (request.args.get("event_type", "").strip().lower() or None)
+
+    with _RESEARCH_EVENTS_LOCK:
+        events = list(_RESEARCH_EVENTS)  # already newest-first
+
+    if inst_f:
+        events = [e for e in events if e.get("instrument") == inst_f]
+    if type_f:
+        events = [e for e in events if e.get("event_type") == type_f]
+
+    events = events[:limit]
+
+    return jsonify({
+        "ok":            True,
+        "events":        events,
+        "total":         len(events),
+        "boot_ts":       _RESEARCH_BOOT_TS,
+        "first_obs_key": _RESEARCH_FIRST_OBS_KEY,
+        "error_count":   _RESEARCH_ERROR_COUNT,
+        "note": (
+            "Phase 8B Operations Readiness event feed — "
+            "display-only, never touches gate or execution."
         ),
     })
 
@@ -79311,6 +80054,25 @@ if __name__ == "__main__":
             logger.info("ProfitabilityEngine: ghost_obs bar-close callback registered")
         except Exception as _go_reg_exc:
             logger.warning("ProfitabilityEngine: bar-close callback registration failed: %s", _go_reg_exc)
+    # ── Phase 8B.1: MTF Trend Alignment bar-close callback + boot seed ───────
+    # DISPLAY-ONLY — never touches gate, scoring, sizing, or execution.
+    if DATABENTO_ENABLED and "_DATABENTO_BRAIN" in globals():
+        try:
+            globals()["_DATABENTO_BRAIN"].register_bar_close_callback(_mtf_bar_close)
+            logger.info("MTFTrend: bar-close callback registered (Phase 8B.1)")
+            # Seed from any 1m bars already buffered (Databento may have bars from
+            # startup symbology pre-fetch or prior connection).
+            try:
+                from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
+                import trend_alignment as _ta_boot                   # noqa: PLC0415
+                for _mtf_inst, _mtf_bars in DATABENTO_BARS_BY_INST.items():
+                    _mtf_n = _ta_boot.seed_from_1m_bars(str(_mtf_inst), list(_mtf_bars))
+                    if _mtf_n:
+                        logger.info("MTFTrend: seeded %d 1m bars for %s", _mtf_n, _mtf_inst)
+            except Exception as _mtf_seed_exc:
+                logger.debug("MTFTrend: boot seed skipped — %s", _mtf_seed_exc)
+        except Exception as _mtf_reg_exc:
+            logger.warning("MTFTrend: callback registration failed — %s", _mtf_reg_exc)
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:

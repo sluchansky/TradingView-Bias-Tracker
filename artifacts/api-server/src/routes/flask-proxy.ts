@@ -413,6 +413,14 @@ export const BOT1_ROUTES = [
   // Shows per-strategy signal outcome vs managed outcome comparison.
   // Never touches gate, learning weights, scoring, or execution.
   "/edge-ledger/diagnostics",
+  // Phase 8B: Operations Readiness — research engine health snapshot + event feed
+  // (DISPLAY-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS).
+  // Never touches gate, scoring, sizing, learning, or execution.
+  "/research-health",
+  "/research-events",
+  // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).
+  // Returns 4H/15M trend states from Databento 1m bar resampling.
+  "/market/trend-alignment",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

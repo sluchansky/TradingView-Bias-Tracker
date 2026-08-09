@@ -1,0 +1,396 @@
+# PHASE 8B — OPERATIONS READINESS
+
+## PRE-MARKET VALIDATION & OBSERVABILITY
+
+The platform has been republished.
+
+The market opens tomorrow.
+
+Do NOT modify:
+
+* Databento ingestion
+* strategy logic
+* scoring
+* risk
+* execution
+* prop rules
+* learning
+* promotion logic
+* Edge Ledger calculations
+
+This phase is purely operational readiness and observability.
+
+---
+
+# OBJECTIVE
+
+When the first MNQ setup occurs tomorrow, I want to know within 30 seconds that:
+
+* the signal was detected
+* one ghost observation was created
+* one Edge Ledger row was created
+* the observation lifecycle is progressing correctly
+* nothing duplicated
+* no silent failures occurred
+
+---
+
+# 1. SYSTEM HEALTH PANEL
+
+Create a read-only "Research Engine Health" panel.
+
+Display:
+
+## Data
+
+* Databento Connected
+* Last Market Update
+* Last Bar Timestamp
+
+## Ghost Engine
+
+* Ghost Engine Running
+* Ghost Callback Registered
+* Ghost Table Ready
+
+## Edge Ledger
+
+* Edge Ledger Ready
+* Last Ledger Insert
+* Last Ledger Update
+
+## Counts
+
+* Open Ghost Observations
+* Closed Ghost Observations
+* Edge Ledger Rows
+
+Show green/red status.
+
+No controls.
+
+No write operations.
+
+---
+
+# 2. LIVE EVENT FEED
+
+Create a scrolling event feed.
+
+Log events like:
+
+09:31:02
+
+MNQ
+
+ORB
+
+READY
+
+Ghost Observation Created
+
+Observation ID
+
+---
+
+09:31:12
+
+Observation Activated
+
+---
+
+09:36:41
+
+TP1 Hit
+
+---
+
+09:42:15
+
+Observation Closed
+
+Net +1.37R
+
+Edge Ledger Updated
+
+Newest first.
+
+Maximum 500 events.
+
+Research only.
+
+---
+
+# 3. OBSERVATION INSPECTOR
+
+Click any observation.
+
+Display:
+
+Observation ID
+
+Strategy
+
+Instrument
+
+Direction
+
+Signal Time
+
+Frozen Entry
+
+Frozen Stop
+
+Frozen Targets
+
+Status
+
+MFE
+
+MAE
+
+Gross R
+
+Net R
+
+Costs
+
+Signal Outcome
+
+Managed Outcome
+
+Management Delta
+
+Exit Reason
+
+Journal Link (if available)
+
+Everything read-only.
+
+---
+
+# 4. DUPLICATE DETECTION
+
+Continuously monitor:
+
+Duplicate observation IDs
+
+Duplicate ghost creation
+
+Duplicate edge ledger rows
+
+Duplicate journal linkage
+
+If duplicates occur:
+
+Highlight immediately.
+
+Do not automatically repair.
+
+---
+
+# 5. FIRST SIGNAL CHECKLIST
+
+Automatically detect:
+
+First ghost observation since boot.
+
+Run validation:
+
+Exactly one observation?
+
+Exactly one ledger row?
+
+Matching strategy?
+
+Matching instrument?
+
+Frozen values populated?
+
+If PASS:
+
+Display:
+
+"First observation validated."
+
+If FAIL:
+
+Display exactly which validation failed.
+
+---
+
+# 6. EDGE LEDGER MONITOR
+
+Display:
+
+Newest Ledger Entry
+
+Newest Closed Observation
+
+Newest Managed Outcome
+
+Newest Journal Link
+
+Newest Management Delta
+
+Newest Expectancy Update
+
+Newest Drawdown Update
+
+Newest Sample Count
+
+---
+
+# 7. TIMING METRICS
+
+Measure:
+
+Signal
+
+↓
+
+Ghost Created
+
+↓
+
+Ledger Created
+
+↓
+
+Observation Closed
+
+↓
+
+Ledger Updated
+
+Display milliseconds where possible.
+
+---
+
+# 8. ERROR PANEL
+
+Show:
+
+Ghost creation failures
+
+Ledger write failures
+
+Journal link failures
+
+Missing frozen fields
+
+Missing outcome
+
+Database errors
+
+API errors
+
+No stack traces.
+
+Readable summaries only.
+
+---
+
+# 9. OPERATOR SUMMARY
+
+Create one compact card.
+
+Example:
+
+Research Engine
+
+Ghost Engine
+
+Running
+
+Edge Ledger
+
+Healthy
+
+Today's Ghost Trades
+
+0
+
+Today's Closed
+
+0
+
+Research Errors
+
+0
+
+Duplicate Events
+
+0
+
+Ready For Market
+
+YES
+
+---
+
+# 10. TESTS
+
+Add tests for:
+
+Health endpoints
+
+Duplicate detection
+
+Observation inspector
+
+Event feed ordering
+
+First observation validation
+
+Health calculations
+
+No regressions.
+
+---
+
+# RULES
+
+Do NOT change:
+
+strategy logic
+
+risk
+
+execution
+
+learning
+
+promotion
+
+ghost calculations
+
+edge calculations
+
+This phase is visibility only.
+
+---
+
+# DELIVERABLE
+
+Create:
+
+OPERATIONS_READINESS_PHASE_8B.md
+
+Include:
+
+Files changed
+
+New endpoints
+
+New UI
+
+New diagnostics
+
+Tests
+
+Regression results
+
+Expected operator workflow from market open through first completed observation.
+
+STOP after implementation.

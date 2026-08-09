@@ -1,0 +1,369 @@
+# PHASE 8B.1 — MULTI-TIMEFRAME TREND ALIGNMENT
+
+## 4H + 15M — FAST OPERATOR VISIBILITY
+
+Add a very simple multi-timeframe trend-status system to the existing trading dashboard.
+
+Primary focus is MNQ, but preserve the existing multi-instrument architecture.
+
+DO NOT change strategy qualification, execution, scoring, risk, ghost trading, Edge Ledger calculations, or learning behavior.
+
+This phase is INFORMATIONAL ONLY.
+
+---
+
+# OBJECTIVE
+
+Within a few seconds I must be able to answer:
+
+1. Is MNQ trending UP, DOWN, or NEUTRAL on the 4-hour timeframe?
+2. Is MNQ trending UP, DOWN, or NEUTRAL on the 15-minute timeframe?
+3. Are those two timeframes ALIGNED or CONFLICTING?
+
+Example display:
+
+4H     ↑ BULLISH
+15M    ↑ BULLISH
+ALIGNMENT     ✅ ALIGNED LONG
+
+or:
+
+4H     ↑ BULLISH
+15M    ↓ BEARISH
+ALIGNMENT     ⚠ CONFLICTING
+
+or:
+
+4H     — NEUTRAL
+15M    ↑ BULLISH
+ALIGNMENT     ○ MIXED / NO ALIGNMENT
+
+---
+
+# STEP 1 — AUDIT EXISTING TREND LOGIC FIRST
+
+Before implementing anything, inspect the existing codebase for:
+
+* Left Brain trend state
+* market structure
+* multi-timeframe analysis
+* 4H analysis
+* 15M analysis
+* EMA/MA trend calculations
+* VWAP trend
+* BOS/CHOCH trend state
+* higher-timeframe bias
+* directional regime
+* thesis alignment
+
+Determine whether canonical 4H and 15M trend calculations already exist.
+
+REUSE existing canonical calculations where possible.
+
+Do not create competing definitions of trend.
+
+Report briefly what existing components were reused.
+
+---
+
+# STEP 2 — CANONICAL TREND STATES
+
+Each timeframe must resolve to exactly one state:
+
+BULLISH
+BEARISH
+NEUTRAL
+UNAVAILABLE
+STALE
+
+Do not force a bullish/bearish classification when evidence is unclear.
+
+---
+
+# STEP 3 — USE CLOSED BARS
+
+The trend calculation must use CLOSED bars only.
+
+Do not allow the current incomplete 4H or 15M candle to flip the official trend state unless the existing canonical system explicitly and safely supports intrabar state separately.
+
+Display the timestamp of the last completed timeframe update.
+
+Example:
+
+4H BULLISH
+updated 20:00 ET
+
+15M BULLISH
+updated 09:45 ET
+
+---
+
+# STEP 4 — DATABENTO ONLY
+
+Use the existing Databento → normalization pipeline.
+
+Do not introduce:
+
+* TradingView
+* Yahoo
+* external price APIs
+* duplicate market feeds
+
+Trend state must derive from the same canonical market data used by the trading system.
+
+---
+
+# STEP 5 — ALIGNMENT CLASSIFICATION
+
+Derive:
+
+# BULLISH + BULLISH
+
+ALIGNED_LONG
+
+# BEARISH + BEARISH
+
+ALIGNED_SHORT
+
+# BULLISH + BEARISH
+
+CONFLICTING
+
+# BEARISH + BULLISH
+
+CONFLICTING
+
+# Any combination involving NEUTRAL
+
+MIXED
+
+# STALE
+
+STALE
+
+# UNAVAILABLE
+
+UNAVAILABLE
+
+Keep this deterministic.
+
+No LLM required.
+
+---
+
+# STEP 6 — STRENGTH
+
+If existing architecture already exposes a trustworthy trend-strength measurement, display it.
+
+Example:
+
+4H ↑ BULLISH — STRONG
+15M ↑ BULLISH — MODERATE
+
+Allowed strength states:
+
+STRONG
+MODERATE
+WEAK
+
+Do NOT invent another complex confidence score solely for this panel.
+
+If no trustworthy strength measure already exists, omit strength in this phase.
+
+---
+
+# STEP 7 — DASHBOARD CARD
+
+Create a prominent compact card near the top of the Main Brain / primary trading view.
+
+Title:
+
+MULTI-TIMEFRAME TREND
+
+Example:
+
+MNQ
+
+4H
+↑ BULLISH
+
+15M
+↑ BULLISH
+
+ALIGNMENT
+✅ ALIGNED LONG
+
+The operator should understand this in under two seconds.
+
+Use obvious visual distinction between:
+
+ALIGNED LONG
+ALIGNED SHORT
+CONFLICTING
+MIXED
+STALE
+
+Do not clutter the card.
+
+---
+
+# STEP 8 — UPDATE SPEED
+
+15M state should update immediately when a new completed 15-minute bar becomes available.
+
+4H state should update immediately when a new completed 4-hour bar becomes available.
+
+The dashboard/status endpoint itself may poll more frequently.
+
+Do not recalculate 4H trend from scratch every few seconds if nothing changed.
+
+The operator should see the latest known state immediately.
+
+---
+
+# STEP 9 — API
+
+Expose a read-only endpoint following existing API conventions.
+
+Example:
+
+GET /api/market/trend-alignment?instrument=MNQ
+
+Return something conceptually like:
+
+{
+"instrument": "MNQ",
+"four_hour": {
+"trend": "BULLISH",
+"last_closed_bar": "...",
+"stale": false
+},
+"fifteen_minute": {
+"trend": "BULLISH",
+"last_closed_bar": "...",
+"stale": false
+},
+"alignment": "ALIGNED_LONG",
+"updated_at": "..."
+}
+
+Reuse an existing endpoint instead if that is architecturally cleaner.
+
+---
+
+# STEP 10 — EDGE LEDGER CONTEXT
+
+This is important.
+
+For every NEW ghost/Edge Ledger observation, preserve the trend context existing at signal time:
+
+4h_trend_at_signal
+
+15m_trend_at_signal
+
+trend_alignment_at_signal
+
+Do not modify historical rows.
+
+Do not use these fields to qualify trades yet.
+
+They are research metadata.
+
+This lets us later compare:
+
+MNQ ORB + aligned trend
+
+versus
+
+MNQ ORB + conflicting trend.
+
+We ultimately want evidence such as:
+
+ALIGNED
+72 trades
++0.42R expectancy
+
+CONFLICTING
+51 trades
+-0.16R expectancy
+
+Only after collecting evidence should alignment potentially become a trade filter.
+
+---
+
+# STEP 11 — DO NOT MAKE ALIGNMENT A GATE
+
+CRITICAL:
+
+Do NOT block trades because 4H and 15M conflict.
+
+Do NOT increase size because they align.
+
+Do NOT change confidence scores.
+
+Do NOT alter strategy thresholds.
+
+Do NOT alter live execution.
+
+For now:
+
+OBSERVE
+DISPLAY
+RECORD
+MEASURE
+
+Then Edge Ledger data can tell us whether alignment matters.
+
+---
+
+# STEP 12 — TESTS
+
+Test:
+
+4H bullish + 15M bullish = ALIGNED_LONG
+
+4H bearish + 15M bearish = ALIGNED_SHORT
+
+4H bullish + 15M bearish = CONFLICTING
+
+4H bearish + 15M bullish = CONFLICTING
+
+neutral handling
+
+stale handling
+
+unavailable data handling
+
+closed-bar-only behavior
+
+Databento source path
+
+timestamp correctness
+
+signal-time context snapshot
+
+no scoring change
+
+no execution change
+
+---
+
+# DEFINITION OF DONE
+
+I can open the dashboard and immediately see:
+
+MNQ
+
+4H trend
+
+15M trend
+
+whether they agree
+
+when each state was last updated
+
+AND every new Edge Ledger observation preserves that alignment state for later profitability analysis.
+
+This phase does NOT use alignment to decide whether to execute a trade.
+
+STOP after implementation and regression testing.
