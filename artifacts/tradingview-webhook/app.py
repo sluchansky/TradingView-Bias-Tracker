@@ -45486,6 +45486,107 @@ def _mtf_bar_close(instrument, _close_price):
         pass
 
 
+def _seed_mtf_from_historical():
+    """Background thread: fetch ~48h of 1m OHLCV bars from Databento at boot
+    and seed the MTF Trend Alignment engine so trends are available immediately
+    after any restart rather than after 2h (15M) / 32h (4H) of cold accumulation.
+
+    DISPLAY-ONLY — never touches gate, scoring, sizing, or execution.
+    FAIL-OPEN — any exception is silently logged at debug level.
+    Runs once at boot; daemon thread exits when the process does.
+    """
+    import time as _time  # noqa: PLC0415
+    _time.sleep(10)        # let the live connection establish first
+    try:
+        import databento as _db                              # noqa: PLC0415
+        import trend_alignment as _ta                        # noqa: PLC0415
+        from databento_brain import DB_DATASET, DB_SYMBOLS  # noqa: PLC0415
+
+        api_key = os.environ.get("DATABENTO_API_KEY", "").strip()
+        if not api_key:
+            logger.debug("MTFTrend hist-seed: no DATABENTO_API_KEY — skipping")
+            return
+
+        hist = _db.Historical(key=api_key)
+        now_utc   = datetime.now(timezone.utc)
+        # Databento historical API lags ~5 min; end must be before available_end.
+        end_utc   = now_utc - timedelta(minutes=10)
+        start_utc = end_utc  - timedelta(hours=80)   # 80h captures the full Friday session (EMA(21) needs 21 closed 15M bars = 315 trading min)
+        start_str = start_utc.strftime("%Y-%m-%dT%H:%M")
+        end_str   = end_utc.strftime("%Y-%m-%dT%H:%M")
+
+        total_seeded = 0
+        for inst, symbol in DB_SYMBOLS.items():
+            try:
+                logger.info("MTFTrend hist-seed: fetching %s (%s) %s→%s", inst, symbol, start_str, end_str)
+                store = hist.timeseries.get_range(
+                    dataset=DB_DATASET,
+                    symbols=[symbol],
+                    schema="ohlcv-1m",
+                    stype_in="continuous",
+                    start=start_str,
+                    end=end_str,
+                )
+                bars = []
+                # to_df() sets ts_event as the DataFrame INDEX (pandas Timestamp).
+                # Prices are already floats (not fixed-point int64).
+                try:
+                    df = store.to_df()
+                    logger.info("MTFTrend hist-seed: %s — %d raw rows from Databento", inst, len(df))
+                    for ts_idx, row in df.iterrows():
+                        try:
+                            # ts_idx is the index — a pandas Timestamp nanoseconds
+                            import pandas as _pd  # noqa: PLC0415
+                            if isinstance(ts_idx, _pd.Timestamp):
+                                ts_sec = ts_idx.timestamp()
+                            else:
+                                ts_sec = float(ts_idx) / 1e9
+                            bars.append({
+                                "ts":     ts_sec,
+                                "open":   float(row.get("open",   0)),
+                                "high":   float(row.get("high",   0)),
+                                "low":    float(row.get("low",    0)),
+                                "close":  float(row.get("close",  0)),
+                                "volume": int(row.get("volume", 0)),
+                            })
+                        except Exception as _row_exc:
+                            logger.debug("MTFTrend hist-seed: row parse error — %s", _row_exc)
+                            continue
+                except Exception as _df_exc:
+                    logger.warning("MTFTrend hist-seed: to_df() failed for %s — %s; trying direct iter", inst, _df_exc)
+                    # Fallback: direct record iteration (ts_event is nanoseconds int)
+                    for rec in store:
+                        try:
+                            ts_sec = rec.ts_event / 1e9
+                            px = lambda v: float(v) / 1e9 if abs(float(v)) > 1_000_000 else float(v)  # noqa: E731
+                            bars.append({
+                                "ts":     ts_sec,
+                                "open":   px(rec.open),
+                                "high":   px(rec.high),
+                                "low":    px(rec.low),
+                                "close":  px(rec.close),
+                                "volume": rec.volume,
+                            })
+                        except Exception:
+                            continue
+
+                n = _ta.seed_from_1m_bars(inst, bars)
+                total_seeded += n
+                state = _ta.get_snapshot_for_signal(inst) if n else {}
+                logger.info(
+                    "MTFTrend hist-seed: %s — %d 1m bars seeded → 15M:%s 4H:%s",
+                    inst, n,
+                    state.get("fifteen_m_trend_at_signal", "?"),
+                    state.get("four_h_trend_at_signal", "?"),
+                )
+            except Exception as _inst_exc:
+                logger.warning("MTFTrend hist-seed: %s FAILED — %s", inst, _inst_exc)
+
+        logger.info("MTFTrend hist-seed complete — %d total bars seeded", total_seeded)
+    except Exception as _outer_exc:
+        logger.warning("MTFTrend hist-seed: outer exception — %s", _outer_exc)
+
+
 def _ghost_observe_setup(result, inst, source="databento_scan"):
     """Create a ghost observation for a READY setup.
 
@@ -80065,17 +80166,13 @@ if __name__ == "__main__":
         try:
             globals()["_DATABENTO_BRAIN"].register_bar_close_callback(_mtf_bar_close)
             logger.info("MTFTrend: bar-close callback registered (Phase 8B.1)")
-            # Seed from any 1m bars already buffered (Databento may have bars from
-            # startup symbology pre-fetch or prior connection).
-            try:
-                from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
-                import trend_alignment as _ta_boot                   # noqa: PLC0415
-                for _mtf_inst, _mtf_bars in DATABENTO_BARS_BY_INST.items():
-                    _mtf_n = _ta_boot.seed_from_1m_bars(str(_mtf_inst), list(_mtf_bars))
-                    if _mtf_n:
-                        logger.info("MTFTrend: seeded %d 1m bars for %s", _mtf_n, _mtf_inst)
-            except Exception as _mtf_seed_exc:
-                logger.debug("MTFTrend: boot seed skipped — %s", _mtf_seed_exc)
+            # Seed from Databento historical API in the background so trends
+            # are available immediately after restart (not after 2h/32h cold start).
+            threading.Thread(
+                target=_seed_mtf_from_historical,
+                name="mtf-hist-seed",
+                daemon=True,
+            ).start()
         except Exception as _mtf_reg_exc:
             logger.warning("MTFTrend: callback registration failed — %s", _mtf_reg_exc)
     if EVAL_HEARTBEAT_ENABLED:
