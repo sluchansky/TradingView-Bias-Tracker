@@ -70,6 +70,7 @@
 - [LIVE 2-contract runner + trade-mgmt suite](live-two-contract-runner.md) — flag-gated default-OFF; runner fires only after primary 2xx; RUNNER_MODE trail|be_2r; primary TP forced to 1R for be_2r; node --check the SERVED dashboard <script>.
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
+- [Profitability Engine Phase 1](profitability-engine-phase1.md) — ghost_observations table; ghost fires BEFORE _maybe_auto_execute; 69 tests; conservative stop-first resolution; net_r = gross_r − cost_r.
 - [FVG Engine Step A](fvg-engine-step-a.md) — all-day FVG/IFVG scanner (shadow/display-only); 3 engine bugs documented; IFVG direction semantics; fixture ATR ratio trap; `@_owner_required` undefined before line 75400.
 - [FVG Sequence Engine Step B](fvg-engine-step-b.md) — shadow state machine (55 tests); two families CONTINUATION/REVERSAL; CHASING fires before target-consumed; IFVG hold from bar data; `/fvg/sequences` route; FVG chart toggle.
 - [Main Brain cognitive layer](main-brain-cognitive.md) — 7 display-only keys at full_analysis seam (mirror in closed-override); _mb_cached None→coerce neutral; heartbeat capture fail-open, never gates.

@@ -1,0 +1,789 @@
+REPLIT BUILD INSTRUCTIONS
+
+Trading Research Lab — Phase 3.3.1
+PostgreSQL / Alembic Schema Hardening and Deployment-Safe Migration Repair
+
+Continue working in the existing standalone Trading Research Lab project.
+
+Do not create a new project.
+
+Do not add new research capabilities.
+
+Do not start Phase 3.4 yet.
+
+Do not modify the production trading application.
+
+Do not add live trading, brokerage connectivity, TradersPost, prop-firm connectivity, production database access, or production execution paths.
+
+Current validated baseline:
+
+* Phase 3.3 autonomy proof complete
+* 722 tests passing
+* Daily autonomy workflow validated
+* Restart persistence validated
+* Idempotency validated
+* Safety supervisor validated
+* Negative-result handling validated
+* Cache-first validation proven
+* Current running app uses PostgreSQL
+* Test suite uses SQLite
+* Existing PostgreSQL schema drift was discovered during Phase 3.3 closure
+* 16 Phase 3.1-era columns were missing from PostgreSQL and were manually added during closure so /experiments and /results could function
+* Alembic history on PostgreSQL was not aligned with the actual schema
+* This must be fixed properly before future deployment or scheduled autonomy
+
+The purpose of this task is to establish one authoritative, deployment-safe migration path for both fresh and existing databases.
+
+────────────────────────────────────
+
+1. PRIMARY OBJECTIVE
+   ────────────────────────────────────
+
+Make Alembic the authoritative schema migration system for Trading Research Lab.
+
+Required outcome:
+
+FRESH DATABASE
+→ ALEMBIC UPGRADE HEAD
+→ COMPLETE SCHEMA
+
+and:
+
+EXISTING CURRENT DATABASE
+→ SAFE MIGRATION RECONCILIATION
+→ ALEMBIC HEAD
+→ NO DATA LOSS
+→ COMPLETE SCHEMA
+
+Do not rely on manual ALTER TABLE commands after this task.
+
+────────────────────────────────────
+2. INSPECT BEFORE EDITING
+────────────────────────────────────
+
+Before changing anything, report:
+
+* current branch
+* current commit
+* current Alembic head
+* all Alembic revisions in order
+* database URL behavior
+* SQLite test DB behavior
+* PostgreSQL runtime DB behavior
+* current startup init_db/create_all behavior
+* current PostgreSQL alembic_version state
+* current SQLite alembic_version state
+* actual PostgreSQL tables
+* actual PostgreSQL columns
+* actual SQLite test schema
+* SQLAlchemy metadata tables/columns
+* migration-defined tables/columns
+
+Build a schema-drift report.
+
+Classify every mismatch as:
+
+MISSING_IN_POSTGRES
+MISSING_IN_SQLITE
+MISSING_IN_MIGRATION
+EXTRA_IN_POSTGRES
+EXTRA_IN_SQLITE
+TYPE_MISMATCH
+NULLABILITY_MISMATCH
+DEFAULT_MISMATCH
+INDEX_MISMATCH
+CONSTRAINT_MISMATCH
+
+Do not stop after inspection.
+
+────────────────────────────────────
+3. AUTHORITATIVE SCHEMA RULE
+────────────────────────────────────
+
+After this task:
+
+SQLAlchemy models define intended application schema.
+
+Alembic defines how databases reach that schema.
+
+Startup may verify schema, but must not silently create new production tables or columns as the long-term migration mechanism.
+
+Do not remove safe startup checks unless necessary.
+
+Do not allow create_all() to conceal missing migrations in production.
+
+────────────────────────────────────
+4. MIGRATION CHAIN AUDIT
+────────────────────────────────────
+
+Audit all existing migrations from Phase 1 through Phase 3.3.
+
+Verify:
+
+revision IDs
+down_revision chain
+table creation order
+foreign-key dependencies
+enum creation
+index creation
+unique constraints
+SQLite batch behavior
+PostgreSQL compatibility
+
+Identify migrations that were generated against SQLite assumptions but may fail or behave differently on PostgreSQL.
+
+────────────────────────────────────
+5. PHASE 3.1 COLUMN DRIFT REPAIR
+────────────────────────────────────
+
+Create a proper Alembic migration for every Phase 3.1 column that existed in SQLAlchemy models but was missing from PostgreSQL.
+
+Do not blindly add columns that already exist.
+
+Migration must be safe when:
+
+* column already exists
+* column does not exist
+* database was created from older create_all state
+* database was created from migrations
+
+Use database-aware inspection where required.
+
+The migration must be idempotent at the operational level.
+
+It must not destroy existing data.
+
+────────────────────────────────────
+6. ENUM SAFETY
+────────────────────────────────────
+
+Audit all PostgreSQL enum types introduced across phases.
+
+For each enum verify:
+
+* type exists
+* values match current model enum
+* migrations do not recreate existing type unsafely
+* migrations do not drop a type still in use
+* new enum values can be added safely
+* SQLite tests remain compatible
+
+Create corrective migration logic if needed.
+
+────────────────────────────────────
+7. EXISTING POSTGRES RECONCILIATION
+────────────────────────────────────
+
+The current PostgreSQL database contains schema created partly by create_all and partly by manual repair.
+
+Create a safe reconciliation procedure.
+
+Do not drop the database.
+
+Do not wipe application data.
+
+The procedure should:
+
+1. Inspect actual schema.
+2. Determine which migration revision the schema effectively represents.
+3. Stamp only when justified.
+4. Apply missing migrations.
+5. Verify final schema against SQLAlchemy metadata.
+
+Do not arbitrarily stamp head before validating actual schema.
+
+────────────────────────────────────
+8. FRESH DATABASE TEST
+────────────────────────────────────
+
+Create an automated migration test using a fresh empty database.
+
+For SQLite:
+
+create empty DB
+→ alembic upgrade head
+→ inspect schema
+
+For PostgreSQL where test infrastructure allows:
+
+create isolated test schema/database
+→ alembic upgrade head
+→ inspect schema
+→ destroy isolated test schema afterward
+
+Verify all expected Phase 1–3.3 tables and columns exist.
+
+────────────────────────────────────
+9. UPGRADE-FROM-OLD TEST
+────────────────────────────────────
+
+Create at least one representative older-schema fixture.
+
+Simulate an older database missing the Phase 3.1 drifted columns.
+
+Then:
+
+run migrations
+→ verify missing columns added
+→ verify existing rows preserved
+→ verify defaults/nullability correct
+
+────────────────────────────────────
+10. MODEL VS DATABASE VALIDATOR
+────────────────────────────────────
+
+Create a schema validation service or script.
+
+Example:
+
+validate_database_schema()
+
+It should compare:
+
+SQLAlchemy metadata
+vs
+connected database
+
+Return structured result:
+
+status
+
+missing_tables
+extra_tables
+missing_columns
+extra_columns
+type_mismatches
+nullable_mismatches
+index_mismatches
+constraint_warnings
+
+Statuses:
+
+VALID
+WARNING
+INVALID
+
+Do not expose credentials.
+
+────────────────────────────────────
+11. STARTUP SCHEMA CHECK
+────────────────────────────────────
+
+At application startup:
+
+Run lightweight schema validation.
+
+If schema is VALID:
+
+start normally.
+
+If schema has non-critical WARNING:
+
+start and log warning.
+
+If required table/column is missing:
+
+fail startup clearly with:
+
+DATABASE_SCHEMA_INVALID
+
+and instruction to run migrations.
+
+Do not silently repair production schema at startup.
+
+────────────────────────────────────
+12. DEVELOPMENT CREATE_ALL POLICY
+────────────────────────────────────
+
+Decide and document how create_all may still be used.
+
+Preferred:
+
+Tests/local ephemeral development only.
+
+For persistent PostgreSQL runtime:
+
+Alembic is authoritative.
+
+If create_all remains in startup:
+
+it must not mask migration requirements.
+
+Add explicit environment-aware behavior if needed.
+
+────────────────────────────────────
+13. MIGRATION COMMANDS
+────────────────────────────────────
+
+Document canonical commands.
+
+Development:
+
+alembic upgrade head
+
+Create migration:
+
+alembic revision --autogenerate -m "description"
+
+Rollback one revision:
+
+alembic downgrade -1
+
+Current revision:
+
+alembic current
+
+History:
+
+alembic history
+
+Do not require manual SQL for normal schema evolution.
+
+────────────────────────────────────
+14. DEPLOYMENT MIGRATION FLOW
+────────────────────────────────────
+
+Document and implement a safe deployment sequence:
+
+1. Backup/confirm DB safety.
+2. Check current Alembic revision.
+3. Run alembic upgrade head.
+4. Run schema validator.
+5. Start application.
+6. Run startup smoke test.
+
+Do not start app first and hope create_all repairs schema.
+
+────────────────────────────────────
+15. MIGRATION LOCK / CONCURRENCY
+────────────────────────────────────
+
+Prevent two app instances from racing schema migrations during deployment.
+
+If migrations are run externally, document that clearly.
+
+If app-triggered migration is considered:
+
+do not implement it unless robust locking exists.
+
+Preferred:
+
+migrations run as deployment step, not application startup side effect.
+
+────────────────────────────────────
+16. POSTGRES-SPECIFIC VALIDATION
+────────────────────────────────────
+
+Verify:
+
+JSON/JSONB mappings
+DateTime timezone behavior
+enum mappings
+Boolean defaults
+Float/Numeric types
+foreign keys
+unique constraints
+indexes
+server defaults
+nullable columns
+
+Do not assume SQLite behavior proves PostgreSQL correctness.
+
+────────────────────────────────────
+17. SQLITE TEST COMPATIBILITY
+────────────────────────────────────
+
+Keep SQLite test suite working.
+
+Use:
+
+render_as_batch=True
+
+where needed.
+
+Do not alter models solely to satisfy SQLite if doing so weakens PostgreSQL correctness.
+
+────────────────────────────────────
+18. DATA PRESERVATION TEST
+────────────────────────────────────
+
+Seed representative rows into an older-schema database:
+
+AgentProfile
+ResearchQuestion
+SemanticMemory
+QuantitativeExperiment
+ExperimentResult
+DailyResearchSession
+
+Run upgrade.
+
+Verify:
+
+row counts unchanged
+IDs unchanged
+relationships intact
+existing JSON data intact
+existing status enums intact
+timestamps intact
+
+────────────────────────────────────
+19. EXPERIMENT / RESULT SCHEMA CHECK
+────────────────────────────────────
+
+Specifically verify all Phase 3/3.1 experiment fields now exist in PostgreSQL.
+
+Include at minimum:
+
+data_provider
+dataset
+schema
+contract
+raw_data_hash
+normalized_data_hash
+feature_version
+bar_builder_version
+event_engine_version
+statistics_engine_version
+validation_only
+provenance-related fields
+
+Use actual model definitions as authority.
+
+Do not assume this list is exhaustive.
+
+────────────────────────────────────
+20. AUTONOMY TABLE CHECK
+────────────────────────────────────
+
+Verify all Phase 3.3 tables exist with correct schema:
+
+agent_operating_settings
+daily_research_sessions
+research_queue
+procedure_performance
+research_stagnation_signals
+
+Verify:
+
+foreign keys
+unique constraints
+status fields
+date uniqueness/idempotency support
+indexes
+
+────────────────────────────────────
+21. ALEMBIC VERSION REPAIR
+────────────────────────────────────
+
+After actual schema is reconciled:
+
+Set PostgreSQL alembic_version to the correct revision.
+
+Do not simply stamp head unless every prior migration effect is verified present.
+
+Capture:
+
+revision before
+revision after
+
+────────────────────────────────────
+22. NO MANUAL PATCH DEPENDENCY
+────────────────────────────────────
+
+After migration repair, verify:
+
+Drop/recreate a fresh dev DB
+→ migrations alone recreate complete application schema.
+
+No manual ALTER TABLE step may be required.
+
+No startup create_all dependency may be required for missing production fields.
+
+────────────────────────────────────
+23. DATABASE STATUS ENDPOINT
+────────────────────────────────────
+
+Add or extend a safe internal status endpoint if one already exists.
+
+Suggested:
+
+GET /api/system/database-status
+
+Return:
+
+database_type
+schema_status
+current_revision
+expected_revision
+migration_required
+missing_table_count
+missing_column_count
+
+Do not expose:
+
+host
+username
+password
+full database URL
+secret parameters
+
+If adding a new endpoint is unnecessary, use existing system-health API.
+
+────────────────────────────────────
+24. DASHBOARD STATUS
+────────────────────────────────────
+
+Add a small database schema status indicator to Settings or system health.
+
+Display:
+
+DATABASE: CONNECTED
+
+SCHEMA: VALID / MIGRATION REQUIRED
+
+REVISION: <short revision>
+
+Do not expose credentials.
+
+This is optional if a suitable existing system status panel already exists.
+
+────────────────────────────────────
+25. REQUIRED TESTS
+────────────────────────────────────
+
+Add deterministic tests.
+
+MIGRATION CHAIN
+
+1. Alembic history has one linear valid head.
+2. Every revision has valid down_revision.
+3. Fresh SQLite upgrade reaches head.
+4. Fresh schema contains all expected tables.
+5. Fresh schema contains all expected columns.
+
+PHASE 3.1 REPAIR
+
+6. Old schema missing Phase 3.1 columns upgrades successfully.
+7. Existing data survives upgrade.
+8. Existing column is not duplicated.
+9. Column defaults correct.
+10. Column nullability correct.
+
+POSTGRES COMPATIBILITY
+
+11. Enum creation safe.
+12. Existing enum reuse safe.
+13. JSON fields map correctly.
+14. timezone-aware DateTime maps correctly.
+15. unique constraints preserved.
+16. foreign keys preserved.
+17. indexes preserved.
+
+SCHEMA VALIDATOR
+
+18. Valid schema returns VALID.
+19. Missing required table returns INVALID.
+20. Missing required column returns INVALID.
+21. Extra non-critical table returns WARNING or documented result.
+22. Type mismatch detected.
+23. Validator does not expose credentials.
+
+STARTUP
+
+24. Valid schema allows startup.
+25. Invalid persistent DB schema fails startup clearly.
+26. Startup does not silently ALTER production tables.
+27. Startup does not silently create missing production columns.
+
+DATA PRESERVATION
+
+28. AgentProfile preserved.
+29. ResearchQuestion preserved.
+30. SemanticMemory preserved.
+31. QuantitativeExperiment preserved.
+32. ExperimentResult preserved.
+33. DailyResearchSession preserved.
+
+AUTONOMY
+
+34. All 5 Phase 3.3 tables present.
+35. Daily-session idempotency constraint present.
+36. Queue indexes/constraints present.
+
+ALEMBIC VERSION
+
+37. Current revision matches expected head after upgrade.
+38. Re-running upgrade head is safe.
+39. No manual SQL required after migration.
+
+REGRESSION
+
+40. Existing 722 tests pass.
+41. Phase 1 tests pass.
+42. Phase 2 tests pass.
+43. Phase 3 tests pass.
+44. Phase 3.1 tests pass.
+45. Phase 3.2 tests pass.
+46. Phase 3.3 tests pass.
+47. Full combined suite passes.
+
+────────────────────────────────────
+26. VALIDATION WORKFLOW
+────────────────────────────────────
+
+STEP 1 — INSPECT
+
+Produce the full schema-drift report.
+
+STEP 2 — REPAIR MIGRATION HISTORY
+
+Correct or extend migrations minimally.
+
+Do not rewrite historical migrations unnecessarily if a forward repair migration is safer.
+
+STEP 3 — RECONCILE POSTGRES
+
+Bring existing PostgreSQL safely to Alembic head.
+
+No data loss.
+
+STEP 4 — VALIDATE FRESH DATABASE
+
+Prove migrations alone can create the entire schema.
+
+STEP 5 — VALIDATE UPGRADE PATH
+
+Prove an older schema can be upgraded safely.
+
+STEP 6 — VALIDATE STARTUP
+
+Prove startup detects schema problems rather than hiding them.
+
+STEP 7 — RUN COMPLETE TEST SUITE
+
+Run existing 722 baseline plus new migration tests.
+
+STEP 8 — APP SMOKE
+
+Restart application against PostgreSQL.
+
+Verify:
+
+/health
+/agent
+/experiments
+/results
+/data
+/evidence
+/contradictions
+/agent/daily-plan
+/agent/queue
+
+all return HTTP 200.
+
+────────────────────────────────────
+27. FINAL REPORT
+────────────────────────────────────
+
+Return:
+
+current branch
+starting commit
+ending commit
+
+Alembic revision before
+Alembic revision after
+Alembic head
+
+Schema drift discovered
+
+Phase 3.1 columns repaired
+
+Tables repaired
+
+Enums repaired
+
+Indexes/constraints repaired
+
+Files changed
+
+Files created
+
+Migration files added
+
+Current PostgreSQL schema status
+
+Fresh SQLite migration result
+
+Fresh PostgreSQL migration result if available
+
+Upgrade-from-old result
+
+Data-preservation result
+
+Schema-validator result
+
+Startup schema-check result
+
+Exact test count
+
+Passed
+
+Failed
+
+Skipped
+
+Warnings
+
+Existing 722 baseline result
+
+HTTP smoke-test results
+
+Known limitations
+
+Deployment status
+
+Do not deploy automatically.
+
+────────────────────────────────────
+28. FINAL REQUIRED STATE
+────────────────────────────────────
+
+At completion:
+
+POSTGRESQL SCHEMA = VALID
+
+SQLITE TEST SCHEMA = VALID
+
+ALEMBIC CURRENT = ALEMBIC HEAD
+
+SQLALCHEMY MODELS = DATABASE SCHEMA
+
+FRESH DATABASE INSTALL = MIGRATIONS ONLY
+
+EXISTING DATABASE UPGRADE = MIGRATIONS ONLY
+
+MANUAL ALTER TABLE REQUIRED = NO
+
+PRODUCTION STARTUP SILENT SCHEMA REPAIR = NO
+
+AUTONOMY DATA PRESERVED = YES
+
+TRADING = IMPOSSIBLE
+
+PRODUCTION BOT ACCESS = IMPOSSIBLE
+
+Daily autonomous schedule should remain:
+
+DISABLED
+
+Operating mode should remain:
+
+ASSISTED
+
+Holdout should remain:
+
+LOCKED
+
+Do not begin Phase 3.4 until this schema foundation is clean.

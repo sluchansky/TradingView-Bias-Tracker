@@ -28990,6 +28990,16 @@ def _databento_bar_scan(inst: str, price: float) -> None:
                                 "Databento scan READY: %s @ %.4f — live card sent (%d bars confirmed)",
                                 inst, price, _bars_confirmed,
                             )
+            # ── Ghost observation (Profitability Engine Phase 1) ──────────────
+            # Records every READY setup as a ghost observation BEFORE the
+            # execution gate.  Research captures the full signal population
+            # regardless of arm state, execution mode, or safety locks.
+            # FAIL-OPEN: exceptions are debug-logged; the caller is unaffected.
+            if is_actionable(a.get("verdict")):
+                try:
+                    _ghost_observe_setup(a, inst, source="databento_scan")
+                except Exception as _goe:
+                    logger.debug("ghost_observe_setup (%s): %s", inst, _goe)
             # ── Databento auto-execute ─────────────────────────────────────────
             # When armed + READY, fire through the SAME audited gateway as the
             # webhook handler. ALL existing safety checks apply (arm flag,
@@ -44906,6 +44916,16 @@ MICRO_SCALP_MODE       = os.environ.get("MICRO_SCALP_ENABLED", "0").strip().lowe
 MICRO_SCALP_LOCK       = threading.Lock()
 MICRO_GHOST_DB_READY   = False
 MICRO_GHOST_WATCH_LOCK = threading.Lock()   # single-flight watcher cycles
+# ── Profitability Engine — Phase 1 ghost observation ledger ─────────────────
+# RESEARCH / DISPLAY-ONLY. Records every READY setup as a ghost observation
+# BEFORE the execution gate so research captures setups even when live trading
+# is disabled/blocked. Never gates, sizes, or sends orders.
+# Table: ghost_observations (created via DB tool / publish schema-diff; no DDL).
+GHOST_OBS_DB_READY       = False
+GHOST_OBS_WATCH_LOCK     = threading.Lock()   # single-flight watcher cycle
+GHOST_OBS_COOLDOWN_SECS  = max(60, int(os.environ.get("GHOST_OBS_COOLDOWN_SECS", "300")))
+_GHOST_OBS_COOLDOWN      = {}                  # (inst, direction, strategy_short) → monotonic ts
+_GHOST_OBS_COOLDOWN_LOCK = threading.Lock()
 MICRO_GHOST_WATCH_INTERVAL     = max(10, int(os.environ.get("MICRO_GHOST_WATCH_INTERVAL", 30)))
 MICRO_GHOST_MAX_HOLD_MIN       = max(10, int(os.environ.get("MICRO_GHOST_MAX_HOLD_MIN", 120)))
 MICRO_GHOST_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("MICRO_GHOST_COOLDOWN_SECS", 600)))
@@ -44993,6 +45013,378 @@ def _check_micro_ghost_db_ready():
             conn.close()
         except Exception:
             pass
+
+
+def _check_ghost_obs_db_ready():
+    """Probe ghost_observations (no DDL) and set GHOST_OBS_DB_READY.
+    FAIL-OPEN: a missing table / unavailable DB disables ghost logging only —
+    all existing behaviour remains byte-identical."""
+    global GHOST_OBS_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM ghost_observations LIMIT 1")
+            cur.fetchone()
+        GHOST_OBS_DB_READY = True
+        logger.info("ProfitabilityEngine: ghost_observations table ready")
+    except Exception as exc:
+        logger.warning("ProfitabilityEngine: ghost_observations table unavailable "
+                       "(ghost logging disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _ghost_observe_setup(result, inst, source="databento_scan"):
+    """Create a ghost observation for a READY setup.
+
+    Fires BEFORE the execution gate so every valid READY signal is recorded
+    for research, regardless of arm state, execution mode, safety locks, or
+    any other live-trading permission check.
+
+    Idempotent: the obs_key dedup (ON CONFLICT DO NOTHING) prevents duplicate
+    observations for the same setup within the same session bucket.
+
+    FAIL-OPEN: any exception is logged at debug level only; the caller is
+    never affected.  NEVER touches gate, scoring, sizing, arm state, or broker.
+    """
+    if not GHOST_OBS_DB_READY or not LEARNING_DB_ENABLED:
+        return
+    try:
+        import profitability_engine as _pe  # noqa: PLC0415
+
+        verdict    = result.get("verdict") or ""
+        trade_plan = result.get("trade_plan") or {}
+        if not is_actionable(verdict):
+            return
+        direction = ready_direction(verdict)
+        if direction not in ("Long", "Short"):
+            return
+
+        entry   = trade_plan.get("entry")
+        stop_px = trade_plan.get("stop")
+        target1 = trade_plan.get("target") or trade_plan.get("tp1")
+        target2 = trade_plan.get("target2") or trade_plan.get("tp2")
+        if entry is None or stop_px is None or target1 is None:
+            return
+        try:
+            entry   = float(entry)
+            stop_px = float(stop_px)
+            target1 = float(target1)
+            target2 = float(target2) if target2 is not None else None
+        except (TypeError, ValueError):
+            return
+        risk_pts = abs(entry - stop_px)
+        if risk_pts <= 0:
+            return
+
+        # Build dedup key — stable within one session/entry-bucket bucket
+        ctx = result.get("learning_ctx") or {}
+        strategy_key = (ctx.get("strategy_key") or
+                        (result.get("strategy_scanner") or {}).get("strategy_key") or
+                        "UNKNOWN")
+        strategy_short = _pe.extract_strategy_short(strategy_key)
+
+        now_et = now_utc().astimezone(ET_TZ)
+        et_day = now_et.strftime("%Y%m%d")
+        bucket = _pe.entry_bucket_from_price(entry)
+        obs_key = _pe.build_obs_key(inst, direction, strategy_short, et_day, bucket)
+
+        # Per-setup cooldown: suppress rapid re-creation for the same (inst, dir, strategy)
+        ckey     = (inst, direction, strategy_short)
+        now_mono = time.monotonic()
+        with _GHOST_OBS_COOLDOWN_LOCK:
+            last = _GHOST_OBS_COOLDOWN.get(ckey)
+            if last is not None and (now_mono - last) < GHOST_OBS_COOLDOWN_SECS:
+                return
+            _GHOST_OBS_COOLDOWN[ckey] = now_mono   # optimistic reservation
+
+        # Commission estimate (stored; watcher uses INSTRUMENT_SPECS at resolve time)
+        cost_r_est = _pe.compute_commission_r(
+            inst, entry, stop_px, INSTRUMENT_SPECS,
+            comm_per_side_usd=SIM_REALISM_COMMISSION_PER_SIDE,
+            slippage_ticks=SIM_REALISM_SLIPPAGE_TICKS,
+        )
+
+        # Context snapshot — frozen at signal time
+        sess_name = (ctx.get("session") or _learning_session_name(now_et) or "UNKNOWN")
+        vol_block = result.get("volatility") or {}
+        cvd_block = CVD_BY_TICKER.get(inst) or {}
+        atr_at_sig = vol_block.get("atr_pts") or vol_block.get("current_atr") or None
+        cvd_dir    = cvd_block.get("direction") if isinstance(cvd_block, dict) else None
+        vwap_val   = VWAP_BY_TICKER.get(inst)
+        vwap_side  = (("above" if entry > vwap_val else "below") if vwap_val else None)
+        regime     = ctx.get("regime") or "UNKNOWN"
+        edge_score = result.get("edge_score")
+
+        conn = _learning_conn()
+        if conn is None:
+            with _GHOST_OBS_COOLDOWN_LOCK:
+                _GHOST_OBS_COOLDOWN.pop(ckey, None)
+            return
+        inserted = False
+        try:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO ghost_observations
+                           (obs_key, strategy_key, strategy_version, instrument,
+                            direction, signal_time, original_entry, original_stop,
+                            original_target1, original_target2, risk_points,
+                            session, trading_mode, source, atr_at_signal,
+                            cvd_direction, vwap_side, regime, edge_score_at_signal,
+                            status, cost_r, holdout_period)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               %s,%s,%s,%s,'open',%s,'training')
+                       ON CONFLICT (obs_key) DO NOTHING
+                       RETURNING id""",
+                    (obs_key, strategy_key, STRATEGY_VERSION, inst,
+                     direction, now_utc(), entry, stop_px,
+                     target1, target2, risk_pts,
+                     sess_name, TRADING_MODE, source, atr_at_sig,
+                     cvd_dir, vwap_side, regime,
+                     (int(round(float(edge_score))) if edge_score is not None else None),
+                     cost_r_est),
+                )
+                row = cur.fetchone()
+                inserted = row is not None
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        if inserted:
+            logger.info(
+                "ghost_obs opened: %s %s %s @ %.4f strategy=%s key=%s",
+                source, inst, direction, entry, strategy_short, obs_key,
+            )
+        else:
+            # ON CONFLICT — already exists; undo cooldown reservation
+            with _GHOST_OBS_COOLDOWN_LOCK:
+                _GHOST_OBS_COOLDOWN.pop(ckey, None)
+    except Exception as exc:
+        logger.debug("ghost_observe_setup error (%s): %s", inst, exc)
+
+
+def _ghost_obs_watcher_cycle():
+    """Resolve open ghost observations against the latest bar data.
+
+    Called on every bar-close via _ghost_obs_bar_close().  Updates MFE/MAE
+    and closes observations when stop, target, or max-hold is reached.
+
+    Conservative resolution: when a bar touches BOTH stop and target, the
+    stop-first outcome is recorded (no optimistic fill assumptions).
+
+    FAIL-OPEN — individual row errors are caught and logged; the cycle
+    continues.  NEVER touches execution path: writes only to ghost_observations.
+    """
+    if not GHOST_OBS_DB_READY or not LEARNING_DB_ENABLED:
+        return
+    try:
+        import profitability_engine as _pe  # noqa: PLC0415
+    except Exception:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    open_rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT id, obs_key, instrument, direction,
+                          original_entry, original_stop,
+                          original_target1, original_target2,
+                          risk_points, bars_held,
+                          mfe_r, mae_r, mfe_price, mae_price, cost_r,
+                          tp1_hit, tp1_exit_price, tp1_gross_r, exit_model
+                   FROM ghost_observations
+                   WHERE status = 'open'
+                   ORDER BY id ASC LIMIT 500""")
+            for r in cur.fetchall():
+                open_rows.append({
+                    "id": r[0], "obs_key": r[1], "instrument": r[2], "direction": r[3],
+                    "entry":      float(r[4]) if r[4] is not None else None,
+                    "stop_px":    float(r[5]) if r[5] is not None else None,
+                    "target1":    float(r[6]) if r[6] is not None else None,
+                    "target2":    float(r[7]) if r[7] is not None else None,
+                    "risk_pts":   float(r[8]) if r[8] is not None else None,
+                    "bars_held":  int(r[9])   if r[9] is not None else 0,
+                    "mfe_r":      float(r[10]) if r[10] is not None else 0.0,
+                    "mae_r":      float(r[11]) if r[11] is not None else 0.0,
+                    "mfe_price":  float(r[12]) if r[12] is not None else None,
+                    "mae_price":  float(r[13]) if r[13] is not None else None,
+                    "cost_r":     float(r[14]) if r[14] is not None else None,
+                    "tp1_hit":        bool(r[15]) if r[15] is not None else False,
+                    "tp1_exit_price": float(r[16]) if r[16] is not None else None,
+                    "tp1_gross_r":    float(r[17]) if r[17] is not None else None,
+                    "exit_model":     (r[18] or _pe.EXIT_MODEL_SINGLE),
+                })
+    except Exception as exc:
+        logger.warning("ghost_obs watcher read failed: %s", exc)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+    if not open_rows:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        return
+
+    # Fetch latest bar per unique instrument (one lookup per instrument)
+    bars: dict = {}
+    for inst in {r["instrument"] for r in open_rows}:
+        try:
+            bars[inst] = _fetch_latest_bar(inst)
+        except Exception:
+            bars[inst] = None
+
+    now_ts = now_utc()
+    try:
+        for row in open_rows:
+            inst = row["instrument"]
+            bar  = bars.get(inst)
+            if bar is None:
+                continue
+            try:
+                bar_h = float(bar.get("high") or bar.get("h") or 0)
+                bar_l = float(bar.get("low")  or bar.get("l") or 0)
+            except (TypeError, ValueError):
+                continue
+            if bar_h <= 0 or bar_l <= 0:
+                continue
+            entry    = row["entry"]
+            stop_px  = row["stop_px"]
+            target1  = row["target1"]
+            target2  = row["target2"]
+            risk_pts = row["risk_pts"]
+            if any(v is None for v in (entry, stop_px, target1, risk_pts)):
+                continue
+            bars_held = row["bars_held"] + 1
+
+            # Update MFE/MAE (every bar, regardless of close)
+            mfe_r, mae_r, mfe_price, mae_price = _pe.update_mfe_mae(
+                row["direction"], bar_h, bar_l, entry, risk_pts,
+                row.get("mfe_price"), row.get("mae_price"),
+                row["mfe_r"], row["mae_r"],
+            )
+
+            # Check for close condition (conservative stop-first)
+            # Pass tp1_hit from DB so TP1-already-hit obs correctly look for TP2
+            status, close_reason, exit_px, gross_r = _pe.resolve_bar_outcome(
+                row["direction"], bar_h, bar_l, entry, stop_px,
+                target1, target2,
+                row.get("tp1_hit", False),
+                bars_held, _pe.GHOST_MAX_HOLD_BARS,
+            )
+
+            if close_reason == _pe.CLOSE_TP1_PARTIAL:
+                # ─── Leg 1 of a two-leg trade hit TP1 — keep open for leg 2 ───
+                # status is None here (observation stays open)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE ghost_observations SET
+                                   tp1_hit=TRUE, tp1_exit_price=%s, tp1_gross_r=%s,
+                                   exit_model=%s,
+                                   mfe_r=%s, mae_r=%s, mfe_price=%s, mae_price=%s,
+                                   bars_held=%s WHERE id=%s""",
+                            (exit_px,
+                             (round(gross_r, 4) if gross_r is not None else None),
+                             _pe.EXIT_MODEL_TWO_LEG,
+                             round(mfe_r, 4), round(mae_r, 4),
+                             mfe_price, mae_price, bars_held, row["id"]))
+                    logger.info(
+                        "ghost_obs tp1_partial: id=%d %s %s TP1 hit @ %s, staying open for leg 2",
+                        row["id"], inst, row["direction"], exit_px)
+                except Exception as exc:
+                    logger.warning("ghost_obs tp1_partial UPDATE id=%d: %s", row["id"], exc)
+
+            elif status is not None:
+                # ─── Observation closing (stop / TP1 single-leg / TP2 / expired) ───
+                # For two-leg trades: compute weighted gross_r
+                if (row.get("exit_model") == _pe.EXIT_MODEL_TWO_LEG
+                        and row.get("tp1_gross_r") is not None
+                        and gross_r is not None):
+                    gross_r = _pe.compute_two_leg_gross_r(
+                        row["tp1_gross_r"], gross_r,
+                    )
+                cost_r = row["cost_r"]
+                if cost_r is None:
+                    cost_r = _pe.compute_commission_r(
+                        inst, entry, stop_px, INSTRUMENT_SPECS,
+                        comm_per_side_usd=SIM_REALISM_COMMISSION_PER_SIDE,
+                        slippage_ticks=SIM_REALISM_SLIPPAGE_TICKS,
+                    )
+                net_r = ((gross_r - cost_r)
+                         if (gross_r is not None and cost_r is not None)
+                         else gross_r)
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE ghost_observations SET
+                                   status=%s, closed_at=%s, close_reason=%s,
+                                   exit_price=%s, gross_r=%s, cost_r=%s, net_r=%s,
+                                   mfe_r=%s, mae_r=%s, mfe_price=%s, mae_price=%s,
+                                   bars_held=%s
+                               WHERE id=%s""",
+                            (status, now_ts, close_reason, exit_px,
+                             (round(gross_r, 4) if gross_r is not None else None),
+                             (round(cost_r,  4) if cost_r  is not None else None),
+                             (round(net_r,   4) if net_r   is not None else None),
+                             (round(mfe_r,   4) if mfe_r   is not None else None),
+                             (round(mae_r,   4) if mae_r   is not None else None),
+                             mfe_price, mae_price, bars_held, row["id"]))
+                    logger.info(
+                        "ghost_obs %s: id=%d %s %s → %s (%s) gross_r=%s net_r=%s",
+                        status, row["id"], inst, row["direction"],
+                        status, close_reason,
+                        (f"{gross_r:+.2f}" if gross_r is not None else "?"),
+                        (f"{net_r:+.2f}"   if net_r   is not None else "?"),
+                    )
+                except Exception as exc:
+                    logger.warning("ghost_obs UPDATE failed id=%d: %s", row["id"], exc)
+
+            else:
+                # Still open — persist updated MFE/MAE and bars_held
+                try:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """UPDATE ghost_observations SET
+                                   mfe_r=%s, mae_r=%s, mfe_price=%s, mae_price=%s,
+                                   bars_held=%s WHERE id=%s""",
+                            (round(mfe_r, 4), round(mae_r, 4),
+                             mfe_price, mae_price, bars_held, row["id"]))
+                except Exception as exc:
+                    logger.debug("ghost_obs mfe_mae update id=%d: %s", row["id"], exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _ghost_obs_bar_close(inst: str, price: float) -> None:
+    """Bar-close callback registered with DatabentoBrain.
+    Triggers one ghost-observation watcher cycle.  Single-flight: returns
+    immediately if another cycle is already running."""
+    if not GHOST_OBS_DB_READY:
+        return
+    if not GHOST_OBS_WATCH_LOCK.acquire(blocking=False):
+        return
+    try:
+        _ghost_obs_watcher_cycle()
+    except Exception as exc:
+        logger.debug("ghost_obs bar_close error: %s", exc)
+    finally:
+        GHOST_OBS_WATCH_LOCK.release()
 
 
 def _micro_scalp_record_event(normalized, inst, price):
@@ -63759,6 +64151,20 @@ function doResetSafetyLock() {}
   </div>
 
 
+  <div class="mod" id="mod-edge-ledger" data-cat="experimental">
+    <div class="mod-h">📒 Edge Ledger <span class="bt-mini">live ghost observations → net expectancy per strategy</span><span class="mod-cat cat-experimental">RESEARCH ONLY</span></div>
+    <div class="bt-mini" style="margin-bottom:8px">
+      Every READY setup is ghost-recorded with an immutable trade plan, then resolved against the real Databento stream.
+      Net R = gross R − estimated round-trip commission. <b>Research only — never influences gate or execution.</b>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;flex-wrap:wrap">
+      <button class="bt-btn alt" onclick="elLoad()" id="el-refresh-btn">↻ Refresh</button>
+      <span class="bt-mini" id="el-meta"></span>
+    </div>
+    <div class="bt-msg" id="el-msg"></div>
+    <div class="bt-scroll" id="el-table" style="overflow-x:auto"></div>
+  </div>
+
   <div class="mod" id="mod-baseline" data-cat="experimental">
     <div class="mod-h">📊 Real Historical Baseline <span class="bt-mini">Phase 6B.1 — 40-combo immutable matrix</span><span class="mod-cat cat-experimental">RESEARCH ONLY</span></div>
     <div class="bt-mini" style="margin-bottom:8px">
@@ -72236,7 +72642,7 @@ function setView(v){
   document.getElementById('vb-ac').classList.toggle('active', isAc);
   if(isBt && btSelDataset===null) btLoadDatasets();
   if(isTz) tzLoadAnalysis();
-  if(isSr) srLoad();
+  if(isSr){ srLoad(); elLoad(); }
   if(isAc) acLoad();
   var _vl={live:'📊 Live',backtest:'🧪 Backtest',tradezella:'📒 TradeZella',research:'🔬 Research',academy:'🎓 Academy'};
   var _vlab=document.getElementById('view-dd-label'); if(_vlab) _vlab.textContent=_vl[v]||_vl.live;
@@ -72302,6 +72708,69 @@ function srRender(j){
   srMount('sr-promo', srTable(['Strategy','Recommendation','Reason','Live Trades','Live Win%','Live Net R','Proven?'],
     promo.map(function(p){ var ls=p.live_sim||{};
       return [p.strategy_name, p.recommendation, p.reason, (ls.live_trades||0), srPct(ls.live_win_rate), srNum(ls.live_net_r,2), (p.live_proven?'YES':'no')]; })));
+}
+// ── Edge Ledger (Profitability Engine — RESEARCH / DISPLAY-ONLY) ─────────────
+function elFmt(v,d){ if(v===null||v===undefined) return '<span style="color:var(--muted)">—</span>'; return (typeof v==='number')?v.toFixed(d):String(v); }
+function elExpColor(v){
+  if(v===null||v===undefined) return 'var(--muted)';
+  if(v>0.1) return 'var(--green)';
+  if(v<0) return 'var(--red)';
+  return 'var(--amber-dim)';
+}
+function elRender(j){
+  var msg=document.getElementById('el-msg');
+  var table=document.getElementById('el-table');
+  var meta=document.getElementById('el-meta');
+  if(!j||!j.ok){ if(msg){ msg.className='bt-msg error'; msg.textContent=(j&&j.error)||'Failed to load.'; } return; }
+  if(msg){ msg.className='bt-msg'; msg.textContent=''; }
+  var rows=j.rows||[];
+  var tot=j.total_observations||0;
+  if(meta) meta.textContent=tot+' total ghost observations, '+rows.length+' strategy group(s)';
+  if(!rows.length){
+    if(table) table.innerHTML='<div class="bt-mini" style="color:var(--muted);padding:12px 0">No closed ghost observations yet — data accumulates during live market hours as READY setups fire.</div>';
+    return;
+  }
+  var MIN_TRADES=10;
+  var h='<table style="width:100%;border-collapse:collapse;font-size:12px">';
+  h+='<thead><tr>';
+  ['Strategy','Inst','Trades','Win%','Net Exp R','Profit Factor','Max DD','Open'].forEach(function(col){
+    h+='<th style="text-align:left;padding:4px 8px;border-bottom:1px solid var(--border);color:var(--muted);white-space:nowrap">'+col+'</th>';
+  });
+  h+='</tr></thead><tbody>';
+  rows.forEach(function(r){
+    var closed=r.closed_trades||0;
+    var pending=closed<MIN_TRADES;
+    var expR=r.net_expectancy_r;
+    var expColor=pending?'var(--muted)':elExpColor(expR);
+    var pf=r.profit_factor;
+    var pfText=pf===null||pf===undefined?'—':(typeof pf==='number'?pf.toFixed(2):pf);
+    var sk=r.strategy_key||'';
+    // Show short strategy name: extract last part after | or _
+    var parts=sk.split('|');
+    var shortSk=parts.length>=3?parts[2]:sk;
+    h+='<tr style="border-bottom:1px solid var(--border)">';
+    h+='<td style="padding:4px 8px;font-family:var(--mono);white-space:nowrap" title="'+aiEsc(sk)+'">'+aiEsc(shortSk)+'</td>';
+    h+='<td style="padding:4px 8px">'+aiEsc(r.instrument||'')+'</td>';
+    h+='<td style="padding:4px 8px">'+(pending?('<span style="color:var(--muted)">'+closed+' <span title="Min '+MIN_TRADES+' trades for reliable stats" style="cursor:help">⚠</span></span>'):closed)+'</td>';
+    h+='<td style="padding:4px 8px">'+(pending?elFmt(null,0):(r.win_rate!==null&&r.win_rate!==undefined?(r.win_rate*100).toFixed(0)+'%':'—'))+'</td>';
+    h+='<td style="padding:4px 8px;color:'+expColor+';font-weight:600">'+(pending?'<span style="color:var(--muted)">accumulating…</span>':elFmt(expR,3)+'R')+'</td>';
+    h+='<td style="padding:4px 8px">'+pfText+'</td>';
+    h+='<td style="padding:4px 8px;color:var(--red)">'+(r.max_drawdown_r?r.max_drawdown_r.toFixed(2)+'R':'—')+'</td>';
+    h+='<td style="padding:4px 8px;color:var(--muted)">'+(r.open_observations||0)+'</td>';
+    h+='</tr>';
+  });
+  h+='</tbody></table>';
+  if(table) table.innerHTML=h;
+}
+function elLoad(){
+  var meta=document.getElementById('el-meta');
+  var msg=document.getElementById('el-msg');
+  if(meta) meta.textContent='Loading…';
+  if(msg){ msg.className='bt-msg'; msg.textContent=''; }
+  api('/profitability/summary').then(elRender).catch(function(e){
+    var msg=document.getElementById('el-msg');
+    if(msg){ msg.className='bt-msg error'; msg.textContent='Could not load edge ledger.'; }
+  });
 }
 function srLoad(){
   api('/scalp-research').then(srRender).catch(function(){ srSet('sr-status','Could not load research.'); });
@@ -75522,6 +75991,145 @@ def fvg_sequences_endpoint():
         return jsonify({"ok": False, "error": str(exc)}), 200
 
 
+@app.route("/profitability/summary", methods=["GET"])
+def route_profitability_summary():
+    """Edge Ledger — aggregated stats per strategy × instrument (RESEARCH / DISPLAY-ONLY).
+    NEVER used by gate, scoring, sizing, or execution path.
+    Auth handled by Express proxy (NOT in OPEN_PATHS)."""
+    if not GHOST_OBS_DB_READY or not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "ghost_observations table not ready",
+                        "rows": [], "total_strategies": 0}), 503
+    try:
+        import profitability_engine as _pe   # noqa: PLC0415
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "rows": []}), 500
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "DB unavailable", "rows": []}), 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT strategy_key, instrument, net_r, gross_r, cost_r,
+                          mfe_r, mae_r, close_reason
+                   FROM ghost_observations
+                   WHERE status IN ('closed', 'expired')
+                   ORDER BY signal_time ASC""")
+            cols = ["strategy_key", "instrument", "net_r", "gross_r", "cost_r",
+                    "mfe_r", "mae_r", "close_reason"]
+            closed_rows = []
+            for r in cur.fetchall():
+                d = dict(zip(cols, r))
+                for k in ("net_r", "gross_r", "cost_r", "mfe_r", "mae_r"):
+                    if d[k] is not None:
+                        try:
+                            d[k] = float(d[k])
+                        except (TypeError, ValueError):
+                            d[k] = None
+                closed_rows.append(d)
+            cur.execute(
+                """SELECT strategy_key, instrument, count(*) as open_count
+                   FROM ghost_observations WHERE status = 'open'
+                   GROUP BY strategy_key, instrument""")
+            open_counts = {(r[0], r[1]): int(r[2]) for r in cur.fetchall()}
+            cur.execute("SELECT count(*) FROM ghost_observations")
+            total_obs = cur.fetchone()[0]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    aggregated = _pe.aggregate_by_strategy_instrument(closed_rows)
+    for row in aggregated:
+        row["open_observations"] = open_counts.get(
+            (row["strategy_key"], row["instrument"]), 0)
+    return jsonify({"ok": True, "rows": aggregated,
+                    "total_strategies": len(aggregated),
+                    "total_observations": int(total_obs)})
+
+
+@app.route("/profitability/observations", methods=["GET"])
+def route_profitability_observations():
+    """Edge Ledger — paginated raw ghost observations (RESEARCH / DISPLAY-ONLY).
+    Query params: instrument, strategy_key, status, source,
+                  limit (1-500, default 100), offset (default 0).
+    Auth handled by Express proxy."""
+    if not GHOST_OBS_DB_READY or not LEARNING_DB_ENABLED:
+        return jsonify({"ok": False, "error": "ghost_observations table not ready",
+                        "observations": [], "total": 0}), 503
+    inst_filter  = (request.args.get("instrument", "").strip().upper() or None)
+    sk_filter    = (request.args.get("strategy_key", "").strip() or None)
+    status_filt  = (request.args.get("status", "").strip().lower() or None)
+    source_filt  = (request.args.get("source", "").strip().lower() or None)
+    try:
+        limit  = min(500, max(1, int(request.args.get("limit",  100))))
+        offset = max(0,           int(request.args.get("offset", 0)))
+    except (TypeError, ValueError):
+        limit, offset = 100, 0
+    conn = _learning_conn()
+    if conn is None:
+        return jsonify({"ok": False, "error": "DB unavailable",
+                        "observations": [], "total": 0}), 503
+    try:
+        where_clauses: list = []
+        params: list = []
+        if inst_filter:
+            where_clauses.append("instrument = %s"); params.append(inst_filter)
+        if sk_filter:
+            where_clauses.append("strategy_key = %s"); params.append(sk_filter)
+        if status_filt:
+            where_clauses.append("status = %s"); params.append(status_filt)
+        if source_filt:
+            where_clauses.append("source = %s"); params.append(source_filt)
+        where_sql = ("WHERE " + " AND ".join(where_clauses)) if where_clauses else ""
+        with conn.cursor() as cur:
+            cur.execute(
+                f"""SELECT id, obs_key, strategy_key, instrument, direction,
+                           signal_time, original_entry, original_stop,
+                           original_target1, original_target2, risk_points,
+                           session, trading_mode, source,
+                           status, closed_at, close_reason, exit_price,
+                           gross_r, cost_r, net_r, mfe_r, mae_r, bars_held,
+                           holdout_period, created_at
+                    FROM ghost_observations
+                    {where_sql}
+                    ORDER BY id DESC LIMIT %s OFFSET %s""",
+                params + [limit, offset])
+            cols = ["id","obs_key","strategy_key","instrument","direction",
+                    "signal_time","original_entry","original_stop",
+                    "original_target1","original_target2","risk_points",
+                    "session","trading_mode","source",
+                    "status","closed_at","close_reason","exit_price",
+                    "gross_r","cost_r","net_r","mfe_r","mae_r","bars_held",
+                    "holdout_period","created_at"]
+            rows = []
+            for r in cur.fetchall():
+                d = dict(zip(cols, r))
+                for tk in ("signal_time", "closed_at", "created_at"):
+                    if d[tk] is not None:
+                        try:
+                            d[tk] = d[tk].isoformat()
+                        except Exception:
+                            d[tk] = str(d[tk])
+                for nk in ("original_entry","original_stop","original_target1",
+                           "original_target2","risk_points","exit_price",
+                           "gross_r","cost_r","net_r","mfe_r","mae_r"):
+                    if d[nk] is not None:
+                        try:
+                            d[nk] = float(d[nk])
+                        except (TypeError, ValueError):
+                            pass
+                rows.append(d)
+            cur.execute(f"SELECT count(*) FROM ghost_observations {where_sql}", params)
+            total = cur.fetchone()[0]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return jsonify({"ok": True, "observations": rows,
+                    "total": int(total), "limit": limit, "offset": offset})
+
+
 @app.route("/volatility-intelligence", methods=["GET"])
 def volatility_intelligence_endpoint():
     """Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY).
@@ -78159,6 +78767,7 @@ if __name__ == "__main__":
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
         _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
+        _check_ghost_obs_db_ready()                # probe ghost_observations (no DDL; created via DB tool/publish diff) — PROFITABILITY ENGINE PHASE 1, RESEARCH/DISPLAY-ONLY
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
         _check_hysteresis_thesis_db_ready()        # probe hysteresis_thesis (no DDL; created via DB tool/publish diff) — THESIS PHASE 2 persistence
@@ -78251,6 +78860,15 @@ if __name__ == "__main__":
         logger.error("VolatilityIntelligence: failed to start — %s", _vi_boot_exc)
     threading.Timer(0, _cross_market_loop).start()  # cross-market index alignment — DISPLAY on dev+prod; Discord SEND gated to live inside the loop
     threading.Timer(0, _micro_ghost_watch_loop).start()  # MICRO SCALP ghost watcher — started UNCONDITIONALLY; the loop self-gates on MICRO_GHOST_DB_READY + DISCORD_LIVE_ENABLED inside, so a lazy DB-ready flip (POST /micro-scalp) still gets its ghosts resolved without a restart. Resolves ghost rows only — never the money path.
+    # Profitability Engine Phase 1 — ghost bar-close callback registered AFTER DatabentoBrain.start()
+    # so it can be attached alongside the other bar-close callbacks.  The callback itself
+    # is a no-op when GHOST_OBS_DB_READY is False (fail-safe).
+    if DATABENTO_ENABLED and "_DATABENTO_BRAIN" in globals():
+        try:
+            globals()["_DATABENTO_BRAIN"].register_bar_close_callback(_ghost_obs_bar_close)
+            logger.info("ProfitabilityEngine: ghost_obs bar-close callback registered")
+        except Exception as _go_reg_exc:
+            logger.warning("ProfitabilityEngine: bar-close callback registration failed: %s", _go_reg_exc)
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:

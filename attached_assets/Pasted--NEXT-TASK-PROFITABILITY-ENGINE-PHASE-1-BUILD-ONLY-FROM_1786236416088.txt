@@ -1,0 +1,682 @@
+# NEXT TASK — PROFITABILITY ENGINE PHASE 1
+
+## BUILD ONLY FROM THE COMPLETED PHASE 0 AUDIT
+
+The Phase 0 profitability audit is already complete.
+
+Use:
+
+`PROFITABILITY_AUDIT_PHASE_0.md`
+
+as the controlling document for this task.
+
+Do NOT repeat the Phase 0 audit.
+
+Do NOT work on the Explain Decision drawer.
+
+Do NOT work on Trading Research Lab Phase 3.3.1.
+
+We are now moving directly into the smallest implementation required to begin proving whether the trading system actually has positive expectancy.
+
+---
+
+# PRIMARY OBJECTIVE
+
+Implement the minimum reliable pipeline:
+
+**VALID STRATEGY SETUP**
+→ **GHOST OBSERVATION**
+→ **IMMUTABLE TRADE PLAN**
+→ **MARKET OUTCOME**
+→ **NET R RESULT**
+→ **EDGE LEDGER**
+
+Nothing beyond that yet.
+
+Do NOT build promotion/demotion automation in this phase.
+
+Do NOT optimize strategies.
+
+Do NOT change strategy behavior.
+
+---
+
+# STEP 1 — READ THE EXISTING AUDIT FIRST
+
+Before writing code, read the entire:
+
+`PROFITABILITY_AUDIT_PHASE_0.md`
+
+Extract the audit's findings regarding:
+
+* existing ghost/shadow infrastructure
+* existing simulation infrastructure
+* trade/journal models
+* strategy identifiers
+* strategy versioning
+* instrument identifiers
+* entry/stop/target storage
+* MFE/MAE support
+* R-multiple support
+* transaction cost/slippage support
+* existing performance tables
+* existing learning tables
+* existing strategy × instrument aggregation
+* known profitability-trust defects
+* reusable components
+* recommended minimum build
+
+Do not invent parallel infrastructure if the audit identifies reusable infrastructure.
+
+---
+
+# STEP 2 — VERIFY CURRENT CODE AGAINST THE AUDIT
+
+The audit is the design source of truth, but verify the specific implementation locations before editing.
+
+For each component we plan to reuse, confirm:
+
+* file still exists
+* model still matches audit
+* functions still behave as described
+* migrations/schema match the model
+* no code has changed since the audit in a way that invalidates the recommendation
+
+If there is drift, report it before changing architecture.
+
+Minor implementation drift can be handled.
+
+Major architectural drift must be documented.
+
+---
+
+# STEP 3 — DEFINE THE CANONICAL GHOST OBSERVATION
+
+Every valid strategy setup must be capable of creating one canonical research observation.
+
+The observation must represent:
+
+**WHAT THE STRATEGY ACTUALLY KNEW AND INTENDED AT SIGNAL TIME.**
+
+At minimum, preserve:
+
+* observation ID
+* strategy ID
+* strategy version if available
+* configuration version if available
+* instrument
+* direction
+* signal timestamp
+* intended entry
+* intended stop
+* intended targets
+* R risk distance
+* source mode
+* session/time context
+* relevant strategy context snapshot
+* lifecycle status
+* final outcome
+* MFE
+* MAE
+* gross R
+* estimated cost R
+* net R
+* close timestamp
+
+Reuse existing fields/models whenever possible.
+
+Do NOT create a second competing trade-history system.
+
+---
+
+# STEP 4 — IMMUTABILITY IS REQUIRED
+
+Once the ghost observation is created, the trade plan must be frozen.
+
+The following must NOT change because a strategy/configuration changes later:
+
+* original entry
+* original stop
+* original targets
+* original strategy
+* original direction
+* original signal time
+* original relevant context
+* original strategy/config version
+
+If existing models are mutable, add the minimum snapshot mechanism required.
+
+Historical research results must reflect the rules that existed when the setup occurred.
+
+---
+
+# STEP 5 — GHOST OBSERVATIONS MUST BE INDEPENDENT OF LIVE EXECUTION
+
+This is critical.
+
+A valid research setup must still be observable even when a real order is blocked by:
+
+* live execution disabled
+* arm state
+* safety lock
+* emergency stop
+* prop rule
+* daily loss limit
+* max position limit
+* correlated exposure limit
+* duplicate execution guard
+* account unavailable
+* broker failure
+
+The research question is:
+
+**What would this strategy have done?**
+
+That is separate from:
+
+**Was the account allowed to execute it?**
+
+Do not bypass safety controls for real orders.
+
+Instead, ensure the ghost/research path happens before or independently of live execution permission where architecturally appropriate.
+
+---
+
+# STEP 6 — DO NOT CREATE FAKE SIGNALS
+
+Ghost trading must only begin when the existing strategy engine produces a legitimate setup under its current rules.
+
+Do NOT:
+
+* loosen thresholds
+* create extra signals for sample size
+* fabricate theoretical setups
+* replay future information into current signals
+* change strategy qualification logic
+
+The research pipeline observes current strategy behavior exactly as-is.
+
+---
+
+# STEP 7 — DEFINE ENTRY ACTIVATION CORRECTLY
+
+A ghost observation should distinguish:
+
+**SETUP CREATED**
+
+from
+
+**ENTRY ACTUALLY TRIGGERED**
+
+where relevant.
+
+If a strategy requires price to touch/cross/retest an entry before becoming active, preserve that behavior.
+
+Do not automatically assume every signal becomes an entered trade unless the strategy currently defines it that way.
+
+Lifecycle may need concepts like:
+
+CREATED
+WAITING_ENTRY
+ACTIVE
+CLOSED
+EXPIRED
+INVALIDATED
+
+Use existing lifecycle conventions wherever possible.
+
+---
+
+# STEP 8 — MARKET OUTCOME TRACKING
+
+Once the ghost trade becomes active, use the canonical Databento-normalized market stream to determine what subsequently happens.
+
+Track at minimum:
+
+## MFE
+
+Maximum favorable excursion.
+
+## MAE
+
+Maximum adverse excursion.
+
+These should be stored both:
+
+* in price/ticks if useful
+* normalized to R
+
+Example:
+
+Risk distance = 20 points.
+
+Maximum favorable move = 30 points.
+
+MFE = +1.5R.
+
+Maximum adverse move = 10 points.
+
+MAE = -0.5R.
+
+---
+
+# STEP 9 — DETERMINE EXIT OUTCOME USING ORIGINAL RULES
+
+Ghost trade lifecycle must use the same intended exit semantics that existed at setup time.
+
+Examples include:
+
+* stop loss
+* TP1
+* TP2
+* breakeven move
+* trailing logic
+* time-based exit
+* session close
+* strategy-specific management
+
+Do not invent generic exits if a strategy already defines its management rules.
+
+If current strategy-management logic cannot safely be reused without invoking live execution state, isolate the pure trade-management calculation rather than duplicating behavior.
+
+---
+
+# STEP 10 — HANDLE INTRABAR AMBIGUITY HONESTLY
+
+Inspect market-data resolution.
+
+If a bar/tick interval shows both stop and target could have been touched but event ordering cannot be determined, do NOT automatically choose the profitable outcome.
+
+Use:
+
+* event-level ordering when available from Databento
+* conservative resolution if exact ordering is unavailable
+* or explicit AMBIGUOUS status
+
+Never allow optimistic fill assumptions to create fake expectancy.
+
+Document the chosen rule.
+
+---
+
+# STEP 11 — TRANSACTION COSTS
+
+We need:
+
+GROSS R
+
+and
+
+NET R.
+
+Use existing commission/slippage configuration from the Phase 0 audit where available.
+
+At minimum:
+
+`net_r = gross_r - estimated_cost_r`
+
+Do not claim precision we do not have.
+
+If exact costs cannot be known for ghost trades, mark them clearly as modeled/estimated.
+
+Store enough information to later compare modeled cost against actual live execution.
+
+---
+
+# STEP 12 — THE EDGE LEDGER
+
+Build the smallest reusable profitability ledger.
+
+Its job is NOT to make trading decisions yet.
+
+Its job is simply to answer:
+
+**WHAT HAPPENED?**
+
+For closed ghost observations, calculate grouped statistics.
+
+Required first-level grouping:
+
+**strategy_id × instrument**
+
+Required statistics:
+
+* total observations
+* activated trades
+* closed trades
+* wins
+* losses
+* breakevens
+* win rate
+* average gross R
+* average net R
+* cumulative gross R
+* cumulative net R
+* average winner R
+* average loser R
+* profit factor
+* max drawdown in R
+* average MFE
+* average MAE
+
+Do not require session/regime grouping in the first implementation unless the existing architecture makes it trivial.
+
+But the raw observation must preserve enough context for us to segment later.
+
+---
+
+# STEP 13 — EXPECTANCY
+
+The primary performance metric is:
+
+**NET EXPECTANCY IN R PER CLOSED TRADE**
+
+Do not use win rate alone to classify a strategy as profitable.
+
+Example:
+
+55% wins can still be bad.
+
+40% wins can still be excellent.
+
+The system must prioritize expected R after costs.
+
+---
+
+# STEP 14 — DO NOT PROMOTE ANYTHING YET
+
+This phase must NOT:
+
+* enable live trading
+* increase size
+* alter risk
+* promote a strategy
+* demote a strategy
+* disable a strategy automatically
+* change strategy weights
+* allow AI to decide which strategy is profitable
+* alter Left Brain scoring
+* alter Right Brain execution
+
+We are creating trustworthy evidence first.
+
+---
+
+# STEP 15 — AI IS NOT THE JUDGE
+
+Do not use:
+
+* LLM confidence
+* narrative quality
+* thesis confidence
+* AI conviction
+* readiness wording
+
+to calculate profitability.
+
+The Edge Ledger must derive from objective market/trade outcomes.
+
+AI-generated context may be stored as metadata, but it cannot determine whether a ghost trade won or lost.
+
+---
+
+# STEP 16 — STRATEGY × INSTRUMENT MUST REMAIN SEPARATE
+
+Do not combine results globally.
+
+Example:
+
+ORB × MNQ
+
+and
+
+ORB × MGC
+
+are different experiments.
+
+Likewise:
+
+Liquidity Sweep × MNQ
+
+and
+
+Liquidity Sweep × MES
+
+must remain independently measurable.
+
+The system must not say:
+
+"ORB has +0.3R expectancy"
+
+if that number masks profitable and unprofitable instruments.
+
+---
+
+# STEP 17 — PRESERVE SOURCE INFORMATION
+
+Each observation should record whether it came from:
+
+* live-time shadow observation
+* historical backtest
+* paper environment
+* replay
+* another existing simulation source
+
+Do not silently mix those populations.
+
+Our first priority is live-time ghost/shadow evidence from the real Databento feed.
+
+Historical results can later be compared separately.
+
+---
+
+# STEP 18 — ADD A READ-ONLY PROFITABILITY API
+
+If consistent with the existing architecture, expose a minimal read-only API.
+
+Suggested endpoints:
+
+`GET /api/profitability/summary`
+
+and/or
+
+`GET /api/profitability/observations`
+
+Use existing API conventions.
+
+Do not redesign the frontend.
+
+No major dashboard required in this phase.
+
+The endpoint should allow us to inspect:
+
+* strategy
+* instrument
+* sample size
+* closed trades
+* net expectancy
+* profit factor
+* cumulative R
+* drawdown
+* MFE
+* MAE
+
+---
+
+# STEP 19 — MINIMAL OPERATOR VISIBILITY
+
+If there is already an appropriate dashboard/status location, add only a small read-only section showing:
+
+PROFITABILITY RESEARCH
+
+with rows like:
+
+Strategy | Instrument | Trades | Expectancy | PF | Net R
+
+Do not build a new complex dashboard.
+
+If a clean frontend insertion would materially expand scope, leave this API-only and document it.
+
+Backend correctness is more important.
+
+---
+
+# STEP 20 — TESTING REQUIREMENTS
+
+Add tests proving:
+
+### A. Observation creation
+
+A valid setup creates exactly one ghost observation.
+
+### B. Duplicate protection
+
+The same setup cannot create duplicate ghost trades accidentally.
+
+### C. Safety independence
+
+A setup blocked from LIVE execution can still create its research observation.
+
+### D. No live bypass
+
+Creating a ghost observation never bypasses execution safety.
+
+### E. Frozen trade plan
+
+Changing strategy/configuration after setup does not change the recorded entry/stop/targets.
+
+### F. MFE
+
+MFE is calculated correctly.
+
+### G. MAE
+
+MAE is calculated correctly.
+
+### H. Stop outcome
+
+Stop-first outcome produces correct negative R.
+
+### I. Target outcome
+
+Target-first outcome produces correct positive R.
+
+### J. Ambiguous ordering
+
+Ambiguous price sequences are not optimistically classified.
+
+### K. Transaction costs
+
+Gross R and net R remain distinct and cost calculation is correct.
+
+### L. Aggregation
+
+Strategy × instrument aggregation is correct.
+
+### M. Expectancy
+
+Net expectancy calculation is mathematically correct.
+
+### N. Drawdown
+
+Cumulative R and max drawdown are calculated correctly.
+
+### O. Source isolation
+
+Backtest/paper/shadow observations are not silently merged if source filtering is required.
+
+### P. No scoring change
+
+Existing strategy scoring behavior remains unchanged.
+
+### Q. No execution change
+
+Existing execution behavior remains unchanged.
+
+---
+
+# STEP 21 — RUN EXISTING REGRESSION SUITES
+
+Before considering this phase complete, run all relevant existing tests for:
+
+* Databento
+* strategies
+* scoring
+* risk
+* execution gateway
+* safety/arm state
+* prop controls
+* journaling
+* database
+* Main Brain if affected
+
+No unrelated regression is acceptable.
+
+---
+
+# STEP 22 — DATABASE SAFETY
+
+Before any schema modification:
+
+1. inspect existing SQLAlchemy models
+2. inspect existing Alembic migrations
+3. inspect PostgreSQL production schema expectations
+4. inspect SQLite/test schema behavior
+5. compare audit findings
+
+Do not perform ad-hoc production schema mutation.
+
+Any schema changes must be migration-backed and compatible with fresh installs and upgrades.
+
+---
+
+# STEP 23 — FINAL REPORT
+
+When finished, produce:
+
+`PROFITABILITY_ENGINE_PHASE_1_REPORT.md`
+
+Include:
+
+1. files changed
+2. migrations added
+3. reused existing components
+4. new components
+5. observation lifecycle
+6. exact ghost creation point
+7. why live safety remains unchanged
+8. immutable fields
+9. MFE/MAE calculation
+10. R calculation
+11. transaction-cost model
+12. Edge Ledger calculations
+13. API endpoints
+14. tests added
+15. regression results
+16. known limitations
+17. remaining Phase 0 blockers not solved yet
+
+Then print a sample table from actual test/dev data:
+
+| Strategy | Instrument | Closed | Win % | Net Exp R | PF | Net R | Max DD |
+| -------- | ---------: | -----: | ----: | --------: | -: | ----: | -----: |
+
+---
+
+# DEFINITION OF DONE
+
+This phase is done when we can truthfully say:
+
+**The trading system can observe legitimate setups without executing them, freeze the original trade plan, follow the real market afterward, determine the outcome without optimistic assumptions, calculate the result in net R, and aggregate expectancy independently for every strategy × instrument combination.**
+
+Nothing has been promoted to live because of these statistics yet.
+
+No strategy has been optimized.
+
+No new strategy has been added.
+
+No execution behavior has changed.
+
+When all tests pass, STOP.
+
+Do not begin promotion logic until I review the Phase 1 results.
