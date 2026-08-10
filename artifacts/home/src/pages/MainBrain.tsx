@@ -11503,77 +11503,17 @@ const ArmControlPanel: React.FC = () => {
   );
 };
 
-// ── Trading Desk View — purpose-built two-column operator desk ─────────────────
-// Replaces the old three-panel grid + ArmControlPanel. All execution state,
-// analysis data, and active-trade management live in one clean layout.
+// ── Trading Desk View — analysis + active positions only ──────────────────────
+// Execution controls live on the Execution page.
 const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
-  // ── Arm state ──
-  const { armData, armErr, refreshArm } = useArmStateData();
-
-  // ── ARM modal inputs ──
-  const [armModal,        setArmModal]       = useState(false);
-  const [confirmPhrase,   setConfirmPhrase]  = useState('');
-  const [armDuration,     setArmDuration]    = useState('30');
-  const [armMaxTrades,    setArmMaxTrades]   = useState('3');
-  const [armMaxLoss,      setArmMaxLoss]     = useState('');
-  const [armInstruments,  setArmInstruments] = useState('MGC');
-  const [armMaxCt,        setArmMaxCt]       = useState('1');
-
-  // ── Action feedback ──
-  const [pending,  setPending]  = useState(false);
-  const [actMsg,   setActMsg]   = useState<{ ok: boolean; text: string } | null>(null);
-
-  // ── Quick trade ──
-  const [tradeLoading, setTradeLoading] = useState<'none'|'long'|'short'>('none');
-  const [tradeToast,   setTradeToast]   = useState<{ ok: boolean; text: string } | null>(null);
-  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
-
-  // ── Send READY setup ──
-  const [sending,    setSending]    = useState(false);
-  const [sendResult, setSendResult] = useState<MbSendOutcome | null>(null);
-  const [sendModal,  setSendModal]  = useState(false);
-
-  // ── Active trade close ──
   const [closing,  setClosing]  = useState<string | null>(null);
   const [tradeMsg, setTradeMsg] = useState<{ inst: string; ok: boolean; text: string } | null>(null);
 
-  // ── Live countdown ──
-  const expiresAtRef = useRef<string | null>(null);
-  const [countdown, setCountdown] = useState('—');
-  useEffect(() => {
-    if (!armData?.expires_at || !armData.armed) { setCountdown('—'); return; }
-    expiresAtRef.current = armData.expires_at;
-    const tick = () => {
-      const exp = expiresAtRef.current;
-      if (!exp) { setCountdown('—'); return; }
-      const s = Math.max(0, Math.floor((new Date(exp).getTime() - Date.now()) / 1000));
-      if (s === 0) { setCountdown('Expired'); return; }
-      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
-      setCountdown(h > 0 ? `${h}h ${m}m` : `${m}m ${sec}s`);
-    };
-    tick();
-    const id = setInterval(tick, 1000);
-    return () => clearInterval(id);
-  }, [armData?.expires_at, armData?.armed]);
-
-  // ── Derived arm state ──
-  const effState     = armData?.effective_state ?? 'unknown';
-  const execEnabled  = armData?.execution_enabled ?? false;
-  const armed        = effState === 'live_armed';
-  const locked       = effState === 'safety_locked';
-  const tradesUsed   = armData?.trades_used ?? 0;
-  const maxTrades    = armData?.max_trades ?? 0;
-  const sessionPnl   = armData?.session_pnl ?? 0;
-  const tradingMode  = armData?.trading_mode ?? '';
-  const effMode      = armData?.effective_mode ?? '';
-
-  // ── Derived analysis state ──
   const v      = (p.verdict           ?? {}) as Record<string, unknown>;
   const lb     = (p.left_brain        ?? {}) as Record<string, unknown>;
   const cp     = (p.candidate_preview ?? {}) as Record<string, unknown>;
   const sc     = (p.strategy_scanner  ?? {}) as Record<string, unknown>;
   const tp     = (sc.trade_plan       ?? {}) as Record<string, unknown>;
-  const mkt    = (p.market            ?? {}) as Record<string, unknown>;
   const at     = (p.active_trades     ?? {}) as Record<string, unknown>;
   const trades = Array.isArray(at.trades) ? at.trades as Record<string, unknown>[] : [];
 
@@ -11583,7 +11523,6 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const dir      = safeStr(cp.direction ?? tp.direction, '');
   const isReady  = cpStatus === 'READY';
   const isPot    = cpStatus === 'POTENTIAL';
-  const inst     = safeStr((p as Record<string,unknown>).active_ticker ?? mkt.instrument, 'MNQ');
 
   const lbDir    = safeStr(lb.direction, 'NEUTRAL');
   const lbConf   = safeNum(lb.confidence) ?? 0;
@@ -11605,86 +11544,6 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const missing: string[] = Array.isArray(cp.missing_confirmations)
     ? (cp.missing_confirmations as string[]).filter(Boolean) : [];
 
-  const eligibility = getMbSendEligibility(p);
-
-  // ── API helpers ──
-  async function doExecAction(path: string, body?: object): Promise<boolean> {
-    setPending(true); setActMsg(null);
-    try {
-      const r = await fetch(`/api/execution/${path}`, {
-        method: 'POST', credentials: 'include',
-        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
-        body: JSON.stringify(body ?? {}),
-      });
-      const j = await r.json().catch(() => ({})) as Record<string, unknown>;
-      setActMsg({ ok: r.ok, text: safeStr(j.reason ?? j.message, r.ok ? 'Done' : `Error ${r.status}`) });
-      if (r.ok) await refreshArm();
-      return r.ok;
-    } catch { setActMsg({ ok: false, text: 'Network error' }); return false; }
-    finally { setPending(false); }
-  }
-
-  const handleEnable = async () => {
-    if (!window.confirm('Enable the execution gateway?\n\nLONG/SHORT and SEND READY SETUP will go live.')) return;
-    await doExecAction('enable', { confirm_phrase: 'ENABLE AUTO TRADING', by: 'operator' });
-  };
-  const handleDisable = async () => {
-    if (!window.confirm('Disable execution gateway?\n\nThis blocks all new entries.')) return;
-    await doExecAction('disable', { reason: 'operator_manual', by: 'operator' });
-  };
-  const handleDisarm = () => doExecAction('disarm', { reason: 'operator_manual' });
-  const handleArm = async () => {
-    if (confirmPhrase !== _ARM_CONFIRM_PHRASE) return;
-    const insts = armInstruments.split(',').map(s => s.trim()).filter(Boolean);
-    const mc: Record<string, number> = {};
-    for (const i of insts) mc[i] = parseInt(armMaxCt) || 1;
-    const ok = await doExecAction('arm', {
-      confirm_phrase: confirmPhrase, duration_min: parseInt(armDuration) || 30,
-      max_trades: parseInt(armMaxTrades) || 3, instruments: insts, max_contracts: mc,
-      ...(armMaxLoss ? { max_session_loss: parseFloat(armMaxLoss) } : {}),
-    });
-    if (ok) { setArmModal(false); setConfirmPhrase(''); }
-  };
-
-  function showToast(ok: boolean, text: string) {
-    setTradeToast({ ok, text });
-    if (toastTimer.current) clearTimeout(toastTimer.current);
-    toastTimer.current = setTimeout(() => setTradeToast(null), 4000);
-  }
-
-  const doQuickTrade = async (direction: 'Long' | 'Short') => {
-    if (tradeLoading !== 'none') return;
-    setTradeLoading(direction === 'Long' ? 'long' : 'short');
-    try {
-      const r = await fetch('/api/manual-order', {
-        method: 'POST', credentials: 'include',
-        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ticker: inst, direction, contracts: 1 }),
-      });
-      const j = await r.json() as Record<string, unknown>;
-      const ok = r.ok && ['sent','simulated','manual_required'].includes(String(j.status));
-      showToast(ok, ok ? `${direction} ${String(j.status)}` : safeStr(j.reason ?? j.error, 'Gateway rejected').slice(0, 60));
-    } catch { showToast(false, 'Network error'); }
-    finally { setTradeLoading('none'); }
-  };
-
-  const handleSendReady = async () => {
-    if (sending || !eligibility.eligible) return;
-    setSending(true);
-    try {
-      const r = await fetch('/api/traderspost', {
-        method: 'POST', credentials: 'include',
-        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
-        body: JSON.stringify({ ticker: inst, contracts: 1 }),
-      });
-      const j = await r.json() as Record<string, unknown>;
-      setSendResult(r.ok
-        ? { type: 'success', status: safeStr(j.status, ''), message: safeStr(j.message, ''), plan: null, ts: new Date().toISOString() }
-        : { type: 'rejected', reason: safeStr(j.reason ?? j.error, `Error ${r.status}`), ts: new Date().toISOString() });
-    } catch { setSendResult({ type: 'unknown', ts: new Date().toISOString() }); }
-    finally { setSending(false); setSendModal(true); }
-  };
-
   const handleClose = async (tInst: string) => {
     if (closing) return;
     setClosing(tInst); setTradeMsg(null);
@@ -11695,7 +11554,8 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
         body: JSON.stringify({ ticker: tInst }),
       });
       const j = await r.json() as Record<string, unknown>;
-      setTradeMsg({ inst: tInst, ok: r.ok, text: r.ok ? `Exit sent${j.pnl != null ? ` · P&L: $${j.pnl}` : ''}` : safeStr(j.reason, 'Failed') });
+      setTradeMsg({ inst: tInst, ok: r.ok,
+        text: r.ok ? 'Exit sent' + (j.pnl != null ? ` · P&L: $${j.pnl}` : '') : safeStr(j.reason, 'Failed') });
     } catch { setTradeMsg({ inst: tInst, ok: false, text: 'Network error' }); }
     finally { setClosing(null); }
   };
@@ -11708,243 +11568,128 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     });
   };
 
-  // ── Style constants ──
   const card: React.CSSProperties = {
-    background: '#060f22', border: `1px solid ${T.border}`, borderRadius: 10, padding: '14px 16px',
+    background: '#060f22', border: `1px solid ${T.border}`, borderRadius: 10,
+    padding: '14px 16px', marginBottom: 10,
   };
   const sLbl: React.CSSProperties = {
     fontSize: 8, fontWeight: 700, letterSpacing: '0.10em', color: T.txtMuted,
     textTransform: 'uppercase' as const, marginBottom: 12,
   };
-  const inpStyle: React.CSSProperties = {
-    background: '#060f1e', border: `1px solid ${T.border}`, color: T.txtPri,
-    borderRadius: 5, padding: '6px 9px', fontSize: 11, outline: 'none',
-    width: '100%', boxSizing: 'border-box' as const,
-  };
   const verdictColor = isReady ? T.green : isPot ? T.amber : T.txtMuted;
   const gradeColor   = grade === 'A+' ? T.green : grade === 'A' ? T.cyan : grade === 'B' ? T.amber : T.txtMuted;
-  const armColor     = armed ? T.green : locked ? T.red : execEnabled ? T.amber : T.txtMuted;
-  const armLabel     = armed ? `⊙ ARMED  ${countdown}` : locked ? '⚠ LOCKED' : execEnabled ? '◎ READY TO ARM' : '○ EXECUTION OFF';
 
   return (
     <>
-      {/* ── Two-column desk ── */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 296px', gap: 10, marginBottom: 10 }}>
+      {/* ── Setup Analysis ── */}
+      <div style={card}>
+        <div style={sLbl}>SETUP ANALYSIS</div>
 
-        {/* LEFT — Setup Analysis */}
-        <div style={card}>
-          <div style={sLbl}>SETUP ANALYSIS</div>
-
-          {/* Verdict + score */}
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-            <div style={{
-              background: `${verdictColor}1e`, border: `1px solid ${verdictColor}55`,
-              borderRadius: 5, padding: '3px 10px',
-              fontSize: 10, fontWeight: 800, color: verdictColor, letterSpacing: '0.07em',
-            }}>
-              {isReady ? '✓ READY' : isPot ? '⚡ FORMING' : '— WAIT'}
-            </div>
-            <div style={{ fontSize: 28, fontWeight: 900, color: gradeColor, lineHeight: 1, fontFamily: T.mono }}>
-              {score > 0 ? score : '—'}
-            </div>
-            {grade && <div style={{ fontSize: 14, fontWeight: 700, color: gradeColor }}>{grade}</div>}
-            {dir && (
-              <div style={{
-                fontSize: 10, fontWeight: 700,
-                color: /long/i.test(dir) ? T.green : T.red,
-                background: /long/i.test(dir) ? `${T.green}14` : `${T.red}14`,
-                border: `1px solid ${/long/i.test(dir) ? T.green : T.red}44`,
-                borderRadius: 4, padding: '2px 8px',
-              }}>{dir.toUpperCase()}</div>
-            )}
-          </div>
-
-          {/* Thesis row */}
+        {/* Verdict + score row */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
           <div style={{
-            display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
-            padding: '8px 10px', background: '#040c1c', borderRadius: 7, border: `1px solid ${T.border}`,
+            background: `${verdictColor}1e`, border: `1px solid ${verdictColor}55`,
+            borderRadius: 5, padding: '3px 10px',
+            fontSize: 10, fontWeight: 800, color: verdictColor, letterSpacing: '0.07em',
           }}>
-            <div style={{ fontSize: 12, fontWeight: 800, color: lbColor }}>{lbDir}</div>
-            {lbConf > 0 && (
-              <div style={{ fontSize: 10, fontWeight: 700, color: lbColor,
-                background: `${lbColor}16`, border: `1px solid ${lbColor}44`, borderRadius: 4, padding: '1px 6px' }}>
-                {lbConf}%
-              </div>
-            )}
-            {strategy && <div style={{ fontSize: 9, color: T.txtSec }}>· {strategy}</div>}
-            {lbAgeStr && <div style={{ marginLeft: 'auto', fontSize: 8, color: T.txtMuted }}>{lbAgeStr}</div>}
+            {isReady ? '✓ READY' : isPot ? '⚡ FORMING' : '— WAIT'}
           </div>
+          <div style={{ fontSize: 28, fontWeight: 900, color: gradeColor, lineHeight: 1, fontFamily: T.mono }}>
+            {score > 0 ? score : '—'}
+          </div>
+          {grade && <div style={{ fontSize: 14, fontWeight: 700, color: gradeColor }}>{grade}</div>}
+          {dir && (
+            <div style={{
+              fontSize: 10, fontWeight: 700,
+              color: /long/i.test(dir) ? T.green : T.red,
+              background: /long/i.test(dir) ? `${T.green}14` : `${T.red}14`,
+              border: `1px solid ${/long/i.test(dir) ? T.green : T.red}44`,
+              borderRadius: 4, padding: '2px 8px',
+            }}>{dir.toUpperCase()}</div>
+          )}
+        </div>
 
-          {/* Levels */}
-          {entry != null ? (
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 12 }}>
-              {([
-                ['ENTRY', entry,  ''],
-                ['STOP',  stopPx, stopPx != null && entry != null ? `${(stopPx  - entry).toFixed(1)}` : ''],
-                ['TP1',   tgt1,   tgt1   != null && entry != null ? `+${(tgt1   - entry).toFixed(1)}` : ''],
-                ['R:R',   null,   rr     != null ? `1 : ${rr.toFixed(1)}` : '—'],
-                ...(tgt2 != null ? [['TP2', tgt2, entry != null ? `+${(tgt2 - entry).toFixed(1)}` : '']] : []),
-              ] as [string, number | null, string][]).map(([k, num, note]) => (
-                <div key={k} style={{
-                  background: '#040c1c', borderRadius: 6, padding: '8px 10px',
-                  border: `1px solid ${T.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-                }}>
-                  <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.07em', color: T.txtMuted }}>{k}</span>
-                  <div style={{ textAlign: 'right' }}>
-                    <div style={{ fontSize: 12, fontWeight: 700, fontFamily: T.mono, color: T.txt }}>
-                      {num != null ? num.toFixed(2) : note}
-                    </div>
-                    {num != null && note && <div style={{ fontSize: 8, color: T.txtMuted }}>{note}</div>}
-                  </div>
-                </div>
-              ))}
-            </div>
-          ) : (
-            <div style={{ padding: '16px 0', textAlign: 'center', fontSize: 10, color: T.txtMuted, marginBottom: 12 }}>
-              No setup active — waiting for signals
+        {/* Thesis row */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
+          padding: '8px 10px', background: '#040c1c', borderRadius: 7, border: `1px solid ${T.border}`,
+        }}>
+          <div style={{ fontSize: 12, fontWeight: 800, color: lbColor }}>{lbDir}</div>
+          {lbConf > 0 && (
+            <div style={{ fontSize: 10, fontWeight: 700, color: lbColor,
+              background: `${lbColor}16`, border: `1px solid ${lbColor}44`, borderRadius: 4, padding: '1px 6px' }}>
+              {lbConf}%
             </div>
           )}
+          {strategy && <div style={{ fontSize: 9, color: T.txtSec }}>· {strategy}</div>}
+          {lbAgeStr && <div style={{ marginLeft: 'auto', fontSize: 8, color: T.txtMuted }}>{lbAgeStr}</div>}
+        </div>
 
-          {/* Blockers / missing */}
-          {(blockers.length > 0 || missing.length > 0) && (
-            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 10 }}>
-              <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.08em', color: T.txtMuted, marginBottom: 6 }}>
-                {blockers.length > 0 ? 'BLOCKERS' : 'MISSING CONFIRMATIONS'}
+        {/* Levels grid */}
+        {entry != null ? (
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 12 }}>
+            {([
+              ['ENTRY', entry,  ''],
+              ['STOP',  stopPx, stopPx != null && entry != null ? `${(stopPx - entry).toFixed(1)}` : ''],
+              ['TP1',   tgt1,   tgt1   != null && entry != null ? `+${(tgt1 - entry).toFixed(1)}` : ''],
+              ['R:R',   null,   rr     != null ? `1 : ${rr.toFixed(1)}` : '—'],
+              ...(tgt2 != null ? [['TP2', tgt2, entry != null ? `+${(tgt2 - entry).toFixed(1)}` : '']] : []),
+            ] as [string, number | null, string][]).map(([k, num, note]) => (
+              <div key={k} style={{
+                background: '#040c1c', borderRadius: 6, padding: '8px 12px',
+                border: `1px solid ${T.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+              }}>
+                <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.07em', color: T.txtMuted }}>{k}</span>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontSize: 13, fontWeight: 700, fontFamily: T.mono, color: T.txt }}>
+                    {num != null ? num.toFixed(2) : note}
+                  </div>
+                  {num != null && note && <div style={{ fontSize: 8, color: T.txtMuted }}>{note}</div>}
+                </div>
               </div>
+            ))}
+          </div>
+        ) : (
+          <div style={{ padding: '16px 0', textAlign: 'center', fontSize: 10, color: T.txtMuted, marginBottom: 12 }}>
+            No setup active — waiting for signals
+          </div>
+        )}
+
+        {/* Blockers / missing confirmations */}
+        {(blockers.length > 0 || missing.length > 0) && (
+          <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 10 }}>
+            <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.08em', color: T.txtMuted, marginBottom: 6 }}>
+              {blockers.length > 0 ? 'BLOCKERS' : 'MISSING CONFIRMATIONS'}
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 20px' }}>
               {[
                 ...blockers.map(b => ({ text: b, hard: true  })),
                 ...missing.map(m => ({ text: m, hard: false })),
-              ].slice(0, 6).map(({ text, hard }, i) => (
-                <div key={i} style={{ display: 'flex', gap: 6, alignItems: 'flex-start', marginBottom: 4 }}>
+              ].slice(0, 8).map(({ text, hard }, i) => (
+                <div key={i} style={{ display: 'flex', gap: 5, alignItems: 'flex-start' }}>
                   <span style={{ fontSize: 9, color: hard ? T.red : T.amber, flexShrink: 0 }}>{hard ? '✗' : '○'}</span>
-                  <span style={{ fontSize: 9, color: hard ? T.amber : T.txtSec, lineHeight: 1.4 }}>{String(text)}</span>
+                  <span style={{ fontSize: 9, color: hard ? T.amber : T.txtSec }}>{String(text)}</span>
                 </div>
               ))}
             </div>
-          )}
-        </div>
-
-        {/* RIGHT — Execution */}
-        <div style={{ ...card, display: 'flex', flexDirection: 'column', gap: 10 }}>
-          <div style={sLbl}>EXECUTION</div>
-
-          {/* Arm state badge */}
-          <div style={{
-            background: `${armColor}14`, border: `1px solid ${armColor}44`,
-            borderRadius: 8, padding: '10px 12px', textAlign: 'center',
-          }}>
-            <div style={{ fontSize: 11, fontWeight: 800, color: armColor, letterSpacing: '0.05em' }}>
-              {armLabel}
-            </div>
-            {armed && maxTrades > 0 && (
-              <div style={{ fontSize: 9, color: T.txtMuted, marginTop: 4 }}>
-                {tradesUsed} / {maxTrades} trades · P&L {sessionPnl >= 0 ? '+' : ''}${sessionPnl.toFixed(0)}
-              </div>
-            )}
-            {(effMode || tradingMode) && (
-              <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 2, letterSpacing: '0.04em' }}>
-                {[effMode, tradingMode].filter(Boolean).join(' · ').toUpperCase()}
-              </div>
-            )}
           </div>
-
-          {/* LONG / SHORT */}
-          <div style={{ display: 'flex', gap: 8 }}>
-            <button onClick={() => doQuickTrade('Long')} disabled={tradeLoading !== 'none' || !inst}
-              style={{ flex: 1, padding: '12px 0', fontSize: 12, fontWeight: 900,
-                background: `${T.green}1e`, border: `2px solid ${T.green}66`,
-                color: T.green, borderRadius: 8, cursor: 'pointer', letterSpacing: '0.05em',
-                opacity: tradeLoading !== 'none' ? 0.5 : 1 }}>
-              {tradeLoading === 'long' ? '…' : '▲ LONG'}
-            </button>
-            <button onClick={() => doQuickTrade('Short')} disabled={tradeLoading !== 'none' || !inst}
-              style={{ flex: 1, padding: '12px 0', fontSize: 12, fontWeight: 900,
-                background: `${T.red}1e`, border: `2px solid ${T.red}66`,
-                color: T.red, borderRadius: 8, cursor: 'pointer', letterSpacing: '0.05em',
-                opacity: tradeLoading !== 'none' ? 0.5 : 1 }}>
-              {tradeLoading === 'short' ? '…' : '▼ SHORT'}
-            </button>
-          </div>
-
-          {tradeToast && (
-            <div style={{ fontSize: 10, fontWeight: 600, textAlign: 'center', padding: '5px 8px', borderRadius: 6,
-              color: tradeToast.ok ? T.green : T.red,
-              background: `${tradeToast.ok ? T.green : T.red}12`,
-              border: `1px solid ${tradeToast.ok ? T.green : T.red}44` }}>
-              {tradeToast.text}
-            </div>
-          )}
-
-          {/* Send READY setup */}
-          <button onClick={handleSendReady} disabled={!eligibility.eligible || sending}
-            style={{ padding: '9px 10px', fontSize: 9.5, fontWeight: 700, letterSpacing: '0.04em',
-              background: eligibility.eligible ? `${T.cyan}18` : '#08111f',
-              border: `1px solid ${eligibility.eligible ? T.cyan : T.border}`,
-              color: eligibility.eligible ? T.cyan : T.txtMuted,
-              borderRadius: 7, cursor: eligibility.eligible ? 'pointer' : 'not-allowed' }}>
-            {sending ? 'Sending…' : eligibility.eligible ? '⊕ SEND READY SETUP TO BROKER' : eligibility.disabledLabel}
-          </button>
-
-          <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8, display: 'flex', flexDirection: 'column', gap: 7 }}>
-            {!execEnabled ? (
-              <button onClick={handleEnable} disabled={pending || locked}
-                style={{ padding: '8px 10px', fontSize: 9.5, fontWeight: 700,
-                  background: `${T.green}18`, border: `1px solid ${T.green}55`,
-                  color: T.green, borderRadius: 7, cursor: 'pointer', letterSpacing: '0.04em',
-                  opacity: locked ? 0.4 : 1 }}>
-                ▶ ENABLE EXECUTION
-              </button>
-            ) : (
-              <button onClick={handleDisable} disabled={pending}
-                style={{ padding: '8px 10px', fontSize: 9.5, fontWeight: 700,
-                  background: `${T.red}12`, border: `1px solid ${T.red}44`,
-                  color: T.red, borderRadius: 7, cursor: 'pointer', letterSpacing: '0.04em' }}>
-                ◻ DISABLE EXECUTION
-              </button>
-            )}
-            {execEnabled && !locked && (armed ? (
-              <button onClick={handleDisarm} disabled={pending}
-                style={{ padding: '8px 10px', fontSize: 9.5, fontWeight: 700,
-                  background: `${T.amber}12`, border: `1px solid ${T.amber}44`,
-                  color: T.amber, borderRadius: 7, cursor: 'pointer', letterSpacing: '0.04em' }}>
-                ⊘ DISARM AUTO-FIRE
-              </button>
-            ) : (
-              <button onClick={() => setArmModal(true)} disabled={pending}
-                style={{ padding: '8px 10px', fontSize: 9.5, fontWeight: 700,
-                  background: `${T.green}12`, border: `1px solid ${T.green}44`,
-                  color: T.green, borderRadius: 7, cursor: 'pointer', letterSpacing: '0.04em' }}>
-                ⊙ ARM AUTO-FIRE
-              </button>
-            ))}
-          </div>
-
-          {actMsg && (
-            <div style={{ fontSize: 9, textAlign: 'center', padding: '4px 8px', borderRadius: 5,
-              color: actMsg.ok ? T.green : T.red,
-              background: `${actMsg.ok ? T.green : T.red}10`,
-              border: `1px solid ${actMsg.ok ? T.green : T.red}33` }}>
-              {actMsg.text}
-            </div>
-          )}
-          {armErr && <div style={{ fontSize: 8, color: T.amber, textAlign: 'center' }}>State: {armErr}</div>}
-        </div>
+        )}
       </div>
 
       {/* ── Active Positions ── */}
       {trades.length > 0 && trades.map((trade, ti) => {
-        const tInst   = safeStr(trade.instrument, '');
-        const tDir    = safeStr(trade.direction, '');
-        const tEntry  = safeNum(trade.entry_price);
-        const tStop   = safeNum(trade.stop_price ?? trade.stop);
-        const tTgt1   = safeNum(trade.target1 ?? trade.take_profit);
-        const tCurR   = safeNum(trade.current_r);
-        const tUpnl   = safeNum(trade.unrealized_pnl);
-        const tCts    = trade.quantity ?? trade.contracts ?? 1;
-        const isLong  = /long/i.test(tDir);
-        const dCol    = isLong ? T.green : T.red;
-        const isCls   = closing === tInst;
-        const msg     = tradeMsg?.inst === tInst ? tradeMsg : null;
+        const tInst  = safeStr(trade.instrument, '');
+        const tDir   = safeStr(trade.direction, '');
+        const tEntry = safeNum(trade.entry_price);
+        const tStop  = safeNum(trade.stop_price ?? trade.stop);
+        const tTgt1  = safeNum(trade.target1 ?? trade.take_profit);
+        const tCurR  = safeNum(trade.current_r);
+        const tUpnl  = safeNum(trade.unrealized_pnl);
+        const tCts   = trade.quantity ?? trade.contracts ?? 1;
+        const isLong = /long/i.test(tDir);
+        const dCol   = isLong ? T.green : T.red;
+        const isCls  = closing === tInst;
+        const msg    = tradeMsg?.inst === tInst ? tradeMsg : null;
         return (
           <div key={ti} style={{
             background: '#050e0a', border: `1px solid ${T.amber}44`, borderRadius: 10,
@@ -11965,7 +11710,8 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                 </div>
               ))}
             {tCurR != null && (
-              <div style={{ fontSize: 11, fontWeight: 700, color: tCurR > 0 ? T.green : tCurR < 0 ? T.red : T.txtMuted }}>
+              <div style={{ fontSize: 11, fontWeight: 700,
+                color: tCurR > 0 ? T.green : tCurR < 0 ? T.red : T.txtMuted }}>
                 {tCurR > 0 ? '+' : ''}{tCurR.toFixed(2)}R
               </div>
             )}
@@ -11992,101 +11738,10 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
           </div>
         );
       })}
-
-      {/* ── ARM Modal ── */}
-      {armModal && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.78)', zIndex: 9000,
-          display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-          onClick={() => setArmModal(false)}>
-          <div style={{ background: '#060f22', border: `1px solid ${T.green}66`, borderRadius: 12,
-            padding: '24px', width: 360, maxWidth: '90vw' }}
-            onClick={e => e.stopPropagation()}>
-            <div style={{ fontSize: 13, fontWeight: 800, color: T.green, marginBottom: 4 }}>⊙ ARM AUTO-FIRE</div>
-            <div style={{ fontSize: 10, color: T.txtMuted, marginBottom: 16 }}>
-              Live orders will fire automatically on every READY signal.
-            </div>
-            <div style={{ marginBottom: 10 }}>
-              <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.08em', color: T.txtMuted, marginBottom: 4 }}>
-                TYPE: "{_ARM_CONFIRM_PHRASE}"
-              </div>
-              <input value={confirmPhrase} onChange={e => setConfirmPhrase(e.target.value)}
-                placeholder={_ARM_CONFIRM_PHRASE} style={inpStyle} autoFocus />
-            </div>
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, marginBottom: 10 }}>
-              {[
-                ['DURATION (min)', armDuration, setArmDuration, 'number'],
-                ['MAX TRADES',     armMaxTrades, setArmMaxTrades, 'number'],
-                ['INSTRUMENTS',    armInstruments, setArmInstruments, 'text'],
-                ['MAX CONTRACTS',  armMaxCt, setArmMaxCt, 'number'],
-              ].map(([label, val, setter, type]) => (
-                <div key={String(label)}>
-                  <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.07em', color: T.txtMuted, marginBottom: 4 }}>{label}</div>
-                  <input value={String(val)} onChange={e => (setter as (v: string) => void)(e.target.value)}
-                    type={String(type)} min={type === 'number' ? '1' : undefined}
-                    placeholder={label === 'INSTRUMENTS' ? 'MGC,MNQ' : undefined} style={inpStyle} />
-                </div>
-              ))}
-            </div>
-            <div style={{ marginBottom: 14 }}>
-              <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.07em', color: T.txtMuted, marginBottom: 4 }}>
-                MAX SESSION LOSS (optional, $)
-              </div>
-              <input value={armMaxLoss} onChange={e => setArmMaxLoss(e.target.value)}
-                type="number" min="0" placeholder="e.g. 500" style={inpStyle} />
-            </div>
-            <div style={{ display: 'flex', gap: 8 }}>
-              <button onClick={handleArm} disabled={confirmPhrase !== _ARM_CONFIRM_PHRASE || pending}
-                style={{ flex: 1, padding: '10px 0', fontSize: 11, fontWeight: 800, letterSpacing: '0.05em',
-                  background: confirmPhrase === _ARM_CONFIRM_PHRASE ? `${T.green}22` : '#0a1628',
-                  border: `1px solid ${confirmPhrase === _ARM_CONFIRM_PHRASE ? T.green : T.border}`,
-                  color: confirmPhrase === _ARM_CONFIRM_PHRASE ? T.green : T.txtMuted, borderRadius: 8,
-                  cursor: confirmPhrase === _ARM_CONFIRM_PHRASE && !pending ? 'pointer' : 'not-allowed' }}>
-                {pending ? '…' : '⊙ CONFIRM ARM'}
-              </button>
-              <button onClick={() => { setArmModal(false); setConfirmPhrase(''); }}
-                style={{ padding: '10px 14px', fontSize: 11, fontWeight: 700,
-                  background: '#0a1628', border: `1px solid ${T.border}`,
-                  color: T.txtMuted, borderRadius: 8, cursor: 'pointer' }}>Cancel</button>
-            </div>
-            {actMsg && (
-              <div style={{ marginTop: 8, fontSize: 9, textAlign: 'center', color: actMsg.ok ? T.green : T.red }}>
-                {actMsg.text}
-              </div>
-            )}
-          </div>
-        </div>
-      )}
-
-      {/* ── Send Result Modal ── */}
-      {sendModal && sendResult && (
-        <div style={{ position: 'fixed', inset: 0, background: 'rgba(0,0,0,0.78)', zIndex: 9000,
-          display: 'flex', alignItems: 'center', justifyContent: 'center' }}
-          onClick={() => setSendModal(false)}>
-          <div style={{ background: '#060f22', border: `1px solid ${T.border}`, borderRadius: 12,
-            padding: '24px 28px', width: 300, maxWidth: '90vw', textAlign: 'center' }}
-            onClick={e => e.stopPropagation()}>
-            <div style={{ fontSize: 30, marginBottom: 8 }}>
-              {sendResult.type === 'success' ? '✓' : sendResult.type === 'unknown' ? '⚠' : '✗'}
-            </div>
-            <div style={{ fontSize: 12, fontWeight: 700, marginBottom: 8,
-              color: sendResult.type === 'success' ? T.green : sendResult.type === 'unknown' ? T.amber : T.red }}>
-              {sendResult.type === 'success' ? 'ORDER SENT' : sendResult.type === 'unknown' ? 'STATUS UNKNOWN — VERIFY' : 'ORDER REJECTED'}
-            </div>
-            {'reason' in sendResult && (
-              <div style={{ fontSize: 10, color: T.amber, marginBottom: 8 }}>{String(sendResult.reason)}</div>
-            )}
-            <button onClick={() => setSendModal(false)}
-              style={{ padding: '8px 24px', fontSize: 10, fontWeight: 700,
-                background: '#0a1628', border: `1px solid ${T.border}`,
-                color: T.txtMuted, borderRadius: 7, cursor: 'pointer', marginTop: 8 }}>Close</button>
-          </div>
-        </div>
-      )}
     </>
   );
 };
 
-// ── Opening Bell Pill — full-width bottom bar at 9:30 AM ET ─────────────────
 
 const OPENING_BELL_DURATION_MS = 60_000; // visible for 60 seconds
 
