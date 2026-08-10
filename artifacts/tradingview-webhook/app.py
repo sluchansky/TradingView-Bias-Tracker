@@ -40991,6 +40991,53 @@ def get_databento_status():
     })
 
 
+@app.route("/canonical-market-state", methods=["GET"])
+def route_canonical_market_state():
+    """
+    GET /canonical-market-state?instrument=MNQ
+    GET /canonical-market-state          (all instruments)
+
+    Databento-derived shadow market-state snapshot.
+    SHADOW / OBSERVATION ONLY — never influences live trading.
+    All source selectors default to LEGACY.
+
+    Auth: Express proxy (owner-only).  NOT in OPEN_PATHS.
+    NEVER touches gate, scoring, sizing, learning, or execution.
+    """
+    try:
+        import canonical_market_state as _cms  # noqa: PLC0415
+    except ImportError:
+        return jsonify({"ok": False, "error": "canonical_market_state module not available"}), 503
+
+    if not _cms.CMS_ENABLED:
+        return jsonify({"ok": False, "enabled": False, "reason": "CANONICAL_MARKET_STATE_ENABLED=0"}), 200
+
+    inst = request.args.get("instrument", "").strip().upper()
+    if inst:
+        if inst not in _cms.INSTRUMENTS:
+            return jsonify({"ok": False, "error": f"Unknown instrument: {inst!r}"}), 400
+        snap = _cms.get_canonical_market_state(inst)
+        if snap is None:
+            return jsonify({"ok": False, "error": "Engine not started — Databento feed may be disabled"}), 503
+        return jsonify({"ok": True, "shadow_only": _cms.CMS_SHADOW_ONLY, "state": snap})
+
+    # All instruments
+    all_states = _cms.get_all_canonical_market_states()
+    return jsonify({
+        "ok":         True,
+        "shadow_only":_cms.CMS_SHADOW_ONLY,
+        "states":     all_states,
+        "source_selectors": {
+            "vwap":      _cms.VWAP_SOURCE,
+            "structure": _cms.STRUCTURE_SOURCE,
+            "cvd":       _cms.CVD_SOURCE,
+            "sweep":     _cms.SWEEP_SOURCE,
+            "fvg":       _cms.FVG_SOURCE,
+            "zone":      _cms.ZONE_SOURCE,
+        },
+    })
+
+
 @app.route("/market/trend-alignment", methods=["GET"])
 def route_market_trend_alignment():
     """Multi-Timeframe Trend Alignment — Phase 8B.1 (DISPLAY-ONLY, FAIL-OPEN).
@@ -80271,6 +80318,29 @@ if __name__ == "__main__":
             ).start()
         except Exception as _mtf_reg_exc:
             logger.warning("MTFTrend: callback registration failed — %s", _mtf_reg_exc)
+    # ── Canonical Market State Engine — SHADOW / OBSERVATION ONLY ────────────
+    # Registers a bar-close callback so every closed Databento 1m bar is fed
+    # into the shadow VWAP / ATR / structure / sweep calculators.
+    # NEVER touches gate, scoring, sizing, learning, or execution.
+    # All source selectors default to LEGACY; promotion requires explicit env change.
+    if DATABENTO_ENABLED and "_DATABENTO_BRAIN" in globals():
+        try:
+            import canonical_market_state as _cms  # noqa: PLC0415
+            if _cms.CMS_ENABLED:
+                from databento_brain import DATABENTO_BARS_BY_INST as _DB_BARS  # noqa: PLC0415
+                _cms.start(
+                    databento_bars_by_inst=_DB_BARS,
+                    cvd_by_ticker=CVD_BY_TICKER,
+                    rvol_by_ticker=RVOL_BY_TICKER,
+                    vwap_by_ticker=AUTO_PRICE_BY_TICKER,
+                    get_db_fn=get_db_connection,
+                )
+                # Boot comparison table (fail-open — DDL error never blocks startup)
+                _cms.ensure_comparison_table(get_db_connection)
+                globals()["_DATABENTO_BRAIN"].register_bar_close_callback(_cms.on_bar_close)
+                logger.info("CanonicalMarketState: shadow engine started + bar-close callback registered")
+        except Exception as _cms_exc:
+            logger.warning("CanonicalMarketState: boot error (non-critical): %s", _cms_exc)
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:

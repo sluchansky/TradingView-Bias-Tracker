@@ -1360,6 +1360,125 @@ const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
   );
 };
 
+// ── Canonical Databento Market State Panel — shadow/observation only ──────────
+const CanonicalStatePanel: React.FC = () => {
+  const [data,    setData]    = useState<Record<string, unknown> | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [err,     setErr]     = useState<string | null>(null);
+  const inst = 'MNQ';  // default to MNQ; full view shows all
+
+  useEffect(() => {
+    let cancelled = false;
+    const load = () => {
+      fetch(`/api/canonical-market-state?instrument=${inst}`, {
+        credentials: 'include',
+        headers: getAuthHeader(),
+      })
+        .then(r => r.ok ? r.json() : Promise.reject(r.status))
+        .then(d => { if (!cancelled) { setData(d); setLoading(false); setErr(null); } })
+        .catch(e => { if (!cancelled) { setErr(String(e)); setLoading(false); } });
+    };
+    load();
+    const id = setInterval(load, 30_000);
+    return () => { cancelled = true; clearInterval(id); };
+  }, []);
+
+  const s = (data?.state ?? {}) as Record<string, unknown>;
+  const vwap = (s.vwap ?? {}) as Record<string, unknown>;
+  const atr  = (s.atr  ?? {}) as Record<string, unknown>;
+  const vol  = (s.volume ?? {}) as Record<string, unknown>;
+  const str  = (s.structure ?? {}) as Record<string, unknown>;
+  const cvd  = (s.cvd ?? {}) as Record<string, unknown>;
+  const trend= (s.trend ?? {}) as Record<string, unknown>;
+  const warm = (s.warmup ?? {}) as Record<string, unknown>;
+
+  const healthColor = (h: string) =>
+    h === 'HEALTHY' ? '#34d399' : h === 'STALE' ? '#fbbf24' : '#6b7280';
+  const dirColor = (d: string) =>
+    d === 'BULLISH' || d === 'ALIGNED_BULLISH' ? '#34d399' :
+    d === 'BEARISH' || d === 'ALIGNED_BEARISH' ? '#ef4444' : '#6b7280';
+
+  const panelStyle: React.CSSProperties = {
+    background: 'rgba(99,102,241,0.05)',
+    border: '1px solid rgba(99,102,241,0.15)',
+    borderRadius: 10, padding: '12px 14px', marginTop: 10,
+  };
+  const rowStyle: React.CSSProperties = {
+    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+    padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.04)',
+    fontSize: 12,
+  };
+  const labelStyle: React.CSSProperties = { color: '#9ca3af', fontWeight: 500 };
+  const valStyle: React.CSSProperties   = { fontWeight: 600, fontVariantNumeric: 'tabular-nums' };
+
+  if (loading) return null;
+  if (err) return null; // silently hide if endpoint not available
+  if (!data?.ok) return null;
+  if (!warm.complete) return (
+    <div style={panelStyle}>
+      <div style={{ fontSize: 11, color: '#6b7280', fontWeight: 600, marginBottom: 6, letterSpacing: '0.06em' }}>
+        CANONICAL STATE · SHADOW · {inst}
+      </div>
+      <div style={{ fontSize: 12, color: '#6b7280' }}>
+        Warming up… {String(warm.bars_available ?? 0)}/{String(warm.bars_required ?? 0)} bars
+      </div>
+    </div>
+  );
+
+  return (
+    <div style={panelStyle}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
+        <span style={{ fontSize: 11, color: '#818cf8', fontWeight: 700, letterSpacing: '0.06em' }}>
+          CANONICAL STATE · SHADOW · {inst}
+        </span>
+        <span style={{ fontSize: 10, color: '#4b5563', fontStyle: 'italic' }}>observation only</span>
+      </div>
+
+      <div style={rowStyle}>
+        <span style={labelStyle}>Session VWAP</span>
+        <span style={{ ...valStyle, color: healthColor(String(vwap.health ?? '')) }}>
+          {vwap.value != null ? `${Number(vwap.value).toFixed(2)} (${String(vwap.side)})` : '—'}
+        </span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>ATR (1m · 14)</span>
+        <span style={{ ...valStyle, color: healthColor(String(atr.health ?? '')) }}>
+          {atr.value != null ? `${Number(atr.value).toFixed(2)} pts` : '—'}
+        </span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>RVOL</span>
+        <span style={{ ...valStyle, color: vol.regime === 'HIGH' ? '#ef4444' : vol.regime === 'ELEVATED' ? '#fbbf24' : '#d1d5db' }}>
+          {vol.relative_volume != null ? `${Number(vol.relative_volume).toFixed(2)}×  ${String(vol.regime ?? '')}` : '—'}
+        </span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>Structure</span>
+        <span style={{ ...valStyle, color: dirColor(String(str.direction ?? 'UNKNOWN')) }}>
+          {String(str.direction ?? 'UNKNOWN')}
+          {str.last_bos ? ` · BOS ${(str.last_bos as Record<string,unknown>).direction}` : ''}
+        </span>
+      </div>
+      <div style={rowStyle}>
+        <span style={labelStyle}>CVD</span>
+        <span style={{ ...valStyle, color: dirColor(String(cvd.direction ?? 'UNKNOWN')) }}>
+          {cvd.value != null ? Number(cvd.value).toFixed(0) : '—'}
+          {cvd.direction ? ` · ${String(cvd.direction)}` : ''}
+        </span>
+      </div>
+      {trend.trend_alignment && (
+        <div style={{ ...rowStyle, borderBottom: 'none', paddingBottom: 0 }}>
+          <span style={labelStyle}>Trend (15m/4H)</span>
+          <span style={{ ...valStyle, color: dirColor(String(trend.trend_alignment ?? '')) }}>
+            {String(trend.trend_15m ?? '?')} / {String(trend.trend_4h ?? '?')}
+            {' · '}{String(trend.trend_alignment ?? '')}
+          </span>
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ─────────────────────────────────────────────────────────────────────────────
 const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const lb    = (p.left_brain ?? {}) as Record<string, unknown>;
@@ -11508,42 +11627,82 @@ const ArmControlPanel: React.FC = () => {
 const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const [closing,  setClosing]  = useState<string | null>(null);
   const [tradeMsg, setTradeMsg] = useState<{ inst: string; ok: boolean; text: string } | null>(null);
+  const [journal,  setJournal]  = useState<Record<string, unknown>[]>([]);
 
+  // Fetch recent journal trades once on mount
+  useEffect(() => {
+    fetch('/api/journal/native-trades?limit=6', {
+      credentials: 'include', headers: getAuthHeader(),
+    })
+      .then(r => r.ok ? r.json() : null)
+      .then((d: Record<string, unknown> | null) => {
+        if (d && Array.isArray(d.trades)) setJournal(d.trades as Record<string, unknown>[]);
+      })
+      .catch(() => {});
+  }, []);
+
+  // ── Derived state ──────────────────────────────────────────────────────────
   const v      = (p.verdict           ?? {}) as Record<string, unknown>;
   const lb     = (p.left_brain        ?? {}) as Record<string, unknown>;
   const cp     = (p.candidate_preview ?? {}) as Record<string, unknown>;
   const sc     = (p.strategy_scanner  ?? {}) as Record<string, unknown>;
-  const tp     = (sc.trade_plan       ?? {}) as Record<string, unknown>;
   const at     = (p.active_trades     ?? {}) as Record<string, unknown>;
+  const vi     = (p.volatility_intelligence ?? {}) as Record<string, unknown>;
   const trades = Array.isArray(at.trades) ? at.trades as Record<string, unknown>[] : [];
 
+  // Verdict / score
   const score    = safeNum(v.edge_score) ?? 0;
   const grade    = safeStr(v.edge_grade, '');
   const cpStatus = safeStr(cp.status, 'NO_CANDIDATE');
-  const dir      = safeStr(cp.direction ?? tp.direction, '');
+  const dir      = safeStr(cp.direction ?? sc.selected ?? '', '');
   const isReady  = cpStatus === 'READY';
   const isPot    = cpStatus === 'POTENTIAL';
+  const verdictColor = isReady ? T.green : isPot ? T.amber : T.txtMuted;
+  const gradeColor   = grade === 'A+' ? T.green : grade === 'A' ? T.cyan : grade === 'B' ? T.amber : T.txtMuted;
 
+  // Left Brain thesis
   const lbDir    = safeStr(lb.direction, 'NEUTRAL');
   const lbConf   = safeNum(lb.confidence) ?? 0;
   const lbAge    = safeNum(lb.age_seconds);
   const lbColor  = /bull/i.test(lbDir) ? T.green : /bear/i.test(lbDir) ? T.red : T.txtMuted;
   const lbAgeStr = lbAge != null
-    ? (lbAge < 60 ? `${lbAge}s` : lbAge < 3600 ? `${Math.floor(lbAge/60)}m` : `${Math.floor(lbAge/3600)}h`) + ' ago'
+    ? (lbAge < 60 ? lbAge + 's' : lbAge < 3600 ? Math.floor(lbAge / 60) + 'm' : Math.floor(lbAge / 3600) + 'h') + ' ago'
     : '';
-  const strategy = safeStr(sc.selected_strategy, '');
+  const strategy = safeStr(sc.selected_label ?? sc.selected, '');
 
-  const entry  = safeNum(tp.entry   ?? cp.entry_zone);
-  const stopPx = safeNum(tp.stop    ?? cp.stop_loss);
-  const tgt1   = safeNum(tp.target1 ?? cp.take_profit);
-  const tgt2   = safeNum(tp.target2);
-  const rr     = safeNum(tp.rr);
+  // Trade plan levels (prefer candidate_preview, fallback to scanner)
+  const entry  = safeNum(sc.entry ?? cp.entry_zone);
+  const stopPx = safeNum(sc.stop  ?? cp.stop_loss);
+  const tgts   = Array.isArray(sc.targets) ? sc.targets as (number | null)[] : [];
+  const tgt1   = safeNum(tgts[0] ?? cp.take_profit);
+  const tgt2   = safeNum(tgts[1]);
+  const rr     = safeNum(sc.risk_reward);
+  const scanReason   = safeStr(sc.reason, '');
+  const marketRegime = safeStr(sc.market_regime, '');
 
+  // Blockers / missing
   const blockers: string[] = Array.isArray(v.hard_blockers)
     ? (v.hard_blockers as string[]).filter(Boolean) : [];
   const missing: string[] = Array.isArray(cp.missing_confirmations)
     ? (cp.missing_confirmations as string[]).filter(Boolean) : [];
 
+  // Scanner strategies
+  const ranked = Array.isArray(sc.ranked_strategies)
+    ? (sc.ranked_strategies as Record<string, unknown>[])
+    : [];
+
+  // VIX
+  const vixBlock   = (vi.vix ?? {}) as Record<string, unknown>;
+  const vixPrice   = safeNum(vixBlock.price);
+  const vixChgPct  = safeNum(vixBlock.change_pct);
+  const vixRegime  = safeStr(vi.regime, 'UNKNOWN');
+  const vixRisk    = safeStr(vi.risk_tone, 'UNKNOWN');
+  const vixEnabled = vi.enabled === true;
+  const vixOk      = vixBlock.status === 'OK' || vixBlock.status === 'DELAYED';
+  const vixColor   = vixRegime === 'LOW' ? T.green : vixRegime === 'ELEVATED' || vixRegime === 'HIGH' ? T.amber
+                   : vixRegime === 'EXTREME' ? T.red : T.txtMuted;
+
+  // ── Handlers ──────────────────────────────────────────────────────────────
   const handleClose = async (tInst: string) => {
     if (closing) return;
     setClosing(tInst); setTradeMsg(null);
@@ -11554,13 +11713,14 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
         body: JSON.stringify({ ticker: tInst }),
       });
       const j = await r.json() as Record<string, unknown>;
+      const pnlStr = j.pnl != null ? ' · P&L: $' + String(j.pnl) : '';
       setTradeMsg({ inst: tInst, ok: r.ok,
-        text: r.ok ? 'Exit sent' + (j.pnl != null ? ` · P&L: $${j.pnl}` : '') : safeStr(j.reason, 'Failed') });
+        text: r.ok ? 'Exit sent' + pnlStr : safeStr(j.reason, 'Failed') });
     } catch { setTradeMsg({ inst: tInst, ok: false, text: 'Network error' }); }
     finally { setClosing(null); }
   };
   const handleClear = async (tInst: string) => {
-    if (!window.confirm(`Remove ${tInst} from tracking? (No broker order sent)`)) return;
+    if (!window.confirm('Remove ' + tInst + ' from tracking? (No broker order sent)')) return;
     await fetch('/api/stop-managing', {
       method: 'POST', credentials: 'include',
       headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
@@ -11568,27 +11728,30 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     });
   };
 
+  // ── Shared styles ─────────────────────────────────────────────────────────
   const card: React.CSSProperties = {
     background: '#060f22', border: `1px solid ${T.border}`, borderRadius: 10,
-    padding: '14px 16px', marginBottom: 10,
+    padding: '12px 14px', marginBottom: 10,
   };
   const sLbl: React.CSSProperties = {
     fontSize: 8, fontWeight: 700, letterSpacing: '0.10em', color: T.txtMuted,
-    textTransform: 'uppercase' as const, marginBottom: 12,
+    textTransform: 'uppercase' as const, marginBottom: 10,
   };
-  const verdictColor = isReady ? T.green : isPot ? T.amber : T.txtMuted;
-  const gradeColor   = grade === 'A+' ? T.green : grade === 'A' ? T.cyan : grade === 'B' ? T.amber : T.txtMuted;
+  const pill = (col: string, text: string): React.CSSProperties => ({
+    background: col + '1e', border: `1px solid ${col}55`, borderRadius: 4,
+    padding: '1px 7px', fontSize: 9, fontWeight: 700, color: col, display: 'inline-block',
+  });
 
   return (
     <>
-      {/* ── Setup Analysis ── */}
+      {/* ═══════════════════════ SETUP ANALYSIS ═══════════════════════════ */}
       <div style={card}>
         <div style={sLbl}>SETUP ANALYSIS</div>
 
         {/* Verdict + score row */}
-        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
           <div style={{
-            background: `${verdictColor}1e`, border: `1px solid ${verdictColor}55`,
+            background: verdictColor + '1e', border: `1px solid ${verdictColor}55`,
             borderRadius: 5, padding: '3px 10px',
             fontSize: 10, fontWeight: 800, color: verdictColor, letterSpacing: '0.07em',
           }}>
@@ -11602,63 +11765,36 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             <div style={{
               fontSize: 10, fontWeight: 700,
               color: /long/i.test(dir) ? T.green : T.red,
-              background: /long/i.test(dir) ? `${T.green}14` : `${T.red}14`,
+              background: (/long/i.test(dir) ? T.green : T.red) + '14',
               border: `1px solid ${/long/i.test(dir) ? T.green : T.red}44`,
               borderRadius: 4, padding: '2px 8px',
             }}>{dir.toUpperCase()}</div>
+          )}
+          {marketRegime && (
+            <div style={{ marginLeft: 'auto', fontSize: 8, color: T.txtMuted }}>{marketRegime}</div>
           )}
         </div>
 
         {/* Thesis row */}
         <div style={{
-          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12,
-          padding: '8px 10px', background: '#040c1c', borderRadius: 7, border: `1px solid ${T.border}`,
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10,
+          padding: '7px 10px', background: '#040c1c', borderRadius: 7, border: `1px solid ${T.border}`,
         }}>
           <div style={{ fontSize: 12, fontWeight: 800, color: lbColor }}>{lbDir}</div>
           {lbConf > 0 && (
-            <div style={{ fontSize: 10, fontWeight: 700, color: lbColor,
-              background: `${lbColor}16`, border: `1px solid ${lbColor}44`, borderRadius: 4, padding: '1px 6px' }}>
-              {lbConf}%
-            </div>
+            <div style={{
+              fontSize: 10, fontWeight: 700, color: lbColor,
+              background: lbColor + '16', border: `1px solid ${lbColor}44`, borderRadius: 4, padding: '1px 6px',
+            }}>{lbConf}%</div>
           )}
           {strategy && <div style={{ fontSize: 9, color: T.txtSec }}>· {strategy}</div>}
           {lbAgeStr && <div style={{ marginLeft: 'auto', fontSize: 8, color: T.txtMuted }}>{lbAgeStr}</div>}
         </div>
 
-        {/* Levels grid */}
-        {entry != null ? (
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: 8, marginBottom: 12 }}>
-            {([
-              ['ENTRY', entry,  ''],
-              ['STOP',  stopPx, stopPx != null && entry != null ? `${(stopPx - entry).toFixed(1)}` : ''],
-              ['TP1',   tgt1,   tgt1   != null && entry != null ? `+${(tgt1 - entry).toFixed(1)}` : ''],
-              ['R:R',   null,   rr     != null ? `1 : ${rr.toFixed(1)}` : '—'],
-              ...(tgt2 != null ? [['TP2', tgt2, entry != null ? `+${(tgt2 - entry).toFixed(1)}` : '']] : []),
-            ] as [string, number | null, string][]).map(([k, num, note]) => (
-              <div key={k} style={{
-                background: '#040c1c', borderRadius: 6, padding: '8px 12px',
-                border: `1px solid ${T.border}`, display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-              }}>
-                <span style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.07em', color: T.txtMuted }}>{k}</span>
-                <div style={{ textAlign: 'right' }}>
-                  <div style={{ fontSize: 13, fontWeight: 700, fontFamily: T.mono, color: T.txt }}>
-                    {num != null ? num.toFixed(2) : note}
-                  </div>
-                  {num != null && note && <div style={{ fontSize: 8, color: T.txtMuted }}>{note}</div>}
-                </div>
-              </div>
-            ))}
-          </div>
-        ) : (
-          <div style={{ padding: '16px 0', textAlign: 'center', fontSize: 10, color: T.txtMuted, marginBottom: 12 }}>
-            No setup active — waiting for signals
-          </div>
-        )}
-
         {/* Blockers / missing confirmations */}
         {(blockers.length > 0 || missing.length > 0) && (
-          <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 10 }}>
-            <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.08em', color: T.txtMuted, marginBottom: 6 }}>
+          <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8 }}>
+            <div style={{ ...sLbl, marginBottom: 6 }}>
               {blockers.length > 0 ? 'BLOCKERS' : 'MISSING CONFIRMATIONS'}
             </div>
             <div style={{ display: 'flex', flexWrap: 'wrap', gap: '4px 20px' }}>
@@ -11676,7 +11812,200 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
         )}
       </div>
 
-      {/* ── Active Positions ── */}
+      {/* ═══════════════════════ TRADE PLAN + SCANNER ═════════════════════ */}
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+
+        {/* Trade Plan */}
+        <div style={{ ...card, marginBottom: 0 }}>
+          <div style={sLbl}>TRADE PLAN</div>
+          {entry != null ? (
+            <>
+              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6, marginBottom: 8 }}>
+                {([
+                  ['ENTRY', entry,  ''],
+                  ['STOP',  stopPx, stopPx != null && entry != null ? (stopPx - entry).toFixed(1) : ''],
+                  ['TP1',   tgt1,   tgt1 != null && entry != null ? '+' + (tgt1 - entry).toFixed(1) : ''],
+                  ['R:R',   null,   rr != null ? '1 : ' + rr.toFixed(1) : '—'],
+                  ...(tgt2 != null ? [['TP2', tgt2, entry != null ? '+' + (tgt2 - entry).toFixed(1) : '']] : []),
+                ] as [string, number | null, string][]).map(([k, num, note]) => (
+                  <div key={k} style={{
+                    background: '#040c1c', borderRadius: 5, padding: '6px 10px',
+                    border: `1px solid ${T.border}`, display: 'flex', justifyContent: 'space-between',
+                    alignItems: 'center',
+                  }}>
+                    <span style={{ fontSize: 7, fontWeight: 700, letterSpacing: '0.07em', color: T.txtMuted }}>{k}</span>
+                    <div style={{ textAlign: 'right' }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, fontFamily: T.mono, color: T.txt }}>
+                        {num != null ? num.toFixed(2) : note}
+                      </div>
+                      {num != null && note && <div style={{ fontSize: 7, color: T.txtMuted }}>{note}</div>}
+                    </div>
+                  </div>
+                ))}
+              </div>
+              {scanReason && (
+                <div style={{ fontSize: 8, color: T.txtSec, fontStyle: 'italic', lineHeight: 1.4 }}>
+                  {scanReason.slice(0, 120)}
+                </div>
+              )}
+            </>
+          ) : (
+            <div style={{ padding: '20px 0', textAlign: 'center', fontSize: 10, color: T.txtMuted }}>
+              No active plan
+            </div>
+          )}
+        </div>
+
+        {/* Scanner */}
+        <div style={{ ...card, marginBottom: 0 }}>
+          <div style={sLbl}>STRATEGY SCANNER</div>
+          {ranked.length > 0 ? (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {ranked.slice(0, 8).map((s, i) => {
+                const sLabel = safeStr(s.label, safeStr(s.strategy_key, ''));
+                const sSel   = s.selected === true;
+                const sElig  = s.eligible === true;
+                const sDir   = safeStr(s.direction, '');
+                const sResult = safeStr(s.result, '');
+                const sSkip  = safeStr(s.skip_reason, '');
+                const sComp  = safeNum(s.completeness);
+                const rowCol = sSel ? T.green : sElig ? T.cyan : T.txtMuted;
+                return (
+                  <div key={i} style={{
+                    display: 'flex', alignItems: 'center', gap: 6, padding: '4px 8px',
+                    background: sSel ? T.green + '12' : sElig ? T.cyan + '08' : '#040c1c',
+                    borderRadius: 5, border: `1px solid ${sSel ? T.green + '44' : T.border}`,
+                  }}>
+                    <div style={{ width: 5, height: 5, borderRadius: '50%', flexShrink: 0,
+                      background: sSel ? T.green : sElig ? T.cyan : sResult === 'pass' ? T.amber : T.txtMuted }} />
+                    <div style={{ flex: 1, fontSize: 9, fontWeight: sSel ? 700 : 400, color: rowCol,
+                      overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                      {sLabel}
+                    </div>
+                    {sDir && (
+                      <span style={{ fontSize: 7, color: /long/i.test(sDir) ? T.green : T.red }}>
+                        {sDir.charAt(0).toUpperCase()}
+                      </span>
+                    )}
+                    {sComp != null && (
+                      <span style={{ fontSize: 7, color: T.txtMuted, fontFamily: T.mono }}>
+                        {sComp}%
+                      </span>
+                    )}
+                    {sSkip && !sSel && (
+                      <span style={{ fontSize: 7, color: T.txtMuted, maxWidth: 60, overflow: 'hidden',
+                        textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                        {sSkip}
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div style={{ padding: '20px 0', textAlign: 'center', fontSize: 10, color: T.txtMuted }}>
+              No strategies evaluated
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* ═══════════════════════ VIX STRIP ════════════════════════════════ */}
+      {vixEnabled && (
+        <div style={{
+          ...card, marginBottom: 10,
+          display: 'flex', alignItems: 'center', gap: 16, padding: '9px 14px',
+        }}>
+          <div style={{ fontSize: 8, fontWeight: 700, letterSpacing: '0.10em', color: T.txtMuted }}>VIX</div>
+          {vixOk && vixPrice != null ? (
+            <>
+              <div style={{ fontSize: 20, fontWeight: 900, fontFamily: T.mono, color: vixColor }}>
+                {vixPrice.toFixed(2)}
+              </div>
+              {vixChgPct != null && (
+                <div style={{ fontSize: 10, fontWeight: 600,
+                  color: vixChgPct > 0 ? T.red : T.green }}>
+                  {vixChgPct > 0 ? '+' : ''}{vixChgPct.toFixed(2)}%
+                </div>
+              )}
+              <div style={pill(vixColor, vixRegime)}>{vixRegime}</div>
+              {vixRisk !== 'UNKNOWN' && (
+                <div style={{ fontSize: 9, color: T.txtSec }}>{vixRisk} RISK</div>
+              )}
+            </>
+          ) : (
+            <div style={{ fontSize: 9, color: T.txtMuted }}>
+              {vixOk ? 'Loading…' : 'Feed error — market may be closed'}
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* ═══════════════════════ MINI JOURNAL ═════════════════════════════ */}
+      <div style={card}>
+        <div style={sLbl}>RECENT TRADES</div>
+        {journal.length > 0 ? (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 3 }}>
+            {journal.map((t, i) => {
+              const jInst   = safeStr(t.instrument, '');
+              const jDir    = safeStr(t.direction, '');
+              const jStrat  = safeStr(t.strategy_display_name, '');
+              const jScore  = safeNum(t.edge_score);
+              const jStatus = safeStr(t.lifecycle_status, '');
+              const jEntry  = safeNum(t.planned_entry);
+              const jReview = safeStr(t.review_status, '');
+              const jDate   = safeStr(t.created_at, '');
+              const jMode   = safeStr(t.mode, '');
+              const isLong  = /long/i.test(jDir);
+              const dCol    = isLong ? T.green : T.red;
+              const sCol    = jStatus === 'CLOSED' ? T.txtMuted
+                            : jStatus === 'SUBMITTED' || jStatus === 'OPEN' ? T.cyan : T.amber;
+              const dateStr = jDate
+                ? new Date(jDate).toLocaleTimeString('en-US',
+                    { hour: '2-digit', minute: '2-digit', timeZone: 'Etc/GMT+4' })
+                : '';
+              return (
+                <div key={i} style={{
+                  display: 'flex', alignItems: 'center', gap: 8, padding: '5px 8px',
+                  background: '#040c1c', borderRadius: 5, border: `1px solid ${T.border}`,
+                }}>
+                  <div style={{ fontSize: 10, fontWeight: 700, color: dCol, width: 30, flexShrink: 0 }}>
+                    {jInst}
+                  </div>
+                  <div style={{ fontSize: 8, fontWeight: 600, color: dCol, width: 14, flexShrink: 0 }}>
+                    {isLong ? '▲' : '▼'}
+                  </div>
+                  <div style={{ flex: 1, fontSize: 9, color: T.txtSec, overflow: 'hidden',
+                    textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                    {jStrat}
+                  </div>
+                  {jEntry != null && (
+                    <div style={{ fontSize: 8, fontFamily: T.mono, color: T.txt, flexShrink: 0 }}>
+                      {jEntry.toFixed(2)}
+                    </div>
+                  )}
+                  {jScore != null && (
+                    <div style={{ fontSize: 8, color: T.txtMuted, flexShrink: 0, fontFamily: T.mono }}>
+                      {jScore}
+                    </div>
+                  )}
+                  <div style={{ fontSize: 7, color: sCol, flexShrink: 0, fontWeight: 600 }}>{jStatus}</div>
+                  {jReview === 'UNREVIEWED' && (
+                    <div style={{ fontSize: 7, color: T.amber, flexShrink: 0 }}>⬤</div>
+                  )}
+                  <div style={{ fontSize: 7, color: T.txtMuted, flexShrink: 0 }}>{dateStr}</div>
+                </div>
+              );
+            })}
+          </div>
+        ) : (
+          <div style={{ padding: '12px 0', textAlign: 'center', fontSize: 10, color: T.txtMuted }}>
+            No trades recorded yet
+          </div>
+        )}
+      </div>
+
+      {/* ═══════════════════════ ACTIVE POSITIONS ═════════════════════════ */}
       {trades.length > 0 && trades.map((trade, ti) => {
         const tInst  = safeStr(trade.instrument, '');
         const tDir   = safeStr(trade.direction, '');
@@ -11697,14 +12026,14 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             flexWrap: 'wrap', marginBottom: 6,
           }}>
             <div style={{ fontSize: 11, fontWeight: 800, color: dCol,
-              background: `${dCol}14`, border: `1px solid ${dCol}44`,
+              background: dCol + '14', border: `1px solid ${dCol}44`,
               borderRadius: 5, padding: '4px 10px', flexShrink: 0 }}>
               {tInst} {tDir.toUpperCase()} {String(tCts)}ct
             </div>
-            {[['ENTRY', tEntry?.toFixed(2)], ['STOP', tStop?.toFixed(2)], ['TP1', tTgt1?.toFixed(2)]]
+            {([['ENTRY', tEntry?.toFixed(2)], ['STOP', tStop?.toFixed(2)], ['TP1', tTgt1?.toFixed(2)]] as [string, string | undefined][])
               .filter(([, val]) => val)
               .map(([k, val]) => (
-                <div key={String(k)} style={{ fontSize: 9 }}>
+                <div key={k} style={{ fontSize: 9 }}>
                   <span style={{ color: T.txtMuted, letterSpacing: '0.06em', marginRight: 3 }}>{k}</span>
                   <span style={{ fontFamily: T.mono, fontWeight: 600, color: T.txt }}>{val}</span>
                 </div>
@@ -11724,7 +12053,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
               {msg && <span style={{ fontSize: 9, color: msg.ok ? T.green : T.red }}>{msg.text}</span>}
               <button onClick={() => handleClose(tInst)} disabled={isCls}
                 style={{ padding: '5px 12px', fontSize: 9, fontWeight: 700,
-                  background: `${T.red}18`, border: `1px solid ${T.red}55`,
+                  background: T.red + '18', border: `1px solid ${T.red}55`,
                   color: T.red, borderRadius: 5, cursor: 'pointer', opacity: isCls ? 0.5 : 1 }}>
                 {isCls ? '…' : '■ CLOSE'}
               </button>
@@ -11741,6 +12070,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     </>
   );
 };
+
 
 
 const OPENING_BELL_DURATION_MS = 60_000; // visible for 60 seconds
@@ -12210,6 +12540,7 @@ export default function MainBrain() {
             <div style={{ marginTop: 10 }}>
               <VolatilityIntelligencePanel p={p} />
             </div>
+            <CanonicalStatePanel />
           </>
         );
       case 'scanner':

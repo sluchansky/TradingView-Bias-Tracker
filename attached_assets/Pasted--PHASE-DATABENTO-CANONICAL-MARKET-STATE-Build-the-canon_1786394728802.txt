@@ -1,0 +1,1036 @@
+# PHASE — DATABENTO CANONICAL MARKET STATE
+
+## Build the canonical Databento-derived market-state layer WITHOUT changing live trading behavior
+
+You are working on the existing AI Trading Partner production codebase.
+
+This is NOT a rewrite.
+
+The system already has working Databento ingestion and Databento is already the primary live market-data feed.
+
+DO NOT replace, refactor, relocate, rename, or otherwise disturb the proven Databento ingestion pipeline.
+
+DO NOT change live execution behavior during this phase.
+
+DO NOT change existing strategy thresholds, edge-score math, risk rules, execution gateway behavior, TradersPost behavior, prop protection, arm-state logic, daily-loss protections, ORB logic, ghost trading behavior, or existing TradingView webhook behavior.
+
+The objective of this phase is to create ONE canonical Databento-derived market-state layer that will eventually replace TradingView/Yahoo-derived analytical inputs.
+
+For now it must run in SHADOW / OBSERVATION mode only.
+
+---
+
+# 1. OBJECTIVE
+
+Build a new canonical market-state engine whose sole raw market-data authority is the existing Databento feed.
+
+Target architecture:
+
+Databento existing ingestion
+│
+▼
+existing normalized bars/trades/order-flow data
+│
+▼
+CANONICAL MARKET STATE ENGINE
+│
+├── price
+├── session state
+├── VWAP
+├── volume
+├── relative volume
+├── ATR / realized volatility
+├── 15m trend
+├── 4H trend
+├── market structure
+├── BOS
+├── CHoCH
+├── swing highs/lows
+├── CVD / delta
+├── liquidity sweeps
+├── FVGs
+├── supply/demand zones
+└── opening-range state
+
+This layer must initially be informational only.
+
+Existing production consumers continue using their current sources until individual Databento-derived components are validated.
+
+---
+
+# 2. ABSOLUTE SAFETY RULE
+
+DO NOT make a "big bang" source migration.
+
+Every field must support:
+
+LEGACY
+SHADOW_COMPARE
+DATABENTO
+
+For this phase the production default MUST remain:
+
+LEGACY
+
+and Databento calculations run beside it.
+
+The new engine must never alter:
+
+READY / EARLY / WAIT
+edge score
+trade direction
+position size
+entry
+stop
+targets
+risk approval
+broker transmission
+
+unless a later explicit phase promotes a specific component.
+
+---
+
+# 3. FIRST: AUDIT BEFORE WRITING CODE
+
+Before modifying anything, inspect the codebase and document:
+
+A. Exact Databento ingestion path
+B. Existing normalized tick/bar representation
+C. Existing 1-minute bar storage
+D. Existing 5m/15m aggregation utilities
+E. Existing 4H resampling code from the recent trend-alignment work
+F. Existing bar-close callback infrastructure
+G. Existing Left Brain observation pipeline
+H. Existing VWAP implementation
+I. Existing CVD/delta implementation
+J. Existing BOS/CHoCH/structure implementation
+K. Existing FVG detector
+L. Existing supply/demand zone detector
+M. Existing liquidity-sweep detector
+N. Existing opening-range implementation
+O. Every place TradingView webhooks currently populate these values
+P. Every place Yahoo Finance currently supplies VWAP
+Q. Every live consumer of those values
+
+DO NOT duplicate reusable Databento aggregation infrastructure.
+
+Specifically inspect the existing bar aggregation utilities and the 15m/4H trend-alignment work before creating anything new.
+
+Produce an audit table:
+
+FIELD
+CURRENT SOURCE
+CURRENT PRODUCER
+CURRENT STORAGE
+CURRENT CONSUMERS
+DATABENTO DATA AVAILABLE?
+NEW CALCULATOR REQUIRED?
+SAFE TO SHADOW?
+
+Do this first.
+
+---
+
+# 4. CREATE A CANONICAL STATE CONTRACT
+
+Create a clean data contract.
+
+Suggested module:
+
+canonical_market_state.py
+
+Use existing project naming conventions if there is already an appropriate module.
+
+Canonical state must be maintained independently PER INSTRUMENT:
+
+MGC
+MNQ
+MES
+MYM
+
+Never allow state to leak across instruments.
+
+Suggested structure:
+
+CanonicalMarketState
+
+instrument
+timestamp
+source
+data_age_ms
+session
+last_price
+
+vwap
+vwap_distance
+vwap_side
+
+atr
+atr_percent
+volatility_regime
+
+volume
+relative_volume
+
+delta
+cvd
+cvd_direction
+
+trend_15m
+trend_4h
+trend_alignment
+
+swing_high
+swing_low
+structure_state
+last_bos
+last_choch
+
+active_sweeps
+active_fvgs
+active_zones
+
+opening_range
+
+calculation_health
+component_freshness
+component_errors
+
+Do not force this exact implementation if the repository already has a superior typed/state pattern.
+
+Reuse the repository's existing conventions.
+
+---
+
+# 5. DATA PROVENANCE IS REQUIRED
+
+Every canonical component must report where it came from.
+
+For example:
+
+{
+"vwap": {
+"value": 23841.25,
+"source": "databento",
+"calculated_at": "...",
+"fresh": true
+}
+}
+
+The Main Brain must eventually be able to know:
+
+DATAbento-derived
+TradingView-derived
+Yahoo-derived
+manual
+unknown
+
+Never silently mix sources.
+
+---
+
+# 6. COMPONENT 1 — DATABENTO VWAP
+
+This is the FIRST calculation to implement.
+
+Stop relying on Yahoo for the shadow version.
+
+Calculate VWAP directly from the existing Databento futures data.
+
+Use the correct trading-session definition already used by the application.
+
+Do not create a mismatched session just for VWAP.
+
+Use the most appropriate Databento fields available in the existing feed.
+
+Preferred calculation when trade volume is available:
+
+VWAP =
+sum(price × volume)
+/
+sum(volume)
+
+If bar data is the canonical existing input, use the repository's appropriate bar price convention and document it.
+
+VWAP must reset at the correct session boundary.
+
+Track:
+
+current VWAP
+distance from VWAP
+percent distance if useful
+price side: ABOVE / BELOW / AT
+last update
+sample volume
+freshness
+
+Do NOT replace Yahoo VWAP yet.
+
+Run both and compare.
+
+Record:
+
+legacy_vwap
+databento_vwap
+absolute_difference
+tick_difference
+comparison_timestamp
+
+---
+
+# 7. COMPONENT 2 — VOLUME / RELATIVE VOLUME
+
+Calculate volume exclusively from Databento.
+
+Do not use TradingView volume for the canonical shadow state.
+
+Track:
+
+current bar volume
+rolling average volume
+relative volume ratio
+session cumulative volume
+volume regime
+
+Reuse existing historical observation infrastructure where appropriate.
+
+Do not introduce arbitrary thresholds if the application already defines them.
+
+---
+
+# 8. COMPONENT 3 — ATR / VOLATILITY
+
+Compute ATR from canonical Databento bars.
+
+Reuse existing ATR periods and thresholds.
+
+DO NOT modify volatility scoring in this phase.
+
+Return:
+
+ATR
+ATR in ticks
+ATR percent
+volatility regime
+calculation timestamp
+freshness
+
+Compare Databento-derived ATR to the currently consumed ATR if another source still exists.
+
+---
+
+# 9. COMPONENT 4 — 15M + 4H TREND
+
+You recently added Databento-derived trend alignment.
+
+DO NOT duplicate it.
+
+Find that implementation and either:
+
+A. make canonical_market_state consume it,
+
+or
+
+B. move the pure reusable calculation into an appropriate shared module without changing behavior.
+
+Canonical state must expose:
+
+trend_15m:
+BULLISH / BEARISH / NEUTRAL / UNKNOWN
+
+trend_4h:
+BULLISH / BEARISH / NEUTRAL / UNKNOWN
+
+trend_alignment:
+ALIGNED_BULLISH
+ALIGNED_BEARISH
+MIXED
+UNKNOWN
+
+Also expose freshness for both timeframes.
+
+Do not change trading gates.
+
+---
+
+# 10. COMPONENT 5 — MARKET STRUCTURE
+
+Build Databento-derived structure from CLOSED bars.
+
+This is critical.
+
+No structure signal may be generated from an unfinished bar unless the existing structure methodology specifically requires intrabar detection.
+
+Track:
+
+swing highs
+swing lows
+HH
+HL
+LH
+LL
+BOS
+CHoCH
+structure direction
+timestamp
+bar/timeframe that caused the event
+
+The implementation must be deterministic.
+
+The same historical Databento bars must produce the same structure events every time.
+
+Do not use an LLM for structure detection.
+
+Do not replace TradingView structure yet.
+
+Run both simultaneously.
+
+---
+
+# 11. STRUCTURE COMPARISON
+
+For every TradingView structure event, compare it with the Databento-derived structure state.
+
+Record:
+
+instrument
+timestamp
+legacy event
+Databento event
+agreement yes/no
+time difference
+price difference
+relevant bar
+reason if known
+
+This comparison dataset will tell us whether TradingView can safely be removed later.
+
+---
+
+# 12. COMPONENT 6 — CVD / DELTA
+
+Determine what Databento schema/data is currently available for aggressor-side/order-flow calculations.
+
+Do not fake CVD.
+
+If the current Databento subscription/feed does NOT expose sufficient information for valid trade-side delta calculation, mark:
+
+CVD_STATUS = DATA_INSUFFICIENT
+
+and document exactly what additional Databento data would be needed.
+
+Do not infer institutional-quality CVD from inadequate data merely to fill the field.
+
+If sufficient data exists, calculate:
+
+bar delta
+cumulative delta
+rolling CVD
+direction
+divergence inputs if the current system uses them
+
+Run in shadow mode.
+
+---
+
+# 13. COMPONENT 7 — LIQUIDITY SWEEPS
+
+Build a deterministic Databento-bar-based sweep detector that mirrors the intent of the existing live definition.
+
+Do NOT invent a completely new trading methodology.
+
+First inspect how existing TradingView sweep alerts define a sweep.
+
+Implement the closest equivalent using canonical bars.
+
+Each event should include:
+
+instrument
+direction
+swept level
+sweep price
+timestamp
+bar
+reclaim status
+event ID
+freshness
+
+Shadow only.
+
+---
+
+# 14. COMPONENT 8 — FVG
+
+Inspect the existing FVG definition first.
+
+Implement the equivalent deterministic detector using Databento bars.
+
+Track:
+
+direction
+upper boundary
+lower boundary
+created_at
+timeframe
+mitigation status
+mitigated_at
+event ID
+
+Do not change the existing FVG Scanner consumer yet.
+
+Create comparison output.
+
+---
+
+# 15. COMPONENT 9 — SUPPLY / DEMAND ZONES
+
+This is especially sensitive because zone state currently affects setup formation.
+
+DO NOT promote new zones into live scoring.
+
+Build Databento-derived zones in SHADOW mode.
+
+Each zone needs:
+
+instrument
+type: SUPPLY / DEMAND
+upper
+lower
+created_at
+source structure
+freshness
+touch count
+mitigated
+invalidated
+event ID
+
+Compare against current TradingView-derived zones.
+
+---
+
+# 16. COMPONENT 10 — OPENING RANGE
+
+The existing 9:30 ORB implementation is already being upgraded separately.
+
+DO NOT replace or modify it.
+
+Canonical market state should READ the existing ORB state instead of reimplementing the ORB algorithm.
+
+Expose the existing canonical ORB values through the state contract:
+
+range high
+range low
+range width
+lock time
+status
+breakout direction
+confirmation state
+
+No duplicate ORB engine.
+
+---
+
+# 17. SHADOW COMPARISON STORE
+
+Create a persistent comparison dataset.
+
+Suggested table:
+
+market_state_source_comparisons
+
+Fields:
+
+id
+timestamp
+instrument
+component
+
+legacy_source
+legacy_value
+
+databento_value
+
+agreement
+difference_numeric
+difference_ticks
+difference_seconds
+
+legacy_freshness
+databento_freshness
+
+metadata JSON
+
+This must NOT block trading if persistence fails.
+
+Comparison recording is observability/research only.
+
+Use fail-open behavior for logging.
+
+---
+
+# 18. CANONICAL STATE SNAPSHOT
+
+Maintain an in-memory current snapshot per instrument.
+
+Suggested API:
+
+get_canonical_market_state(instrument)
+
+and:
+
+get_all_canonical_market_states()
+
+The read path must be thread-safe according to the application's existing concurrency model.
+
+Never recompute expensive history from scratch on every dashboard request.
+
+Calculations should happen on incoming data/bar close and update state incrementally.
+
+---
+
+# 19. API ENDPOINT
+
+Add an owner/debug endpoint such as:
+
+GET /api/canonical-market-state
+
+Return all four instruments.
+
+Also support:
+
+GET /api/canonical-market-state?instrument=MNQ
+
+Response must include:
+
+current canonical values
+freshness
+source/provenance
+errors
+legacy comparison
+whether each component is:
+
+SHADOW
+VALIDATING
+READY_FOR_PROMOTION
+UNAVAILABLE
+
+Do not expose credentials or broker secrets.
+
+---
+
+# 20. DASHBOARD — SMALL OBSERVABILITY PANEL ONLY
+
+Do NOT redesign Main Brain.
+
+Add a small section under Analysis / diagnostics titled:
+
+DATABENTO CANONICAL STATE
+
+For selected instrument show:
+
+VWAP
+15m Trend
+4H Trend
+Trend Alignment
+ATR
+Relative Volume
+Structure
+Latest BOS/CHoCH
+CVD
+Latest Sweep
+FVG count
+Zone count
+
+Each row must show source:
+
+DB = Databento
+LEGACY = existing source
+
+For components with comparisons show:
+
+MATCH
+DIFF
+WAITING FOR SAMPLE
+
+Do not let this panel influence live scoring.
+
+---
+
+# 21. FEATURE FLAGS
+
+Add explicit configuration flags.
+
+Example:
+
+CANONICAL_MARKET_STATE_ENABLED=1
+CANONICAL_MARKET_STATE_SHADOW_ONLY=1
+
+And component source controls if useful:
+
+VWAP_SOURCE=legacy
+STRUCTURE_SOURCE=legacy
+CVD_SOURCE=legacy
+SWEEP_SOURCE=legacy
+FVG_SOURCE=legacy
+ZONE_SOURCE=legacy
+
+Production defaults MUST preserve existing behavior.
+
+Do not allow an accidental missing environment variable to promote Databento calculations into live trading.
+
+Default all source selectors to LEGACY.
+
+Fail safe.
+
+---
+
+# 22. HEALTH / FRESHNESS
+
+Every component must independently know whether its data is valid.
+
+Examples:
+
+HEALTHY
+STALE
+INSUFFICIENT_HISTORY
+DATA_UNAVAILABLE
+CALCULATION_ERROR
+
+One broken component must not make the entire canonical state disappear.
+
+Example:
+
+VWAP healthy
+trend healthy
+structure healthy
+CVD unavailable
+
+is valid.
+
+Do not synthesize zero values for unknown calculations.
+
+Use null/UNKNOWN with an explicit reason.
+
+---
+
+# 23. STARTUP WARMUP
+
+Some calculations require history.
+
+Do not emit false states while buffers are warming.
+
+Examples:
+
+ATR requires adequate bars
+4H EMA trend requires adequate history
+swing structure requires enough bars
+relative volume requires baseline data
+
+Expose:
+
+warmup_complete
+bars_required
+bars_available
+
+per component where appropriate.
+
+---
+
+# 24. REPLAY / DETERMINISM TEST
+
+Provide a way to feed historical Databento bars through the calculation engine.
+
+Running the same bars twice must create identical:
+
+VWAP
+ATR
+trend
+structure events
+sweeps
+FVGs
+zones
+
+except for non-deterministic metadata such as runtime timestamps.
+
+This is mandatory before promoting anything to live use.
+
+---
+
+# 25. TESTS
+
+Add comprehensive tests.
+
+At minimum:
+
+1. Per-instrument state isolation
+2. VWAP calculation
+3. VWAP session reset
+4. Relative-volume calculation
+5. ATR calculation
+6. 15m trend
+7. 4H trend
+8. trend alignment
+9. HH/HL structure
+10. LH/LL structure
+11. bullish BOS
+12. bearish BOS
+13. bullish CHoCH
+14. bearish CHoCH
+15. stale-data behavior
+16. insufficient-history behavior
+17. deterministic replay
+18. Databento disconnect behavior
+19. comparison logging failure does not block trading
+20. feature flag OFF produces zero live behavior change
+21. canonical engine ON + SHADOW mode produces zero live behavior change
+22. existing READY/EARLY/WAIT regression remains identical
+23. existing risk regression remains identical
+24. execution gateway regression remains identical
+25. ORB regression remains identical
+26. arm/safety tests remain identical
+27. live broker payload tests remain identical
+
+---
+
+# 26. CRITICAL PARITY TEST
+
+Before and after this phase, run a fixed captured set of existing market inputs through the production scoring path.
+
+Assert byte-equivalent or semantically equivalent results for:
+
+verdict
+direction
+edge_score
+blockers
+entry
+stop
+TP
+quantity
+risk approval
+
+With:
+
+CANONICAL_MARKET_STATE_SHADOW_ONLY=1
+
+there must be ZERO trading-decision differences.
+
+If there is any difference, STOP and investigate.
+
+Do not accept "probably unrelated."
+
+---
+
+# 27. DO NOT REMOVE LEGACY SOURCES
+
+During this phase:
+
+DO NOT delete TradingView webhooks.
+DO NOT disable TradingView alerts.
+DO NOT remove Yahoo VWAP.
+DO NOT redirect live structure to Databento.
+DO NOT redirect live CVD to Databento.
+DO NOT redirect live FVGs to Databento.
+DO NOT redirect live zones to Databento.
+DO NOT redirect live sweeps to Databento.
+
+We are building and validating the replacement before promotion.
+
+---
+
+# 28. IMPORTANT ARCHITECTURAL RULE
+
+The final target is:
+
+DATAbento → normalized market data → canonical derived state
+
+NOT:
+
+Databento → fake TradingView webhook → existing system
+
+Do not make Databento pretend to be TradingView.
+
+The new market-state layer should be source-native and clean.
+
+Later phases can update consumers to use canonical fields.
+
+---
+
+# 29. PERFORMANCE
+
+Do not calculate 4H/15m history repeatedly for every tick.
+
+Reuse cached bars.
+
+Use incremental calculations where possible.
+
+Bar-dependent calculations should generally occur at appropriate bar-close events.
+
+Tick/trade-dependent calculations can update more frequently where required.
+
+Do not degrade existing Databento ingestion latency.
+
+Instrument processing failures must be isolated.
+
+MNQ failure must not stop MGC/MES/MYM processing.
+
+---
+
+# 30. LOGGING
+
+Add useful structured logs, not high-volume spam.
+
+Examples:
+
+CANONICAL_STATE_STARTED
+CANONICAL_STATE_WARM
+CANONICAL_COMPONENT_STALE
+CANONICAL_COMPONENT_RECOVERED
+SOURCE_COMPARISON_MISMATCH
+
+Rate-limit repetitive mismatch/staleness logs.
+
+---
+
+# 31. MIGRATION READINESS METRICS
+
+Track enough comparison data to eventually answer:
+
+How often does Databento VWAP match legacy VWAP?
+
+How often does Databento structure agree with TradingView?
+
+How much later/earlier are BOS and CHoCH events?
+
+How often do sweep detectors agree?
+
+How often do FVG detectors agree?
+
+How often do zone states agree?
+
+What percentage of time is each Databento-derived component healthy?
+
+Do not promote components based on intuition.
+
+Promotion requires measured evidence.
+
+---
+
+# 32. PROMOTION STATUS
+
+Each component gets a state:
+
+SHADOW
+VALIDATING
+READY_FOR_PROMOTION
+LIVE_CANONICAL
+
+For this task, no component may finish as LIVE_CANONICAL.
+
+VWAP may become READY_FOR_PROMOTION if testing proves it, but it remains shadow.
+
+---
+
+# 33. DOCUMENTATION
+
+Update the operator/architecture documentation to clearly distinguish:
+
+RAW MARKET SOURCE:
+Databento
+
+CANONICAL DERIVED MARKET STATE:
+new engine
+
+LEGACY SIGNAL SOURCE:
+TradingView/Yahoo still temporarily active
+
+EXECUTION:
+unchanged
+
+Explain that the project is undergoing staged source consolidation.
+
+Do NOT falsely claim TradingView/Yahoo have already been removed.
+
+---
+
+# 34. FINAL VALIDATION
+
+Before declaring completion run:
+
+full automated test suite
+existing scoring regressions
+risk regression
+execution regression
+Databento ingestion tests
+Left Brain tests
+ORB tests
+prop protection tests
+arm-state tests
+dashboard/API tests
+new canonical-state tests
+
+Also perform a startup smoke test.
+
+Confirm Databento ingestion continues normally.
+
+Confirm existing dashboard continues receiving prices.
+
+Confirm legacy setup scoring continues normally.
+
+Confirm canonical state begins populating separately.
+
+Confirm NO broker/execution behavior changed.
+
+---
+
+# 35. COMPLETION REPORT
+
+Do not just say "done."
+
+Return:
+
+A. Files created
+B. Files modified
+C. Existing code reused
+D. Databento ingestion code touched — YES/NO and why
+E. Components implemented
+F. Components unavailable because source data is insufficient
+G. Current source for each live production component
+H. Current shadow source for each component
+I. Number of source comparisons recorded
+J. Agreement metrics observed so far
+K. Tests added
+L. Tests passed
+M. Tests failed
+N. Live scoring parity result
+O. Execution parity result
+P. Performance impact
+Q. Any discovered architectural issues
+R. Git commit hash
+
+Finish with this explicit statement:
+
+LIVE TRADING BEHAVIOR CHANGED: YES / NO
+
+DATABENTO CANONICAL STATE ACTIVE: YES / NO
+
+CANONICAL STATE SHADOW ONLY: YES / NO
+
+TRADINGVIEW STILL LIVE DEPENDENCY: YES / NO
+
+YAHOO VWAP STILL LIVE DEPENDENCY: YES / NO
+
+SAFE FOR NEXT MIGRATION PHASE: YES / NO
+
+---
+
+# CORE PRINCIPLE
+
+This phase is infrastructure, not strategy optimization.
+
+Do not improve the strategy.
+Do not loosen gates.
+Do not change thresholds.
+Do not optimize profitability.
+Do not promote shadow calculations automatically.
+
+Build a trustworthy Databento-derived market truth beside the existing system, prove parity/quality, and leave production trading behavior untouched.

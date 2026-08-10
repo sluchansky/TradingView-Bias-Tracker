@@ -442,9 +442,10 @@ def start(provider: Optional[VolatilityDataProvider] = None) -> None:
     _assert_observe_only("start()")
     if provider is not None:
         _provider = provider
-    elif os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip():
-        _provider = AlphaVantageProvider()
     else:
+        # yfinance is the reliable provider for ^VIX — Alpha Vantage's GLOBAL_QUOTE
+        # endpoint does not support index symbols and always returns an empty response.
+        # AlphaVantageProvider remains available via the provider= argument.
         _provider = YFinanceProvider()
     _bg_thread = threading.Thread(target=_bg_loop, daemon=True, name="vol-intelligence-bg")
     _bg_thread.start()
