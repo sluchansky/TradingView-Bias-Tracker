@@ -3626,6 +3626,68 @@ const ActiveTradesPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const avail = at.available !== false;
   const trades = Array.isArray(at.trades) ? at.trades as Record<string, unknown>[] : [];
 
+  // Per-instrument loading + toast state for close actions
+  const [closing,   setClosing]   = useState<string | null>(null); // instrument being closed
+  const [clearing,  setClearing]  = useState<string | null>(null); // instrument being stop-managed
+  const [tradeMsg,  setTradeMsg]  = useState<{ inst: string; text: string; ok: boolean } | null>(null);
+  const tradeMsgTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showTradeMsg = (inst: string, text: string, ok: boolean) => {
+    if (tradeMsgTimer.current) clearTimeout(tradeMsgTimer.current);
+    setTradeMsg({ inst, text, ok });
+    tradeMsgTimer.current = setTimeout(() => setTradeMsg(null), 4000);
+  };
+
+  const handleClose = async (inst: string) => {
+    if (closing || clearing) return;
+    setClosing(inst);
+    try {
+      const r = await fetch('/api/quick-exit', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+        body: JSON.stringify({ ticker: inst }),
+      });
+      const j = await r.json() as Record<string, unknown>;
+      if (r.ok && (j.status === 'sent' || j.status === 'simulated')) {
+        const pnl = j.pnl_dollars != null
+          ? ` · $${Number(j.pnl_dollars) >= 0 ? '+' : ''}${Number(j.pnl_dollars).toFixed(0)}`
+          : '';
+        showTradeMsg(inst, `Closed ${inst}${pnl}`, true);
+      } else {
+        showTradeMsg(inst, safeStr(j.reason ?? j.error ?? '', 'Close failed').slice(0, 70), false);
+      }
+    } catch {
+      showTradeMsg(inst, 'Network error — verify at broker', false);
+    } finally {
+      setClosing(null);
+    }
+  };
+
+  const handleStopManaging = async (inst: string) => {
+    if (closing || clearing) return;
+    if (!window.confirm(
+      `Clear tracking for ${inst}?\n\nThis removes the bot's local position record only — it does NOT send any order. Use this after you've already closed the trade at your broker.`
+    )) return;
+    setClearing(inst);
+    try {
+      const r = await fetch('/api/stop-managing', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', ...getAuthHeader() },
+        body: JSON.stringify({ ticker: inst }),
+      });
+      const j = await r.json() as Record<string, unknown>;
+      if (r.ok) {
+        showTradeMsg(inst, `Tracking cleared for ${inst}`, true);
+      } else {
+        showTradeMsg(inst, safeStr(j.reason ?? j.error ?? '', 'Failed').slice(0, 70), false);
+      }
+    } catch {
+      showTradeMsg(inst, 'Network error', false);
+    } finally {
+      setClearing(null);
+    }
+  };
+
   return (
     <Panel title={`Active Trades (${trades.length})`}>
       {!avail ? <UnavailableNote /> : trades.length === 0 ? (
@@ -3637,22 +3699,81 @@ const ActiveTradesPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
           const dCol = dirColor(dir);
           const pnl  = safeNum(t.unrealized_pnl);
           const curR = safeNum(t.current_r);
-          const pnlCol = pnl == null ? T.txtSec : pnl >= 0 ? T.green : T.red;
+          const pnlCol  = pnl == null ? T.txtSec : pnl >= 0 ? T.green : T.red;
+          const isBusy  = closing === inst || clearing === inst;
+          const msg     = tradeMsg?.inst === inst ? tradeMsg : null;
           return (
             <div key={i} style={{ background:T.panelAlt, borderRadius:8, border:`1px solid ${T.border}`, padding:'10px 12px', marginBottom:8 }}>
+              {/* Header row */}
               <div style={{ display:'flex', alignItems:'center', gap:8, marginBottom:8 }}>
                 <Pill text={dir || '—'} color={dCol} />
                 <span style={{ fontSize:12, fontWeight:700, color:T.txtPri, fontFamily:T.mono }}>{inst}</span>
                 <span style={{ marginLeft:'auto', fontSize:9, color:T.cyan }}>OPEN</span>
               </div>
-              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'2px 12px' }}>
-                <KV label="Strategy" value={safeStr(t.strategy, '—')} />
-                <KV label="Contracts" value={safeStr(t.quantity, '—')} mono />
-                <KV label="Entry" value={fmtNum(t.entry)} mono />
+
+              {/* Stats grid */}
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:'2px 12px', marginBottom:10 }}>
+                <KV label="Strategy"    value={safeStr(t.strategy, '—')} />
+                <KV label="Contracts"   value={safeStr(t.quantity, '—')} mono />
+                <KV label="Entry"       value={fmtNum(t.entry)} mono />
                 {t.stop  != null && <KV label="Stop"  value={fmtNum(t.stop)}  mono valueColor={T.red} />}
                 {curR != null && <KV label="Current R" value={`${curR >= 0 ? '+' : ''}${fmtNum(curR, 2)}R`} mono valueColor={curR >= 0 ? T.green : T.red} />}
-                {pnl != null && <KV label="Unreal. P&L" value={`$${fmtNum(pnl, 0)}`} mono valueColor={pnlCol} />}
-                <KV label="Opened" value={fmtTs(t.opened_at)} />
+                {pnl  != null && <KV label="Unreal. P&L" value={`$${fmtNum(pnl, 0)}`} mono valueColor={pnlCol} />}
+                <KV label="Opened"      value={fmtTs(t.opened_at)} />
+              </div>
+
+              {/* Toast */}
+              {msg && (
+                <div style={{
+                  marginBottom: 8, padding: '5px 10px', borderRadius: 5, fontSize: 10.5,
+                  background: msg.ok ? `${T.green}10` : `${T.red}10`,
+                  border: `1px solid ${msg.ok ? T.green : T.red}44`,
+                  color: msg.ok ? T.green : T.red,
+                }}>
+                  {msg.ok ? '✓' : '✗'} {msg.text}
+                </div>
+              )}
+
+              {/* Action buttons */}
+              <div style={{ display:'flex', gap:6, alignItems:'center' }}>
+                {/* Primary: close position at broker */}
+                <button
+                  onClick={() => handleClose(inst)}
+                  disabled={isBusy || !inst}
+                  title={`Send market-flat order for ${inst} to broker`}
+                  style={{
+                    flex: 1, padding: '7px 0', borderRadius: 6,
+                    fontSize: 11, fontWeight: 700, letterSpacing: '0.06em',
+                    cursor: (isBusy || !inst) ? 'not-allowed' : 'pointer',
+                    opacity: (isBusy || !inst) ? 0.45 : 1,
+                    background: `${T.amber}12`, border: `1px solid ${T.amber}55`, color: T.amber,
+                    transition: 'background 0.15s',
+                  }}
+                  onMouseEnter={e => { if (!isBusy) (e.currentTarget as HTMLButtonElement).style.background = `${T.amber}22`; }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.background = `${T.amber}12`; }}
+                >
+                  {closing === inst ? '…' : '■ CLOSE POSITION'}
+                </button>
+
+                {/* Secondary: clear tracking only (no order sent) */}
+                <button
+                  onClick={() => handleStopManaging(inst)}
+                  disabled={isBusy || !inst}
+                  title="Clear bot tracking only — does NOT send a close order"
+                  style={{
+                    padding: '7px 10px', borderRadius: 6,
+                    fontSize: 9.5, fontWeight: 600, letterSpacing: '0.04em',
+                    cursor: (isBusy || !inst) ? 'not-allowed' : 'pointer',
+                    opacity: (isBusy || !inst) ? 0.35 : 0.65,
+                    background: 'rgba(255,255,255,0.03)', border: `1px solid ${T.border}`,
+                    color: T.txtMuted,
+                    transition: 'opacity 0.15s',
+                  }}
+                  onMouseEnter={e => { if (!isBusy) (e.currentTarget as HTMLButtonElement).style.opacity = '1'; }}
+                  onMouseLeave={e => { (e.currentTarget as HTMLButtonElement).style.opacity = '0.65'; }}
+                >
+                  {clearing === inst ? '…' : 'Clear tracking'}
+                </button>
               </div>
             </div>
           );
@@ -11680,31 +11801,36 @@ export default function MainBrain() {
         const todayET = new Intl.DateTimeFormat('en-US', {
           timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
         }).format(new Date()).replace(/\//g, '-');
-        if (localStorage.getItem(`ob_fired_${todayET}`)) {
+        if (localStorage.getItem(`ob_fired_v2_${todayET}`)) {
           openingBellFiredRef.current = true;
           return;
         }
       } catch {/* ignore storage errors */}
 
-      // Get ET time components via Intl
+      // Get ET time components via Intl.
+      // Use hour12: true + explicit dayPeriod check — hour12: false is unreliable
+      // across browsers (some return 9 for 9 PM instead of 21).
       const parts = new Intl.DateTimeFormat('en-US', {
         timeZone: 'America/New_York',
-        weekday: 'short', hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: false,
+        weekday: 'short', hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true,
       }).formatToParts(new Date());
       const get = (type: string) => parseInt(parts.find(pt => pt.type === type)?.value ?? '0');
       const dayName = parts.find(pt => pt.type === 'weekday')?.value ?? '';
+      const period  = (parts.find(pt => pt.type === 'dayPeriod')?.value ?? '').toUpperCase();
       if (dayName === 'Sat' || dayName === 'Sun') return;
 
       const h = get('hour'); const m = get('minute'); const s = get('second');
-      // Fire at 9:30:00 – 9:30:44 ET so an 8s poll always catches it
-      if (!(h === 9 && m === 30 && s < 45)) return;
+      // Fire at 9:30:00 – 9:30:44 ET (AM only) so an 8s poll always catches it.
+      // The dayPeriod guard is the critical cross-browser safety check.
+      if (!(h === 9 && m === 30 && s < 45 && period === 'AM')) return;
 
       openingBellFiredRef.current = true;
       try {
         const todayET = new Intl.DateTimeFormat('en-US', {
           timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
         }).format(new Date()).replace(/\//g, '-');
-        localStorage.setItem(`ob_fired_${todayET}`, '1');
+        // v2 key — clears any stale keys from the PM-firing bug
+        localStorage.setItem(`ob_fired_v2_${todayET}`, '1');
       } catch {/* noop */}
 
       audioManager.play(SoundEvent.MARKET_OPEN);
