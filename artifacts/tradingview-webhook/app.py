@@ -60202,13 +60202,14 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     # Guards against a disarm that races with the send after all prior checks passed.
     # Paper/manual_only are exempt (arm control is live-execution only).
     #
-    # Manual source (dashboard two-click ENTER): the operator is literally at the
-    # keyboard confirming each trade — the two-click confirm IS the session gate.
-    # We still require execution_enabled (DB-persistent, must be explicitly set) but
-    # skip the armed/session-expiry checks that exist to prevent autonomous fires.
+    # Manual source (dashboard two-click ENTER or manual_desk LONG/SHORT click):
+    # the operator is literally at the keyboard confirming each trade — the
+    # explicit click IS the session gate.  We still require execution_enabled
+    # (DB-persistent, must be explicitly set) but skip the armed/session-expiry
+    # checks that exist to prevent autonomous bot fires.
     # Every other live source keeps the full ARM check.
     if execution_is_live(mode):
-        if source == "manual":
+        if source in ("manual", "manual_desk"):
             # Execution-enabled check only — skip armed / session-expiry for operator clicks.
             with _ARM_STATE_LOCK:
                 _manual_exec_enabled = _ARM_STATE.get("execution_enabled", False)
@@ -60651,7 +60652,10 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
             if not _md_exec_enabled:
                 logger.warning(
                     "Manual desk order blocked for %s — execution gateway not enabled", inst)
-                return False
+                return {"status": "error",
+                        "reason": ("Execution is not enabled. "
+                                   "Go to the Execution panel and click ▶ ENABLE EXECUTION first."),
+                        "reason_code": RC_EXECUTION_DISABLED}, 409
         else:
             try:
                 # Best-effort strategy key for arm strategy-restriction checks
