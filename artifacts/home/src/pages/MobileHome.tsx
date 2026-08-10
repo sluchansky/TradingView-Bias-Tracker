@@ -23,8 +23,8 @@ function useClock() {
     const tick = () => setTime(
       new Date().toLocaleTimeString('en-US', {
         hour: 'numeric', minute: '2-digit', second: '2-digit',
-        hour12: true, timeZone: 'America/New_York',
-      }) + ' ET'
+        hour12: true, timeZone: 'Etc/GMT+4',
+      }) + ' UTC-4'
     );
     tick();
     const id = setInterval(tick, 1000);
@@ -604,7 +604,7 @@ function PositionCard({ trade }: { trade: any }) {
   const curR  = Number(trade.current_r   || 0);
   const pnl   = Number(trade.unrealized_pnl || 0);
   const opened = trade.opened_at ? new Date(trade.opened_at).toLocaleTimeString('en-US',
-    { hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'America/New_York' }) : '—';
+    { hour:'2-digit', minute:'2-digit', hour12:true, timeZone:'Etc/GMT+4' }) : '—';
   return (
     <Card>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:12 }}>

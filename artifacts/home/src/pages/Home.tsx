@@ -38,8 +38,8 @@ function useClock() {
   useEffect(() => {
     const tick = () => setTime(
       new Date().toLocaleTimeString('en-US', {
-        hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true, timeZone: 'America/New_York',
-      }) + ' ET'
+        hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: true, timeZone: 'Etc/GMT+4',
+      }) + ' UTC-4'
     );
     tick(); const id = setInterval(tick, 1000); return () => clearInterval(id);
   }, []);
@@ -1527,7 +1527,7 @@ function useConvMemory() {
     const TAG: Record<MemTag, string> = { pref:'NOTE', setup:'SETUP', trade:'TRADE', chat:'YOU', insight:'BRAIN' };
     if (entries.length === 0) return PERSONA + '\n';
     const lines = entries.slice(-20).map(e => {
-      const hh = new Date(e.t).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/New_York' });
+      const hh = new Date(e.t).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Etc/GMT+4' });
       return hh + ' [' + TAG[e.tag] + '] ' + e.text;
     });
     return PERSONA + '\n[TODAY\'S SESSION — weave in naturally if relevant]\n' + lines.join('\n') + '\n---\n';
@@ -1548,7 +1548,7 @@ function MemoryPanel({ entries, onClear }: { entries: MemEntry[]; onClear: () =>
   return (
     <div style={{ display:'flex', flexDirection:'column', gap:5 }}>
       {[...entries].reverse().slice(0, 18).map((e, i) => {
-        const hh = new Date(e.t).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'America/New_York' });
+        const hh = new Date(e.t).toLocaleTimeString('en-US', { hour:'2-digit', minute:'2-digit', hour12:false, timeZone:'Etc/GMT+4' });
         return (
           <div key={i} style={{ display:'flex', gap:7, alignItems:'flex-start', opacity: i > 9 ? 0.5 : 1, transition:'opacity 0.3s' }}>
             <span style={{ fontSize:8.5, fontFamily:'monospace', color:'rgba(255,255,255,0.22)', flexShrink:0, paddingTop:2, letterSpacing:'0.04em' }}>{hh}</span>

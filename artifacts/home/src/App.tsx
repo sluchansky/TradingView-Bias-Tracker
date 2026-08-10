@@ -7,6 +7,7 @@ import Home from "@/pages/Home";
 import MobileHome from "@/pages/MobileHome";
 import Cockpit from "@/pages/Cockpit";
 import MainBrain from "@/pages/MainBrain";
+import ManualPage from "@/pages/ManualPage";
 import NotFound from "@/pages/not-found";
 
 const queryClient = new QueryClient();
@@ -37,6 +38,7 @@ function Router() {
       <Route path="/legacy" component={isMobile ? MobileHome : Home} />
       <Route path="/mobile" component={MobileHome} />
       <Route path="/cockpit" component={Cockpit} />
+      <Route path="/manual" component={ManualPage} />
       <Route component={NotFound} />
     </Switch>
   );
