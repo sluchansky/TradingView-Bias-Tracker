@@ -10754,6 +10754,8 @@ interface ArmStateData {
   last_changed_at: string | null;
   configured_mode: string;
   effective_mode: string;
+  runtime_mode_override: string | null;
+  trading_mode: string | null;
   safety_locked: boolean;
   safety_lock_reason: string | null;
   allowed_instruments: string[] | null;
@@ -10803,7 +10805,10 @@ const ArmControlPanel: React.FC = () => {
   const [armInstruments,setArmInstruments]  = useState('MGC');
   const [armMaxCt,      setArmMaxCt]        = useState('1');
   const [pending,       setPending]         = useState(false);
+  const [modePending,   setModePending]     = useState(false);
+  const [tmPending,     setTmPending]       = useState(false);
   const [actMsg,        setActMsg]          = useState<{ ok: boolean; text: string; errors?: string[] } | null>(null);
+  const [modeMsg,       setModeMsg]         = useState<{ ok: boolean; text: string } | null>(null);
   const expiresAtRef = useRef<string | null>(null);
   const [countdown, setCountdown] = useState('—');
 
@@ -10862,9 +10867,39 @@ const ArmControlPanel: React.FC = () => {
 
   async function handleDisable() {
     if (!window.confirm(
-      'Disable auto trading?\n\nThis will disarm and block all new automated entries.\nExisting protective orders on open trades are not affected.'
+      'Disable execution gateway?\n\nThis will disarm and block all new entries (auto and manual ENTER).\nExisting protective orders on open trades are not affected.'
     )) return;
     await doAction('disable', { reason: 'operator_manual', by: 'operator' });
+  }
+
+  async function handleSetGatewayMode(mode: string) {
+    setModePending(true); setModeMsg(null);
+    try {
+      const r = await fetch('/api/execution/set-mode', {
+        method: 'POST', credentials: 'include',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode, by: 'operator' }),
+      });
+      const j = await r.json().catch(() => ({}));
+      setModeMsg({ ok: r.ok, text: r.ok ? `Gateway mode set to ${mode.toUpperCase()}` : (j.reason ?? `Error ${r.status}`) });
+      if (r.ok) await refreshArm();
+    } catch { setModeMsg({ ok: false, text: 'Network error' }); }
+    finally { setModePending(false); }
+  }
+
+  async function handleSetTradingMode(mode: string) {
+    setTmPending(true); setModeMsg(null);
+    try {
+      const r = await fetch('/api/mode', {
+        method: 'POST', credentials: 'include',
+        headers: { ...getAuthHeader(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ mode }),
+      });
+      const j = await r.json().catch(() => ({}));
+      setModeMsg({ ok: r.ok, text: r.ok ? `Trading mode set to ${mode}` : (j.reason ?? `Error ${r.status}`) });
+      if (r.ok) await refreshArm();
+    } catch { setModeMsg({ ok: false, text: 'Network error' }); }
+    finally { setTmPending(false); }
   }
 
   async function handleArm() {
@@ -10910,14 +10945,35 @@ const ArmControlPanel: React.FC = () => {
   };
 
   // Derived display values
-  const newEntriesAllowed = execEnabled && armed && !locked;
+  const manualEntryOpen = execEnabled && !locked;  // ENTER button works when enabled (no arm needed)
+  const autoFireAllowed = execEnabled && armed && !locked;
+  const effectiveMode   = armData?.effective_mode ?? '';
+  const tradingMode     = armData?.trading_mode ?? '';
   const modeLabel = (() => {
-    const m = armData?.effective_mode ?? '';
-    if (m === 'traderspost' || m === 'pickmytrade') return 'LIVE';
-    if (m === 'paper') return 'PAPER';
-    if (m === 'manual_only') return 'OBSERVE';
-    return m.toUpperCase() || '—';
+    if (effectiveMode === 'traderspost' || effectiveMode === 'pickmytrade') return 'LIVE';
+    if (effectiveMode === 'paper')       return 'PAPER';
+    if (effectiveMode === 'manual_only') return 'MANUAL PLAN';
+    if (effectiveMode === 'disabled')    return 'DISABLED';
+    return '—';
   })();
+
+  // ── Sub-component: mode picker button
+  const ModeBtn = ({ label, value, current, onClick, color }: {
+    label: string; value: string; current: string; onClick: () => void; color: string;
+  }) => {
+    const active = current === value;
+    return (
+      <button onClick={onClick} disabled={modePending || tmPending}
+        style={{ flex: 1, padding: '6px 4px', fontSize: 9.5, fontWeight: active ? 700 : 400,
+          border: `1px solid ${active ? color : T.border}`,
+          background: active ? `${color}18` : 'rgba(255,255,255,0.03)',
+          color: active ? color : T.txtMuted,
+          borderRadius: 5, cursor: 'pointer', letterSpacing: '0.04em',
+          opacity: (modePending || tmPending) ? 0.5 : 1 }}>
+        {active ? '● ' : ''}{label}
+      </button>
+    );
+  };
 
   return (
     <Panel title="Execution Control" id="execution-arm-control"
@@ -10936,19 +10992,19 @@ const ArmControlPanel: React.FC = () => {
         </div>
       )}
 
-      {/* ── Required 6-field status block ── */}
+      {/* ── Status grid ─────────────────────────────────────────── */}
       <div style={{
         display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '2px 0',
         marginBottom: 14, padding: '10px 12px',
         background: '#060f1e', border: `1px solid ${T.border}`, borderRadius: 7,
       }}>
         {([
-          ['AUTO TRADING',           execEnabled ? 'ENABLED'  : 'DISABLED',  execEnabled ? T.green : T.red],
-          ['ARM STATE',              armed        ? 'ARMED'    : 'DISARMED',  armed ? T.green : T.amber],
-          ['MODE',                   modeLabel,                               T.txtPri],
-          ['NEW ENTRIES',            newEntriesAllowed ? 'ALLOWED' : 'BLOCKED', newEntriesAllowed ? T.green : T.red],
-          ['TRADE MANAGEMENT',       (armData?.active_trade_count ?? 0) > 0 ? 'ACTIVE' : 'NONE', (armData?.active_trade_count ?? 0) > 0 ? T.green : T.txtMuted],
-          ['LAST CHANGED',           fmtTs(armData?.last_changed_at),         T.txtSec],
+          ['EXECUTION GATEWAY', execEnabled ? 'ENABLED'  : 'DISABLED',  execEnabled ? T.green : T.red],
+          ['AUTO-FIRE (ARM)',    armed        ? 'ARMED'    : 'DISARMED',  armed ? T.green : T.amber],
+          ['GATEWAY MODE',      modeLabel,                               effectiveMode === 'disabled' ? T.red : effectiveMode ? T.txtPri : T.txtMuted],
+          ['TRADING MODE',      tradingMode || '—',                      tradingMode === 'SCALP' ? T.cyan : tradingMode === 'SWING' ? T.purple : T.txtMuted],
+          ['MANUAL ENTRY',      manualEntryOpen ? 'OPEN' : 'BLOCKED',   manualEntryOpen ? T.green : T.red],
+          ['AUTO-FIRE ENTRIES', autoFireAllowed ? 'OPEN' : 'BLOCKED',   autoFireAllowed ? T.green : T.txtMuted],
         ] as [string, string, string][]).map(([label, value, color]) => (
           <React.Fragment key={label}>
             <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.07em',
@@ -10963,19 +11019,49 @@ const ArmControlPanel: React.FC = () => {
         ))}
       </div>
 
-      {/* Mode / config notices */}
-      {effState === 'disabled' && (
-        <div style={{ color: T.amber, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
-          background: `${T.amber}0e`, border: `1px solid ${T.amber}33`, borderRadius: 5, lineHeight: 1.5 }}>
-          <strong>Gateway DISABLED.</strong> Set <code style={{ background: `${T.amber}18`, borderRadius: 3, padding: '1px 4px' }}>EXECUTION_MODE=traderspost</code> in Secrets, then republish.
+      {/* ── Gateway Mode selector ─────────────────────────────────── */}
+      <div style={{ marginBottom: 12 }}>
+        <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 }}>
+          GATEWAY MODE
+          {armData?.runtime_mode_override && (
+            <span style={{ marginLeft: 6, color: T.amber, fontWeight: 400 }}>(runtime override — resets on restart)</span>
+          )}
         </div>
-      )}
-      {effState === 'paper' && (
-        <div style={{ color: T.txtMuted, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
-          background: '#ffffff08', border: `1px solid ${T.border}`, borderRadius: 5, lineHeight: 1.5 }}>
-          <strong>PAPER mode.</strong> No live orders will be sent.
+        <div style={{ display: 'flex', gap: 5 }}>
+          <ModeBtn label="MANUAL PLAN"       value="manual_only" current={effectiveMode} color={T.txtPri}
+            onClick={() => handleSetGatewayMode('manual_only')} />
+          <ModeBtn label="PAPER SIM"         value="paper"       current={effectiveMode} color={T.amber}
+            onClick={() => handleSetGatewayMode('paper')} />
+          <ModeBtn label="LIVE (TradersPost)" value="traderspost" current={effectiveMode} color={T.green}
+            onClick={() => handleSetGatewayMode('traderspost')} />
         </div>
-      )}
+        <div style={{ fontSize: 9, color: T.txtMuted, marginTop: 4, lineHeight: 1.5 }}>
+          {effectiveMode === 'manual_only' && 'Returns the trade plan only — no orders sent.'}
+          {effectiveMode === 'paper'       && 'Simulates execution locally. No real orders.'}
+          {(effectiveMode === 'traderspost' || effectiveMode === 'pickmytrade') && 'Live orders sent to your broker via TradersPost.'}
+          {effectiveMode === 'disabled'    && 'Gateway disabled. Select a mode above to enable.'}
+          {!effectiveMode                  && 'No mode set. Select one above.'}
+        </div>
+      </div>
+
+      {/* ── Trading Mode selector ─────────────────────────────────── */}
+      <div style={{ marginBottom: 14 }}>
+        <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 }}>
+          TRADING MODE
+        </div>
+        <div style={{ display: 'flex', gap: 5 }}>
+          <ModeBtn label="SCALP" value="SCALP" current={tradingMode} color={T.cyan}
+            onClick={() => handleSetTradingMode('SCALP')} />
+          <ModeBtn label="SWING" value="SWING" current={tradingMode} color={T.purple}
+            onClick={() => handleSetTradingMode('SWING')} />
+        </div>
+        <div style={{ fontSize: 9, color: T.txtMuted, marginTop: 4, lineHeight: 1.5 }}>
+          {tradingMode === 'SCALP' && 'Short-term entries, tighter targets, zone-only gate.'}
+          {tradingMode === 'SWING' && 'Longer-duration setups, full zone+VWAP+structure gate.'}
+        </div>
+      </div>
+
+      {/* ── Safety lock notice ── */}
       {locked && (
         <div style={{ color: T.red, fontSize: 10.5, marginBottom: 10, padding: '7px 10px',
           background: `${T.red}0e`, border: `1px solid ${T.red}44`, borderRadius: 5, lineHeight: 1.5 }}>
@@ -10984,62 +11070,101 @@ const ArmControlPanel: React.FC = () => {
         </div>
       )}
 
-      {/* ── Primary action buttons (spec-required layout) ── */}
-      <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: actMsg ? 10 : 8 }}>
-        {/* DISABLED state: only ENABLE */}
-        {!execEnabled && !locked && btn(T.green, '▶ ENABLE AUTO TRADING', () => {
-          setEnableModalOpen(true); setActMsg(null);
-        })}
+      {/* ── Mode feedback ── */}
+      {modeMsg && (
+        <div style={{ fontSize: 10, padding: '5px 8px', borderRadius: 4, marginBottom: 8,
+          background: modeMsg.ok ? `${T.green}12` : `${T.red}12`,
+          color: modeMsg.ok ? T.green : T.red,
+          border: `1px solid ${modeMsg.ok ? T.green : T.red}33` }}>
+          {modeMsg.ok ? '✓' : '✗'} {modeMsg.text}
+        </div>
+      )}
 
-        {/* ENABLED + DISARMED: ARM + DISABLE */}
-        {execEnabled && !armed && !locked && btn(T.green, '⊙ ARM AUTO TRADING', () => {
-          setArmModalOpen(true); setConfirmPhrase(''); setActMsg(null);
-        })}
-        {execEnabled && !armed && !locked && btn(T.red, '■ DISABLE AUTO TRADING', handleDisable)}
+      <div style={{ borderTop: `1px solid ${T.border}33`, marginBottom: 12 }} />
 
-        {/* ENABLED + ARMED: DISARM + DISABLE */}
-        {execEnabled && armed && !locked && btn(T.amber, '◎ DISARM AUTO TRADING', () =>
-          doAction('disarm', { reason: 'operator_manual' })
-        )}
-        {execEnabled && armed && !locked && btn(T.red, '■ DISABLE AUTO TRADING', handleDisable)}
-
-        {/* SAFETY LOCKED: DISABLE (still available) + RESET LOCK */}
-        {locked && execEnabled && btn(T.red, '■ DISABLE AUTO TRADING', handleDisable)}
-        {locked && btn(T.purple, '↺ RESET SAFETY LOCK', () => {
-          if (window.confirm('Reset the safety lock? Ensure the system is safe before proceeding.')) {
-            doAction('reset-safety-lock', {});
-          }
-        })}
+      {/* ── EXECUTION GATEWAY enable/disable ─────────────────────── */}
+      <div style={{ marginBottom: 6 }}>
+        <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 }}>
+          EXECUTION GATEWAY
+          <span style={{ marginLeft: 6, fontWeight: 400, color: T.txtMuted }}>
+            — controls the ENTER button + ARM sessions
+          </span>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {!execEnabled && !locked && btn(T.green, '▶ ENABLE EXECUTION', () => {
+            setEnableModalOpen(true); setActMsg(null);
+          })}
+          {execEnabled && !locked && btn(T.red, '■ DISABLE EXECUTION', handleDisable)}
+        </div>
+        <div style={{ fontSize: 9, color: T.txtMuted, marginTop: 4, lineHeight: 1.5 }}>
+          {!execEnabled && 'Disabled — ENTER button is blocked. Enable to allow manual entries.'}
+          {execEnabled  && 'Enabled — ENTER button is open. The bot still will not auto-fire unless you also ARM.'}
+        </div>
       </div>
 
-      {/* Emergency kill switch — small danger link, available when execution_enabled */}
+      <div style={{ borderTop: `1px solid ${T.border}33`, margin: '10px 0' }} />
+
+      {/* ── AUTO-FIRE arm/disarm ──────────────────────────────────── */}
+      <div style={{ marginBottom: 8 }}>
+        <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 }}>
+          AUTO-FIRE
+          <span style={{ marginLeft: 6, fontWeight: 400, color: T.txtMuted }}>
+            — bot sends orders automatically on READY setups
+          </span>
+        </div>
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+          {execEnabled && !armed && !locked && btn(T.amber, '⊙ ARM AUTO-FIRE', () => {
+            setArmModalOpen(true); setConfirmPhrase(''); setActMsg(null);
+          })}
+          {execEnabled && armed && !locked && btn(T.amber, '◎ DISARM AUTO-FIRE', () =>
+            doAction('disarm', { reason: 'operator_manual' })
+          )}
+          {!execEnabled && (
+            <span style={{ fontSize: 9.5, color: T.txtMuted, padding: '6px 0', fontStyle: 'italic' }}>
+              Enable execution gateway first
+            </span>
+          )}
+        </div>
+        {armed && armData && (
+          <div style={{ marginTop: 8, opacity: 0.85 }}>
+            <KV label="Session Expires"  value={countdown} valueColor={countdown !== '—' && !countdown.includes('h') && parseInt(countdown) < 5 ? T.amber : T.txtPri} />
+            <KV label="Trades Used"      value={`${armData.trades_used} / ${armData.max_trades ?? '—'}`} valueColor={tradesOver ? T.red : T.txtPri} />
+            <KV label="Session P&L"      value={`$${armData.session_pnl.toFixed(0)}`} valueColor={armData.session_pnl < 0 ? (lossNear ? T.red : T.amber) : T.green} />
+            <KV label="Instruments"      value={armData.allowed_instruments?.join(', ') ?? '—'} />
+          </div>
+        )}
+      </div>
+
+      {/* Safety locked actions */}
+      {locked && (
+        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 8 }}>
+          {execEnabled && btn(T.red, '■ DISABLE EXECUTION', handleDisable)}
+          {btn(T.purple, '↺ RESET SAFETY LOCK', () => {
+            if (window.confirm('Reset the safety lock? Ensure the system is safe before proceeding.')) {
+              doAction('reset-safety-lock', {});
+            }
+          })}
+        </div>
+      )}
+
+      {/* Emergency kill switch */}
       {execEnabled && !locked && (
-        <div style={{ marginBottom: 8 }}>
+        <div style={{ marginTop: 4, marginBottom: 8 }}>
           <button onClick={() => {
-            if (window.confirm('Activate emergency kill switch?\n\nThis will immediately lock auto-execution and require a manual safety-lock reset.')) {
+            if (window.confirm('Activate emergency kill switch?\n\nThis immediately disarms + safety-locks the system.\nRequires a manual reset before re-enabling.')) {
               doAction('kill-switch', {});
             }
           }} disabled={pending}
-            style={{ background: 'none', border: 'none', color: `${T.red}99`, fontSize: 9.5,
+            style={{ background: 'none', border: 'none', color: `${T.red}88`, fontSize: 9.5,
               cursor: 'pointer', padding: 0, textDecoration: 'underline', letterSpacing: '0.04em' }}>
             ⚠ emergency kill switch
           </button>
         </div>
       )}
 
-      {/* Detailed session info (secondary) */}
-      {(armed || disarmed) && armData && (
-        <div style={{ marginBottom: 8, opacity: 0.85 }}>
-          <KV label="Session Expires"       value={armed ? countdown : '—'} valueColor={armed && countdown !== '—' && !countdown.includes('h') && parseInt(countdown) < 5 ? T.amber : T.txtPri} />
-          <KV label="Trades Used / Limit"   value={`${armData.trades_used} / ${armData.max_trades ?? '—'}`} valueColor={tradesOver ? T.red : T.txtPri} />
-          <KV label="Session P&L"           value={`$${armData.session_pnl.toFixed(0)}`} valueColor={armData.session_pnl < 0 ? (lossNear ? T.red : T.amber) : T.green} />
-          <KV label="Instruments"           value={armData.allowed_instruments?.join(', ') ?? '—'} />
-          <KV label="Max Contracts"         value={armData.max_contracts ? Object.entries(armData.max_contracts).map(([k,v]) => `${k}:${v}`).join(', ') : '—'} />
-        </div>
-      )}
       <KV label="Last Disarm Reason" value={armData?.disarm_reason ?? '—'} />
 
-      {/* Feedback */}
+      {/* Action feedback */}
       {actMsg && (
         <div style={{ fontSize: 10.5, padding: '6px 10px', borderRadius: 5, marginTop: 8,
           background: actMsg.ok ? `${T.green}15` : `${T.red}15`,
@@ -11054,7 +11179,7 @@ const ArmControlPanel: React.FC = () => {
         </div>
       )}
 
-      {/* ENABLE Modal */}
+      {/* ── ENABLE Modal ── */}
       {enableModalOpen && (
         <div style={{ position: 'fixed', inset: 0, background: 'rgba(5,12,26,0.85)',
           zIndex: 2000, display: 'flex', alignItems: 'center', justifyContent: 'center' }}
@@ -11063,12 +11188,12 @@ const ArmControlPanel: React.FC = () => {
             borderRadius: 12, padding: '24px 28px', width: 380, maxWidth: '95vw',
             boxShadow: `0 0 40px ${T.green}18` }}>
             <div style={{ fontSize: 12, fontWeight: 700, color: T.green, marginBottom: 4, letterSpacing: '0.08em' }}>
-              ▶ ENABLE AUTO TRADING
+              ▶ ENABLE EXECUTION GATEWAY
             </div>
             <div style={{ fontSize: 10, color: T.txtSec, marginBottom: 20, lineHeight: 1.65 }}>
-              Enabling auto trading allows the system to accept ARM sessions and
-              execute automated orders through the configured broker.
-              You must ARM a session separately before any orders are sent.
+              <strong style={{ color: T.txtPri }}>What this does:</strong> unlocks the ENTER button so you can manually send a trade. The bot still will <em>not</em> auto-fire on its own.
+              <br /><br />
+              <strong style={{ color: T.txtPri }}>To enable auto-firing:</strong> enable execution here, then separately press <em>ARM AUTO-FIRE</em> with a session duration + limit.
             </div>
             <div style={{ display: 'flex', gap: 8, justifyContent: 'flex-end' }}>
               <button onClick={() => { setEnableModalOpen(false); setActMsg(null); }}
@@ -11081,7 +11206,7 @@ const ArmControlPanel: React.FC = () => {
                   color: T.green, borderRadius: 6, padding: '7px 18px', fontSize: 10.5,
                   fontWeight: 700, cursor: pending ? 'not-allowed' : 'pointer',
                   opacity: pending ? 0.5 : 1, letterSpacing: '0.06em' }}>
-                {pending ? '…' : '▶ CONFIRM ENABLE'}
+                {pending ? '…' : '▶ ENABLE'}
               </button>
             </div>
           </div>

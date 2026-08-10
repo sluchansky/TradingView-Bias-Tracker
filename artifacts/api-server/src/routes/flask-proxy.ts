@@ -403,6 +403,7 @@ export const BOT1_ROUTES = [
   "/execution/kill-switch",
   "/execution/reset-safety-lock",
   "/execution/audit-log",
+  "/execution/set-mode",
   // Profitability Engine Phase 1 — ghost observation ledger (RESEARCH/DISPLAY-ONLY;
   // owner-only; NOT in dashboard-auth OPEN_PATHS). Aggregated stats + raw
   // observation list. Never touches gate, scoring, sizing, or execution.

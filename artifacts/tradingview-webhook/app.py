@@ -3268,9 +3268,15 @@ _EXECUTION_PROVIDER_LABELS = {
     "pickmytrade": "PickMyTrade",
 }
 
+# Runtime override — set via POST /execution/set-mode; takes precedence over env.
+# Resets to None on server restart (fail-closed: env var wins on cold boot).
+_EXECUTION_MODE_RUNTIME_OVERRIDE = None  # type: str | None
+_EXECUTION_MODE_OVERRIDE_LOCK = threading.Lock()
+
 def resolve_execution_mode():
     """Resolve the active execution mode (fail-closed).
 
+    Priority: runtime override → env var → 'disabled'.
     FAIL-CLOSED invariant: if EXECUTION_MODE is missing, blank, or unrecognised,
     the resolved mode is 'disabled' — no execution is authorised at all.
     The presence of a webhook URL NEVER enables live execution; only an explicit
@@ -3278,6 +3284,10 @@ def resolve_execution_mode():
     'paper' simulates execution; 'disabled' blocks all execution (gateway 409).
     Mode comparisons are case-insensitive (raw value is lowercased at load time).
     """
+    with _EXECUTION_MODE_OVERRIDE_LOCK:
+        override = _EXECUTION_MODE_RUNTIME_OVERRIDE
+    if override in _VALID_EXECUTION_MODES:
+        return override
     if _EXECUTION_MODE_RAW in _VALID_EXECUTION_MODES:
         return _EXECUTION_MODE_RAW
     # Missing / blank / unknown → disabled (strongest safe default; never live).
@@ -3287,6 +3297,10 @@ def _configured_execution_mode():
     """Return the explicitly configured raw value, or None if unset / invalid.
     Used for audit/status reporting; callers must use resolve_execution_mode() for
     actual execution decisions."""
+    with _EXECUTION_MODE_OVERRIDE_LOCK:
+        override = _EXECUTION_MODE_RUNTIME_OVERRIDE
+    if override in _VALID_EXECUTION_MODES:
+        return override
     return _EXECUTION_MODE_RAW if _EXECUTION_MODE_RAW in _VALID_EXECUTION_MODES else None
 
 def execution_is_live(mode=None):
@@ -55948,6 +55962,8 @@ def execution_state_route():
         "last_changed_at":        st.get("last_changed_at"),
         "configured_mode":        _configured_execution_mode(),
         "effective_mode":         resolve_execution_mode(),
+        "runtime_mode_override":  _EXECUTION_MODE_RUNTIME_OVERRIDE,
+        "trading_mode":           TRADING_MODE,
         "safety_locked":          st.get("safety_locked", False),
         "safety_lock_reason":     st.get("safety_lock_reason"),
         "allowed_instruments":    st.get("allowed_instruments"),
@@ -56257,6 +56273,45 @@ def execution_audit_log_route():
     with _ARM_AUDIT_LOCK:
         records = list(_ARM_AUDIT_LOG)[-50:]
     return jsonify({"records": records, "total": len(records)})
+
+
+@app.route("/execution/set-mode", methods=["POST"])
+@_arm_owner_required
+def execution_set_mode_route():
+    """Set the execution gateway mode at runtime (no restart required).
+    Owner-only; auth enforced at the Express /api edge.
+
+    Accepts: { "mode": "paper" | "traderspost" | "pickmytrade" | "manual_only" | "disabled" }
+
+    The runtime override takes precedence over the EXECUTION_MODE env var until
+    the server restarts (fail-closed: env var wins on cold boot).
+
+    Returns:
+      200  { status: "ok", effective_mode: "<mode>", runtime_override: true }
+      400  Unknown mode
+    """
+    global _EXECUTION_MODE_RUNTIME_OVERRIDE
+    data = request.get_json(force=True, silent=True) or {}
+    mode = str(data.get("mode", "")).strip().lower()
+    if mode not in _VALID_EXECUTION_MODES:
+        return jsonify({
+            "status": "error",
+            "reason": f"Unknown mode {mode!r}. Valid: {sorted(_VALID_EXECUTION_MODES)}",
+        }), 400
+    by = str(data.get("by") or "operator")[:100]
+    with _EXECUTION_MODE_OVERRIDE_LOCK:
+        prev = _EXECUTION_MODE_RUNTIME_OVERRIDE
+        _EXECUTION_MODE_RUNTIME_OVERRIDE = mode
+    logger.info(
+        "POST /execution/set-mode — mode=%s (was %s), by=%s", mode, prev, by
+    )
+    return jsonify({
+        "status":           "ok",
+        "effective_mode":   mode,
+        "previous_mode":    prev,
+        "runtime_override": True,
+        "note":             "Override resets to env-var value on server restart.",
+    })
 
 
 @app.route("/take-preview", methods=["POST"])
