@@ -60637,45 +60637,58 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
 
     # ── Arm/Disarm gate (live execution only) ────────────────────────────────────
     # Paper/manual_only skip this check so paper trading is unaffected.
-    # For live execution: both EXECUTION_MODE=traderspost AND a valid arm session
-    # are required.  FAIL-CLOSED: any arm-check exception blocks.
+    # For live execution the full arm gate applies to autonomous bot sources.
+    # EXCEPTION — manual_desk (operator explicitly clicked LONG/SHORT on the
+    # dashboard): the deliberate click IS the confirmation session — skip the
+    # arm/session-expiry checks that guard against autonomous fires.  Only verify
+    # execution_enabled, mirroring how the dashboard ENTER button (source="manual")
+    # is handled in the final arm gate.  FAIL-CLOSED: any exception blocks.
     if execution_is_live(mode):
-        try:
-            # Best-effort strategy key for arm strategy-restriction checks
-            _arm_sk = None
-            try:
-                _arm_a  = full_analysis(ticker_override=inst)
-                _arm_sk = ((_arm_a.get("strategy_engine") or {}).get("active_key")
-                            or (_arm_a.get("learning_score_influence") or {}).get("meta", {}).get("active_key"))
-                _arm_dir = ready_direction(str(_arm_a.get("verdict", "")))
-            except Exception:
-                _arm_sk = None; _arm_dir = None
-
-            _arm_ok, _arm_reason, _arm_diag = _check_arm_for_transmission(
-                inst, contracts_override or 1, strategy=_arm_sk, direction=_arm_dir)
-            if not _arm_ok:
+        if source == "manual_desk":
+            # Operator-click path — execution_enabled is the only gate.
+            with _ARM_STATE_LOCK:
+                _md_exec_enabled = _ARM_STATE.get("execution_enabled", False)
+            if not _md_exec_enabled:
                 logger.warning(
-                    "Auto-trade blocked (arm gate) for %s — %s (%s)",
-                    inst, _arm_reason, _arm_diag.get("reason", ""))
-                _record_exec_attempt({
-                    "instrument":    inst,
-                    "source":        source,
-                    "setup_key":     str(setup_key),
-                    "configured_mode": _configured_execution_mode(),
-                    "effective_mode":  resolve_execution_mode(),
-                    "arm_check":     _arm_diag,
-                    "arm_session_id": _arm_diag.get("active_session_id"),
-                    "lre_state":     None,
-                    "mandatory_gate": "arm_disarmed",
-                    "duplicate_guard": None,
-                    "final_action":  "blocked",
-                    "reason_code":   _arm_reason,
-                })
+                    "Manual desk order blocked for %s — execution gateway not enabled", inst)
                 return False
-        except Exception as _arm_exc:
-            logger.error(
-                "Arm gate EXCEPTION for %s — blocking (fail-closed): %s", inst, _arm_exc)
-            return False
+        else:
+            try:
+                # Best-effort strategy key for arm strategy-restriction checks
+                _arm_sk = None
+                try:
+                    _arm_a  = full_analysis(ticker_override=inst)
+                    _arm_sk = ((_arm_a.get("strategy_engine") or {}).get("active_key")
+                                or (_arm_a.get("learning_score_influence") or {}).get("meta", {}).get("active_key"))
+                    _arm_dir = ready_direction(str(_arm_a.get("verdict", "")))
+                except Exception:
+                    _arm_sk = None; _arm_dir = None
+
+                _arm_ok, _arm_reason, _arm_diag = _check_arm_for_transmission(
+                    inst, contracts_override or 1, strategy=_arm_sk, direction=_arm_dir)
+                if not _arm_ok:
+                    logger.warning(
+                        "Auto-trade blocked (arm gate) for %s — %s (%s)",
+                        inst, _arm_reason, _arm_diag.get("reason", ""))
+                    _record_exec_attempt({
+                        "instrument":    inst,
+                        "source":        source,
+                        "setup_key":     str(setup_key),
+                        "configured_mode": _configured_execution_mode(),
+                        "effective_mode":  resolve_execution_mode(),
+                        "arm_check":     _arm_diag,
+                        "arm_session_id": _arm_diag.get("active_session_id"),
+                        "lre_state":     None,
+                        "mandatory_gate": "arm_disarmed",
+                        "duplicate_guard": None,
+                        "final_action":  "blocked",
+                        "reason_code":   _arm_reason,
+                    })
+                    return False
+            except Exception as _arm_exc:
+                logger.error(
+                    "Arm gate EXCEPTION for %s — blocking (fail-closed): %s", inst, _arm_exc)
+                return False
 
     with _AUTO_EXEC_LOCK:
         # A still-open USER-APPROVED PREVIEW take holds this instrument's slot by the
