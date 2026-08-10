@@ -37737,6 +37737,28 @@ def _restore_market_state_from_db():
     except Exception as exc:
         logger.debug("ALERT_HISTORY restore fail-open: %s", exc)
 
+    # ── Execution gateway mode override (PERSIST ACROSS RESTARTS) ────────────
+    try:
+        global _EXECUTION_MODE_RUNTIME_OVERRIDE, TRADING_MODE
+        data = _load_market_state("exec_mode_override")
+        saved_mode = (data or {}).get("mode", "")
+        if saved_mode in _VALID_EXECUTION_MODES:
+            with _EXECUTION_MODE_OVERRIDE_LOCK:
+                _EXECUTION_MODE_RUNTIME_OVERRIDE = saved_mode
+            logger.info("Market-state restore: execution mode=%s (from cache)", saved_mode)
+    except Exception as exc:
+        logger.debug("Exec mode restore fail-open: %s", exc)
+
+    # ── Trading mode (SCALP / SWING) ──────────────────────────────────────────
+    try:
+        data = _load_market_state("trading_mode_override")
+        saved_tm = str((data or {}).get("mode", "")).upper()
+        if saved_tm in MODES:
+            TRADING_MODE = saved_tm
+            logger.info("Market-state restore: trading_mode=%s (from cache)", TRADING_MODE)
+    except Exception as exc:
+        logger.debug("Trading mode restore fail-open: %s", exc)
+
     logger.info(
         "Market-state restore complete: CVD=%d vol=%d tp_dedup=%d "
         "auto_keys=%d alerts=%d",
@@ -56302,15 +56324,16 @@ def execution_set_mode_route():
     with _EXECUTION_MODE_OVERRIDE_LOCK:
         prev = _EXECUTION_MODE_RUNTIME_OVERRIDE
         _EXECUTION_MODE_RUNTIME_OVERRIDE = mode
+    _save_market_state("exec_mode_override", {"mode": mode})
     logger.info(
-        "POST /execution/set-mode — mode=%s (was %s), by=%s", mode, prev, by
+        "POST /execution/set-mode — mode=%s (was %s), by=%s (persisted)", mode, prev, by
     )
     return jsonify({
         "status":           "ok",
         "effective_mode":   mode,
         "previous_mode":    prev,
         "runtime_override": True,
-        "note":             "Override resets to env-var value on server restart.",
+        "note":             "Override persisted to DB — survives restarts.",
     })
 
 
@@ -76649,7 +76672,8 @@ def mode():
             return jsonify({"status": "error",
                             "reason": f"Unknown mode {requested!r}. Use one of {list(MODES)}."}), 400
         TRADING_MODE = requested
-        logger.info("Trading mode switched to %s", TRADING_MODE)
+        _save_market_state("trading_mode_override", {"mode": requested})
+        logger.info("Trading mode switched to %s (persisted)", TRADING_MODE)
     return jsonify({
         "status":          "ok",
         "trading_mode":    TRADING_MODE,

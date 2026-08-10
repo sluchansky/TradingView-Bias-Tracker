@@ -853,53 +853,56 @@ def _thesis_momentum(
 # ── Structured thesis content ─────────────────────────────────────────────────
 
 def _thesis_narrative_structured(mi: dict, direction: str) -> list[str]:
-    """3–6 factual bullet strings explaining WHY the current thesis holds."""
+    """2–4 plain-English bullets telling the operator exactly what the market is doing."""
     outlook = mi.get("directional_outlook") or {}
     auction = mi.get("auction_control", "CONTESTED")
     ms      = mi.get("market_state", "UNKNOWN")
-    phase   = mi.get("session_phase", "UNKNOWN")
     conf    = mi.get("data_confidence", 0)
     l       = outlook.get("long",  0)
     s       = outlook.get("short", 0)
+    margin  = abs(l - s)
 
     reasons: list[str] = []
 
-    # 1. Primary evidence weight
+    # 1. One decisive directional call — no percentages, no hedging
+    total_directional = l + s
     if direction == "BULLISH":
-        reasons.append(
-            f"Directional evidence {l}% long vs {s}% short — buy-side leads the weight.")
+        strength = "strongly" if margin >= 30 else "leaning"
+        reasons.append(f"Bias is {strength} long — buy-side evidence dominates.")
     elif direction == "BEARISH":
-        reasons.append(
-            f"Directional evidence {s}% short vs {l}% long — sell-side leads the weight.")
-    elif direction == "NEUTRAL":
-        reasons.append(
-            f"Directional evidence balanced: {l}% long / {s}% short — no dominant side.")
+        strength = "strongly" if margin >= 30 else "leaning"
+        reasons.append(f"Bias is {strength} short — sell-side evidence dominates.")
+    elif direction == "NEUTRAL" or (total_directional < 20):
+        # Low total directional evidence = not conflicted, just not enough signal yet
+        reasons.append("No clear directional signal yet — market is neutral or data is still building.")
     else:
-        reasons.append(
-            f"Directional evidence conflicted: {l}% long / {s}% short — mixed signals.")
+        # Both sides have meaningful evidence but neither dominates
+        reasons.append("Long and short signals are roughly balanced — no edge in either direction.")
 
-    # 2. Auction control
+    # 2. Who controls price right now
     if auction == "BUYER":
-        reasons.append("Buyers control the auction (CVD positive, price above VWAP).")
+        reasons.append("Buyers in control: CVD is positive and price is above VWAP.")
     elif auction == "SELLER":
-        reasons.append("Sellers control the auction (CVD negative, price below VWAP).")
+        reasons.append("Sellers in control: CVD is negative and price is below VWAP.")
     else:
-        reasons.append("Auction is contested — neither side has clear control.")
+        reasons.append("Neither side controls price — wait for the auction to resolve.")
 
-    # 3. Market state
-    reasons.append(f"Market state: {ms.replace('_', ' ').title()}.")
-
-    # 4. Session context
-    reasons.append(f"Session phase: {phase.replace('_', ' ').title()}.")
-
-    # 5. Confidence note
-    if conf >= 70:
-        reasons.append(f"Data confidence {conf}% — evidence is well-supported.")
-    elif conf >= 40:
-        reasons.append(f"Data confidence {conf}% — moderate data availability.")
+    # 3. Structure context — plain English
+    _MS_LABELS = {
+        "TRENDING_UP_STRONG":   "Trend is up and strong.",
+        "TRENDING_UP_MILD":     "Trend has a mild upward bias.",
+        "TRENDING_DOWN_STRONG": "Trend is down and strong.",
+        "TRENDING_DOWN_MILD":   "Trend has a mild downward bias.",
+    }
+    label = _MS_LABELS.get(ms)
+    if label:
+        reasons.append(label)
     else:
-        reasons.append(
-            f"Data confidence {conf}% — limited data; treat thesis with caution.")
+        reasons.append("Structure is choppy — no clean trend in either direction.")
+
+    # 4. Only mention data quality when it's actually a problem
+    if conf < 40:
+        reasons.append(f"Low confidence ({conf}%) — reading may shift as more bars close.")
 
     return reasons
 

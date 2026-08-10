@@ -281,9 +281,152 @@ class YFinanceProvider(VolatilityDataProvider):
             self._reconnect_cnt += 1
 
 
+# ── Alpha Vantage provider ────────────────────────────────────────────────────
+
+class AlphaVantageProvider(VolatilityDataProvider):
+    """
+    Fetches ^VIX from Alpha Vantage GLOBAL_QUOTE endpoint.
+    Requires ALPHA_VANTAGE_API_KEY env var.
+    Returns daily-close data; returns last known price when market is closed
+    (Alpha Vantage returns the previous session's final quote after hours).
+    Falls back to ERROR state if the key is missing or the call fails.
+    """
+
+    _AV_URL = (
+        "https://www.alphavantage.co/query"
+        "?function=GLOBAL_QUOTE&symbol=%5EVIX&apikey={key}"
+    )
+
+    def __init__(self) -> None:
+        self._api_key: str = os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip()
+        self._latest:  Dict[str, Any] = _null_vix_record("UNAVAILABLE", "Not yet fetched")
+        self._history: List[Dict[str, Any]] = []
+        self._lock = threading.Lock()
+        self._last_quote_fetch: float = 0.0
+        self._consecutive_errors: int = 0
+        self._total_errors:  int = 0
+        self._reconnect_cnt: int = 0
+        self._last_error:    Optional[str] = None
+        self._last_ok_utc:   Optional[str] = None
+
+    def get_latest_vix(self) -> Dict[str, Any]:
+        with self._lock:
+            return dict(self._latest)
+
+    def get_vix_history(self) -> List[Dict[str, Any]]:
+        with self._lock:
+            return list(self._history)
+
+    def get_provider_status(self) -> Dict[str, Any]:
+        with self._lock:
+            return {
+                "provider":           "AlphaVantage",
+                "symbol":             _VIX_SYMBOL,
+                "connected":          self._consecutive_errors == 0 and self._last_ok_utc is not None,
+                "last_ok_utc":        self._last_ok_utc,
+                "last_error":         self._last_error,
+                "consecutive_errors": self._consecutive_errors,
+                "total_errors":       self._total_errors,
+                "reconnect_count":    self._reconnect_cnt,
+                "fetch_interval_sec": _FETCH_INTERVAL_SEC,
+                "api_key_present":    bool(self._api_key),
+                "is_delayed":         False,  # AV GLOBAL_QUOTE is real-time during market hours
+            }
+
+    def maybe_refresh(self) -> None:
+        now = time.time()
+        if now - self._last_quote_fetch >= _FETCH_INTERVAL_SEC:
+            self._fetch_quote()
+            self._last_quote_fetch = now
+
+    def _fetch_quote(self) -> None:
+        if not self._api_key:
+            self._record_error("ALPHA_VANTAGE_API_KEY not configured")
+            return
+        try:
+            import urllib.request as _urllib
+            import json as _json
+            url = self._AV_URL.format(key=self._api_key)
+            with _urllib.urlopen(url, timeout=10) as resp:
+                data = _json.loads(resp.read().decode())
+
+            # Rate-limit or info note (free-tier throttle)
+            note = data.get("Note") or data.get("Information") or ""
+            if note:
+                self._record_error(f"Alpha Vantage API: {note[:120]}")
+                return
+
+            gq = data.get("Global Quote") or {}
+            if not gq:
+                self._record_error("Alpha Vantage: empty Global Quote (market may be closed)")
+                return
+
+            def _f(key: str) -> Optional[float]:
+                val = gq.get(key, "")
+                try:
+                    return float(str(val).replace("%", "").strip()) if val else None
+                except (ValueError, TypeError):
+                    return None
+
+            price = _f("05. price")
+            if price is None:
+                self._record_error("Alpha Vantage: price field missing in response")
+                return
+
+            prev_close = _f("08. previous close")
+            change     = _f("09. change")
+            change_pct = _f("10. change percent")
+            s_open     = _f("02. open")
+            s_high     = _f("03. high")
+            s_low      = _f("04. low")
+
+            now_utc_s = datetime.now(timezone.utc).isoformat()
+            rec = {
+                "symbol":         "VIX",
+                "source":         "alpha_vantage",
+                "price":          price,
+                "previous_close": prev_close,
+                "change":         change,
+                "change_pct":     change_pct,
+                "session_open":   s_open,
+                "session_high":   s_high,
+                "session_low":    s_low,
+                "timestamp_utc":  now_utc_s,
+                "age_seconds":    0.0,
+                "is_fresh":       True,
+                "is_delayed":     False,
+                "status":         "OK",
+                "error":          None,
+            }
+            with self._lock:
+                self._latest  = rec
+                self._history.append({"price": price, "timestamp_str": now_utc_s})
+                if len(self._history) > 200:
+                    self._history = self._history[-200:]
+                self._consecutive_errors = 0
+                self._last_ok_utc = now_utc_s
+            logger.info(
+                "VIX quote fetched via Alpha Vantage: %.2f (%.2f%%)",
+                price, change_pct or 0,
+            )
+        except Exception as exc:
+            self._record_error(str(exc))
+
+    def _record_error(self, msg: str) -> None:
+        with self._lock:
+            self._consecutive_errors += 1
+            self._total_errors += 1
+            self._last_error = msg
+            self._latest = _null_vix_record("ERROR", msg[:200])
+        if self._consecutive_errors == 1 or self._consecutive_errors % 5 == 0:
+            logger.warning("VIX provider error #%d: %s", self._consecutive_errors, msg[:120])
+        if self._consecutive_errors > 1:
+            self._reconnect_cnt += 1
+
+
 # ── Background thread ─────────────────────────────────────────────────────────
 
-_provider: Optional[YFinanceProvider] = None
+_provider: Optional[VolatilityDataProvider] = None
 _bg_thread: Optional[threading.Thread] = None
 _obs_buffer: deque = deque(maxlen=_MAX_OBS)  # timestamped snapshots
 _obs_lock = threading.Lock()
@@ -297,7 +440,12 @@ def start(provider: Optional[VolatilityDataProvider] = None) -> None:
         logger.info("VolatilityIntelligence: disabled (VOL_INTELLIGENCE_ENABLED=0)")
         return
     _assert_observe_only("start()")
-    _provider = provider or YFinanceProvider()
+    if provider is not None:
+        _provider = provider
+    elif os.environ.get("ALPHA_VANTAGE_API_KEY", "").strip():
+        _provider = AlphaVantageProvider()
+    else:
+        _provider = YFinanceProvider()
     _bg_thread = threading.Thread(target=_bg_loop, daemon=True, name="vol-intelligence-bg")
     _bg_thread.start()
     _MODULE_STARTED = True

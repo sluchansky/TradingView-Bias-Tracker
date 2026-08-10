@@ -1356,7 +1356,13 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
   const dir     = safeStr(lb.direction, '');
   const conf    = safeNum(lb.confidence);
-  const narr    = safeStr(lb.narrative, '');
+  // narrative may be a list of strings (new format) or a plain string (fallback)
+  const _rawNarr = lb.narrative;
+  const narrLines: string[] = Array.isArray(_rawNarr)
+    ? (_rawNarr as unknown[]).map(x => String(x)).filter(Boolean)
+    : safeStr(_rawNarr, '') ? [safeStr(_rawNarr, '')] : [];
+  // Display label: CONFLICTED is internal jargon — surface it as NO EDGE
+  const displayDir = dir === 'CONFLICTED' ? 'NO EDGE' : (dir || '—');
   const age     = fmtAge(lb.generated_at);
   const dCol    = dirColor(dir);
 
@@ -1376,10 +1382,10 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const badge = isAvailable
     ? isMiFallback
       ? <div style={{ display: 'flex', gap: 4 }}>
-          <Badge label={dir || 'NEUTRAL'} color={dCol} />
+          <Badge label={displayDir} color={dCol} />
           <Badge label="DATA QUALITY LOW" color={T.amber} />
         </div>
-      : <Badge label={dir || 'NEUTRAL'} color={dCol} />
+      : <Badge label={displayDir} color={dCol} />
     : isStale
       ? <Badge label="STALE" color={T.amber} />
       : isCollect
@@ -1480,7 +1486,7 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
           {/* Direction + confidence bar */}
           <div style={{ display:'flex', alignItems:'center', gap:12, marginBottom:12 }}>
             <div>
-              <div style={{ fontSize:22, fontWeight:800, color:dCol, lineHeight:1 }}>{dir || '—'}</div>
+              <div style={{ fontSize:22, fontWeight:800, color:dCol, lineHeight:1 }}>{displayDir}</div>
               <div style={{ fontSize:9.5, color:T.txtMuted, marginTop:2 }}>{age}</div>
             </div>
             {conf != null && (
@@ -1499,10 +1505,14 @@ const ThesisPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             )}
           </div>
 
-          {/* Narrative */}
-          {narr && (
-            <div style={{ fontSize:11, color:T.txtSec, lineHeight:1.55, marginBottom:10,
-              borderLeft:`2px solid ${dCol}55`, paddingLeft:8 }}>{narr}</div>
+          {/* Narrative — render each bullet on its own line */}
+          {narrLines.length > 0 && (
+            <div style={{ display:'flex', flexDirection:'column', gap:5, marginBottom:10,
+              borderLeft:`2px solid ${dCol}55`, paddingLeft:10 }}>
+              {narrLines.map((line, i) => (
+                <div key={i} style={{ fontSize:11, color:T.txtSec, lineHeight:1.5 }}>{line}</div>
+              ))}
+            </div>
           )}
 
           {/* Meta */}
@@ -2278,11 +2288,10 @@ function computeConsensus(p: Record<string, unknown>): ConsensusResult {
   if (totalVotes === 0) return { direction: 'DIVIDED', longVotes: 0, shortVotes: 0, totalVotes: 0, confidence: 0, signals };
   const maxV = Math.max(longVotes, shortVotes);
   const confidence = Math.round((maxV / totalVotes) * 100);
-  // 60% threshold: a direction must hold a clear supermajority or we call it
-  // DIVIDED. This stops a single signal flip in a tight vote (3 vs 2) from
-  // toggling the display.
+  // 65% threshold: a direction must hold a clear supermajority or we call it
+  // DIVIDED. Raised from 60% to reduce noise when votes are close (e.g. 4 vs 3).
   const direction: 'LONG' | 'SHORT' | 'DIVIDED' =
-    confidence < 60 ? 'DIVIDED'
+    confidence < 65 ? 'DIVIDED'
     : longVotes > shortVotes ? 'LONG' : 'SHORT';
   return { direction, longVotes, shortVotes, totalVotes, confidence, signals };
 }
@@ -11355,6 +11364,121 @@ const ArmControlPanel: React.FC = () => {
 };
 
 
+// ── Opening Bell Pill — full-width bottom bar at 9:30 AM ET ─────────────────
+
+const OPENING_BELL_DURATION_MS = 60_000; // visible for 60 seconds
+
+interface OpeningBellState {
+  firedAt:   number; // Date.now() when bell fired
+  dateLabel: string; // e.g. "MON AUG 10"
+}
+
+const OpeningBellPill: React.FC<{
+  state:     OpeningBellState;
+  p:         Record<string, unknown>;
+  onDismiss: () => void;
+}> = ({ state, p, onDismiss }) => {
+  const [remaining, setRemaining] = React.useState(
+    Math.max(0, OPENING_BELL_DURATION_MS - (Date.now() - state.firedAt)),
+  );
+
+  useEffect(() => {
+    const iv = setInterval(() => {
+      const rem = Math.max(0, OPENING_BELL_DURATION_MS - (Date.now() - state.firedAt));
+      setRemaining(rem);
+      if (rem <= 0) onDismiss();
+    }, 500);
+    return () => clearInterval(iv);
+  }, [state.firedAt, onDismiss]);
+
+  const pct    = (remaining / OPENING_BELL_DURATION_MS) * 100;
+  const remSec = Math.ceil(remaining / 1_000);
+
+  // Build a one-line status summary from current payload
+  const verdict = (p.verdict ?? {}) as Record<string, unknown>;
+  const eb      = (p.edge_breakdown ?? {}) as Record<string, unknown>;
+  const market  = (p.market  ?? {}) as Record<string, unknown>;
+  const inst    = safeStr(market.instrument, '');
+  const score   = safeNum(eb.score ?? eb.total_score);
+  const isReady = verdict.is_actionable === true;
+  const vDir    = safeStr(verdict.direction, '');
+
+  const statusLine = inst
+    ? isReady
+      ? `${inst} READY${vDir ? ' · ' + vDir : ''}${score != null ? '  ·  Edge ' + score : ''} — setup confirmed at open`
+      : `${inst} WAIT${score != null ? '  ·  Edge ' + score : ''} — no confirmed setup at open yet`
+    : 'Waiting for first signal…';
+
+  return (
+    <div style={{
+      position: 'fixed', bottom: 0, left: 0, right: 0,
+      zIndex: 9998,
+      background: 'rgba(8,14,22,0.97)',
+      borderTop: `1px solid ${T.amber}55`,
+      backdropFilter: 'blur(20px)',
+    }}>
+      {/* Countdown bar — drains left-to-right */}
+      <div style={{ height: 2, background: `${T.amber}20` }}>
+        <div style={{
+          height: '100%', width: `${pct}%`,
+          background: `linear-gradient(90deg, ${T.amber}cc, ${T.amber})`,
+          transition: 'width 0.5s linear',
+        }} />
+      </div>
+
+      <div style={{ display: 'flex', alignItems: 'center', gap: 14, padding: '10px 20px' }}>
+        {/* Bell icon */}
+        <span style={{ fontSize: 22, lineHeight: 1, flexShrink: 0 }}>🛎</span>
+
+        {/* Text block */}
+        <div style={{ flex: 1, minWidth: 0 }}>
+          <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, flexWrap: 'wrap' }}>
+            <span style={{
+              fontSize: 12, fontWeight: 800, color: T.amber,
+              letterSpacing: '0.10em', whiteSpace: 'nowrap',
+            }}>
+              MARKET OPEN
+            </span>
+            <span style={{ fontSize: 10, color: T.txtMuted, fontFamily: T.mono, whiteSpace: 'nowrap' }}>
+              9:30 AM ET  ·  {state.dateLabel}
+            </span>
+          </div>
+          <div style={{ fontSize: 10.5, color: T.txtSec, marginTop: 3,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+            {statusLine}
+          </div>
+        </div>
+
+        {/* Countdown + dismiss */}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexShrink: 0 }}>
+          <span style={{ fontSize: 10, color: T.txtMuted, fontFamily: T.mono, minWidth: 28, textAlign: 'right' }}>
+            {remSec}s
+          </span>
+          <button
+            onClick={onDismiss}
+            style={{
+              background: 'none', border: `1px solid ${T.border}`, color: T.txtSec,
+              borderRadius: 6, padding: '4px 12px', fontSize: 10.5, cursor: 'pointer',
+              letterSpacing: '0.05em', transition: 'border-color 0.15s, color 0.15s',
+            }}
+            onMouseEnter={e => {
+              (e.currentTarget as HTMLButtonElement).style.borderColor = T.amber;
+              (e.currentTarget as HTMLButtonElement).style.color = T.amber;
+            }}
+            onMouseLeave={e => {
+              (e.currentTarget as HTMLButtonElement).style.borderColor = T.border;
+              (e.currentTarget as HTMLButtonElement).style.color = T.txtSec;
+            }}
+          >
+            CLOSE
+          </button>
+        </div>
+      </div>
+    </div>
+  );
+};
+
+
 // ── Bell Toast — fixed bottom-centre banner shown when any audio event fires ──
 interface BellToastData {
   key:      number;
@@ -11453,12 +11577,12 @@ export default function MainBrain() {
   // is silently discarded instead of overwriting the newer one.
   const scanGenRef = useRef(0);
 
-  // Consensus direction stability (2-poll hysteresis).
-  // _prevConDirRef  = the direction returned by computeConsensus on the LAST render.
-  // _stableConDirRef = the direction we actually DISPLAY — only updated when the
-  //   computed direction matches on two consecutive renders (i.e. two consecutive polls).
+  // Consensus direction stability (4-poll hysteresis ~28s).
+  // A direction flip must hold for 4 consecutive polls before the display switches.
+  // Single-poll noise and brief reversals are silently absorbed.
   const _prevConDirRef   = useRef<string>('DIVIDED');
   const _stableConDirRef = useRef<string>('DIVIDED');
+  const _conStreakRef     = useRef<number>(0);
 
   const [cleanestOpen,     setCleanestOpen]     = useState(false);
   const [cleanestScanning, setCleanestScanning] = useState(false);
@@ -11543,6 +11667,59 @@ export default function MainBrain() {
 
   // Bell toast — shown at the bottom of the screen whenever a sound fires.
   const [bellToast, setBellToast] = useState<BellToastData | null>(null);
+
+  // Opening bell — 9:30 AM ET opening bell pill
+  const [openingBell, setOpeningBell] = useState<OpeningBellState | null>(null);
+  const openingBellFiredRef = useRef(false);
+
+  useEffect(() => {
+    const check = () => {
+      if (openingBellFiredRef.current) return;
+      // Guard: already fired today (survives page refresh)
+      try {
+        const todayET = new Intl.DateTimeFormat('en-US', {
+          timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+        }).format(new Date()).replace(/\//g, '-');
+        if (localStorage.getItem(`ob_fired_${todayET}`)) {
+          openingBellFiredRef.current = true;
+          return;
+        }
+      } catch {/* ignore storage errors */}
+
+      // Get ET time components via Intl
+      const parts = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York',
+        weekday: 'short', hour: 'numeric', minute: '2-digit', second: '2-digit', hour12: false,
+      }).formatToParts(new Date());
+      const get = (type: string) => parseInt(parts.find(pt => pt.type === type)?.value ?? '0');
+      const dayName = parts.find(pt => pt.type === 'weekday')?.value ?? '';
+      if (dayName === 'Sat' || dayName === 'Sun') return;
+
+      const h = get('hour'); const m = get('minute'); const s = get('second');
+      // Fire at 9:30:00 – 9:30:44 ET so an 8s poll always catches it
+      if (!(h === 9 && m === 30 && s < 45)) return;
+
+      openingBellFiredRef.current = true;
+      try {
+        const todayET = new Intl.DateTimeFormat('en-US', {
+          timeZone: 'America/New_York', year: 'numeric', month: '2-digit', day: '2-digit',
+        }).format(new Date()).replace(/\//g, '-');
+        localStorage.setItem(`ob_fired_${todayET}`, '1');
+      } catch {/* noop */}
+
+      audioManager.play(SoundEvent.MARKET_OPEN);
+
+      const dateLabel = new Intl.DateTimeFormat('en-US', {
+        timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric',
+      }).format(new Date()).toUpperCase();
+
+      setOpeningBell({ firedAt: Date.now(), dateLabel });
+    };
+
+    check();
+    const iv = setInterval(check, 8_000);
+    return () => clearInterval(iv);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     // Ignore during initial loading — wait for first real payload.
@@ -11714,11 +11891,15 @@ export default function MainBrain() {
       default: {
         // Root overview — Consensus strip replaces Thesis + Verdict + Scanner top row
         const _rawCon = computeConsensus(p);
-        // 2-poll hysteresis: commit a direction only when it matches the previous poll.
-        // This means a flip must appear on two consecutive renders before the display
-        // switches — single-poll noise that immediately reverts goes unnoticed.
+        // 4-poll hysteresis: commit a direction only after 4 consecutive matching polls.
+        // A direction flip needs ~28s of sustained signal to show on screen.
         if (_rawCon.direction === _prevConDirRef.current) {
-          _stableConDirRef.current = _rawCon.direction;
+          _conStreakRef.current += 1;
+          if (_conStreakRef.current >= 4) {
+            _stableConDirRef.current = _rawCon.direction;
+          }
+        } else {
+          _conStreakRef.current = 0;
         }
         _prevConDirRef.current = _rawCon.direction;
         const _con = { ..._rawCon, direction: _stableConDirRef.current as 'LONG' | 'SHORT' | 'DIVIDED' };
@@ -11867,8 +12048,18 @@ export default function MainBrain() {
         p={p}
       />
 
-      {/* Bell toast — fixed bottom-centre banner, auto-dismisses after 4.5 s */}
-      {bellToast && (
+      {/* Opening bell pill — full-width bottom bar at 9:30 AM ET */}
+      {openingBell && (
+        <OpeningBellPill
+          state={openingBell}
+          p={p}
+          onDismiss={() => setOpeningBell(null)}
+        />
+      )}
+
+      {/* Bell toast — fixed bottom-centre banner, auto-dismisses after 4.5 s.
+          Offset upward when the opening bell pill is visible so they don't overlap. */}
+      {bellToast && !openingBell && (
         <BellToast data={bellToast} onDismiss={() => setBellToast(null)} />
       )}
 

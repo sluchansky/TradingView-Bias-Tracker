@@ -38,6 +38,8 @@ export const SoundEvent = {
   SYSTEM_ONLINE: 'SYSTEM_ONLINE',
   /** Connection lost / system went offline. */
   SYSTEM_OFFLINE: 'SYSTEM_OFFLINE',
+  /** NYSE-style opening bell at 9:30 AM ET. */
+  MARKET_OPEN: 'MARKET_OPEN',
 } as const;
 
 export type SoundEventType = typeof SoundEvent[keyof typeof SoundEvent];
@@ -53,6 +55,7 @@ const THROTTLE_MS: Record<string, number> = {
   ERROR:            5_000,
   SYSTEM_ONLINE:   10_000,
   SYSTEM_OFFLINE:  10_000,
+  MARKET_OPEN:  3_600_000,  // once per session — caller also gates on date
 };
 
 // ── Singleton class ───────────────────────────────────────────────────────────
@@ -157,6 +160,7 @@ class AudioManager {
         case SoundEvent.ERROR:           this._playError(ctx);           break;
         case SoundEvent.SYSTEM_ONLINE:   this._playSystemOnline(ctx);    break;
         case SoundEvent.SYSTEM_OFFLINE:  this._playSystemOffline(ctx);   break;
+        case SoundEvent.MARKET_OPEN:     this._playMarketOpen(ctx);      break;
       }
     } catch {/* synthesis errors must never propagate to callers */}
   }
@@ -274,6 +278,44 @@ class AudioManager {
     this._tone(ctx, 659, t,        0.14, 0.08, 0.010, 0.12);
     this._tone(ctx, 554, t + 0.14, 0.14, 0.08, 0.010, 0.12);
     this._tone(ctx, 440, t + 0.28, 0.16, 0.06, 0.010, 0.17);
+  }
+
+  /**
+   * MARKET_OPEN — NYSE-style opening bell.
+   * Five rapid strikes (like the real exchange floor bell), each with
+   * a C-major bell chord (fundamental + octave + 3rd + 5th + 2nd octave).
+   * Fast 5 ms attack, long 2.2 s exponential decay per strike.
+   * Sounds distinct and ceremonial — impossible to confuse with any alert.
+   */
+  private _playMarketOpen(ctx: AudioContext): void {
+    const vol = this._volume;
+    // 5 strikes, 420 ms apart — matches the real NYSE cadence
+    const strikes = [0, 0.42, 0.84, 1.26, 1.68];
+    // Bell partials: fundamental C5 + harmonics
+    const partials: Array<{ freq: number; gain: number }> = [
+      { freq: 523.25, gain: 0.42 }, // C5  — fundamental
+      { freq: 1046.5, gain: 0.26 }, // C6  — octave
+      { freq: 1318.5, gain: 0.17 }, // E6  — major third
+      { freq: 1568.0, gain: 0.10 }, // G6  — fifth
+      { freq: 2093.0, gain: 0.05 }, // C7  — second octave shimmer
+    ];
+    strikes.forEach(delay => {
+      partials.forEach(({ freq, gain }) => {
+        const osc = ctx.createOscillator();
+        const g   = ctx.createGain();
+        osc.connect(g);
+        g.connect(ctx.destination);
+        osc.type = 'sine';
+        osc.frequency.value = freq;
+        const t0 = ctx.currentTime + delay;
+        g.gain.setValueAtTime(0, t0);
+        g.gain.linearRampToValueAtTime(gain * vol, t0 + 0.005); // 5 ms attack
+        g.gain.exponentialRampToValueAtTime(0.0001, t0 + 2.2);  // 2.2 s bell decay
+        osc.start(t0);
+        osc.stop(t0 + 2.25);
+        osc.onended = () => { try { osc.disconnect(); g.disconnect(); } catch {/* noop */} };
+      });
+    });
   }
 }
 
