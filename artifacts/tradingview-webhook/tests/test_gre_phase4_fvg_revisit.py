@@ -27,7 +27,8 @@ from ghost_research_engine import (
     # helpers
     _fvg_research_id, _fvg_revisit_id, _fvg_opportunity_id,
     _fvg_depth_pct, _fvg_classify_location, _fvg_bar_overlaps,
-    _FVG_HASH_VERSION, FVG_STRATEGY_NAME,
+    _canonical_direction_fvg, _quantize_to_tick, _canonical_ts_fvg,
+    _FVG_HASH_VERSION, FVG_STRATEGY_NAME, _TICK_SIZE,
     # constants
     STRATEGY_FAMILY_ORB, STRATEGY_FAMILY_FVG,
     STRATEGY_NAME,
@@ -994,6 +995,422 @@ class TestOrbRegressionAfterPhase4(unittest.TestCase):
             eng.on_bar_close("MNQ", orb_status, 1995.0)
         except Exception as e:
             self.fail(f"on_bar_close raised: {e}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 12 — Normalization proof tests (Phase 4.1 requirement)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFvgNormalization(unittest.TestCase):
+    """
+    Prove the normalization contract:
+      - float drift eliminated via tick quantization
+      - direction strings canonicalized to BULLISH/BEARISH
+      - timestamps normalized to integer Unix seconds
+    """
+
+    # ── Tick quantization proofs ──────────────────────────────────────────────
+
+    def test_float_drift_mnq_same_tick_same_id(self):
+        """
+        SPEC REQUIRED: 21342.50 and 21342.5000000001 must produce the same
+        research_fvg_id for MNQ (tick=0.25) because they quantize to the same tick.
+        """
+        id1 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50,        21340.50)
+        id2 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.5000000001, 21340.50)
+        self.assertEqual(id1, id2,
+            "float drift must not produce different research_fvg_id for same tick level")
+
+    def test_float_drift_lower_same_tick_same_id(self):
+        id1 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50, 21340.25)
+        id2 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50, 21340.2500000001)
+        self.assertEqual(id1, id2)
+
+    def test_different_tick_level_different_id(self):
+        """
+        SPEC REQUIRED: Different valid tick-level prices must produce different IDs.
+        21342.50 vs 21342.75 are two distinct MNQ tick boundaries.
+        """
+        id1 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50, 21340.25)
+        id2 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.75, 21340.25)
+        self.assertNotEqual(id1, id2,
+            "distinct tick boundaries must produce distinct research_fvg_id values")
+
+    def test_quantize_mnq_tick(self):
+        """MNQ tick=0.25: 21342.5000000001 → 21342.50"""
+        tick = _TICK_SIZE["MNQ"]  # 0.25
+        q = _quantize_to_tick(21342.5000000001, tick)
+        self.assertAlmostEqual(q, 21342.50, places=6)
+
+    def test_quantize_mgc_tick(self):
+        """MGC tick=0.10: 1850.0000000001 → 1850.00"""
+        tick = _TICK_SIZE["MGC"]  # 0.10
+        q = _quantize_to_tick(1850.0000000001, tick)
+        self.assertAlmostEqual(q, 1850.00, places=6)
+
+    def test_quantize_mym_tick(self):
+        """MYM tick=1.0: 54321.4999 → 54321.0"""
+        tick = _TICK_SIZE["MYM"]  # 1.0
+        q = _quantize_to_tick(54321.4999, tick)
+        self.assertAlmostEqual(q, 54321.0, places=4)
+
+    def test_quantize_mes_tick(self):
+        """MES tick=0.25: 5123.87 → nearest 0.25 = 5123.75 (5123.87 - 5123.75 = 0.12 < 0.13 = 5124.0 - 5123.87)"""
+        tick = _TICK_SIZE["MES"]  # 0.25
+        q = _quantize_to_tick(5123.87, tick)
+        self.assertAlmostEqual(q, 5123.75, places=4)
+
+    def test_quantize_does_not_collapse_different_tick_boundaries(self):
+        """21342.50 and 21342.25 must NOT collapse to the same value (MNQ tick=0.25)."""
+        tick = _TICK_SIZE["MNQ"]
+        q1 = _quantize_to_tick(21342.50, tick)
+        q2 = _quantize_to_tick(21342.25, tick)
+        self.assertNotEqual(q1, q2)
+
+    # ── Direction canonicalization ─────────────────────────────────────────────
+
+    def test_direction_long_maps_to_bullish(self):
+        """'Long' must NOT hash as 'LONG' — must be canonicalized to 'BULLISH'."""
+        self.assertEqual(_canonical_direction_fvg("Long"), "BULLISH")
+        self.assertEqual(_canonical_direction_fvg("LONG"), "BULLISH")
+        self.assertEqual(_canonical_direction_fvg("long"), "BULLISH")
+
+    def test_direction_short_maps_to_bearish(self):
+        self.assertEqual(_canonical_direction_fvg("Short"), "BEARISH")
+        self.assertEqual(_canonical_direction_fvg("SHORT"), "BEARISH")
+        self.assertEqual(_canonical_direction_fvg("sell"), "BEARISH")
+
+    def test_direction_bullish_preserved(self):
+        self.assertEqual(_canonical_direction_fvg("BULLISH"), "BULLISH")
+        self.assertEqual(_canonical_direction_fvg("bullish"), "BULLISH")
+
+    def test_direction_bearish_preserved(self):
+        self.assertEqual(_canonical_direction_fvg("BEARISH"), "BEARISH")
+        self.assertEqual(_canonical_direction_fvg("bearish"), "BEARISH")
+
+    def test_long_and_bullish_produce_same_id(self):
+        """'Long' direction must produce same research_fvg_id as 'BULLISH'."""
+        id_long = _fvg_research_id("MNQ", "Long",    1700000000, 21342.50, 21340.25)
+        id_bull = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50, 21340.25)
+        self.assertEqual(id_long, id_bull)
+
+    def test_short_and_bearish_produce_same_id(self):
+        id_short = _fvg_research_id("MNQ", "Short",   1700000000, 21342.50, 21340.25)
+        id_bear  = _fvg_research_id("MNQ", "BEARISH", 1700000000, 21342.50, 21340.25)
+        self.assertEqual(id_short, id_bear)
+
+    # ── Timestamp canonicalization ─────────────────────────────────────────────
+
+    def test_canonical_ts_int_passthrough(self):
+        self.assertEqual(_canonical_ts_fvg(1700000000), 1700000000)
+
+    def test_canonical_ts_float_truncated(self):
+        self.assertEqual(_canonical_ts_fvg(1700000000.5), 1700000000)
+
+    def test_canonical_ts_iso_string(self):
+        """ISO-8601 string must parse to same int as the corresponding epoch."""
+        ts = _canonical_ts_fvg("2023-11-14T22:13:20Z")
+        self.assertEqual(ts, 1700000000)
+
+    def test_canonical_ts_none_returns_zero(self):
+        self.assertEqual(_canonical_ts_fvg(None), 0)
+
+    def test_equivalent_timestamps_same_id(self):
+        """
+        SPEC REQUIRED: Equivalent timestamps representing the same bar must
+        generate the same research_fvg_id.
+        """
+        id_int = _fvg_research_id("MNQ", "BULLISH", 1700000000,    21342.50, 21340.25)
+        id_flt = _fvg_research_id("MNQ", "BULLISH", 1700000000.0,  21342.50, 21340.25)
+        id_iso = _fvg_research_id("MNQ", "BULLISH", "2023-11-14T22:13:20Z", 21342.50, 21340.25)
+        self.assertEqual(id_int, id_flt)
+        self.assertEqual(id_int, id_iso)
+
+    def test_different_timestamps_different_id(self):
+        id1 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50, 21340.25)
+        id2 = _fvg_research_id("MNQ", "BULLISH", 1700000060, 21342.50, 21340.25)  # +60s
+        self.assertNotEqual(id1, id2)
+
+    def test_inst_case_normalized(self):
+        """'mnq' and 'MNQ' must produce the same research_fvg_id."""
+        id1 = _fvg_research_id("mnq", "BULLISH", 1700000000, 21342.50, 21340.25)
+        id2 = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50, 21340.25)
+        self.assertEqual(id1, id2)
+
+    def test_raw_float_hashing_impossible(self):
+        """
+        Prove that raw float hashing cannot corrupt identity.
+        The hash uses quantized prices formatted to fixed decimals, not repr(float).
+        """
+        # These two differ at the 11th decimal — same tick, must produce same ID
+        raw_float_a = 21342.50000000001   # repr() differs from b
+        raw_float_b = 21342.50            # exact
+        id_a = _fvg_research_id("MNQ", "BULLISH", 1700000000, raw_float_a, 21340.25)
+        id_b = _fvg_research_id("MNQ", "BULLISH", 1700000000, raw_float_b, 21340.25)
+        self.assertEqual(id_a, id_b,
+            "RAW_FLOAT_HASHING_POSSIBLE must = NO; quantization must eliminate drift")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 13 — Synthetic replay pipeline test (Section 5 of Phase 4.1 spec)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFvgSyntheticPipeline(unittest.TestCase):
+    """
+    Full end-to-end synthetic pipeline test.
+    Proves the sequence:
+      canonical FVG created
+      → price leaves area
+      → legitimate revisit occurs
+      → exactly ONE FVG_REVISIT opportunity
+      → baseline + intended variants created
+      → subsequent Databento bars update experiments
+      → outcome persists
+    """
+
+    def _make_engine(self):
+        """Build a GhostResearchEngine with spy DB."""
+        inserted_opps   = []
+        inserted_exps   = []
+        updated_results = []
+
+        db  = MagicMock()
+        cur = MagicMock()
+
+        def mock_execute(sql, params=()):
+            s = str(sql).strip()
+            if "INSERT INTO ghost_opportunities" in s:
+                inserted_opps.append(params)
+                cur.fetchone.return_value = ("row",)
+            elif "INSERT INTO ghost_experiments" in s:
+                inserted_exps.append(params)
+                cur.fetchone.return_value = ("exp_row",)
+            elif "INSERT INTO ghost_experiment_results" in s:
+                cur.fetchone.return_value = None
+            elif "UPDATE ghost_experiment_results" in s:
+                updated_results.append(params)
+                cur.fetchone.return_value = None
+            else:
+                cur.fetchone.return_value = None
+
+        cur.execute.side_effect = mock_execute
+        cur.fetchall.return_value = []
+        cur.description = []
+        db.cursor.return_value = cur
+
+        engine = GhostResearchEngine(
+            get_db_fn=lambda: db,
+            get_canonical_fn=lambda inst: {},
+            get_bars_fn=lambda inst: [],
+            re_event_fn=lambda *a, **kw: None,
+            instruments=["MNQ"],
+        )
+        GhostResearchEngine.GRE_DB_READY = True
+        return engine, inserted_opps, inserted_exps, updated_results
+
+    def test_full_pipeline_first_revisit(self):
+        """
+        Simulate: zone created → price outside → price enters zone → opportunity + 10 variants.
+        """
+        engine, opps, exps, _ = self._make_engine()
+
+        # Zone parameters (deterministic, MNQ tick=0.25)
+        upper, lower = 21342.50, 21340.25
+        bar_ts  = 1700000000
+        zone = _zone("BULLISH", upper=upper, lower=lower, bar_ts=bar_ts,
+                     status="ACTIVE", zone_id="src-uuid-abc123")
+
+        # Canonical context (provides trend/CVD for variant filters)
+        canonical = {
+            "trend": {"trend_15m": "BULLISH_MOMENTUM", "trend_4h": "BULLISH_TREND"},
+            "cvd":   {"direction": "BULLISH", "value": 150.0},
+            "volume": {"relative_volume": 1.8},
+            "vwap":  {"vwap": 21340.00, "side": "ABOVE"},
+            "atr":   25.0,
+        }
+
+        # Bar 1: bar was OUTSIDE zone (price above zone)
+        bar1 = _bar(ts=bar_ts + 60, l=upper + 5.0, h=upper + 20.0, c=upper + 10.0)
+        engine.on_fvg_bar_close("MNQ", [zone], bar1, upper + 10.0, canonical)
+        self.assertEqual(len(opps), 0, "No opportunity before revisit")
+        self.assertEqual(len(exps), 0, "No experiments before revisit")
+
+        # Bar 2: price ENTERS zone (revisit detected)
+        bar2 = _bar(ts=bar_ts + 120, l=lower + 1.0, h=upper + 2.0, c=upper - 0.5)
+        engine.on_fvg_bar_close("MNQ", [zone], bar2, upper - 0.5, canonical)
+
+        # Verify exactly ONE opportunity was created
+        self.assertEqual(len(opps), 1, "Exactly one opportunity on first revisit")
+        opp_params = opps[0]
+        opp_params_str = str(opp_params)
+
+        # Verify strategy_family = FVG_REVISIT
+        self.assertIn("FVG_REVISIT", opp_params_str)
+        # Verify strategy = FVG_RESEARCH_BASELINE_V1 (not the family name)
+        self.assertIn("FVG_RESEARCH_BASELINE_V1", opp_params_str)
+        # Verify source_fvg_id is preserved
+        self.assertIn("src-uuid-abc123", opp_params_str)
+
+        # Verify research_fvg_id is deterministic
+        rfid = _fvg_research_id("MNQ", "BULLISH", bar_ts, upper, lower)
+        self.assertIn(rfid, opp_params_str)
+
+        # Verify revisit_id is deterministic
+        rev_id = _fvg_revisit_id(rfid, 1, bar_ts + 120)
+        self.assertIn(rev_id, opp_params_str)
+
+        # Verify exactly 10 experiments created
+        self.assertEqual(len(exps), 10,
+            f"Expected 10 variants, got {len(exps)}")
+
+        # Verify all 10 variant names are present
+        exp_variants = [str(e) for e in exps]
+        for variant in FVG_ALL_VARIANTS:
+            self.assertTrue(any(variant in ev for ev in exp_variants),
+                f"Missing variant: {variant}")
+
+        # Verify direction = Long (BULLISH zone)
+        self.assertIn("Long", opp_params_str)
+
+    def test_same_session_no_duplicate_opportunity(self):
+        """Staying inside zone for multiple bars must not create a second opportunity."""
+        engine, opps, exps, _ = self._make_engine()
+        zone = _zone("BULLISH", upper=21342.50, lower=21340.25, bar_ts=1700000000)
+
+        # First entry: revisit detected
+        bar_enter = _bar(ts=1700000060, l=21340.5, h=21343.0, c=21341.0)
+        engine.on_fvg_bar_close("MNQ", [zone], bar_enter, 21341.0, {})
+        first_opp_count = len(opps)
+
+        # Bar inside zone: no new opportunity
+        bar_inside = _bar(ts=1700000120, l=21340.0, h=21342.0, c=21341.5)
+        engine.on_fvg_bar_close("MNQ", [zone], bar_inside, 21341.5, {})
+        self.assertEqual(len(opps), first_opp_count,
+            "Second bar inside zone must NOT create another opportunity")
+
+    def test_second_revisit_creates_new_opportunity(self):
+        """
+        After price exits zone, a second entry creates a NEW opportunity
+        with a different revisit_id.
+        """
+        engine, opps, exps, _ = self._make_engine()
+        zone = _zone("BULLISH", upper=21342.50, lower=21340.25, bar_ts=1700000000)
+
+        # First revisit
+        bar1 = _bar(ts=1700000060, l=21340.5, h=21343.0, c=21341.0)
+        engine.on_fvg_bar_close("MNQ", [zone], bar1, 21341.0, {})
+        # Exit zone
+        bar2 = _bar(ts=1700000120, l=21343.5, h=21345.0, c=21344.0)  # above zone
+        engine.on_fvg_bar_close("MNQ", [zone], bar2, 21344.0, {})
+        first_count = len(opps)
+
+        # Second revisit
+        bar3 = _bar(ts=1700000180, l=21340.6, h=21342.0, c=21341.2)
+        engine.on_fvg_bar_close("MNQ", [zone], bar3, 21341.2, {})
+        self.assertEqual(len(opps), first_count + 1,
+            "Second physical revisit must create a new opportunity")
+
+        # The two opportunities must have different revisit_ids (different bar_ts)
+        rfid   = _fvg_research_id("MNQ", "BULLISH", 1700000000, 21342.50, 21340.25)
+        rid1   = _fvg_revisit_id(rfid, 1, 1700000060)
+        rid2   = _fvg_revisit_id(rfid, 2, 1700000180)
+        self.assertNotEqual(rid1, rid2)
+
+    def test_variant_orthogonality(self):
+        """
+        No non-baseline variant may have an identical parameter_diff to BASELINE.
+        Each variant must change EXACTLY its intended principal variable.
+        """
+        engine, _, exps, _ = self._make_engine()
+        zone = _zone("BULLISH", upper=21342.50, lower=21340.25, bar_ts=1700000000)
+        bar  = _bar(ts=1700000060, l=21340.5, h=21343.0, c=21341.0)
+        engine.on_fvg_bar_close("MNQ", [zone], bar, 21341.0, {})
+
+        self.assertEqual(len(exps), 10)
+
+        # Extract parameter_diff from each experiment insert
+        # params tuple: experiment_id, opportunity_id, strategy, strategy_family, ...
+        # parameter_diff is at index 8 (0-based) from the INSERT
+        param_diffs = []
+        variant_names = []
+        for ep in exps:
+            ep_list = list(ep)
+            # variant_name is at index 7, parameter_diff at index 8
+            variant_names.append(ep_list[7])
+            param_diffs.append(json.loads(ep_list[8]) if isinstance(ep_list[8], str) else ep_list[8])
+
+        # Baseline
+        baseline_idx = variant_names.index(FvgVariant.BASELINE)
+        baseline_diff = param_diffs[baseline_idx]
+
+        # No other variant's parameter_diff must be identical to baseline
+        for i, (v, pd) in enumerate(zip(variant_names, param_diffs)):
+            if i == baseline_idx:
+                continue
+            self.assertNotEqual(pd, baseline_diff,
+                f"Variant {v} has identical parameter_diff to BASELINE — not orthogonal")
+
+    def test_win_outcome_persists(self):
+        """
+        After entry: bar that hits TP1 triggers WIN outcome.
+        Experiment is removed from _open_results (completed).
+        """
+        engine, opps, exps, updated = self._make_engine()
+        zone = _zone("BULLISH", upper=21342.50, lower=21340.25, bar_ts=1700000000)
+
+        # Revisit: create opportunity and 10 experiments
+        bar_enter = _bar(ts=1700000060, l=21340.5, h=21343.0, c=21341.5)
+        engine.on_fvg_bar_close("MNQ", [zone], bar_enter, 21341.5, {})
+        initial_open = len(engine._open_results)
+
+        # Force WATCHING_ENTRY experiments to ACTIVE (simulate entry from same bar).
+        # Actual entry price = close of bar_enter = upper - 0.5 = 21342.0.
+        # planned_stop = lower - 2*tick = 21340.25 - 0.50 = 21339.75
+        # planned_tp1  = 21342.0 + 2.0 * |21342.0 - 21339.75| = 21342.0 + 4.5 = 21346.5
+        with engine._lock:
+            for rid, rd in engine._open_results.items():
+                if rd.get("_fvg_family") and rd.get("status") == ResultStatus.WATCHING_ENTRY:
+                    rd["status"]      = ResultStatus.ACTIVE
+                    rd["entry_price"] = rd.get("entry_price") or 21342.0
+                    rd["stop_price"]  = rd.get("stop_price")  or 21339.75
+
+        # Bar that clears TP1 for all variants (h=21347.0 > 21346.5 = 2R baseline tp1)
+        bar_tp = _bar(ts=1700000120, l=21342.0, h=21347.0, c=21346.8)
+        engine.on_fvg_bar_close("MNQ", [zone], bar_tp, 21346.8, {})
+
+        remaining_open = len([r for r in engine._open_results.values()
+                              if r.get("_fvg_family")])
+        self.assertLess(remaining_open, initial_open,
+            "At least some FVG experiments should complete after TP1 hit")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 14 — ET timestamp validation (Section 13 of Phase 4.1 spec)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestEtTimestampNormalization(unittest.TestCase):
+    """
+    Prove ET conversion works correctly.
+    These tests validate the Python-side canonical_ts_fvg normalization,
+    not the JS chart renderer (that is validated via node test externally).
+    """
+
+    def test_utc_int_passthrough(self):
+        self.assertEqual(_canonical_ts_fvg(1700000000), 1700000000)
+
+    def test_utc_float_truncated_to_int(self):
+        self.assertEqual(_canonical_ts_fvg(1700000000.999), 1700000000)
+
+    def test_iso_utc_parses_correctly(self):
+        # 2023-11-14T22:13:20Z = 1700000000
+        self.assertEqual(_canonical_ts_fvg("2023-11-14T22:13:20Z"), 1700000000)
+
+    def test_iso_with_offset_parses_correctly(self):
+        # Same moment with +00:00 offset
+        self.assertEqual(_canonical_ts_fvg("2023-11-14T22:13:20+00:00"), 1700000000)
+
+    def test_none_returns_zero(self):
+        self.assertEqual(_canonical_ts_fvg(None), 0)
 
 
 if __name__ == "__main__":

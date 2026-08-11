@@ -1,0 +1,480 @@
+PHASE 4.1 — ORB + FVG LIVE RESEARCH VALIDATION
+
+Phase 4 implementation is complete.
+
+DO NOT add Liquidity Sweep or any third research family yet.
+
+This task is validation and correction only.
+
+We need to prove that the multi-family Ghost Research Engine behaves correctly with actual FVG events and actual database rows.
+
+==================================================
+1. VERIFY DETERMINISTIC FVG NORMALIZATION
+==================================================
+
+Audit _fvg_research_id().
+
+The research ID must normalize all inputs BEFORE hashing.
+
+Required normalization:
+
+instrument:
+canonical uppercase instrument
+
+direction:
+canonical BULLISH / BEARISH
+
+creation timestamp:
+canonical bar timestamp / UTC representation
+
+upper/lower:
+quantize to the instrument's valid tick size BEFORE string/hash serialization
+
+MGC tick = authoritative project tick
+MNQ tick = authoritative project tick
+MES tick = authoritative project tick
+MYM tick = authoritative project tick
+
+Do not hash uncontrolled Python float representations.
+
+Also include an explicit FVG research identity/version in the hash contract if not already present.
+
+Add tests proving:
+
+21342.50
+21342.5000000001
+
+produce the same normalized MNQ price identity when both quantize to the same valid tick.
+
+Equivalent timestamps representing the same bar must generate the same research_fvg_id.
+
+Different valid price levels must generate different IDs.
+
+If this is already implemented, prove it from code/tests and make no unnecessary changes.
+
+==================================================
+2. RESEARCH IDENTITY CONTRACT
+==================================================
+
+Confirm all three identities are independently preserved:
+
+source_fvg_id
+research_fvg_id
+revisit_id
+
+Verify:
+
+source UUID may change on replay
+research_fvg_id stays identical
+same physical revisit stays identical
+later legitimate revisit gets a new revisit_id
+
+==================================================
+3. DATABASE VERIFICATION
+==================================================
+
+Inspect the live schemas.
+
+Confirm first-class columns exist in ghost_opportunities:
+
+strategy_family
+strategy
+instrument
+direction
+source_fvg_id
+research_fvg_id
+revisit_id
+
+Confirm ghost_experiments has strategy_family.
+
+Confirm existing ORB rows were safely backfilled:
+
+strategy_family = 09:30_ORB
+
+Do not alter their original strategy values.
+
+==================================================
+4. FAMILY FILTER VERIFICATION
+==================================================
+
+Exercise the real APIs:
+
+family=09:30_ORB
+family=FVG_REVISIT
+family=ALL / no filter
+
+Verify no family leakage.
+
+FVG query must not return ORB experiments.
+
+ORB query must not return FVG experiments.
+
+==================================================
+5. FVG LIVE PIPELINE
+==================================================
+
+Observe actual Databento/FVG activity.
+
+Verify this sequence when available:
+
+canonical FVG created
+→ no Ghost opportunity yet
+→ price leaves area
+→ legitimate revisit occurs
+→ exactly ONE FVG_REVISIT opportunity
+→ baseline + intended variants created
+→ subsequent Databento bars update experiments
+→ outcome persists
+
+Do not manufacture a real-market conclusion from synthetic data.
+
+If no natural revisit occurs during the validation window, use a deterministic synthetic/replay test IN ADDITION to keeping live collection enabled.
+
+==================================================
+6. OPPORTUNITY SNAPSHOT QUALITY
+==================================================
+
+Inspect one actual or deterministic replay FVG opportunity.
+
+Verify frozen values include:
+
+strategy_family
+strategy
+instrument
+direction
+
+source_fvg_id
+research_fvg_id
+revisit_id
+
+FVG upper
+FVG lower
+midpoint
+gap size
+gap size ticks
+gap / ATR
+
+creation time
+revisit time
+age
+touch/revisit number
+mitigation/fill percentage
+interaction depth
+
+15m trend
+4H trend
+VWAP
+CVD
+RVOL
+canonical structure
+canonical sweep
+
+Decision Contract dc_* context
+
+Missing fields must remain UNKNOWN/null.
+
+Future bars must not mutate the frozen snapshot.
+
+==================================================
+7. VARIANT AUDIT
+==================================================
+
+List the exact ten FVG experiments generated for one opportunity.
+
+For every variant show:
+
+variant name
+parameter_diff
+entry rule
+stop rule
+target rule
+filter rule
+
+Prove that each non-baseline experiment changes only its intended principal variable.
+
+No duplicate variant may be equivalent to BASELINE.
+
+==================================================
+8. FVG_RESEARCH_BASELINE_V1
+==================================================
+
+Since the audit found no complete existing live FVG trading strategy, document the exact research baseline.
+
+Return explicitly:
+
+opportunity definition
+entry trigger
+entry price
+confirmation requirement
+stop location
+target
+expiration rule
+pre-entry invalidation rule
+revisit eligibility
+first-touch/later-touch behavior
+
+No subjective terms such as:
+
+strong rejection
+good candle
+clean setup
+
+unless they are backed by deterministic definitions.
+
+==================================================
+9. OUTCOME VALIDATION
+==================================================
+
+Validate:
+
+NO_ENTRY
+
+INVALIDATED_BEFORE_ENTRY
+
+EXPIRED
+
+WIN
+
+LOSS
+
+BREAKEVEN if supported
+
+same-bar stop/target ambiguity
+
+MFE
+
+MAE
+
+gross R
+cost R
+net R
+
+Use the same conservative policies as ORB research.
+
+==================================================
+10. RESTART VALIDATION
+==================================================
+
+Create/identify active FVG experiments.
+
+Restart the research service.
+
+Confirm:
+
+active FVG experiments restore
+
+strategy_family remains correct
+
+research_fvg_id remains correct
+
+revisit_id remains correct
+
+last processed bar is preserved
+
+old bars are not processed twice
+
+==================================================
+11. ORB REGRESSION
+==================================================
+
+Verify adding FVG has not altered:
+
+ORB opportunity generation
+ORB variant generation
+ORB outcome processing
+ORB statistics
+ORB family filtering
+ORB restart restore
+
+09:30_ORB must remain operational.
+
+==================================================
+12. RESEARCH HEALTH
+==================================================
+
+Verify Research Health reports separately:
+
+ORB opportunities
+FVG opportunities
+
+ORB active
+FVG active
+
+ORB completed
+FVG completed
+
+No opaque combined-only totals.
+
+==================================================
+13. ET CHART VALIDATION
+==================================================
+
+Code already uses America/New_York.
+
+Now perform rendered validation.
+
+Verify a known summer timestamp:
+
+05:30 UTC
+→ 01:30 ET
+
+Verify a known winter timestamp uses EST correctly.
+
+Confirm BOTH:
+
+x-axis labels
+bar/status timestamp
+
+Do not report visual PASS until rendered evidence is actually observed.
+
+==================================================
+14. SAFETY
+==================================================
+
+Confirm:
+
+FVG ghost broker orders = 0
+
+ORB ghost broker orders = 0
+
+09:30 ORB live orders = 0
+
+FVG research cannot call execution gateway
+
+FVG research cannot modify live FVG state/config
+
+FVG research cannot modify strategy weights
+
+Decision Contract remains shadow
+
+Live trading behavior changed = NO
+
+==================================================
+15. TEST / REGRESSION
+==================================================
+
+Run:
+
+FVG Research tests
+GRE tests
+ORB tests
+Decision Contract tests
+FVG engine tests
+canonical state
+structure dedup
+sweep dedup
+
+PARITY
+SCALP GOLDEN
+DUAL-SIM
+BREAKOUT
+
+No new failures.
+
+==================================================
+COMPLETION REPORT
+==================================================
+
+PHASE 4 LIVE VALIDATION:
+PASS/FAIL
+
+MULTI-FAMILY GRE:
+PASS/FAIL
+
+STRATEGY_FAMILY DB CONTRACT:
+PASS/FAIL
+
+ORB BACKFILL:
+PASS/FAIL
+
+RAW FLOAT HASHING POSSIBLE:
+MUST = NO
+
+TICK-NORMALIZED FVG ID:
+PASS/FAIL
+
+CANONICAL TIMESTAMP ID:
+PASS/FAIL
+
+SOURCE UUID INDEPENDENCE:
+PASS/FAIL
+
+SAME REPLAY SAME FVG ID:
+PASS/FAIL
+
+SAME REVISIT DEDUP:
+PASS/FAIL
+
+LATER REVISIT NEW ID:
+PASS/FAIL
+
+FVG BASELINE DEFINITION:
+
+FVG VARIANTS:
+
+LIVE/REPLAY FVG OPPORTUNITIES:
+MGC =
+MNQ =
+MES =
+MYM =
+
+FVG EXPERIMENTS CREATED:
+
+ACTIVE:
+COMPLETED:
+NO_ENTRY:
+INVALIDATED_BEFORE_ENTRY:
+EXPIRED:
+WIN:
+LOSS:
+
+FROZEN SNAPSHOT:
+PASS/FAIL
+
+DECISION CONTRACT SNAPSHOT:
+PASS/FAIL
+
+RESTART RESTORE:
+PASS/FAIL
+
+ORB REGRESSION:
+PASS/FAIL
+
+FAMILY API FILTER:
+PASS/FAIL
+
+ET X-AXIS RENDERED:
+PASS/FAIL
+
+ET STATUS TIME RENDERED:
+PASS/FAIL
+
+FVG TESTS:
+
+GRE TESTS:
+
+ORB TESTS:
+
+PARITY:
+PASS/FAIL
+
+SCALP GOLDEN:
+PASS/FAIL
+
+DUAL-SIM:
+PASS/FAIL
+
+BREAKOUT:
+PASS/FAIL
+
+FVG GHOST BROKER ORDERS:
+MUST = 0
+
+LIVE BEHAVIOR CHANGED:
+MUST = NO
+
+SAFE TO LET ORB + FVG ACCUMULATE REAL EVIDENCE:
+YES/NO
+
+NEXT FAMILY:
+identify only; DO NOT implement

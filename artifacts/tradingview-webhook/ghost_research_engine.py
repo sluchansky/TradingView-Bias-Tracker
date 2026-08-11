@@ -264,30 +264,110 @@ def _experiment_id(opportunity_id: str, variant: str) -> str:
 def _result_id(experiment_id: str) -> str:
     return f"RES_{experiment_id}"
 
-# ── Phase 4: FVG identity helpers ─────────────────────────────────────────────
+# ── Phase 4: FVG identity normalization helpers ───────────────────────────────
+#
+# All inputs to _fvg_research_id MUST be normalized before hashing.
+# Changing any normalization rule requires bumping _FVG_HASH_VERSION.
 
-_FVG_HASH_VERSION = "V1"  # bump if hashing logic changes (invalidates replay identity)
+_FVG_HASH_VERSION = "V1"  # bump → ALL stored research_fvg_id values become stale
+
+def _canonical_direction_fvg(direction: str) -> str:
+    """
+    Normalize any direction string to canonical "BULLISH" or "BEARISH".
+    Raw strings like "Long", "SHORT", "Buy" must not appear in the hash key.
+    """
+    d = str(direction).strip().upper()
+    if d in ("BULLISH", "BULL", "LONG", "L", "BUY", "UP"):
+        return "BULLISH"
+    if d in ("BEARISH", "BEAR", "SHORT", "S", "SELL", "DOWN"):
+        return "BEARISH"
+    return d  # unknown: pass-through; different unknowns produce different IDs (fail-visible)
+
+def _quantize_to_tick(price: float, tick: float) -> float:
+    """
+    Round price to the nearest valid tick boundary.
+    Eliminates raw float representation drift:
+        21342.5000000001  →  same tick as  21342.50  (MNQ 0.25 tick)
+
+    Invariant: different valid tick boundaries always produce different floats.
+    """
+    if tick <= 0:
+        return price
+    n = round(price / tick)         # nearest integer multiple of tick
+    q = n * tick                    # quantized value
+    # Suppress residual floating-point noise from the multiply
+    # tick's own decimal places: e.g. 0.25 → 2 places; 0.10 → 2 places; 1.0 → 0 places
+    decimals = max(0, -int(math.floor(math.log10(tick)))) + 2 if tick < 1 else 2
+    return round(q, decimals)
+
+def _canonical_ts_fvg(bar_ts: Any) -> int:
+    """
+    Normalize a bar timestamp to integer Unix seconds.
+    Accepts int, float, ISO-8601 str. Returns 0 for None/unparseable.
+    Fractional seconds (sub-second timestamps) are truncated to whole seconds.
+    """
+    if bar_ts is None:
+        return 0
+    if isinstance(bar_ts, int):
+        return bar_ts
+    if isinstance(bar_ts, float):
+        return int(bar_ts)
+    # ISO string: "2024-01-01T09:30:00Z" or "2024-01-01T09:30:00+00:00"
+    try:
+        return int(datetime.fromisoformat(
+            str(bar_ts).replace("Z", "+00:00")
+        ).timestamp())
+    except Exception:
+        pass
+    try:
+        return int(float(str(bar_ts)))
+    except Exception:
+        return 0
+
+# ── FVG identity functions ─────────────────────────────────────────────────────
 
 def _fvg_research_id(inst: str, direction: str, bar_ts: Any, upper: float, lower: float) -> str:
     """
     Deterministic 24-hex research identity for an FVG zone.
-    Based only on IMMUTABLE creation attributes — touch_count/status/mitigation excluded.
-    Same Databento bars replayed → same research_fvg_id regardless of source_fvg_id (uuid4).
+
+    NORMALIZATION CONTRACT (frozen at V1; bump _FVG_HASH_VERSION to revise):
+      inst      → str.upper()                             e.g. "MNQ"
+      direction → _canonical_direction_fvg()              "BULLISH" or "BEARISH"
+      bar_ts    → _canonical_ts_fvg() → int Unix seconds  e.g. 1700000000
+      upper     → _quantize_to_tick(price, inst_tick)     e.g. 21342.50 (not 21342.5000000001)
+      lower     → same quantization
+
+    Guarantees:
+      • Same Databento bars replayed → same ID regardless of source_fvg_id (uuid4).
+      • Different valid tick-level price levels → always different IDs.
+      • Raw Python float representation drift cannot produce different IDs.
     """
-    key = f"FVGR_{_FVG_HASH_VERSION}|{inst}|{direction.upper()}|{bar_ts}|{upper:.4f}|{lower:.4f}"
+    tick    = _TICK_SIZE.get(inst.upper(), 0.25)
+    q_upper = _quantize_to_tick(upper, tick)
+    q_lower = _quantize_to_tick(lower, tick)
+    c_dir   = _canonical_direction_fvg(direction)
+    c_ts    = _canonical_ts_fvg(bar_ts)
+    key = (
+        f"FVGR_{_FVG_HASH_VERSION}"
+        f"|{inst.upper()}|{c_dir}|{c_ts}"
+        f"|{q_upper:.8f}|{q_lower:.8f}"
+    )
     return hashlib.sha256(key.encode()).hexdigest()[:24]
 
 def _fvg_revisit_id(rfid: str, revisit_n: int, revisit_bar_ts: Any) -> str:
     """
     Deterministic revisit session identity.
-    Same revisit callback → same revisit_id.  Later revisit → different revisit_id.
+    Same physical revisit → same revisit_id.
+    Later legitimate revisit (different bar_ts or revisit_n) → different revisit_id.
     """
-    key = f"FVGR_VISIT_{_FVG_HASH_VERSION}|{rfid}|{revisit_n}|{revisit_bar_ts}|{FVG_STRATEGY_NAME}"
+    c_ts = _canonical_ts_fvg(revisit_bar_ts)
+    key  = f"FVGR_VISIT_{_FVG_HASH_VERSION}|{rfid}|{int(revisit_n)}|{c_ts}|{FVG_STRATEGY_NAME}"
     return hashlib.sha256(key.encode()).hexdigest()[:24]
 
 def _fvg_opportunity_id(inst: str, rfid: str, revisit_n: int, revisit_bar_ts: Any) -> str:
     """One ghost opportunity row per FVG per revisit session."""
-    key = f"FVGO_{_FVG_HASH_VERSION}|{inst}|{rfid}|{revisit_n}|{revisit_bar_ts}"
+    c_ts = _canonical_ts_fvg(revisit_bar_ts)
+    key  = f"FVGO_{_FVG_HASH_VERSION}|{inst.upper()}|{rfid}|{int(revisit_n)}|{c_ts}"
     return hashlib.sha256(key.encode()).hexdigest()[:24]
 
 def _fvg_depth_pct(zone: Dict, bar_low: float, bar_high: float) -> float:
@@ -2507,7 +2587,7 @@ class GhostResearchEngine:
             try:
                 self._fvg_process_one_experiment(
                     result_id, inst, zones_by_rfid,
-                    bar_ts, bar_low, bar_high, bar_c, canonical,
+                    bar_ts, bar_high, bar_low, bar_c, canonical,  # bar_h=high, bar_l=low
                 )
             except Exception as exc:
                 self._log.debug("GRE FVG process-experiment (%s): %s", result_id, exc)
