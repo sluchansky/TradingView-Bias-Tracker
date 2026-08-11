@@ -1,0 +1,970 @@
+PHASE 2 — GHOST RESEARCH & EVIDENCE ENGINE
+
+We have completed the Canonical Databento Market State foundation.
+
+The next objective is to turn the existing ghost/research infrastructure into a rigorous experimentation and evidence system.
+
+THIS PHASE MUST NOT CHANGE LIVE TRADING BEHAVIOR.
+
+Do not alter live strategy thresholds, scoring, READY/EARLY/WAIT, risk, execution, TradersPost, prop protection, arm-state behavior, ORB live behavior, or broker orders.
+
+The live system remains conservative.
+
+The ghost system becomes the experimental laboratory.
+
+==================================================
+1. AUDIT FIRST — NO CODE UNTIL COMPLETE
+==================================================
+
+Before modifying anything, audit the existing:
+
+- ghost_observations
+- ghost trades
+- research simulator
+- strategy research engine
+- Coach / learning engine
+- strategy weighting
+- journal
+- trade outcome tracking
+- MAE/MFE tracking
+- R-multiple calculations
+- existing strategy registry
+- ORB research implementation
+- canonical_market_state integration
+- promotion gate work
+- bootstrap / Monte Carlo statistics if already implemented
+- forward-validation infrastructure
+- versioning/provenance infrastructure
+
+Determine exactly what already exists.
+
+DO NOT create duplicate research systems.
+
+Produce an audit table:
+
+COMPONENT
+EXISTING IMPLEMENTATION
+STORAGE
+CURRENT INPUT SOURCE
+CURRENT OUTPUT
+REUSABLE?
+GAP
+
+==================================================
+2. CORE OBJECTIVE
+==================================================
+
+For every legitimate market opportunity, the research system should be able to answer:
+
+“What would have happened under multiple controlled strategy variants?”
+
+Target architecture:
+
+Databento
+   ↓
+Canonical Market State
+   ↓
+Opportunity Event
+   ↓
+Ghost Experiment Engine
+   ↓
+Multiple controlled variants
+   ↓
+Outcome tracking
+   ↓
+Evidence / statistics
+   ↓
+Promotion recommendation
+   ↓
+HUMAN REVIEW
+   ↓
+possible future live change
+
+Ghost research NEVER directly promotes itself into live trading.
+
+==================================================
+3. GHOST OPPORTUNITY RECORD
+==================================================
+
+Create or extend a canonical ghost opportunity record.
+
+Every opportunity needs a unique immutable ID.
+
+Suggested identity:
+
+date
+instrument
+strategy
+strategy_version
+market_event_id
+direction
+timestamp
+
+Record the market state AT THE MOMENT OF THE OPPORTUNITY.
+
+At minimum capture:
+
+instrument
+strategy
+strategy_version
+direction
+
+timestamp
+session
+time_of_day
+
+price
+
+15m trend
+4H trend
+trend alignment
+
+VWAP
+VWAP side
+VWAP distance
+
+ATR
+volatility regime
+
+volume
+relative volume
+
+delta
+CVD
+CVD direction
+
+market structure
+last BOS
+last CHoCH
+
+liquidity sweep state
+
+FVG state
+zone state
+
+ORB state
+
+edge score
+verdict
+
+all blockers
+all confirmations
+
+VIX context if already available in the application
+
+Never rewrite this entry snapshot afterward.
+
+It must represent what the system knew at that exact moment.
+
+==================================================
+4. RECORD REJECTED OPPORTUNITIES TOO
+==================================================
+
+This is extremely important.
+
+Do NOT only ghost setups that live trading accepted.
+
+Record opportunities rejected because of:
+
+VWAP
+CVD
+trend
+zone
+volatility
+session
+score threshold
+confirmation
+max chase
+risk
+etc.
+
+We need to eventually answer:
+
+“Did this gate save us money, or did it reject profitable trades?”
+
+However:
+
+Do not create meaningless ghost trades on every random bar.
+
+There must still be a legitimate base strategy opportunity/event.
+
+==================================================
+5. CONTROLLED VARIANTS
+==================================================
+
+One opportunity may spawn multiple ghost experiments.
+
+Experiments must change ONE clearly identified variable or an explicitly named parameter set.
+
+For example ORB:
+
+BASELINE
+close outside
+
+VARIANT A
+close + retest
+
+VARIANT B
+touch
+
+VARIANT C
+2 tick buffer
+
+VARIANT D
+4 tick buffer
+
+VARIANT E
+trend aligned only
+
+VARIANT F
+no HTF requirement
+
+VARIANT G
+VWAP aligned
+
+VARIANT H
+ignore VWAP
+
+VARIANT I
+TP = 1R
+
+VARIANT J
+TP = 1.5R
+
+VARIANT K
+TP = 2R
+
+Do NOT create a combinatorial explosion.
+
+Implement experiment-family budgets.
+
+Maximum simultaneous variants per opportunity must be configurable.
+
+Default conservative limit:
+
+MAX_GHOST_VARIANTS_PER_OPPORTUNITY = 12
+
+==================================================
+6. EXPERIMENT DEFINITION
+==================================================
+
+Every experiment must store:
+
+experiment_id
+opportunity_id
+
+strategy
+strategy_version
+
+experiment_family
+variant_name
+
+parameter_diff
+
+entry_rule
+stop_rule
+target_rule
+management_rule
+
+filter state
+
+created_at
+
+No experiment result may exist without the exact configuration that produced it.
+
+==================================================
+7. ENTRY SIMULATION
+==================================================
+
+Ghost execution must use actual subsequent Databento market data.
+
+Do not assume entry occurred just because a setup existed.
+
+Track:
+
+qualified timestamp
+entry trigger
+entry timestamp
+entry price
+
+If price never satisfies entry conditions:
+
+result = NO_ENTRY
+
+This matters especially for retest strategies and limit-style entries.
+
+==================================================
+8. REALISTIC SIMULATION
+==================================================
+
+Use the application's existing tick sizes and instrument specifications.
+
+Support configurable:
+
+slippage
+commissions
+fees
+
+Do not fabricate perfect fills.
+
+If an existing ghost execution simulator already handles this, reuse it.
+
+Record both:
+
+gross result
+net result after simulated costs
+
+==================================================
+9. OUTCOME TRACKING
+==================================================
+
+Every entered ghost trade should eventually have:
+
+entry
+stop
+targets
+
+exit timestamp
+exit reason
+exit price
+
+gross P&L
+net P&L
+
+R multiple
+
+MAE
+MFE
+
+bars held
+minutes held
+
+TP1 hit
+TP2 hit
+stop hit
+
+max favorable R
+max adverse R
+
+result:
+
+WIN
+LOSS
+BREAKEVEN
+NO_ENTRY
+EXPIRED
+INVALID_DATA
+
+==================================================
+10. PREVENT LOOKAHEAD BIAS
+==================================================
+
+Absolutely no future information may affect:
+
+entry qualification
+market-state snapshot
+strategy selection
+variant generation
+
+The engine may only use information that existed as of the opportunity timestamp.
+
+Future bars may only be used to determine outcomes.
+
+Add explicit lookahead-bias tests.
+
+==================================================
+11. STRATEGY-SPECIFIC EVIDENCE
+==================================================
+
+Do not pool all instruments together by default.
+
+Evidence needs dimensions such as:
+
+strategy
+instrument
+direction
+session
+time bucket
+15m trend
+4H trend
+trend alignment
+volatility regime
+VIX regime
+VWAP relationship
+CVD relationship
+volume regime
+
+Example:
+
+MNQ
+OPENING_RANGE_BREAKOUT
+09:40–10:30
+15m bullish
+4H bullish
+VWAP aligned
+
+must be measurable separately from:
+
+MGC
+OPENING_RANGE_BREAKOUT
+overnight
+mixed trend
+
+==================================================
+12. BASELINE VS VARIANT
+==================================================
+
+Every experiment family must have a defined BASELINE.
+
+Comparison should answer:
+
+variant expectancy minus baseline expectancy
+
+variant win rate minus baseline
+
+variant drawdown difference
+
+variant MAE/MFE improvement
+
+variant trade-frequency impact
+
+Do not promote a variant merely because its absolute performance looks good.
+
+Compare it against what it is intended to replace.
+
+==================================================
+13. STATISTICS
+==================================================
+
+Reuse the statistics engine already added if available.
+
+For each strategy/variant calculate:
+
+sample count
+
+win rate
+loss rate
+
+average R
+median R
+
+expectancy
+
+profit factor
+
+gross P&L
+net P&L
+
+average winner
+average loser
+
+largest winner
+largest loser
+
+max drawdown
+
+MAE
+MFE
+
+standard deviation
+
+bootstrap confidence interval for expectancy
+
+Monte Carlo drawdown estimate
+
+Do not claim significance from tiny samples.
+
+==================================================
+14. SAMPLE STATES
+==================================================
+
+Use explicit evidence states:
+
+INSUFFICIENT_DATA
+OBSERVING
+PROMISING
+VALIDATING
+READY_FOR_REVIEW
+REJECTED
+RETIRED
+
+These are RESEARCH states.
+
+They do NOT change live trading.
+
+Suggested minimum:
+
+<25 trades:
+INSUFFICIENT_DATA
+
+25–49:
+OBSERVING
+
+50+:
+eligible for deeper statistical validation
+
+Do not promote based on sample count alone.
+
+==================================================
+15. PROMOTION GATE
+==================================================
+
+Reuse the existing promotion-gate/state-machine infrastructure if already implemented.
+
+A strategy/variant should only reach:
+
+READY_FOR_REVIEW
+
+when it passes rigorous evidence requirements.
+
+At minimum consider:
+
+minimum sample count
+positive net expectancy
+acceptable profit factor
+bootstrap confidence
+drawdown
+Monte Carlo risk
+parameter stability
+recent performance
+out-of-sample / forward validation
+performance across multiple days
+
+Do NOT hard-code arbitrary final thresholds if equivalent canonical thresholds already exist.
+
+Audit existing rules first.
+
+==================================================
+16. HUMAN APPROVAL REQUIRED
+==================================================
+
+READY_FOR_REVIEW does NOT mean live.
+
+No research strategy or parameter change may automatically:
+
+change live configuration
+change strategy weights
+change scoring
+change gates
+change risk
+change execution
+
+Promotion into live behavior requires explicit operator approval in a later phase.
+
+==================================================
+17. FORWARD VALIDATION
+==================================================
+
+When a candidate reaches the appropriate research threshold:
+
+freeze its configuration.
+
+Create a versioned forward-validation candidate.
+
+Once frozen:
+
+do not optimize it using forward-validation data.
+
+Track forward results separately.
+
+This prevents repeated tuning to the test set.
+
+==================================================
+18. PARAMETER STABILITY
+==================================================
+
+Eventually the system must distinguish:
+
+real edge
+
+from
+
+one lucky parameter value.
+
+For numerical parameters, compare nearby values.
+
+Example:
+
+ORB breakout buffer:
+
+2 ticks
+3 ticks
+4 ticks
+5 ticks
+6 ticks
+
+A strategy that only works at exactly 4 ticks but collapses at 3 and 5 should receive a stability warning.
+
+Do this within reasonable experiment budgets.
+
+==================================================
+19. REPLICATION
+==================================================
+
+Measure whether an edge appears:
+
+on multiple days
+in multiple market regimes
+
+and, when logically appropriate:
+
+across related instruments
+
+Do NOT require an MGC strategy to work on MNQ if the strategy is instrument-specific.
+
+Replication rules must respect strategy intent.
+
+==================================================
+20. GHOST BUDGET CONTROLS
+==================================================
+
+Research must not overwhelm production.
+
+Add or reuse budgets for:
+
+max variants per opportunity
+max active ghost trades
+max DB writes per minute if necessary
+max research calculations per bar
+
+Production trading always has priority.
+
+Research failure must fail open and never block live processing.
+
+==================================================
+21. RESEARCH PROVENANCE
+==================================================
+
+Every result must be traceable back to:
+
+Databento bars used
+canonical market-state snapshot
+strategy version
+configuration version
+experiment definition
+entry simulation
+exit simulation
+cost assumptions
+
+If someone asks:
+
+“Why did this experiment show +0.38R expectancy?”
+
+we must be able to reconstruct the dataset.
+
+==================================================
+22. DASHBOARD
+==================================================
+
+Do not redesign the whole UI.
+
+Enhance the existing Research/Coach area.
+
+Show:
+
+Ghost Engine Health
+
+opportunities today
+experiments today
+active ghost positions
+completed experiments
+
+Top promising variants
+
+strategy
+instrument
+variant
+sample count
+expectancy
+profit factor
+max drawdown
+evidence state
+
+Also provide:
+
+Baseline vs Variant comparison
+
+and
+
+Recently rejected / promoted research candidates.
+
+Research states must be visually distinct from LIVE.
+
+Never make a ghost strategy look like a live recommendation.
+
+==================================================
+23. DETAILED DRILL-DOWN
+==================================================
+
+For one research candidate show:
+
+strategy
+variant
+exact parameters
+
+sample size
+
+win rate
+expectancy
+profit factor
+drawdown
+
+bootstrap CI
+Monte Carlo drawdown
+
+MAE/MFE
+
+market-regime breakdown
+
+time-of-day breakdown
+
+trend-aligned vs unaligned
+
+VWAP aligned vs unaligned
+
+CVD aligned vs unaligned
+
+VIX regime if available
+
+forward-validation status
+
+promotion blockers
+
+==================================================
+24. API
+==================================================
+
+Add/reuse endpoints for:
+
+ghost engine health
+research candidates
+experiment statistics
+candidate drill-down
+
+Keep owner-only/debug controls protected according to existing application conventions.
+
+==================================================
+25. STEP 1 INTEGRATION
+==================================================
+
+Use canonical_market_state snapshots for new research context whenever available.
+
+If an individual canonical component is:
+
+STALE
+UNAVAILABLE
+SHADOW
+
+record that truthfully.
+
+Do not substitute a fake zero.
+
+Important:
+
+Canonical status such as SHADOW/VALIDATING does NOT prevent research from recording the value.
+
+Research may observe it.
+
+Live trading still may not consume it unless separately promoted.
+
+==================================================
+26. MGC VWAP SPECIAL CASE
+==================================================
+
+Do not modify correct Databento VWAP to match Yahoo.
+
+Yahoo has known session-boundary and midnight anomalies.
+
+For research:
+
+store both when available:
+
+legacy_vwap
+canonical_databento_vwap
+
+mark provenance clearly.
+
+Canonical Databento VWAP remains the research-market-state value.
+
+Legacy comparison remains available for diagnostics.
+
+==================================================
+27. TESTS
+==================================================
+
+Add comprehensive tests including:
+
+opportunity creation
+immutable entry snapshot
+per-instrument isolation
+variant generation
+variant-budget enforcement
+NO_ENTRY handling
+stop hit
+target hit
+same-bar stop/target ambiguity handling
+MAE
+MFE
+R calculation
+commissions/slippage
+strategy version provenance
+config provenance
+lookahead prevention
+replay determinism
+baseline association
+statistics
+evidence-state transitions
+promotion gate
+human review requirement
+forward freeze
+research failure does not block live engine
+canonical state unavailable behavior
+restart/recovery behavior
+
+Also rerun existing:
+
+canonical state tests
+parity regression
+scalp golden
+risk tests
+execution tests
+ORB tests
+prop protection tests
+arm/safety tests
+
+==================================================
+28. PARITY REQUIREMENT
+==================================================
+
+With research enabled or disabled:
+
+live production trading results must remain identical for the same inputs.
+
+Assert parity for:
+
+verdict
+direction
+edge_score
+blockers
+entry
+stop
+targets
+quantity
+risk decision
+execution payload
+
+Any difference is a failure.
+
+==================================================
+29. INITIAL EXPERIMENT SCOPE
+==================================================
+
+Do NOT immediately activate every imaginable experiment.
+
+Start with a controlled pilot.
+
+Recommended first experiment family:
+
+OPENING_RANGE_BREAKOUT
+
+because it already has:
+
+clear opportunity definition
+clear range
+clear confirmation options
+clear entry rules
+clear stop
+clear target variants
+
+Run independently on:
+
+MGC
+MNQ
+MES
+MYM
+
+Pilot variants:
+
+BASELINE current ORB
+
+CLOSE_AND_RETEST
+
+TOUCH
+
+CURRENT BUFFER + 2 ticks
+
+CURRENT BUFFER - 2 ticks where valid
+
+1R exit
+
+1.5R exit
+
+2R exit
+
+15m+4H trend aligned only
+
+VWAP aligned only
+
+Maximum 10 variants per ORB opportunity during pilot.
+
+Do NOT alter the live ORB algorithm.
+
+==================================================
+30. COMPLETION REPORT
+==================================================
+
+Return:
+
+AUDIT SUMMARY:
+
+EXISTING GHOST INFRASTRUCTURE REUSED:
+NEW FILES:
+MODIFIED FILES:
+
+STRATEGIES ENABLED FOR EXPERIMENTS:
+INITIAL EXPERIMENT FAMILY:
+VARIANTS ACTIVE:
+
+CANONICAL STATE CONTEXT CAPTURED:
+VIX CAPTURED:
+CVD CAPTURED:
+VWAP CAPTURED:
+15M/4H TREND CAPTURED:
+
+OPPORTUNITIES RECORDED:
+EXPERIMENTS CREATED:
+GHOST TRADES ENTERED:
+NO_ENTRY COUNT:
+COMPLETED:
+
+BASELINE PERFORMANCE:
+VARIANT PERFORMANCE:
+
+STATISTICS AVAILABLE:
+BOOTSTRAP:
+MONTE CARLO:
+MAE/MFE:
+
+FORWARD VALIDATION:
+PROMOTION GATE:
+HUMAN REVIEW REQUIRED:
+
+RESEARCH FAIL-OPEN VERIFIED:
+LOOKAHEAD TESTS:
+REPLAY DETERMINISM:
+
+TOTAL TESTS:
+PASSED:
+FAILED:
+
+SCORING PARITY:
+SCALP GOLDEN:
+EXECUTION PARITY:
+
+LIVE TRADING BEHAVIOR CHANGED: YES/NO
+
+RESEARCH CAN MODIFY LIVE CONFIG: YES/NO
+
+SAFE TO RUN GHOST EXPERIMENTS DURING LIVE MARKET: YES/NO
+
+GIT COMMIT:

@@ -1,0 +1,283 @@
+PHASE 2 AUDIT ACCEPTED WITH ONE REQUIRED PRE-IMPLEMENTATION RESOLUTION.
+
+DO NOT BEGIN BUILDING ghost_experiment_engine.py OR THE NEW TABLES YET.
+
+The audit uncovered a potentially critical ORB identity conflict.
+
+You reported:
+
+- current ORB tracker = 08:00–08:30 ET
+- live ORB scorer uses that tracker
+- pilot BASELINE target_r = 4.0
+
+However, the current AI Trading Partner project also contains the newer 9:30 OPENING RANGE BREAKOUT algorithm that was explicitly designed around the US cash open.
+
+Before Phase 2 implementation, determine WHICH ORB implementation is the intended canonical strategy for this experiment pilot.
+
+==================================================
+1. AUDIT ALL ORB IMPLEMENTATIONS
+==================================================
+
+Search the entire codebase for every implementation related to:
+
+OPENING_RANGE_BREAKOUT
+ORB
+opening range
+09:30
+09:40
+08:00
+08:30
+INTRADAY_BY_TICKER
+or_high
+or_low
+or_complete
+RANGE_LOCKED
+WATCHING_BREAKOUT
+CONFIRMATION_PENDING
+CLOSE_OUTSIDE
+CLOSE_AND_RETEST
+TOUCH
+BREAKOUT_MISSED
+
+Produce a table:
+
+IMPLEMENTATION
+FILE/FUNCTION
+SESSION/RANGE WINDOW
+LOCK TIME
+INSTRUMENTS
+CONFIRMATION MODE
+BREAKOUT BUFFER
+STOP RULE
+TARGET RULE
+EXECUTION MODE
+CURRENTLY USED BY LIVE?
+CURRENTLY USED BY SHADOW?
+CURRENTLY DISPLAYED IN DASHBOARD?
+VERSION / CONFIG OWNER
+
+==================================================
+2. IDENTIFY THE NEW 9:30 ORB
+==================================================
+
+Specifically determine whether the recently built/upgraded 9:30 algorithm exists and whether it is currently:
+
+- DISABLED
+- SHADOW
+- PAPER
+- LIVE_ALGORITHMIC
+
+Its intended configuration should be compared against the recent design:
+
+Instruments:
+MGC
+MNQ
+MES
+MYM
+
+Opening range default:
+09:30–09:39 ET
+
+Range lock:
+09:40 ET
+
+Entry window:
+09:40–10:30 ET
+
+Supported range durations:
+5 / 10 / 15 / 30 minutes
+
+Confirmation modes:
+TOUCH
+CLOSE_OUTSIDE
+CLOSE_AND_RETEST
+
+Per-instrument independent state.
+
+Do not assume these values are present.
+Verify them in code.
+
+==================================================
+3. RESOLVE WHETHER 08:00–08:30 IS LEGACY
+==================================================
+
+Determine what the 08:00–08:30 ORB implementation actually is.
+
+Possible outcomes:
+
+A. It is an old/legacy ORB still in code.
+
+B. It is a separate OPENING_DRIVE strategy and has been mislabeled ORB.
+
+C. It is still the active live ORB.
+
+D. Both ORB implementations coexist intentionally.
+
+Report which is true.
+
+DO NOT DELETE either implementation during this audit.
+
+==================================================
+4. RESOLVE TARGET_R=4.0
+==================================================
+
+The audit says the current scorer uses target_r=4.0.
+
+Trace exactly where this is used.
+
+Determine whether:
+
+- 4R is truly the current live ORB target,
+- it belongs to the old 08:00 strategy,
+- it is research-only,
+- or it is stale/legacy configuration.
+
+Also locate the newer ORB target-management configuration, including any use of:
+
+TP1 = 1R
+TP2 = 2R
+one-contract target = 1.5R
+
+Again, do not change anything yet.
+
+==================================================
+5. CHOOSE THE PHASE 2 PILOT BASELINE
+==================================================
+
+The Ghost Research pilot must test the strategy we actually intend to optimize.
+
+If the newer 9:30 ORB implementation is present and is the intended algorithmic ORB, then Phase 2 BASELINE must reference THAT implementation.
+
+Do not recreate its rules manually inside the ghost engine.
+
+The baseline should be produced from a frozen/versioned copy of the actual strategy configuration.
+
+The ghost engine may then test variants against it.
+
+If the 08:00–08:30 implementation is actually the intended ORB, explain why and stop for operator review before proceeding.
+
+==================================================
+6. REJECTED OPPORTUNITY DEFINITION
+==================================================
+
+Also tighten the rejected-opportunity plan before implementation.
+
+Do NOT record every WAIT state or every bar.
+
+A rejected ghost opportunity must begin with a legitimate BASE STRATEGY EVENT.
+
+Example:
+
+ORB breakout event exists
+→ candidate is rejected by VWAP
+
+RECORD IT.
+
+But:
+
+random bar
+→ no ORB event
+→ verdict WAIT
+
+DO NOT create a ghost opportunity.
+
+Define the exact pre-gate event boundary for the ORB pilot.
+
+This prevents research-database spam and biased denominator counts.
+
+==================================================
+7. VARIANT DESIGN RULE
+==================================================
+
+Once the correct ORB baseline is identified:
+
+Each variant must explicitly state what changes from BASELINE.
+
+Avoid accidentally combining multiple variables.
+
+Examples:
+
+CLOSE_AND_RETEST:
+only confirmation rule changes
+
+TOUCH:
+only confirmation rule changes
+
+BUFFER_PLUS_2:
+only breakout buffer changes
+
+TP_1R:
+only target changes
+
+TREND_ALIGNED:
+only adds trend eligibility filter
+
+VWAP_ALIGNED:
+only adds VWAP eligibility filter
+
+If the existing baseline already includes one of these conditions, do not create a fake variant that is identical to baseline.
+
+==================================================
+8. DO NOT CHANGE LIVE CODE
+==================================================
+
+This task remains audit/resolution only.
+
+Do not modify:
+
+live ORB
+scoring
+READY/EARLY/WAIT
+risk
+gateway
+TradersPost
+prop protection
+arm state
+learning weights
+
+==================================================
+FINAL REPORT
+==================================================
+
+Return:
+
+NUMBER OF ORB IMPLEMENTATIONS FOUND:
+
+ORB IMPLEMENTATION #1:
+name =
+file/function =
+range window =
+entry window =
+confirmation =
+targets =
+current mode =
+live consumer =
+
+ORB IMPLEMENTATION #2:
+[same]
+
+CURRENT 9:30 ORB EXISTS: YES/NO
+
+CURRENT 9:30 ORB MODE:
+
+08:00–08:30 IMPLEMENTATION IS:
+LEGACY / SEPARATE STRATEGY / ACTIVE ORB / UNKNOWN
+
+TARGET_R=4.0 BELONGS TO:
+
+NEWER ORB TARGET CONFIG FOUND: YES/NO
+NEWER ORB TARGET RULES:
+
+PHASE 2 PILOT BASELINE SHOULD USE:
+
+BASELINE STRATEGY VERSION:
+BASELINE CONFIG VERSION:
+
+EXACT PRE-GATE OPPORTUNITY EVENT:
+
+VARIANTS THAT ARE ACTUALLY DIFFERENT FROM BASELINE:
+
+SAFE TO BEGIN PHASE 2 IMPLEMENTATION: YES/NO
+
+Do not write Phase 2 implementation code until
+SAFE TO BEGIN PHASE 2 IMPLEMENTATION = YES.

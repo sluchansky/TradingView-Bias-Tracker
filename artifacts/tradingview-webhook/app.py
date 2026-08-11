@@ -45592,9 +45592,11 @@ def _seed_mtf_from_historical():
 
         hist = _db.Historical(key=api_key)
         now_utc   = datetime.now(timezone.utc)
-        # Databento historical API lags ~5 min; end must be before available_end.
-        end_utc   = now_utc - timedelta(minutes=10)
-        start_utc = end_utc  - timedelta(hours=80)   # 80h captures the full Friday session (EMA(21) needs 21 closed 15M bars = 315 trading min)
+        # Databento historical API lags ~4 h (not ~5 min as originally assumed).
+        # Cap end at now-5h so the query always lands within the available window.
+        # The live stream fills the most-recent 5h gap automatically.
+        end_utc   = now_utc - timedelta(hours=5)
+        start_utc = end_utc  - timedelta(hours=80)   # 80h captures the full weekend (EMA(21) needs 21 closed 15M bars = 315 trading min)
         start_str = start_utc.strftime("%Y-%m-%dT%H:%M")
         end_str   = end_utc.strftime("%Y-%m-%dT%H:%M")
 
@@ -80333,6 +80335,9 @@ if __name__ == "__main__":
                     cvd_by_ticker=CVD_BY_TICKER,
                     rvol_by_ticker=RVOL_BY_TICKER,
                     vwap_by_ticker=AUTO_PRICE_BY_TICKER,
+                    # ORB state — TradingView-sourced; injected for provenance reporting only.
+                    # The canonical engine READS these dicts but NEVER writes to them.
+                    intraday_by_ticker=INTRADAY_BY_TICKER,
                     get_db_fn=get_db_connection,
                 )
                 # Boot comparison table (fail-open — DDL error never blocks startup)

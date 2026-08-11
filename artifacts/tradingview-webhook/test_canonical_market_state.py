@@ -159,29 +159,28 @@ class TestVwapCalculation:
 
 class TestVwapSessionReset:
     def test_session_reset_at_boundary(self):
-        """VWAP must reset when crossing the session boundary (22:00 UTC)."""
+        """VWAP must reset when crossing the 18:00 ET session boundary.
+
+        Use a summer date (EDT = UTC-4) where 18:00 ET = 22:00 UTC.
+        Bar before boundary at 21:50 UTC, bar after at 22:05 UTC.
+        """
         e = _engine()
-        # Session 1: bars at 21:30 UTC
-        sess1_ts = 1_700_000_000.0  # a Monday at some time
-        # Force to 21:30 UTC on a specific day
-        from datetime import datetime, timezone, timedelta
-        day_start = datetime(2023, 11, 15, 21, 30, 0, tzinfo=timezone.utc)
-        ts1 = day_start.timestamp()
-        e.on_bar_close(_bar(ts1,       100, 105, 95, 100, vol=500))
+        from datetime import datetime, timezone
+        # 2024-06-15 is EDT (UTC-4): 18:00 ET = 22:00 UTC
+        ts1 = datetime(2024, 6, 15, 21, 50, 0, tzinfo=timezone.utc).timestamp()
+        e.on_bar_close(_bar(ts1, 100, 105, 95, 100, vol=500))
         snap1 = e.get_snapshot()
         vwap1 = snap1["vwap"]["value"]
 
-        # Session 2: bars at 22:05 UTC (new session)
-        day2 = datetime(2023, 11, 15, 22, 5, 0, tzinfo=timezone.utc)
-        ts2 = day2.timestamp()
+        # Session 2: bar at 22:05 UTC (18:05 EDT → new session)
+        ts2 = datetime(2024, 6, 15, 22, 5, 0, tzinfo=timezone.utc).timestamp()
         e.on_bar_close(_bar(ts2, 200, 210, 195, 205, vol=100))
         snap2 = e.get_snapshot()
         vwap2 = snap2["vwap"]["value"]
 
         # After session reset, VWAP should be based only on session2 bars
         assert vwap2 is not None
-        # New session VWAP should be close to 205 typical price, not 100
-        assert vwap2 > 150  # far from old vwap1
+        assert vwap2 > 150, f"Expected VWAP > 150 after reset, got {vwap2}"
 
     def test_no_reset_within_same_session(self):
         """Bars in same session should accumulate (VWAP shifts smoothly)."""
@@ -696,10 +695,11 @@ class TestExecutionIsolation:
         assert _session_start(ts) == _session_start(ts)
 
     def test_session_start_resets_at_boundary(self):
+        """Straddles 18:00 ET on a summer date (EDT=UTC-4 → boundary=22:00 UTC)."""
         from datetime import datetime, timezone
-        # 21:59 UTC and 22:01 UTC should be different sessions
-        ts_before = datetime(2023, 11, 15, 21, 59, 0, tzinfo=timezone.utc).timestamp()
-        ts_after  = datetime(2023, 11, 15, 22,  1, 0, tzinfo=timezone.utc).timestamp()
+        # 2024-06-15 is EDT: 21:59 UTC = 17:59 ET, 22:01 UTC = 18:01 ET → different sessions
+        ts_before = datetime(2024, 6, 15, 21, 59, 0, tzinfo=timezone.utc).timestamp()
+        ts_after  = datetime(2024, 6, 15, 22,  1, 0, tzinfo=timezone.utc).timestamp()
         assert _session_start(ts_before) != _session_start(ts_after)
 
 
@@ -762,3 +762,489 @@ class TestProvenance:
         assert snap["vwap"]["value"] is None
         assert snap["atr"]["value"] is None
         assert snap["volume"]["relative_volume"] is None
+
+
+# ── DST session boundary tests ─────────────────────────────────────────────────
+
+class TestVwapDstSessionBoundary:
+    """Verify VWAP session reset uses 18:00 America/New_York (DST-aware)."""
+
+    def test_edt_session_reset_at_2200_utc(self):
+        """Summer (EDT = UTC-4): 18:00 ET = 22:00 UTC — reset must fire at 22:00 UTC."""
+        from datetime import datetime, timezone
+        # 2024-06-15 is a Saturday; CME trades Sun–Fri; just testing boundary math
+        before = datetime(2024, 6, 15, 21, 59, 0, tzinfo=timezone.utc).timestamp()
+        after  = datetime(2024, 6, 15, 22,  1, 0, tzinfo=timezone.utc).timestamp()
+        assert _session_start(before) != _session_start(after), (
+            "EDT: 21:59 UTC and 22:01 UTC should be in different sessions (boundary = 22:00 UTC)"
+        )
+
+    def test_est_session_reset_at_2300_utc(self):
+        """Winter (EST = UTC-5): 18:00 ET = 23:00 UTC — reset must fire at 23:00 UTC."""
+        from datetime import datetime, timezone
+        before = datetime(2024, 1, 15, 22, 59, 0, tzinfo=timezone.utc).timestamp()
+        after  = datetime(2024, 1, 15, 23,  1, 0, tzinfo=timezone.utc).timestamp()
+        assert _session_start(before) != _session_start(after), (
+            "EST: 22:59 UTC and 23:01 UTC should be in different sessions (boundary = 23:00 UTC)"
+        )
+
+    def test_no_false_reset_at_2200_utc_in_winter(self):
+        """Winter (EST): 22:00 UTC = 17:00 ET — must NOT reset (boundary is 23:00 UTC)."""
+        from datetime import datetime, timezone
+        ts_2200 = datetime(2024, 1, 15, 22,  0, 0, tzinfo=timezone.utc).timestamp()
+        ts_2230 = datetime(2024, 1, 15, 22, 30, 0, tzinfo=timezone.utc).timestamp()
+        assert _session_start(ts_2200) == _session_start(ts_2230), (
+            "EST: 22:00 UTC and 22:30 UTC should be in the SAME session (no reset until 23:00 UTC)"
+        )
+
+    def test_session_start_deterministic(self):
+        """Same input must always produce same output."""
+        from datetime import datetime, timezone
+        ts = datetime(2024, 6, 15, 22, 5, 0, tzinfo=timezone.utc).timestamp()
+        assert _session_start(ts) == _session_start(ts)
+
+    def test_session_start_is_utc_timestamp(self):
+        """session_start must be a Unix timestamp (float), not None."""
+        from datetime import datetime, timezone
+        ts = datetime(2024, 6, 15, 22, 5, 0, tzinfo=timezone.utc).timestamp()
+        result = _session_start(ts)
+        assert isinstance(result, float)
+        assert result > 0
+
+    def test_vwap_resets_on_edt_session_boundary(self):
+        """Engine VWAP must reset when a bar crosses the 18:00 ET boundary in summer."""
+        from datetime import datetime, timezone
+        e = _engine()
+        # Bar before EDT session boundary (21:50 UTC = 17:50 ET)
+        ts_pre = datetime(2024, 6, 15, 21, 50, 0, tzinfo=timezone.utc).timestamp()
+        e.on_bar_close(_bar(ts_pre, 1000, 1010, 990, 1000, vol=500))
+        v1 = e._vwap
+
+        # Bar after EDT session boundary (22:05 UTC = 18:05 ET → new session)
+        ts_post = datetime(2024, 6, 15, 22, 5, 0, tzinfo=timezone.utc).timestamp()
+        e.on_bar_close(_bar(ts_post, 2000, 2010, 1990, 2000, vol=100))
+        v2 = e._vwap
+
+        assert v2 is not None
+        assert v2 > 1500, "After session reset, VWAP should reflect only the new session bar"
+
+    def test_vwap_resets_on_est_session_boundary(self):
+        """Engine VWAP must reset when a bar crosses the 18:00 ET boundary in winter."""
+        from datetime import datetime, timezone
+        e = _engine()
+        # Bar before EST session boundary (22:50 UTC = 17:50 ET)
+        ts_pre = datetime(2024, 1, 15, 22, 50, 0, tzinfo=timezone.utc).timestamp()
+        e.on_bar_close(_bar(ts_pre, 1000, 1010, 990, 1000, vol=500))
+
+        # Bar after EST session boundary (23:05 UTC = 18:05 ET → new session)
+        ts_post = datetime(2024, 1, 15, 23, 5, 0, tzinfo=timezone.utc).timestamp()
+        e.on_bar_close(_bar(ts_post, 2000, 2010, 1990, 2000, vol=100))
+
+        assert e._vwap > 1500, "After EST session reset, VWAP must reflect only new session bar"
+        assert e._session_start_ts == _session_start(ts_post)
+
+    def test_session_start_exposed_in_vwap_block(self):
+        """Snapshot vwap block must include session_start (ISO string or None)."""
+        from datetime import datetime, timezone
+        e = _engine()
+        ts = datetime(2024, 6, 15, 22, 5, 0, tzinfo=timezone.utc).timestamp()
+        e.on_bar_close(_bar(ts, 1000, 1010, 990, 1000, vol=100))
+        snap = e.get_snapshot()
+        # session_start must be present (either ISO string or None before first bar)
+        assert "session_start" in snap["vwap"]
+        assert snap["vwap"]["session_start"] is not None
+
+
+# ── Provenance audit tests ─────────────────────────────────────────────────────
+
+class TestProvenanceAudit:
+    """Verify that canonical state reports TRUE source for each component."""
+
+    def _augmented_snap(self, inst="MNQ"):
+        from canonical_market_state import _augment_snapshot
+        e = CanonicalMarketStateEngine(inst)
+        _feed(e, _bars_trend_up(30))
+        snap = e.get_snapshot()
+        with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+             patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+            _augment_snapshot(inst, snap)
+        return snap
+
+    def test_cvd_true_source_is_databento_primary(self):
+        snap = self._augmented_snap()
+        assert snap["cvd"]["true_source"] == "databento_primary"
+
+    def test_rvol_true_source_is_databento_primary(self):
+        snap = self._augmented_snap()
+        assert snap["volume"]["true_source"] == "databento_primary"
+
+    def test_trend_true_source_is_databento(self):
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(30))
+        snap = e.get_snapshot()
+        from canonical_market_state import _augment_snapshot
+        with patch("trend_alignment.MTF_STATE_BY_INST", {
+            "MNQ": {"trend_15m": {"direction": "BULLISH"}, "trend_4h": {"direction": "BULLISH"}}
+        }, create=True), patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+            _augment_snapshot("MNQ", snap)
+        assert snap["trend"]["true_source"] == "databento"
+
+    def test_fvg_zones_true_source_is_databento(self):
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(30))
+        snap = e.get_snapshot()
+        from canonical_market_state import _augment_snapshot
+        with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+             patch("fvg_engine.FVG_ZONES_BY_INST", {"MNQ": []}, create=True):
+            _augment_snapshot("MNQ", snap)
+        assert snap["fvg_zones"]["true_source"] == "databento"
+
+    def test_zone_state_true_source_is_tradingview(self):
+        snap = self._augmented_snap()
+        assert snap["zone_state"]["true_source"] == "tradingview"
+        assert snap["zone_state"]["promotion_status"] == "UNAVAILABLE_FOR_DATABENTO_PROMOTION"
+
+    def test_zone_state_not_labeled_as_fvg(self):
+        snap = self._augmented_snap()
+        # zone_state is a SEPARATE block from fvg_zones
+        assert "zone_state" in snap
+        assert "fvg_zones" in snap
+        # zone_state must not say "databento"
+        assert snap["zone_state"]["true_source"] != "databento"
+
+    def test_orb_returns_unavailable_without_injection(self):
+        """Without intraday_by_ticker injection, ORB must return UNAVAILABLE (not a fake value)."""
+        snap = self._augmented_snap()
+        orb = snap.get("orb", {})
+        assert orb.get("status") == "UNAVAILABLE" or orb.get("true_source") == "tradingview"
+        assert orb.get("promotion_status") == "UNAVAILABLE_FOR_DATABENTO_PROMOTION"
+
+    def test_orb_exposed_when_injected(self):
+        """With injection, ORB block exposes or_high/or_low/or_complete."""
+        from canonical_market_state import _augment_snapshot
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(10))
+        snap = e.get_snapshot()
+
+        intraday = {"MNQ": {"or_high": 29500.0, "or_low": 29400.0, "or_complete": True}}
+        orig = cms._INTRADAY_BY_TICKER
+        cms._INTRADAY_BY_TICKER = intraday
+        try:
+            with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+                 patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+                _augment_snapshot("MNQ", snap)
+        finally:
+            cms._INTRADAY_BY_TICKER = orig
+
+        orb = snap.get("orb", {})
+        assert orb.get("or_high") == 29500.0
+        assert orb.get("or_low")  == 29400.0
+        assert orb.get("or_complete") is True
+        assert orb.get("true_source") == "tradingview"
+        assert orb.get("or_width") == pytest.approx(100.0, abs=0.01)
+
+    def test_no_component_lies_about_tradingview_source(self):
+        """Components that are TradingView-sourced must not claim 'databento' true_source."""
+        snap = self._augmented_snap()
+        tv_components = ["zone_state", "orb"]
+        for comp in tv_components:
+            if comp in snap:
+                assert snap[comp].get("true_source") != "databento", (
+                    f"{comp} claims databento source but is TradingView-derived"
+                )
+
+
+# ── Comparison metrics tests ───────────────────────────────────────────────────
+
+class TestComparisonMetrics:
+    """Verify _VwapStats rolling accumulator and agreement_status logic."""
+
+    def test_vwap_stats_tracks_sample_count(self):
+        from canonical_market_state import _VwapStats
+        s = _VwapStats()
+        s.record(1.5)
+        s.record(2.0)
+        assert s.sample_count == 2
+
+    def test_vwap_stats_max_tick_diff(self):
+        from canonical_market_state import _VwapStats
+        s = _VwapStats()
+        s.record(3.0)
+        s.record(8.0)
+        s.record(1.0)
+        assert s.max_tick_diff == pytest.approx(8.0, abs=0.001)
+
+    def test_vwap_stats_avg_tick_diff(self):
+        from canonical_market_state import _VwapStats
+        s = _VwapStats()
+        s.record(2.0)
+        s.record(4.0)
+        d = s.to_dict()
+        assert d["avg_tick_diff"] == pytest.approx(3.0, abs=0.01)
+
+    def test_vwap_stats_consecutive_acceptable_resets_on_miss(self):
+        from canonical_market_state import _VwapStats, VWAP_MATCH_TICKS
+        s = _VwapStats()
+        s.record(VWAP_MATCH_TICKS - 0.1)  # acceptable
+        s.record(VWAP_MATCH_TICKS - 0.1)  # acceptable
+        assert s.consecutive_acceptable == 2
+        s.record(VWAP_MATCH_TICKS + 1.0)  # miss — resets counter
+        assert s.consecutive_acceptable == 0
+
+    def test_vwap_stats_pct_within_tolerance(self):
+        from canonical_market_state import _VwapStats, VWAP_TOLERANCE_TICKS
+        s = _VwapStats()
+        s.record(VWAP_TOLERANCE_TICKS - 0.1)   # within
+        s.record(VWAP_TOLERANCE_TICKS - 0.1)   # within
+        s.record(VWAP_TOLERANCE_TICKS + 1.0)   # outside
+        d = s.to_dict()
+        assert d["pct_within_tolerance"] == pytest.approx(66.7, abs=0.5)
+
+    def test_agreement_status_match(self):
+        """VWAP diff ≤ 2 ticks → MATCH."""
+        from canonical_market_state import _augment_snapshot, AGREE_MATCH, TICK_SIZES
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(10, start_price=29800.0))
+        snap = e.get_snapshot()
+        tick = TICK_SIZES["MNQ"]
+        close_legacy = snap["vwap"]["value"]  # match: same as databento
+        if close_legacy is None:
+            pytest.skip("No VWAP computed yet")
+        orig = cms._VWAP_BY_TICKER
+        cms._VWAP_BY_TICKER = {"MNQ": {"vwap": close_legacy + tick * 1.0}}  # 1 tick diff
+        try:
+            with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+                 patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+                _augment_snapshot("MNQ", snap)
+        finally:
+            cms._VWAP_BY_TICKER = orig
+        assert snap["vwap_comparison"]["agreement_status"] == AGREE_MATCH
+
+    def test_agreement_status_large_diff(self):
+        """VWAP diff > 10 ticks → LARGE_DIFF."""
+        from canonical_market_state import _augment_snapshot, AGREE_LARGE_DIFF, TICK_SIZES
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(10, start_price=29800.0))
+        snap = e.get_snapshot()
+        tick = TICK_SIZES["MNQ"]
+        db_vwap = snap["vwap"]["value"]
+        if db_vwap is None:
+            pytest.skip("No VWAP computed yet")
+        orig = cms._VWAP_BY_TICKER
+        cms._VWAP_BY_TICKER = {"MNQ": {"vwap": db_vwap + tick * 15.0}}  # 15 ticks diff
+        try:
+            with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+                 patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+                _augment_snapshot("MNQ", snap)
+        finally:
+            cms._VWAP_BY_TICKER = orig
+        assert snap["vwap_comparison"]["agreement_status"] == AGREE_LARGE_DIFF
+
+    def test_agreement_status_waiting_when_no_db_vwap(self):
+        """WAITING when Databento VWAP not yet computed."""
+        from canonical_market_state import _augment_snapshot, AGREE_WAITING
+        e = CanonicalMarketStateEngine("MNQ")
+        snap = e.get_snapshot()  # fresh engine — no VWAP
+        orig = cms._VWAP_BY_TICKER
+        cms._VWAP_BY_TICKER = {"MNQ": {"vwap": 29800.0}}
+        try:
+            with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+                 patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+                _augment_snapshot("MNQ", snap)
+        finally:
+            cms._VWAP_BY_TICKER = orig
+        assert snap["vwap_comparison"]["agreement_status"] == AGREE_WAITING
+
+    def test_vwap_comparison_block_has_all_required_fields(self):
+        """vwap_comparison must include all fields needed by the dashboard."""
+        from canonical_market_state import _augment_snapshot
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(10, start_price=29800.0))
+        snap = e.get_snapshot()
+        db_vwap = snap["vwap"]["value"]
+        if db_vwap is None:
+            pytest.skip("No VWAP yet")
+        orig = cms._VWAP_BY_TICKER
+        cms._VWAP_BY_TICKER = {"MNQ": {"vwap": db_vwap + 1.0}}
+        try:
+            with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+                 patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+                _augment_snapshot("MNQ", snap)
+        finally:
+            cms._VWAP_BY_TICKER = orig
+        vc = snap["vwap_comparison"]
+        required = [
+            "legacy_vwap", "legacy_source", "legacy_freshness",
+            "databento_vwap", "databento_source", "databento_freshness",
+            "absolute_difference", "tick_difference", "tick_size",
+            "agreement_status", "session_start", "sample_volume",
+            "sample_count", "consecutive_acceptable",
+            "avg_tick_diff", "max_tick_diff", "pct_within_tolerance",
+        ]
+        for field in required:
+            assert field in vc, f"vwap_comparison missing required field: {field!r}"
+
+    def test_tick_size_per_instrument(self):
+        """Each instrument uses its own tick size for tick_difference."""
+        from canonical_market_state import TICK_SIZES
+        assert TICK_SIZES["MGC"] == pytest.approx(0.10, abs=0.001)
+        assert TICK_SIZES["MNQ"] == pytest.approx(0.25, abs=0.001)
+        assert TICK_SIZES["MES"] == pytest.approx(0.25, abs=0.001)
+        assert TICK_SIZES["MYM"] == pytest.approx(1.00, abs=0.001)
+
+    def test_vwap_stats_acceptable_and_unacceptable_counts(self):
+        from canonical_market_state import _VwapStats, VWAP_MATCH_TICKS
+        s = _VwapStats()
+        s.record(VWAP_MATCH_TICKS - 0.1)   # acceptable
+        s.record(VWAP_MATCH_TICKS - 0.1)   # acceptable
+        s.record(VWAP_MATCH_TICKS + 1.0)   # unacceptable
+        assert s.acceptable_count   == 2
+        assert s.unacceptable_count == 1
+        assert s.sample_count       == 3
+
+    def test_vwap_stats_longest_streak_tracked_separately(self):
+        """longest_consecutive_acceptable must survive a reset."""
+        from canonical_market_state import _VwapStats, VWAP_MATCH_TICKS
+        s = _VwapStats()
+        # Build streak of 5
+        for _ in range(5):
+            s.record(VWAP_MATCH_TICKS - 0.1)
+        assert s.longest_consecutive_acceptable == 5
+        assert s.consecutive_acceptable         == 5
+        # Break streak
+        s.record(VWAP_MATCH_TICKS + 1.0)
+        assert s.consecutive_acceptable         == 0   # current reset
+        assert s.longest_consecutive_acceptable == 5   # longest preserved
+        # New run of 3 — longest stays 5
+        for _ in range(3):
+            s.record(VWAP_MATCH_TICKS - 0.1)
+        assert s.longest_consecutive_acceptable == 5
+        assert s.consecutive_acceptable         == 3
+
+    def test_vwap_stats_median_tick_diff(self):
+        from canonical_market_state import _VwapStats
+        s = _VwapStats()
+        for v in [1.0, 2.0, 3.0, 4.0, 5.0]:
+            s.record(v)
+        assert s._percentile(50) == pytest.approx(3.0, abs=0.01)
+
+    def test_vwap_stats_p95_tick_diff(self):
+        from canonical_market_state import _VwapStats
+        s = _VwapStats()
+        for v in range(1, 101):     # 1..100
+            s.record(float(v))
+        p95 = s._percentile(95)
+        # 95th percentile of 1..100 should be ~95-96
+        assert 94.0 <= p95 <= 97.0
+
+    def test_vwap_stats_promotion_shadow_by_default(self):
+        from canonical_market_state import _VwapStats, VWAP_MATCH_TICKS
+        s = _VwapStats()
+        for _ in range(49):   # one short of 50
+            s.record(VWAP_MATCH_TICKS - 0.1)
+        assert s.promotion_status  == "SHADOW"
+        assert s.promotion_eligible is False
+
+    def test_vwap_stats_promotion_requires_50_consecutive(self):
+        """Total ≥50 but streak broken — must stay SHADOW."""
+        from canonical_market_state import _VwapStats, VWAP_MATCH_TICKS
+        s = _VwapStats()
+        for _ in range(49):
+            s.record(VWAP_MATCH_TICKS - 0.1)
+        s.record(VWAP_MATCH_TICKS + 5.0)    # break streak — longest = 49
+        for _ in range(49):
+            s.record(VWAP_MATCH_TICKS - 0.1)
+        # total = 99, longest = 49 → SHADOW
+        assert s.sample_count > 50
+        assert s.longest_consecutive_acceptable == 49
+        assert s.promotion_status  == "SHADOW"
+        assert s.promotion_eligible is False
+
+    def test_vwap_stats_promotion_validating_on_qualifying_streak(self):
+        """≥50 total AND ≥50 consecutive longest → VALIDATING."""
+        from canonical_market_state import _VwapStats, VWAP_MATCH_TICKS
+        s = _VwapStats()
+        for _ in range(50):
+            s.record(VWAP_MATCH_TICKS - 0.1)
+        assert s.promotion_status  == "VALIDATING"
+        assert s.promotion_eligible is True
+
+    def test_vwap_stats_to_dict_has_all_validation_fields(self):
+        from canonical_market_state import _VwapStats
+        s = _VwapStats()
+        s.record(1.0)
+        d = s.to_dict()
+        required = [
+            "sample_count", "acceptable_count", "unacceptable_count",
+            "consecutive_acceptable", "longest_consecutive_acceptable",
+            "avg_tick_diff", "median_tick_diff", "p95_tick_diff",
+            "max_tick_diff", "latest_tick_diff", "pct_within_tolerance",
+            "promotion_status", "promotion_eligible",
+        ]
+        for field in required:
+            assert field in d, f"to_dict() missing field: {field!r}"
+
+    def test_vwap_comparison_block_has_all_new_fields(self):
+        """vwap_comparison in get_snapshot() must include all new validation fields."""
+        from canonical_market_state import _augment_snapshot
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(10, start_price=29800.0))
+        snap = e.get_snapshot()
+        db_vwap = snap["vwap"]["value"]
+        if db_vwap is None:
+            pytest.skip("No VWAP yet")
+        orig = cms._VWAP_BY_TICKER
+        cms._VWAP_BY_TICKER = {"MNQ": {"vwap": db_vwap + 1.0}}
+        try:
+            with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+                 patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+                _augment_snapshot("MNQ", snap)
+        finally:
+            cms._VWAP_BY_TICKER = orig
+        vc = snap["vwap_comparison"]
+        new_fields = [
+            "acceptable_count", "unacceptable_count",
+            "longest_consecutive_acceptable",
+            "median_tick_diff", "p95_tick_diff",
+            "promotion_status", "promotion_eligible",
+        ]
+        for field in new_fields:
+            assert field in vc, f"vwap_comparison missing new field: {field!r}"
+
+    def test_promotion_status_shadow_in_vwap_comparison_before_qualifying(self):
+        """vwap_comparison must report SHADOW before 50-sample streak."""
+        from canonical_market_state import _augment_snapshot
+        e = CanonicalMarketStateEngine("MNQ")
+        _feed(e, _bars_trend_up(10, start_price=29800.0))
+        snap = e.get_snapshot()
+        db_vwap = snap["vwap"]["value"]
+        if db_vwap is None:
+            pytest.skip("No VWAP yet")
+        orig_vwap  = cms._VWAP_BY_TICKER
+        orig_stats = cms._VWAP_STATS
+        cms._VWAP_BY_TICKER = {"MNQ": {"vwap": db_vwap + 1.0}}
+        cms._VWAP_STATS = {"MNQ": cms._VwapStats()}   # fresh — 0 samples
+        try:
+            with patch("trend_alignment.MTF_STATE_BY_INST", {}, create=True), \
+                 patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+                _augment_snapshot("MNQ", snap)
+        finally:
+            cms._VWAP_BY_TICKER = orig_vwap
+            cms._VWAP_STATS     = orig_stats
+        assert snap["vwap_comparison"]["promotion_status"]  == "SHADOW"
+        assert snap["vwap_comparison"]["promotion_eligible"] is False
+
+    def test_four_instruments_remain_isolated(self):
+        """Stats for MGC must not bleed into MNQ."""
+        import canonical_market_state as cms_mod
+        orig_stats = cms_mod._VWAP_STATS
+        cms_mod._VWAP_STATS = {inst: cms_mod._VwapStats() for inst in ("MGC", "MNQ", "MES", "MYM")}
+        try:
+            cms_mod._VWAP_STATS["MGC"].record(5.0)
+            cms_mod._VWAP_STATS["MGC"].record(3.0)
+            assert cms_mod._VWAP_STATS["MGC"].sample_count == 2
+            assert cms_mod._VWAP_STATS["MNQ"].sample_count == 0
+            assert cms_mod._VWAP_STATS["MES"].sample_count == 0
+            assert cms_mod._VWAP_STATS["MYM"].sample_count == 0
+        finally:
+            cms_mod._VWAP_STATS = orig_stats

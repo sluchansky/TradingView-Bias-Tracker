@@ -422,6 +422,11 @@ export const BOT1_ROUTES = [
   // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).
   // Returns 4H/15M trend states from Databento 1m bar resampling.
   "/market/trend-alignment",
+  // Canonical Market State Engine (shadow/DISPLAY-ONLY; owner-only; NOT in
+  // dashboard-auth OPEN_PATHS).  Returns per-instrument Databento-computed
+  // VWAP/ATR/structure/CVD/RVOL/trend snapshot with source-comparison metadata.
+  // All six selectors default to "legacy" — no promotion is possible this phase.
+  "/canonical-market-state",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

@@ -1,0 +1,292 @@
+This is a very good Step 1 result. The most important safety checks passed:
+
+SHADOW_ONLY=1
+all live source selectors still default to legacy
+Parity OK
+Scalp Golden byte-identical
+56/56 canonical-state tests passing
+production server boots with all four instruments
+no write path into scoring, risk, sizing, or execution
+
+So the new Databento layer is sitting beside the live system exactly like we wanted.
+
+I would not move to Step 2 quite yet, though. I see four things worth closing first.
+
+1. Fix the VWAP session reset before we validate it
+
+Replit says:
+
+“Session VWAP resets at UTC hour 22 (6 PM ET)”
+
+That is only 6 PM Eastern during daylight-saving time. In winter, 22:00 UTC = 5 PM ET.
+
+The reset should be defined as 18:00 America/New_York, then converted appropriately. Otherwise VWAP will silently reset an hour early for part of the year.
+
+That's important enough to fix before we start judging VWAP agreement.
+
+2. Verify that “canonical” really means Databento
+
+This sentence needs scrutiny:
+
+“Reuses CVD from CVD_BY_TICKER, RVOL from RVOL_BY_TICKER, trend from trend_alignment, and FVG zones from fvg_engine”
+
+That's good reuse only if those values themselves originate from Databento.
+
+If CVD_BY_TICKER is still fed by TradingView, then the canonical state should say:
+
+CVD source = LEGACY/TRADINGVIEW
+
+—not present it as Databento canonical CVD.
+
+Same check for:
+
+RVOL
+FVG
+zones
+trend
+
+We need truthful provenance, even if some components remain legacy temporarily.
+
+3. A couple requested fields aren't mentioned
+
+The report doesn't say whether it exposed:
+
+existing Opening Range / ORB state
+actual Supply/Demand zones separately from FVGs
+
+They don't necessarily need new algorithms, but the canonical contract should either expose them or explicitly say UNAVAILABLE/LEGACY.
+
+4. Now do the four-instrument VWAP comparison
+
+This is exactly where the first suggested Replit task makes sense.
+
+Right now the panel apparently only shows MNQ. I want MGC, MNQ, MES, and MYM visible together before any VALIDATING promotion.
+
+So yes: pick the top task, but I would give Replit these additional instructions when it starts:
+
+Proceed with the suggested task:
+
+“Show shadow Databento VWAP for all 4 instruments side-by-side so divergences are obvious at a glance.”
+
+Before marking this task complete, also perform this Step 1 closure work.
+
+1. VWAP SESSION RESET
+
+The canonical VWAP currently resets at UTC hour 22.
+
+Do not hard-code the futures session boundary as a fixed UTC hour.
+
+The intended boundary is 18:00 America/New_York.
+
+Implement the reset using timezone-aware America/New_York session logic so DST is handled correctly.
+
+Verify with tests for both:
+- EDT
+- EST
+
+Do not change the live legacy VWAP source.
+
+Canonical VWAP remains SHADOW ONLY.
+
+2. PROVENANCE AUDIT
+
+Audit the actual upstream producer of:
+
+- CVD_BY_TICKER
+- RVOL_BY_TICKER
+- trend_alignment
+- fvg_engine
+- zone state
+
+For each component determine whether its underlying market data is:
+
+DATABENTO
+TRADINGVIEW
+YAHOO
+MIXED
+OTHER
+
+Do not label a component Databento-derived merely because canonical_market_state.py reads it.
+
+The canonical API/dashboard must report the TRUE source.
+
+If CVD is still TradingView-derived, report:
+
+source = legacy/tradingview
+promotion_status = SHADOW or UNAVAILABLE_FOR_DATABENTO_PROMOTION
+
+Do the equivalent for all other reused components.
+
+Do not rewrite these components during this task unless a trivial provenance fix is required.
+
+3. VERIFY ORB + ZONE CONTRACT
+
+Confirm whether canonical state currently exposes:
+
+- opening range high
+- opening range low
+- opening range width
+- lock status/time
+- breakout/confirmation state
+
+Reuse the existing ORB engine. Do not create another ORB implementation.
+
+Also confirm whether supply/demand zones exist separately from FVGs.
+
+Do not call FVGs “supply/demand zones” unless that is genuinely how the existing system defines them.
+
+If a component is not implemented, return an explicit:
+
+status = UNAVAILABLE
+reason = ...
+
+Do not fabricate a value.
+
+4. FOUR-INSTRUMENT VWAP COMPARISON UI
+
+On the Analysis page add a compact comparison view for:
+
+MGC
+MNQ
+MES
+MYM
+
+For each show:
+
+Instrument
+Legacy VWAP
+Databento Shadow VWAP
+Absolute Difference
+Difference in Ticks
+Legacy Freshness
+Databento Freshness
+Agreement Status
+Databento sample volume
+Current session start
+
+Agreement states:
+
+MATCH
+SMALL_DIFF
+LARGE_DIFF
+WAITING
+STALE
+UNAVAILABLE
+
+Do not hide instruments during warmup.
+
+Show WAITING/INSUFFICIENT_HISTORY instead.
+
+5. COMPARISON METRICS
+
+For each instrument show at least:
+
+comparison sample count
+consecutive acceptable comparisons
+average tick difference
+maximum tick difference
+latest difference
+percentage within tolerance
+
+Do not promote anything automatically.
+
+6. SAFETY
+
+All live source selectors remain:
+
+legacy
+
+CANONICAL_MARKET_STATE_SHADOW_ONLY remains:
+
+1
+
+Absolutely no changes to:
+
+READY/EARLY/WAIT
+edge score
+direction
+entries
+stops
+targets
+position sizing
+risk
+ORB trading logic
+execution gateway
+TradersPost
+arm state
+prop protection
+
+7. TESTS
+
+Add tests for:
+
+- VWAP reset during EDT
+- VWAP reset during EST
+- session does not reset at the wrong UTC boundary
+- four instruments remain isolated
+- provenance reporting is accurate
+- unavailable components return UNKNOWN/UNAVAILABLE rather than zero
+- dashboard/API comparison fields
+- live scoring parity
+
+Run:
+
+canonical state tests
+parity test
+scalp golden
+ORB regression
+execution/risk safety tests
+
+FINAL REPORT
+
+Return:
+
+VWAP DST FIX: PASS/FAIL
+
+MGC:
+legacy VWAP source =
+shadow VWAP source =
+comparison samples =
+avg tick difference =
+max tick difference =
+
+MNQ:
+legacy VWAP source =
+shadow VWAP source =
+comparison samples =
+avg tick difference =
+max tick difference =
+
+MES:
+legacy VWAP source =
+shadow VWAP source =
+comparison samples =
+avg tick difference =
+max tick difference =
+
+MYM:
+legacy VWAP source =
+shadow VWAP source =
+comparison samples =
+avg tick difference =
+max tick difference =
+
+CVD TRUE SOURCE:
+RVOL TRUE SOURCE:
+15M TREND TRUE SOURCE:
+4H TREND TRUE SOURCE:
+FVG TRUE SOURCE:
+ZONE TRUE SOURCE:
+ORB EXPOSED IN CANONICAL STATE: YES/NO
+
+SCORING PARITY: PASS/FAIL
+SCALP GOLDEN: PASS/FAIL
+CANONICAL STATE SHADOW ONLY: YES/NO
+LIVE SOURCE SELECTORS ALL LEGACY: YES/NO
+LIVE TRADING BEHAVIOR CHANGED: YES/NO
+
+SAFE TO BEGIN VWAP VALIDATION PERIOD: YES/NO
+
+Once that returns clean, then we let it accumulate the 50+ comparisons. After that we can consider the second button—Promote shadow VWAP to Validating.
+
+We are not replacing live VWAP at that point. VALIDATING should mean “we've gathered enough evidence to formally evaluate this component”, not “use it for trades.”

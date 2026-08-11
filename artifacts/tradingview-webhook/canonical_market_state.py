@@ -51,6 +51,16 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+try:
+    from zoneinfo import ZoneInfo  # Python 3.9+
+except ImportError:
+    try:
+        from backports.zoneinfo import ZoneInfo  # type: ignore[no-redef]
+    except ImportError:
+        ZoneInfo = None  # type: ignore[assignment,misc]
+
+_ET: Any = ZoneInfo("America/New_York") if ZoneInfo is not None else None
+
 logger = logging.getLogger(__name__)
 
 # ── Feature flags ─────────────────────────────────────────────────────────────
@@ -67,27 +77,46 @@ FVG_SOURCE       = os.environ.get("FVG_SOURCE",       "legacy").strip().lower()
 ZONE_SOURCE      = os.environ.get("ZONE_SOURCE",      "legacy").strip().lower()
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-INSTRUMENTS            = ("MGC", "MNQ", "MES", "MYM")
-ATR_PERIOD             = 14
-SWING_LOOKBACK         = 5      # bars each side for pivot detection
-STALE_THRESHOLD_S      = 300    # 5 min — component goes STALE after this
-WARMUP_BARS            = ATR_PERIOD + SWING_LOOKBACK * 2 + 1
-SESSION_RESET_UTC_HOUR = 22     # 22:00 UTC ≈ 6 PM ET (summer, UTC-4)
-COMPARISON_RATE_LIMIT_S = 60    # min seconds between comparison log bursts
-MAX_SWEEP_HISTORY      = 10
-MAX_STRUCTURE_EVENTS   = 50
+INSTRUMENTS             = ("MGC", "MNQ", "MES", "MYM")
+ATR_PERIOD              = 14
+SWING_LOOKBACK          = 5      # bars each side for pivot detection
+STALE_THRESHOLD_S       = 300    # 5 min — component goes STALE after this
+WARMUP_BARS             = ATR_PERIOD + SWING_LOOKBACK * 2 + 1
+COMPARISON_RATE_LIMIT_S = 60     # min seconds between comparison log bursts
+MAX_SWEEP_HISTORY       = 10
+MAX_STRUCTURE_EVENTS    = 50
+VWAP_MATCH_TICKS        = 2.0    # ≤2 ticks → MATCH
+VWAP_SMALL_DIFF_TICKS   = 10.0   # ≤10 ticks → SMALL_DIFF; >10 → LARGE_DIFF
+VWAP_TOLERANCE_TICKS    = 5.0    # "within tolerance" threshold for pct metric
+
+# Tick sizes per instrument (price per tick)
+TICK_SIZES: Dict[str, float] = {
+    "MGC": 0.10,
+    "MNQ": 0.25,
+    "MES": 0.25,
+    "MYM": 1.00,
+}
 
 # ── Component health / promotion states ───────────────────────────────────────
-HEALTHY               = "HEALTHY"
-STALE                 = "STALE"
-INSUFFICIENT_HISTORY  = "INSUFFICIENT_HISTORY"
-DATA_UNAVAILABLE      = "DATA_UNAVAILABLE"
-CALCULATION_ERROR     = "CALCULATION_ERROR"
+HEALTHY                           = "HEALTHY"
+STALE                             = "STALE"
+INSUFFICIENT_HISTORY              = "INSUFFICIENT_HISTORY"
+DATA_UNAVAILABLE                  = "DATA_UNAVAILABLE"
+CALCULATION_ERROR                 = "CALCULATION_ERROR"
 
-SHADOW                = "SHADOW"          # all components start here
-VALIDATING            = "VALIDATING"      # comparison data being collected
-READY_FOR_PROMOTION   = "READY_FOR_PROMOTION"
-LIVE_CANONICAL        = "LIVE_CANONICAL"  # never allowed this phase
+SHADOW                            = "SHADOW"          # all components start here
+VALIDATING                        = "VALIDATING"      # comparison data being collected
+READY_FOR_PROMOTION               = "READY_FOR_PROMOTION"
+LIVE_CANONICAL                    = "LIVE_CANONICAL"  # never allowed this phase
+UNAVAILABLE_FOR_DATABENTO_PROMOTION = "UNAVAILABLE_FOR_DATABENTO_PROMOTION"
+
+# VWAP agreement status codes (used in vwap_comparison block)
+AGREE_MATCH       = "MATCH"
+AGREE_SMALL_DIFF  = "SMALL_DIFF"
+AGREE_LARGE_DIFF  = "LARGE_DIFF"
+AGREE_WAITING     = "WAITING"
+AGREE_STALE       = "STALE"
+AGREE_UNAVAILABLE = "UNAVAILABLE"
 
 # ── Internal data structures ──────────────────────────────────────────────────
 
@@ -142,6 +171,94 @@ class SweepEvent:
         }
 
 
+@dataclass
+class _VwapStats:
+    """Rolling VWAP comparison stats — shadow validation metrics.
+
+    Tracks enough detail for the SHADOW → VALIDATING promotion check:
+      - total, acceptable, unacceptable counts
+      - current and longest consecutive-acceptable streak
+      - sorted tick-diff list for median/p95 (bounded — max 10 000 entries)
+    """
+    sample_count:                  int   = 0
+    acceptable_count:              int   = 0   # total diffs ≤ VWAP_MATCH_TICKS
+    unacceptable_count:            int   = 0   # total diffs > VWAP_MATCH_TICKS
+    consecutive_acceptable:        int   = 0   # CURRENT streak
+    longest_consecutive_acceptable: int  = 0   # LONGEST streak ever seen
+    tick_diff_sum:                 float = 0.0
+    max_tick_diff:                 float = 0.0
+    within_tolerance_count:        int   = 0   # diffs ≤ VWAP_TOLERANCE_TICKS
+    latest_tick_diff:              Optional[float] = None
+    _sorted_diffs: List[float] = field(default_factory=list)  # kept sorted via bisect
+
+    def record(self, tick_diff: float) -> None:
+        import bisect  # stdlib — import here to avoid module-level dep ordering issues
+        abs_diff = abs(tick_diff)
+        self.sample_count  += 1
+        self.tick_diff_sum += abs_diff
+        self.max_tick_diff  = max(self.max_tick_diff, abs_diff)
+        self.latest_tick_diff = round(tick_diff, 3)
+        if abs_diff <= VWAP_MATCH_TICKS:
+            self.acceptable_count      += 1
+            self.consecutive_acceptable += 1
+            self.longest_consecutive_acceptable = max(
+                self.longest_consecutive_acceptable,
+                self.consecutive_acceptable,
+            )
+        else:
+            self.unacceptable_count    += 1
+            self.consecutive_acceptable = 0
+        if abs_diff <= VWAP_TOLERANCE_TICKS:
+            self.within_tolerance_count += 1
+        # Keep sorted list bounded at 10 000 entries (oldest dropped from front)
+        if len(self._sorted_diffs) < 10_000:
+            bisect.insort(self._sorted_diffs, abs_diff)
+
+    def _percentile(self, pct: float) -> Optional[float]:
+        """Return the pct-th percentile (0–100) of recorded tick diffs."""
+        n = len(self._sorted_diffs)
+        if n == 0:
+            return None
+        idx = int(pct / 100.0 * (n - 1) + 0.5)
+        return round(self._sorted_diffs[min(idx, n - 1)], 3)
+
+    @property
+    def promotion_status(self) -> str:
+        """VALIDATING when qualifying streak reached; SHADOW otherwise.
+
+        Criteria (all must be true for that instrument):
+          1. ≥ 50 total valid comparison samples
+          2. longest_consecutive_acceptable ≥ 50
+        VALIDATING is informational only — no money-path effect.
+        """
+        if (self.sample_count >= 50
+                and self.longest_consecutive_acceptable >= 50):
+            return "VALIDATING"
+        return "SHADOW"
+
+    @property
+    def promotion_eligible(self) -> bool:
+        return self.promotion_status == "VALIDATING"
+
+    def to_dict(self) -> dict:
+        n = self.sample_count
+        return {
+            "sample_count":                   n,
+            "acceptable_count":               self.acceptable_count,
+            "unacceptable_count":             self.unacceptable_count,
+            "consecutive_acceptable":         self.consecutive_acceptable,
+            "longest_consecutive_acceptable": self.longest_consecutive_acceptable,
+            "avg_tick_diff":                  round(self.tick_diff_sum / n, 3) if n > 0 else None,
+            "median_tick_diff":               self._percentile(50),
+            "p95_tick_diff":                  self._percentile(95),
+            "max_tick_diff":                  round(self.max_tick_diff, 3),
+            "latest_tick_diff":               self.latest_tick_diff,
+            "pct_within_tolerance":           round(self.within_tolerance_count / n * 100, 1) if n > 0 else None,
+            "promotion_status":               self.promotion_status,
+            "promotion_eligible":             self.promotion_eligible,
+        }
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _iso(ts: float) -> str:
@@ -153,19 +270,32 @@ def _session_start(ts: float) -> float:
 
     CME equity-index and micro-gold futures trade Sunday–Friday with a
     daily maintenance window 17:00–18:00 ET.  The trading 'session' that
-    VWAP resets to starts at 18:00 ET (22:00 UTC in summer / 23:00 UTC
-    in winter).  We use a fixed UTC offset matching the app convention
-    (UTC-4) so session resets are stable across DST transitions for the
-    purposes of shadow VWAP comparison.
+    VWAP resets to starts at 18:00 America/New_York each calendar day.
+
+    DST is handled correctly: in EDT (UTC-4) 18:00 ET = 22:00 UTC; in
+    EST (UTC-5) 18:00 ET = 23:00 UTC.  Using a fixed UTC hour would
+    silently reset an hour early for half the year.
+
+    Falls back to a fixed UTC-5 (EST) offset when zoneinfo is unavailable,
+    which is conservative (may be one hour off in summer).
     """
-    dt = datetime.fromtimestamp(ts, tz=timezone.utc)
-    # Boundary = SESSION_RESET_UTC_HOUR:00 UTC each calendar day
-    boundary = dt.replace(
-        hour=SESSION_RESET_UTC_HOUR, minute=0, second=0, microsecond=0
-    )
-    if dt < boundary:
-        boundary -= timedelta(days=1)
-    return boundary.timestamp()
+    dt_utc = datetime.fromtimestamp(ts, tz=timezone.utc)
+
+    if _ET is not None:
+        # Timezone-aware: correct for both EDT and EST
+        dt_et = dt_utc.astimezone(_ET)
+        boundary_et = dt_et.replace(hour=18, minute=0, second=0, microsecond=0)
+        if dt_et < boundary_et:
+            boundary_et -= timedelta(days=1)
+        return boundary_et.astimezone(timezone.utc).timestamp()
+    else:
+        # Fallback: EST fixed offset (UTC-5) — conservative, never early
+        UTC_MINUS_5 = timezone(timedelta(hours=-5))
+        dt_et = dt_utc.astimezone(UTC_MINUS_5)
+        boundary_et = dt_et.replace(hour=18, minute=0, second=0, microsecond=0)
+        if dt_et < boundary_et:
+            boundary_et -= timedelta(days=1)
+        return boundary_et.astimezone(timezone.utc).timestamp()
 
 
 def _freshness(last_update: Optional[float]) -> str:
@@ -495,6 +625,7 @@ class CanonicalMarketStateEngine:
                     "distance_pct": vwap_dist_pct,
                     "side":         vwap_side,
                     "sample_volume":round(self._v_sum, 0),
+                    "session_start":_iso(self._session_start_ts) if self._session_start_ts else None,
                     "source":       "databento",
                     "health":       vwap_health,
                     "promotion_status": SHADOW,
@@ -569,10 +700,16 @@ _engines_lock = threading.Lock()
 _started       = False
 
 # References to shared state dicts injected at start()
-_DATABENTO_BARS: Optional[Dict]  = None
-_CVD_BY_TICKER:  Optional[Dict]  = None
-_RVOL_BY_TICKER: Optional[Dict]  = None
-_VWAP_BY_TICKER: Optional[Dict]  = None   # Yahoo-derived legacy VWAP
+_DATABENTO_BARS:      Optional[Dict] = None
+_CVD_BY_TICKER:       Optional[Dict] = None
+_RVOL_BY_TICKER:      Optional[Dict] = None
+_VWAP_BY_TICKER:      Optional[Dict] = None   # Yahoo/auto-sourced legacy VWAP
+# ORB state — TradingView-sourced; injected at boot (optional)
+_INTRADAY_BY_TICKER:  Optional[Dict] = None   # or_high, or_low, or_complete
+_BREAKOUT_OR_BY_TICKER: Optional[Dict] = None # 09:30 ET ORB; or_high, or_low, post_high, post_low
+
+# Per-instrument VWAP comparison rolling stats
+_VWAP_STATS: Dict[str, _VwapStats] = {}
 
 # Comparison rate-limiting
 _last_comparison_log: Dict[str, float] = {}
@@ -584,33 +721,44 @@ _get_db_fn = None
 # ── Boot ──────────────────────────────────────────────────────────────────────
 
 def start(
-    databento_bars_by_inst: Dict,
-    cvd_by_ticker:          Dict,
-    rvol_by_ticker:         Dict,
-    vwap_by_ticker:         Optional[Dict] = None,
+    databento_bars_by_inst:   Dict,
+    cvd_by_ticker:            Dict,
+    rvol_by_ticker:           Dict,
+    vwap_by_ticker:           Optional[Dict] = None,
+    intraday_by_ticker:       Optional[Dict] = None,
+    breakout_or_by_ticker:    Optional[Dict] = None,
     get_db_fn=None,
 ) -> None:
-    """Boot the engine.  Call once at application start after DatabentoBrain.start()."""
+    """Boot the engine.  Call once at application start after DatabentoBrain.start().
+
+    Optional injections:
+      intraday_by_ticker    — INTRADAY_BY_TICKER from app.py (ORB state, TradingView-sourced)
+      breakout_or_by_ticker — BREAKOUT_OR_BY_TICKER from app.py (09:30 ET ORB, TradingView-sourced)
+    """
     global _started, _DATABENTO_BARS, _CVD_BY_TICKER, _RVOL_BY_TICKER, _VWAP_BY_TICKER, _get_db_fn
+    global _INTRADAY_BY_TICKER, _BREAKOUT_OR_BY_TICKER, _VWAP_STATS
 
     if not CMS_ENABLED:
         logger.info("CanonicalMarketState: disabled (CANONICAL_MARKET_STATE_ENABLED=0)")
         return
 
-    _DATABENTO_BARS = databento_bars_by_inst
-    _CVD_BY_TICKER  = cvd_by_ticker
-    _RVOL_BY_TICKER = rvol_by_ticker
-    _VWAP_BY_TICKER = vwap_by_ticker
-    _get_db_fn      = get_db_fn
+    _DATABENTO_BARS        = databento_bars_by_inst
+    _CVD_BY_TICKER         = cvd_by_ticker
+    _RVOL_BY_TICKER        = rvol_by_ticker
+    _VWAP_BY_TICKER        = vwap_by_ticker
+    _INTRADAY_BY_TICKER    = intraday_by_ticker
+    _BREAKOUT_OR_BY_TICKER = breakout_or_by_ticker
+    _get_db_fn             = get_db_fn
 
     with _engines_lock:
         for inst in INSTRUMENTS:
             _engines[inst] = CanonicalMarketStateEngine(inst)
+            _VWAP_STATS[inst] = _VwapStats()
 
     _started = True
     logger.info(
-        "CANONICAL_STATE_STARTED instruments=%s shadow_only=%s",
-        list(INSTRUMENTS), CMS_SHADOW_ONLY,
+        "CANONICAL_STATE_STARTED instruments=%s shadow_only=%s orb_injected=%s",
+        list(INSTRUMENTS), CMS_SHADOW_ONLY, intraday_by_ticker is not None,
     )
 
 
@@ -677,25 +825,51 @@ def get_all_canonical_market_states() -> Dict[str, dict]:
 
 
 def _augment_snapshot(inst: str, snap: dict) -> None:
-    """Attach data from other Databento-derived modules (CVD, RVOL, trend, FVG)."""
-    # ── CVD (already Databento-derived in DatabentoBrain) ─────────────────────
+    """Attach data from other modules with accurate provenance labeling.
+
+    TRUE SOURCE AUDIT (per instrument):
+      CVD         — DatabentoBrain 1m bar accumulator (primary); TV alerts may inject.
+      RVOL        — DatabentoBrain 1m bar computation (primary); TV alerts may inject.
+      15m/4H Trend— trend_alignment module, fed by DATABENTO_BARS_BY_INST. DATABENTO.
+      FVG zones   — fvg_engine module, fed by DATABENTO_BARS_BY_INST. DATABENTO.
+      Zone state  — TradingView ALERT_HISTORY → get_price_context(). NOT Databento-derivable.
+      ORB state   — TradingView webhook price path → INTRADAY_BY_TICKER. NOT Databento.
+    """
+    # ── CVD ────────────────────────────────────────────────────────────────────
+    # TRUE SOURCE: DatabentoBrain 1m bar accumulator (continuous primary writer).
+    # TradingView alerts can also inject via alert field — hence "MIXED" upstream,
+    # but Databento is the authoritative continuous source used for shadow validation.
     cvd_rec = (_CVD_BY_TICKER or {}).get(inst) or {}
     snap["cvd"] = {
         "value":            cvd_rec.get("value"),
         "direction":        cvd_rec.get("state", "UNKNOWN"),
-        "source":           "databento",
-        "note":             "Reused from DatabentoBrain accumulator",
+        "true_source":      "databento_primary",
+        "upstream_tag":     cvd_rec.get("source", "unknown"),
+        "note":             (
+            "Primary writer: DatabentoBrain 1m bar accumulator. "
+            "TradingView alerts may also inject (secondary). "
+            "Databento is the continuous authoritative source."
+        ),
         "health":           HEALTHY if cvd_rec.get("value") is not None else DATA_UNAVAILABLE,
         "promotion_status": SHADOW,
     }
 
-    # ── RVOL (already Databento-derived in DatabentoBrain) ────────────────────
+    # ── RVOL ───────────────────────────────────────────────────────────────────
+    # TRUE SOURCE: DatabentoBrain 1m bar rolling computation (primary).
+    # TradingView alert `rvol` field may inject — Databento overwrites continuously.
     rvol_rec = (_RVOL_BY_TICKER or {}).get(inst) or {}
+    snap["volume"]["true_source"]      = "databento_primary"
+    snap["volume"]["note"]             = (
+        "Primary writer: DatabentoBrain 1m bar RVOL. "
+        "TradingView alerts may inject (secondary)."
+    )
     if rvol_rec.get("value") is not None:
-        snap["volume"]["databento_rvol"] = rvol_rec.get("value")
+        snap["volume"]["databento_rvol"]        = rvol_rec.get("value")
         snap["volume"]["databento_rvol_source"] = "databento_brain"
 
-    # ── 15m / 4H Trend (trend_alignment module — already Databento-derived) ───
+    # ── 15m / 4H Trend ────────────────────────────────────────────────────────
+    # TRUE SOURCE: DATABENTO — trend_alignment.ingest_1m_bar() consumes
+    # DATABENTO_BARS_BY_INST; TradingView signals only read the snapshot.
     try:
         import trend_alignment as _ta  # noqa: PLC0415
         mtf = _ta.MTF_STATE_BY_INST.get(inst) or {}
@@ -717,15 +891,17 @@ def _augment_snapshot(inst: str, snap: dict) -> None:
             "trend_alignment": alignment,
             "bars_15m":        t15.get("bars_count", 0),
             "bars_4h":         t4h.get("bars_count", 0),
-            "source":          "databento",
-            "note":            "Consumed from trend_alignment module",
+            "true_source":     "databento",
+            "note":            "trend_alignment module fed by DATABENTO_BARS_BY_INST.",
             "health":          HEALTHY if alignment != "UNKNOWN" else INSUFFICIENT_HISTORY,
             "promotion_status":SHADOW,
         }
     except Exception as exc:  # noqa: BLE001
         snap["trend"] = {"health": CALCULATION_ERROR, "error": str(exc)[:80]}
 
-    # ── FVG zones (fvg_engine — already Databento-derived) ───────────────────
+    # ── FVG zones ──────────────────────────────────────────────────────────────
+    # TRUE SOURCE: DATABENTO — fvg_engine.process_bar_close() consumes
+    # DATABENTO_BARS_BY_INST. Distinct from Supply/Demand zones (see zone_state).
     try:
         from fvg_engine import FVG_ZONES_BY_INST  # noqa: PLC0415
         zones = FVG_ZONES_BY_INST.get(inst) or []
@@ -733,32 +909,144 @@ def _augment_snapshot(inst: str, snap: dict) -> None:
         snap["fvg_zones"] = {
             "active_count":    len(active_fvgs),
             "total_count":     len(zones),
-            "source":          "databento",
-            "note":            "Consumed from fvg_engine module",
+            "true_source":     "databento",
+            "note":            "fvg_engine.process_bar_close() fed by DATABENTO_BARS_BY_INST.",
             "health":          HEALTHY,
             "promotion_status":SHADOW,
         }
     except Exception:  # noqa: BLE001
-        snap["fvg_zones"] = {"health": DATA_UNAVAILABLE}
+        snap["fvg_zones"] = {"health": DATA_UNAVAILABLE, "true_source": "databento"}
 
-    # ── Legacy VWAP comparison ─────────────────────────────────────────────────
-    legacy_vwap = None
+    # ── Supply/Demand Zone state ───────────────────────────────────────────────
+    # TRUE SOURCE: TRADINGVIEW — zones are distinct from FVG zones and are built
+    # from TradingView ALERT_HISTORY via get_price_context().  Not Databento-
+    # derivable in the current phase.  Reported explicitly so consumers see the
+    # real provenance rather than assuming Databento coverage.
+    snap["zone_state"] = {
+        "true_source":      "tradingview",
+        "promotion_status": UNAVAILABLE_FOR_DATABENTO_PROMOTION,
+        "status":           "AVAILABLE_LEGACY",
+        "note":             (
+            "Supply/demand zones are SEPARATE from FVG zones. "
+            "Built from TradingView ALERT_HISTORY via get_price_context(). "
+            "Not a Databento-derivable component this phase."
+        ),
+    }
+
+    # ── ORB (Opening Range / Breakout) ─────────────────────────────────────────
+    # TRUE SOURCE: TRADINGVIEW — INTRADAY_BY_TICKER is populated by the TradingView
+    # webhook price path.  Reuses the existing ORB engine without duplication.
+    # BREAKOUT_OR_BY_TICKER holds the dedicated 09:30 ET breakout ORB.
+    orb_rec = (_INTRADAY_BY_TICKER or {}).get(inst) or {}
+    brk_rec = (_BREAKOUT_OR_BY_TICKER or {}).get(inst) or {}
+    if orb_rec:
+        snap["orb"] = {
+            "or_high":          orb_rec.get("or_high"),
+            "or_low":           orb_rec.get("or_low"),
+            "or_complete":      orb_rec.get("or_complete", False),
+            "or_width":         (
+                round(orb_rec["or_high"] - orb_rec["or_low"], 4)
+                if orb_rec.get("or_high") is not None and orb_rec.get("or_low") is not None
+                else None
+            ),
+            "true_source":      "tradingview",
+            "promotion_status": UNAVAILABLE_FOR_DATABENTO_PROMOTION,
+            "note":             "INTRADAY_BY_TICKER — TradingView webhook price path. Existing ORB engine.",
+            "health":           HEALTHY,
+        }
+        if brk_rec:
+            snap["orb"]["breakout_or"] = {
+                "or_high":    brk_rec.get("or_high"),
+                "or_low":     brk_rec.get("or_low"),
+                "or_complete":brk_rec.get("or_complete", False),
+                "post_high":  brk_rec.get("post_high"),
+                "post_low":   brk_rec.get("post_low"),
+                "note":       "BREAKOUT_OR_BY_TICKER — dedicated 09:30 ET ORB engine.",
+            }
+    else:
+        snap["orb"] = {
+            "status":           "UNAVAILABLE",
+            "reason":           "INTRADAY_BY_TICKER not injected at boot; add intraday_by_ticker= to cms.start()",
+            "true_source":      "tradingview",
+            "promotion_status": UNAVAILABLE_FOR_DATABENTO_PROMOTION,
+        }
+
+    # ── Legacy VWAP comparison with full metrics ───────────────────────────────
+    legacy_vwap    = None
+    legacy_freshness = DATA_UNAVAILABLE
     try:
         if _VWAP_BY_TICKER:
             vwap_rec = _VWAP_BY_TICKER.get(inst) or {}
-            legacy_vwap = vwap_rec.get("vwap") if isinstance(vwap_rec, dict) else None
+            if isinstance(vwap_rec, dict):
+                legacy_vwap    = vwap_rec.get("vwap")
+                legacy_updated = (
+                    vwap_rec.get("last_updated")
+                    or vwap_rec.get("updated_at")
+                    or vwap_rec.get("timestamp")
+                )
+                if legacy_updated is not None:
+                    age = time.time() - float(legacy_updated)
+                    legacy_freshness = HEALTHY if age < STALE_THRESHOLD_S else STALE
+                elif legacy_vwap is not None:
+                    legacy_freshness = HEALTHY  # value present but no timestamp → assume fresh
     except Exception:  # noqa: BLE001
         pass
 
-    db_vwap = snap.get("vwap", {}).get("value")
-    if legacy_vwap is not None and db_vwap is not None:
-        diff = round(db_vwap - legacy_vwap, 4)
-        snap["vwap_comparison"] = {
-            "legacy_vwap":          legacy_vwap,
-            "databento_vwap":       db_vwap,
-            "absolute_difference":  diff,
-            "agreement":            abs(diff) < 1.0,
-        }
+    db_vwap       = snap.get("vwap", {}).get("value")
+    db_freshness  = snap.get("vwap", {}).get("health", DATA_UNAVAILABLE)
+    tick_size     = TICK_SIZES.get(inst, 1.0)
+
+    # Determine agreement status
+    if db_vwap is None:
+        agreement_status = AGREE_WAITING
+    elif legacy_vwap is None:
+        agreement_status = AGREE_UNAVAILABLE
+    elif db_freshness == STALE or legacy_freshness == STALE:
+        agreement_status = AGREE_STALE
+    else:
+        abs_diff_raw = abs(db_vwap - legacy_vwap)
+        tick_diff_raw = abs_diff_raw / tick_size
+        if tick_diff_raw <= VWAP_MATCH_TICKS:
+            agreement_status = AGREE_MATCH
+        elif tick_diff_raw <= VWAP_SMALL_DIFF_TICKS:
+            agreement_status = AGREE_SMALL_DIFF
+        else:
+            agreement_status = AGREE_LARGE_DIFF
+
+    abs_diff  = round(db_vwap - legacy_vwap, 4) if (db_vwap is not None and legacy_vwap is not None) else None
+    tick_diff = round(abs(abs_diff) / tick_size, 2) if abs_diff is not None else None
+
+    stats = _VWAP_STATS.get(inst)
+    _stats_dict = stats.to_dict() if stats else {
+        "sample_count":                   0,
+        "acceptable_count":               0,
+        "unacceptable_count":             0,
+        "consecutive_acceptable":         0,
+        "longest_consecutive_acceptable": 0,
+        "avg_tick_diff":                  None,
+        "median_tick_diff":               None,
+        "p95_tick_diff":                  None,
+        "max_tick_diff":                  0.0,
+        "latest_tick_diff":               None,
+        "pct_within_tolerance":           None,
+        "promotion_status":               "SHADOW",
+        "promotion_eligible":             False,
+    }
+    snap["vwap_comparison"] = {
+        "legacy_vwap":         legacy_vwap,
+        "legacy_source":       "yahoo_finance",
+        "legacy_freshness":    legacy_freshness,
+        "databento_vwap":      db_vwap,
+        "databento_source":    "databento",
+        "databento_freshness": db_freshness,
+        "absolute_difference": abs_diff,
+        "tick_difference":     tick_diff,
+        "tick_size":           tick_size,
+        "agreement_status":    agreement_status,
+        "session_start":       snap.get("vwap", {}).get("session_start"),
+        "sample_volume":       snap.get("vwap", {}).get("sample_volume"),
+        **_stats_dict,
+    }
 
 
 # ── Shadow comparison store ───────────────────────────────────────────────────
@@ -786,14 +1074,17 @@ def record_legacy_comparison(
         diff      = round(db_f - legacy_f, 6) if (legacy_f is not None and db_f is not None) else None
         agreement = abs(diff) < 1.0 if diff is not None else None
 
+        tick_size  = TICK_SIZES.get(inst, 1.0) if component == "vwap" else 1.0
+        tick_diff  = round(abs(diff) / tick_size, 4) if diff is not None else None
+
         cur.execute(
             """INSERT INTO market_state_source_comparisons
                (timestamp, instrument, component,
                 legacy_value, databento_value,
-                agreement, difference_numeric,
+                agreement, difference_numeric, difference_ticks,
                 metadata)
-               VALUES (%s, %s, %s, %s, %s, %s, %s, %s)""",
-            (now, inst, component, legacy_f, db_f, agreement, diff,
+               VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)""",
+            (now, inst, component, legacy_f, db_f, agreement, diff, tick_diff,
              _json.dumps(meta or {})),
         )
         db.commit()
@@ -802,7 +1093,7 @@ def record_legacy_comparison(
 
 
 def _maybe_compare_vwap(inst: str, engine: CanonicalMarketStateEngine) -> None:
-    """Rate-limited VWAP comparison write."""
+    """Rate-limited VWAP comparison write + in-memory rolling stats update."""
     with _comparison_lock:
         key  = f"vwap:{inst}"
         last = _last_comparison_log.get(key, 0)
@@ -818,15 +1109,39 @@ def _maybe_compare_vwap(inst: str, engine: CanonicalMarketStateEngine) -> None:
         db_val     = engine._vwap  # noqa: SLF001 — same module, OK
         if legacy_val is None or db_val is None:
             return
-        diff = abs(db_val - legacy_val)
-        if diff > 0.01:
+
+        tick_size  = TICK_SIZES.get(inst, 1.0)
+        abs_diff   = abs(db_val - legacy_val)
+        tick_diff  = abs_diff / tick_size
+
+        if abs_diff > 0.01:
             logger.debug(
-                "SOURCE_COMPARISON_MISMATCH inst=%s comp=VWAP legacy=%.4f db=%.4f diff=%.4f",
-                inst, legacy_val, db_val, diff,
+                "SOURCE_COMPARISON_MISMATCH inst=%s comp=VWAP "
+                "legacy=%.4f db=%.4f diff=%.4f ticks=%.2f",
+                inst, legacy_val, db_val, abs_diff, tick_diff,
             )
+
+        # Update in-memory rolling stats
+        stats = _VWAP_STATS.get(inst)
+        if stats is not None:
+            stats.record(tick_diff)
+
         record_legacy_comparison(inst, "vwap", legacy_val, db_val)
     except Exception:  # noqa: BLE001
         pass
+
+
+def get_vwap_comparison_stats(instrument: Optional[str] = None) -> dict:
+    """Return rolling VWAP comparison stats for one or all instruments.
+
+    These are in-memory accumulators — they reset on server restart.
+    Use the market_state_source_comparisons DB table for durable history.
+    """
+    if instrument is not None:
+        stats = _VWAP_STATS.get(instrument)
+        return stats.to_dict() if stats else {}
+    return {inst: (_VWAP_STATS[inst].to_dict() if inst in _VWAP_STATS else {})
+            for inst in INSTRUMENTS}
 
 
 # ── DB table DDL (called once at boot) ───────────────────────────────────────

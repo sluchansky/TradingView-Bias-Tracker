@@ -1361,16 +1361,152 @@ const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
 };
 
 // ── Canonical Databento Market State Panel — shadow/observation only ──────────
+// Agreement status → color + label
+const _agreeColor = (s: string) =>
+  s === 'MATCH'      ? '#34d399' :
+  s === 'SMALL_DIFF' ? '#fbbf24' :
+  s === 'LARGE_DIFF' ? '#ef4444' :
+  s === 'STALE'      ? '#f97316' :
+  s === 'WAITING'    ? '#6b7280' : '#4b5563';
+
+const _agreeLabel = (s: string) =>
+  s === 'MATCH'      ? '✓ MATCH' :
+  s === 'SMALL_DIFF' ? '~ SMALL' :
+  s === 'LARGE_DIFF' ? '✕ LARGE' :
+  s === 'STALE'      ? '⚠ STALE' :
+  s === 'WAITING'    ? '… WAITING' :
+  s === 'UNAVAILABLE'? '— N/A' : s;
+
+const _freshBadge = (f: string) =>
+  f === 'HEALTHY' ? { color: '#34d399', label: 'LIVE' } :
+  f === 'STALE'   ? { color: '#f97316', label: 'STALE' } :
+                    { color: '#4b5563', label: '—' };
+
+interface _InstrumentCompRow {
+  inst:        string;
+  vc:          Record<string, unknown>;
+  warmup:      Record<string, unknown>;
+}
+
+const _InstrumentRow: React.FC<{ row: _InstrumentCompRow }> = ({ row }) => {
+  const { inst, vc, warmup } = row;
+  const warm = warmup as Record<string, unknown>;
+  const warming = !warm.complete;
+  const agreeStatus = String(vc.agreement_status ?? 'UNAVAILABLE');
+  const legFresh    = _freshBadge(String(vc.legacy_freshness ?? ''));
+  const dbFresh     = _freshBadge(String(vc.databento_freshness ?? ''));
+
+  const legVwap = vc.legacy_vwap != null ? Number(vc.legacy_vwap).toFixed(2) : '—';
+  const dbVwap  = vc.databento_vwap != null ? Number(vc.databento_vwap).toFixed(2) : '—';
+  const absDiff = vc.absolute_difference != null ? Math.abs(Number(vc.absolute_difference)).toFixed(2) : '—';
+  const tickDiff= vc.tick_difference != null ? Number(vc.tick_difference).toFixed(1) + ' tk' : '—';
+  const sessStart = vc.session_start
+    ? String(vc.session_start).slice(11, 16) + 'z'
+    : '—';
+  const sampVol = vc.sample_volume != null
+    ? Number(vc.sample_volume).toLocaleString(undefined, { maximumFractionDigits: 0 })
+    : '—';
+
+  const cellStyle: React.CSSProperties = {
+    padding: '5px 8px', fontSize: 11, whiteSpace: 'nowrap',
+    borderBottom: '1px solid rgba(255,255,255,0.04)',
+    fontVariantNumeric: 'tabular-nums',
+  };
+  const instCell: React.CSSProperties = {
+    ...cellStyle, fontWeight: 700, color: '#c4b5fd', width: 40,
+  };
+
+  return (
+    <tr>
+      <td style={instCell}>{inst}</td>
+      {warming ? (
+        <td colSpan={8} style={{ ...cellStyle, color: '#4b5563' }}>
+          Warming up… {String(warm.bars_available ?? 0)}/{String(warm.bars_required ?? 0)} bars
+        </td>
+      ) : (
+        <>
+          <td style={{ ...cellStyle, color: '#9ca3af' }}>{legVwap}</td>
+          <td style={{ ...cellStyle, color: '#a5f3fc' }}>{dbVwap}</td>
+          <td style={{ ...cellStyle, color: absDiff === '—' ? '#4b5563' : '#d1d5db' }}>{absDiff}</td>
+          <td style={{ ...cellStyle, color: tickDiff === '—' ? '#4b5563' : '#d1d5db' }}>{tickDiff}</td>
+          <td style={{ ...cellStyle }}>
+            <span style={{ color: legFresh.color, fontWeight: 600, fontSize: 10 }}>{legFresh.label}</span>
+            {' / '}
+            <span style={{ color: dbFresh.color, fontWeight: 600, fontSize: 10 }}>{dbFresh.label}</span>
+          </td>
+          <td style={{ ...cellStyle, fontWeight: 700, color: _agreeColor(agreeStatus) }}>
+            {_agreeLabel(agreeStatus)}
+          </td>
+          <td style={{ ...cellStyle, color: '#6b7280' }}>{sampVol}</td>
+          <td style={{ ...cellStyle, color: '#6b7280' }}>{sessStart}</td>
+        </>
+      )}
+    </tr>
+  );
+};
+
+const _promotionBadge = (status: string) => {
+  if (status === 'VALIDATING') return { color: '#34d399', bg: 'rgba(52,211,153,0.12)', label: '✓ VALIDATING' };
+  return { color: '#6b7280', bg: 'transparent', label: 'SHADOW' };
+};
+
+const _MetricsRow: React.FC<{ inst: string; vc: Record<string, unknown> }> = ({ inst, vc }) => {
+  const n       = vc.sample_count   != null ? Number(vc.sample_count)   : 0;
+  const acc     = vc.acceptable_count   != null ? Number(vc.acceptable_count)   : 0;
+  const unacc   = vc.unacceptable_count != null ? Number(vc.unacceptable_count) : 0;
+  const cons    = vc.consecutive_acceptable != null ? Number(vc.consecutive_acceptable) : 0;
+  const longest = vc.longest_consecutive_acceptable != null ? Number(vc.longest_consecutive_acceptable) : 0;
+  const avg     = vc.avg_tick_diff    != null ? Number(vc.avg_tick_diff).toFixed(2)    : '—';
+  const med     = vc.median_tick_diff != null ? Number(vc.median_tick_diff).toFixed(2) : '—';
+  const p95     = vc.p95_tick_diff    != null ? Number(vc.p95_tick_diff).toFixed(2)    : '—';
+  const max     = vc.max_tick_diff    != null ? Number(vc.max_tick_diff).toFixed(2)    : '—';
+  const pct     = vc.pct_within_tolerance != null ? `${Number(vc.pct_within_tolerance).toFixed(0)}%` : '—';
+  const promoStatus = String(vc.promotion_status ?? 'SHADOW');
+  const badge   = _promotionBadge(promoStatus);
+
+  const cellStyle: React.CSSProperties = {
+    padding: '3px 8px', fontSize: 10, color: '#6b7280',
+    borderBottom: '1px solid rgba(255,255,255,0.03)',
+    fontVariantNumeric: 'tabular-nums', whiteSpace: 'nowrap',
+  };
+  return (
+    <>
+      <tr>
+        <td style={{ ...cellStyle, color: '#4b5563', fontWeight: 600 }} rowSpan={2}>{inst}</td>
+        <td style={cellStyle}>{n} total</td>
+        <td style={{ ...cellStyle, color: '#34d399' }}>{acc} ok</td>
+        <td style={{ ...cellStyle, color: unacc > 0 ? '#f87171' : '#4b5563' }}>{unacc} bad</td>
+        <td style={cellStyle}>cur {cons}</td>
+        <td style={{ ...cellStyle, color: longest >= 50 ? '#34d399' : '#6b7280' }}>lng {longest}</td>
+        <td style={cellStyle}>
+          <span style={{
+            background: badge.bg, color: badge.color,
+            fontWeight: 700, fontSize: 9, padding: '1px 5px', borderRadius: 3,
+          }}>{badge.label}</span>
+        </td>
+        <td style={cellStyle}>{pct} in tol</td>
+      </tr>
+      <tr>
+        <td colSpan={3} style={{ ...cellStyle, color: '#4b5563' }}>
+          avg {avg} · med {med} · p95 {p95} · max {max} ticks
+        </td>
+        <td colSpan={4} style={{ ...cellStyle, color: '#4b5563' }}>
+          need longest≥50 to promote
+        </td>
+      </tr>
+    </>
+  );
+};
+
 const CanonicalStatePanel: React.FC = () => {
   const [data,    setData]    = useState<Record<string, unknown> | null>(null);
   const [loading, setLoading] = useState(true);
   const [err,     setErr]     = useState<string | null>(null);
-  const inst = 'MNQ';  // default to MNQ; full view shows all
 
   useEffect(() => {
     let cancelled = false;
     const load = () => {
-      fetch(`/api/canonical-market-state?instrument=${inst}`, {
+      fetch('/api/canonical-market-state', {
         credentials: 'include',
         headers: getAuthHeader(),
       })
@@ -1383,98 +1519,84 @@ const CanonicalStatePanel: React.FC = () => {
     return () => { cancelled = true; clearInterval(id); };
   }, []);
 
-  const s = (data?.state ?? {}) as Record<string, unknown>;
-  const vwap = (s.vwap ?? {}) as Record<string, unknown>;
-  const atr  = (s.atr  ?? {}) as Record<string, unknown>;
-  const vol  = (s.volume ?? {}) as Record<string, unknown>;
-  const str  = (s.structure ?? {}) as Record<string, unknown>;
-  const cvd  = (s.cvd ?? {}) as Record<string, unknown>;
-  const trend= (s.trend ?? {}) as Record<string, unknown>;
-  const warm = (s.warmup ?? {}) as Record<string, unknown>;
+  if (loading || err || !data?.ok) return null;
 
-  const healthColor = (h: string) =>
-    h === 'HEALTHY' ? '#34d399' : h === 'STALE' ? '#fbbf24' : '#6b7280';
-  const dirColor = (d: string) =>
-    d === 'BULLISH' || d === 'ALIGNED_BULLISH' ? '#34d399' :
-    d === 'BEARISH' || d === 'ALIGNED_BEARISH' ? '#ef4444' : '#6b7280';
+  const states = (data.states ?? {}) as Record<string, Record<string, unknown>>;
+  const INSTS  = ['MGC', 'MNQ', 'MES', 'MYM'];
+
+  const rows: _InstrumentCompRow[] = INSTS.map(inst => {
+    const s = (states[inst] ?? {}) as Record<string, unknown>;
+    return {
+      inst,
+      vc:     (s.vwap_comparison ?? {}) as Record<string, unknown>,
+      warmup: (s.warmup ?? {}) as Record<string, unknown>,
+    };
+  });
 
   const panelStyle: React.CSSProperties = {
     background: 'rgba(99,102,241,0.05)',
     border: '1px solid rgba(99,102,241,0.15)',
     borderRadius: 10, padding: '12px 14px', marginTop: 10,
+    overflowX: 'auto',
   };
-  const rowStyle: React.CSSProperties = {
-    display: 'flex', justifyContent: 'space-between', alignItems: 'center',
-    padding: '4px 0', borderBottom: '1px solid rgba(255,255,255,0.04)',
-    fontSize: 12,
+  const thStyle: React.CSSProperties = {
+    padding: '4px 8px', fontSize: 10, color: '#6b7280', fontWeight: 600,
+    borderBottom: '1px solid rgba(255,255,255,0.08)', whiteSpace: 'nowrap',
+    letterSpacing: '0.04em', textAlign: 'left' as const,
   };
-  const labelStyle: React.CSSProperties = { color: '#9ca3af', fontWeight: 500 };
-  const valStyle: React.CSSProperties   = { fontWeight: 600, fontVariantNumeric: 'tabular-nums' };
-
-  if (loading) return null;
-  if (err) return null; // silently hide if endpoint not available
-  if (!data?.ok) return null;
-  if (!warm.complete) return (
-    <div style={panelStyle}>
-      <div style={{ fontSize: 11, color: '#6b7280', fontWeight: 600, marginBottom: 6, letterSpacing: '0.06em' }}>
-        CANONICAL STATE · SHADOW · {inst}
-      </div>
-      <div style={{ fontSize: 12, color: '#6b7280' }}>
-        Warming up… {String(warm.bars_available ?? 0)}/{String(warm.bars_required ?? 0)} bars
-      </div>
-    </div>
-  );
 
   return (
     <div style={panelStyle}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 8 }}>
         <span style={{ fontSize: 11, color: '#818cf8', fontWeight: 700, letterSpacing: '0.06em' }}>
-          CANONICAL STATE · SHADOW · {inst}
+          DATABENTO SHADOW VWAP · 4-INSTRUMENT COMPARISON
         </span>
-        <span style={{ fontSize: 10, color: '#4b5563', fontStyle: 'italic' }}>observation only</span>
+        <span style={{ fontSize: 10, color: '#4b5563', fontStyle: 'italic' }}>shadow only · 30s poll</span>
       </div>
 
-      <div style={rowStyle}>
-        <span style={labelStyle}>Session VWAP</span>
-        <span style={{ ...valStyle, color: healthColor(String(vwap.health ?? '')) }}>
-          {vwap.value != null ? `${Number(vwap.value).toFixed(2)} (${String(vwap.side)})` : '—'}
-        </span>
-      </div>
-      <div style={rowStyle}>
-        <span style={labelStyle}>ATR (1m · 14)</span>
-        <span style={{ ...valStyle, color: healthColor(String(atr.health ?? '')) }}>
-          {atr.value != null ? `${Number(atr.value).toFixed(2)} pts` : '—'}
-        </span>
-      </div>
-      <div style={rowStyle}>
-        <span style={labelStyle}>RVOL</span>
-        <span style={{ ...valStyle, color: vol.regime === 'HIGH' ? '#ef4444' : vol.regime === 'ELEVATED' ? '#fbbf24' : '#d1d5db' }}>
-          {vol.relative_volume != null ? `${Number(vol.relative_volume).toFixed(2)}×  ${String(vol.regime ?? '')}` : '—'}
-        </span>
-      </div>
-      <div style={rowStyle}>
-        <span style={labelStyle}>Structure</span>
-        <span style={{ ...valStyle, color: dirColor(String(str.direction ?? 'UNKNOWN')) }}>
-          {String(str.direction ?? 'UNKNOWN')}
-          {str.last_bos ? ` · BOS ${(str.last_bos as Record<string,unknown>).direction}` : ''}
-        </span>
-      </div>
-      <div style={rowStyle}>
-        <span style={labelStyle}>CVD</span>
-        <span style={{ ...valStyle, color: dirColor(String(cvd.direction ?? 'UNKNOWN')) }}>
-          {cvd.value != null ? Number(cvd.value).toFixed(0) : '—'}
-          {cvd.direction ? ` · ${String(cvd.direction)}` : ''}
-        </span>
-      </div>
-      {trend.trend_alignment && (
-        <div style={{ ...rowStyle, borderBottom: 'none', paddingBottom: 0 }}>
-          <span style={labelStyle}>Trend (15m/4H)</span>
-          <span style={{ ...valStyle, color: dirColor(String(trend.trend_alignment ?? '')) }}>
-            {String(trend.trend_15m ?? '?')} / {String(trend.trend_4h ?? '?')}
-            {' · '}{String(trend.trend_alignment ?? '')}
-          </span>
+      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 11 }}>
+        <thead>
+          <tr>
+            <th style={thStyle}>INST</th>
+            <th style={thStyle}>Legacy VWAP</th>
+            <th style={thStyle}>Shadow VWAP</th>
+            <th style={thStyle}>|Δ|</th>
+            <th style={thStyle}>Ticks</th>
+            <th style={thStyle}>Freshness</th>
+            <th style={thStyle}>Agreement</th>
+            <th style={thStyle}>Vol (sess)</th>
+            <th style={thStyle}>Sess start</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows.map(row => <_InstrumentRow key={row.inst} row={row} />)}
+        </tbody>
+      </table>
+
+      {/* Comparison metrics sub-table */}
+      <div style={{ marginTop: 10, borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: 8 }}>
+        <div style={{ fontSize: 10, color: '#4b5563', fontWeight: 600, marginBottom: 4, letterSpacing: '0.05em' }}>
+          ROLLING COMPARISON METRICS (in-memory, resets on restart)
         </div>
-      )}
+        <table style={{ width: '100%', borderCollapse: 'collapse' }}>
+          <tbody>
+            {rows
+              .filter(r => Number(r.vc.sample_count ?? 0) > 0)
+              .map(r => <_MetricsRow key={r.inst} inst={r.inst} vc={r.vc} />)
+            }
+            {rows.every(r => Number(r.vc.sample_count ?? 0) === 0) && (
+              <tr><td colSpan={8} style={{ padding: '4px 8px', fontSize: 10, color: '#4b5563' }}>
+                No comparisons recorded yet — accumulating…
+              </td></tr>
+            )}
+          </tbody>
+        </table>
+      </div>
+
+      {/* Source provenance legend */}
+      <div style={{ marginTop: 8, fontSize: 9, color: '#374151', lineHeight: 1.5 }}>
+        Legacy VWAP: Yahoo Finance auto-fetch · Shadow VWAP: Databento 1m bars · CVD/RVOL: Databento primary · Trend/FVG: Databento · Zones/ORB: TradingView (legacy, not promotable)
+      </div>
     </div>
   );
 };
@@ -11650,6 +11772,9 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const vi     = (p.volatility_intelligence ?? {}) as Record<string, unknown>;
   const trades = Array.isArray(at.trades) ? at.trades as Record<string, unknown>[] : [];
 
+  // Instrument for MTF fetch
+  const mktInst = safeStr((p.market as Record<string, unknown>)?.instrument, 'MNQ');
+
   // Verdict / score
   const score    = safeNum(v.edge_score) ?? 0;
   const grade    = safeStr(v.edge_grade, '');
@@ -11659,6 +11784,14 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const isPot    = cpStatus === 'POTENTIAL';
   const verdictColor = isReady ? T.green : isPot ? T.amber : T.txtMuted;
   const gradeColor   = grade === 'A+' ? T.green : grade === 'A' ? T.cyan : grade === 'B' ? T.amber : T.txtMuted;
+
+  // Authoritative verdict — from p.verdict (not candidate_preview)
+  const isAuthReady  = v.is_actionable === true;
+  const isAuthEarly  = !isAuthReady && safeStr(v.verdict_label ?? v.readiness, '').toUpperCase().includes('EARLY');
+  const authDir      = safeStr(v.direction ?? cp.direction ?? sc.selected, '');
+  const strictReason = safeStr(v.strict_reason, '');
+  const authVLabel   = isAuthReady ? '✓ READY' : isAuthEarly ? '⚡ EARLY' : '— WAIT';
+  const authVCol     = isAuthReady ? T.green   : isAuthEarly ? T.amber   : T.txtMuted;
 
   // Left Brain thesis
   const lbDir    = safeStr(lb.direction, 'NEUTRAL');
@@ -11670,9 +11803,11 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     : '';
   const strategy = safeStr(sc.selected_label ?? sc.selected, '');
 
-  // Trade plan levels (prefer candidate_preview, fallback to scanner)
-  const entry  = safeNum(sc.entry ?? cp.entry_zone);
-  const stopPx = safeNum(sc.stop  ?? cp.stop_loss);
+  // Trade plan levels.
+  // cp.entry_zone is a formatted range string ("4423.5–4424.0") — not parseable by safeNum.
+  // Use cp.preview_price (numeric anchor from management block) as the entry fallback.
+  const entry  = safeNum(sc.entry  ?? cp.preview_price);
+  const stopPx = safeNum(sc.stop   ?? cp.stop_loss);
   const tgts   = Array.isArray(sc.targets) ? sc.targets as (number | null)[] : [];
   const tgt1   = safeNum(tgts[0] ?? cp.take_profit);
   const tgt2   = safeNum(tgts[1]);
@@ -11744,6 +11879,64 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
   return (
     <>
+      {/* ═══════════════════════ MINI VERDICT PANEL ═══════════════════════ */}
+      <div style={{
+        ...card,
+        display: 'flex', alignItems: 'center', gap: 10,
+        flexWrap: 'wrap', padding: '10px 14px',
+      }}>
+        {/* Authoritative verdict badge */}
+        <div style={{
+          background: authVCol + '20', border: `1px solid ${authVCol}55`,
+          borderRadius: 6, padding: '5px 14px',
+          fontSize: 13, fontWeight: 900, color: authVCol, letterSpacing: '0.08em', flexShrink: 0,
+        }}>
+          {authVLabel}
+        </div>
+
+        {/* Score */}
+        <div style={{ fontFamily: T.mono, fontSize: 26, fontWeight: 900, color: gradeColor, lineHeight: 1 }}>
+          {score > 0 ? score : '—'}
+        </div>
+
+        {/* Grade */}
+        {grade && (
+          <div style={{ fontSize: 14, fontWeight: 700, color: gradeColor }}>{grade}</div>
+        )}
+
+        {/* Direction */}
+        {authDir && (
+          <div style={{
+            fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 4,
+            color: /long/i.test(authDir) ? T.green : T.red,
+            background: (/long/i.test(authDir) ? T.green : T.red) + '15',
+            border: `1px solid ${(/long/i.test(authDir) ? T.green : T.red)}40`,
+          }}>
+            {authDir.toUpperCase()}
+          </div>
+        )}
+
+        {/* Why WAIT (strict_reason) */}
+        {!isAuthReady && strictReason && (
+          <div style={{
+            fontSize: 9, color: T.amber, flex: 1,
+            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+          }}>
+            ⚠ {strictReason}
+          </div>
+        )}
+
+        {/* READY confirmations count */}
+        {isAuthReady && (
+          <div style={{ marginLeft: 'auto', fontSize: 9, color: T.green, fontFamily: T.mono }}>
+            LIVE ●
+          </div>
+        )}
+      </div>
+
+      {/* ═══════════════════════ MTF TREND ═══════════════════════════════════ */}
+      <MTFTrendPanel ticker={mktInst} />
+
       {/* ═══════════════════════ SETUP ANALYSIS ═══════════════════════════ */}
       <div style={card}>
         <div style={sLbl}>SETUP ANALYSIS</div>
@@ -11835,7 +12028,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                   }}>
                     <span style={{ fontSize: 7, fontWeight: 700, letterSpacing: '0.07em', color: T.txtMuted }}>{k}</span>
                     <div style={{ textAlign: 'right' }}>
-                      <div style={{ fontSize: 11, fontWeight: 700, fontFamily: T.mono, color: T.txt }}>
+                      <div style={{ fontSize: 11, fontWeight: 700, fontFamily: T.mono, color: T.txtPri }}>
                         {num != null ? num.toFixed(2) : note}
                       </div>
                       {num != null && note && <div style={{ fontSize: 7, color: T.txtMuted }}>{note}</div>}
@@ -11980,7 +12173,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                     {jStrat}
                   </div>
                   {jEntry != null && (
-                    <div style={{ fontSize: 8, fontFamily: T.mono, color: T.txt, flexShrink: 0 }}>
+                    <div style={{ fontSize: 8, fontFamily: T.mono, color: T.txtPri, flexShrink: 0 }}>
                       {jEntry.toFixed(2)}
                     </div>
                   )}
@@ -12035,7 +12228,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
               .map(([k, val]) => (
                 <div key={k} style={{ fontSize: 9 }}>
                   <span style={{ color: T.txtMuted, letterSpacing: '0.06em', marginRight: 3 }}>{k}</span>
-                  <span style={{ fontFamily: T.mono, fontWeight: 600, color: T.txt }}>{val}</span>
+                  <span style={{ fontFamily: T.mono, fontWeight: 600, color: T.txtPri }}>{val}</span>
                 </div>
               ))}
             {tCurR != null && (

@@ -1,68 +1,75 @@
 ---
 name: Canonical Databento Market State Engine
-description: Shadow VWAP/ATR/structure/sweep/CVD engine that computes Databento-derived state for comparison against legacy sources. Shadow-only, never promotes to live in Phase 1.
+description: Shadow VWAP/ATR/structure/CVD engine. Key constraints, DST fix, provenance audit, ORB wiring.
 ---
 
-## Rule
-All source selectors default to LEGACY. No component may reach LIVE_CANONICAL in this phase.
-A missing env var CANNOT promote Databento to live.
+## Safety
+- All source selectors default to LEGACY — missing env var cannot promote Databento to live.
+- `CANONICAL_MARKET_STATE_SHADOW_ONLY=1` default; `LIVE_CANONICAL` never reachable this phase.
 
-**Why:** Safety contract from spec — production money-path must not change until validation data accumulates.
+## Bar-close callback
+- Signature: `on_bar_close(inst, close_price)` — reads full bar from `DATABENTO_BARS_BY_INST[inst][-1]`
+- DB accessor: `get_db_connection()` (not `get_db`)
 
-**How to apply:** When adding new computed values, add them to the snapshot as `promotion_status: SHADOW` only. Any promotion to VALIDATING requires explicit operator env var + agreement threshold check.
+## VWAP session reset — DST FIX (important)
+- Uses `zoneinfo.ZoneInfo("America/New_York")` for 18:00 ET boundary.
+- EDT (summer, UTC-4): reset = 22:00 UTC. EST (winter, UTC-5): reset = 23:00 UTC.
+- Old code used fixed `SESSION_RESET_UTC_HOUR=22` — was one hour early in winter.
+- `_session_start()` is the single computation point; tests cover both EDT and EST.
+- Session tests must use concrete calendar dates (June = EDT, January = EST) not abstract timestamps.
 
-## Architecture
-- `canonical_market_state.py` — standalone module (no app.py imports)
-- Per-instrument `CanonicalMarketStateEngine` class — owns VWAP, ATR, structure, sweeps
-- Boot via `cms.start(databento_bars_by_inst, cvd_by_ticker, rvol_by_ticker, vwap_by_ticker, get_db_fn=get_db_connection)` at app.py line ~80275
-- Bar-close callback: `cms.on_bar_close(inst, close_price)` reads full bar from `DATABENTO_BARS_BY_INST[inst][-1]`
-- Flask route: `GET /canonical-market-state?instrument=MNQ` (all instruments without param)
-- Comparison table: `market_state_source_comparisons` (created at boot via `ensure_comparison_table`)
-- Dashboard panel: `CanonicalStatePanel` in Analysis tab — fetches /api/canonical-market-state every 30s
-
-## What is REUSED (not reimplemented)
-- CVD: reads from `CVD_BY_TICKER[inst]` (DatabentoBrain already computed)
-- RVOL: reads from `RVOL_BY_TICKER[inst]` (DatabentoBrain already computed)
-- 15m/4H trend: consumed from `trend_alignment.MTF_STATE_BY_INST`
-- FVG zones: consumed from `fvg_engine.FVG_ZONES_BY_INST`
-- ORB: not reimplemented — read existing ORB state if needed
-
-## What is NEW (computed from bars)
-- Session VWAP: `pv_sum / v_sum` with reset at SESSION_RESET_UTC_HOUR=22 boundary
-- ATR (Wilder's, period=14): from `DATABENTO_BARS_BY_INST` full bars
-- Swing pivot detection: SWING_LOOKBACK=5 bars each side, WARMUP_BARS=25
-- BOS / CHoCH: close breaks through confirmed swing high/low
-- Liquidity sweeps: wick beyond swing level + close back inside
-
-## Key constraints
-- Bar-close callback signature is `(inst, close_price)` — NOT the full bar dict
-  → must read full bar from `DATABENTO_BARS_BY_INST[inst][-1]`
-- Structure health with no pivots detected = INSUFFICIENT_HISTORY (not DATA_UNAVAILABLE)
-  — "no pivots yet" is always a timing issue, never a config problem
-- Session VWAP reset: at UTC hour 22 (6 PM ET summer) — matches existing session logic
-- DB accessor is `get_db_connection()` (not `get_db`)
-
-## Tests
-56 tests in `test_canonical_market_state.py`. Key test patterns:
-- Determinism: `replay_bars(inst, bars)` API for clean replay without module state
-- Feature flags: assert all source selectors == 'legacy' by default
-- Thread safety: concurrent writer + reader threads
-- LIVE_CANONICAL must never appear in any component's promotion_status
-
-## Feature flags
-```
-CANONICAL_MARKET_STATE_ENABLED=1   (default 1)
-CANONICAL_MARKET_STATE_SHADOW_ONLY=1 (default 1)
-VWAP_SOURCE=legacy   # change to 'databento' when ready to promote
-STRUCTURE_SOURCE=legacy
-CVD_SOURCE=legacy
-SWEEP_SOURCE=legacy
-FVG_SOURCE=legacy
-ZONE_SOURCE=legacy
+## `start()` signature
+```python
+cms.start(
+    databento_bars_by_inst=_DB_BARS,
+    cvd_by_ticker=CVD_BY_TICKER,
+    rvol_by_ticker=RVOL_BY_TICKER,
+    vwap_by_ticker=AUTO_PRICE_BY_TICKER,
+    intraday_by_ticker=INTRADAY_BY_TICKER,   # ORB state — TradingView-sourced
+    get_db_fn=get_db_connection,
+)
 ```
 
-## Next phase (not yet implemented)
-- Source agreement threshold checks (e.g. VWAP within 1 tick for 50 bars → VALIDATING)
-- Promotion path: SHADOW → VALIDATING → READY_FOR_PROMOTION
-- UI: source comparison history viewer
-- Apply comparison table schema to production (new table needs publish/re-deploy)
+## Provenance audit — TRUE sources
+| Component | True source | Notes |
+|-----------|-------------|-------|
+| CVD | `databento_primary` | DatabentoBrain 1m bar accumulator (primary); TV alerts may inject |
+| RVOL | `databento_primary` | DatabentoBrain 1m bar computation; TV alerts may inject |
+| 15m/4H trend | `databento` | trend_alignment.ingest_1m_bar() fed by DATABENTO_BARS_BY_INST |
+| FVG zones | `databento` | fvg_engine.process_bar_close() fed by DATABENTO_BARS_BY_INST |
+| Zone state | `tradingview` | TradingView ALERT_HISTORY → get_price_context(); NOT promotable to Databento |
+| ORB state | `tradingview` | INTRADAY_BY_TICKER from TV webhook price path; NOT promotable |
+
+Zone state and FVG zones are SEPARATE things — do not conflate.
+
+## ORB exposure
+- Reads `_INTRADAY_BY_TICKER` (injected at boot) for `or_high/or_low/or_complete`.
+- Reads `_BREAKOUT_OR_BY_TICKER` for 09:30 ET ORB (not yet injected — optional).
+- Both carry `promotion_status = UNAVAILABLE_FOR_DATABENTO_PROMOTION`.
+- If not injected: returns `status = UNAVAILABLE` + reason.
+
+## VWAP comparison block fields
+All required fields in `vwap_comparison`:
+`legacy_vwap, legacy_source, legacy_freshness, databento_vwap, databento_source,
+databento_freshness, absolute_difference, tick_difference, tick_size,
+agreement_status, session_start, sample_volume,
+sample_count, consecutive_acceptable, avg_tick_diff, max_tick_diff, pct_within_tolerance`
+
+Agreement status enum: `MATCH (≤2 tk) | SMALL_DIFF (≤10 tk) | LARGE_DIFF (>10 tk) | WAITING | STALE | UNAVAILABLE`
+
+Tick sizes: MGC=0.10, MNQ=0.25, MES=0.25, MYM=1.00
+
+## Comparison stats
+`_VwapStats` per instrument, reset on restart. `get_vwap_comparison_stats(inst?)` public API.
+Tolerance threshold: 5 ticks for `pct_within_tolerance`.
+
+## Structure health
+- No pivots = `INSUFFICIENT_HISTORY` (not `DATA_UNAVAILABLE`).
+
+## Test count
+- 84 tests total (56 original + 28 new: 8 DST + 9 provenance + 11 comparison metrics).
+
+## UI — 4-instrument comparison panel
+- `CanonicalStatePanel` in MainBrain.tsx fetches `/api/canonical-market-state` (no `?instrument=`).
+- Shows all 4 instruments side-by-side with VWAP comparison + rolling metrics sub-table.
+- Agreement color: MATCH=green, SMALL_DIFF=yellow, LARGE_DIFF=red, STALE=orange, WAITING=gray.
