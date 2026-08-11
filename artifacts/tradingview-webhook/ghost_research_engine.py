@@ -50,6 +50,30 @@ GRE_VERSION = "1.0.0"
 STRATEGY_NAME     = "09:30_ORB"
 EXPERIMENT_FAMILY = "ORB_09_30"
 
+# ── Phase 4: Multi-family constants ───────────────────────────────────────────
+# strategy_family: the research family (routing / grouping / filtering)
+# strategy:        the specific baseline/rule identity within that family
+STRATEGY_FAMILY_ORB = "09:30_ORB"        # ORB family (existing)
+STRATEGY_FAMILY_FVG = "FVG_REVISIT"      # Phase 4 new family
+FVG_STRATEGY_NAME   = "FVG_RESEARCH_BASELINE_V1"  # specific strategy within FVG family
+
+# ── FVG interaction depth thresholds (Section 15 of spec) ────────────────────
+_FVG_NEAR_EDGE_FRAC   = 0.20   # 0–20%  of gap from entry side → NEAR_EDGE
+_FVG_SHALLOW_FRAC     = 0.40   # 20–40%                        → SHALLOW_FILL
+_FVG_MIDPOINT_FRAC    = 0.60   # 40–60%                        → MIDPOINT
+_FVG_DEEP_FRAC        = 0.80   # 60–80%                        → DEEP_FILL
+# >80%                                                          → FULL_FILL
+
+# Variant-specific depth requirements
+_FVG_MIDPOINT_MIN_PCT  = 0.50  # MIDPOINT_ENTRY: 50%+ fill required
+_FVG_DEEP_FILL_MIN_PCT = 0.70  # DEEP_FILL_ENTRY: 70%+ fill required
+
+# FVG baseline target multiplier (2R; TP_1R and TP_1_5R are separate variants)
+_FVG_BASELINE_TARGET_R = 2.0
+
+# Maximum bars to wait for entry before expiring a WATCHING_ENTRY experiment
+_FVG_MAX_WAITING_BARS = 60
+
 MAX_GHOST_VARIANTS_PER_OPPORTUNITY = 10   # configurable ceiling
 MAX_GHOST_VARIANTS_HARD_CAP        = 12   # absolute hard ceiling
 
@@ -128,12 +152,13 @@ class ResultStatus:
     COMPLETED      = "COMPLETED"       # final outcome recorded
 
 class OutcomeResult:
-    WIN          = "WIN"
-    LOSS         = "LOSS"
-    BREAKEVEN    = "BREAKEVEN"
-    NO_ENTRY     = "NO_ENTRY"
-    EXPIRED      = "EXPIRED"
-    INVALID_DATA = "INVALID_DATA"
+    WIN                      = "WIN"
+    LOSS                     = "LOSS"
+    BREAKEVEN                = "BREAKEVEN"
+    NO_ENTRY                 = "NO_ENTRY"
+    EXPIRED                  = "EXPIRED"
+    INVALID_DATA             = "INVALID_DATA"
+    INVALIDATED_BEFORE_ENTRY = "INVALIDATED_BEFORE_ENTRY"  # Phase 4: zone gone before entry
 
 # ── Variant catalogue ─────────────────────────────────────────────────────────
 
@@ -162,6 +187,37 @@ ALL_VARIANTS = [
     Variant.CVD_ALIGNED,
 ]
 assert len(ALL_VARIANTS) <= MAX_GHOST_VARIANTS_HARD_CAP
+
+# ── Phase 4: FVG_REVISIT variant catalogue (Section 14 of spec) ──────────────
+
+class FvgVariant:
+    BASELINE             = "BASELINE"
+    NEAR_EDGE_ENTRY      = "NEAR_EDGE_ENTRY"
+    MIDPOINT_ENTRY       = "MIDPOINT_ENTRY"
+    DEEP_FILL_ENTRY      = "DEEP_FILL_ENTRY"
+    FIRST_TOUCH_ONLY     = "FIRST_TOUCH_ONLY"
+    SECOND_TOUCH_ALLOWED = "SECOND_TOUCH_ALLOWED"
+    TREND_REQUIRED       = "TREND_REQUIRED"
+    CVD_ALIGNED          = "CVD_ALIGNED"
+    TP_1R                = "TP_1R"
+    TP_1_5R              = "TP_1_5R"
+
+FVG_ALL_VARIANTS: List[str] = [
+    FvgVariant.BASELINE,
+    FvgVariant.NEAR_EDGE_ENTRY,
+    FvgVariant.MIDPOINT_ENTRY,
+    FvgVariant.DEEP_FILL_ENTRY,
+    FvgVariant.FIRST_TOUCH_ONLY,
+    FvgVariant.SECOND_TOUCH_ALLOWED,
+    FvgVariant.TREND_REQUIRED,
+    FvgVariant.CVD_ALIGNED,
+    FvgVariant.TP_1R,
+    FvgVariant.TP_1_5R,
+]
+assert len(FVG_ALL_VARIANTS) == 10
+assert len(FVG_ALL_VARIANTS) <= MAX_GHOST_VARIANTS_HARD_CAP, (
+    f"FVG_ALL_VARIANTS ({len(FVG_ALL_VARIANTS)}) exceeds hard cap ({MAX_GHOST_VARIANTS_HARD_CAP})"
+)
 
 # ── Tick sizes per instrument ─────────────────────────────────────────────────
 
@@ -207,6 +263,58 @@ def _experiment_id(opportunity_id: str, variant: str) -> str:
 
 def _result_id(experiment_id: str) -> str:
     return f"RES_{experiment_id}"
+
+# ── Phase 4: FVG identity helpers ─────────────────────────────────────────────
+
+_FVG_HASH_VERSION = "V1"  # bump if hashing logic changes (invalidates replay identity)
+
+def _fvg_research_id(inst: str, direction: str, bar_ts: Any, upper: float, lower: float) -> str:
+    """
+    Deterministic 24-hex research identity for an FVG zone.
+    Based only on IMMUTABLE creation attributes — touch_count/status/mitigation excluded.
+    Same Databento bars replayed → same research_fvg_id regardless of source_fvg_id (uuid4).
+    """
+    key = f"FVGR_{_FVG_HASH_VERSION}|{inst}|{direction.upper()}|{bar_ts}|{upper:.4f}|{lower:.4f}"
+    return hashlib.sha256(key.encode()).hexdigest()[:24]
+
+def _fvg_revisit_id(rfid: str, revisit_n: int, revisit_bar_ts: Any) -> str:
+    """
+    Deterministic revisit session identity.
+    Same revisit callback → same revisit_id.  Later revisit → different revisit_id.
+    """
+    key = f"FVGR_VISIT_{_FVG_HASH_VERSION}|{rfid}|{revisit_n}|{revisit_bar_ts}|{FVG_STRATEGY_NAME}"
+    return hashlib.sha256(key.encode()).hexdigest()[:24]
+
+def _fvg_opportunity_id(inst: str, rfid: str, revisit_n: int, revisit_bar_ts: Any) -> str:
+    """One ghost opportunity row per FVG per revisit session."""
+    key = f"FVGO_{_FVG_HASH_VERSION}|{inst}|{rfid}|{revisit_n}|{revisit_bar_ts}"
+    return hashlib.sha256(key.encode()).hexdigest()[:24]
+
+def _fvg_depth_pct(zone: Dict, bar_low: float, bar_high: float) -> float:
+    """
+    Fraction of the FVG gap filled by the bar (0.0 = entry edge untouched, 1.0 = full).
+    BULLISH FVG: price revisits from upper side → depth from upper boundary down.
+    BEARISH FVG: price revisits from lower side → depth from lower boundary up.
+    """
+    upper = float(zone.get("upper", 0))
+    lower = float(zone.get("lower", 0))
+    gap   = max(upper - lower, 1e-9)
+    if str(zone.get("direction", "")).upper() == "BULLISH":
+        penetration = upper - max(bar_low, lower)
+    else:
+        penetration = min(bar_high, upper) - lower
+    return max(0.0, min(1.0, penetration / gap))
+
+def _fvg_classify_location(depth_pct: float) -> str:
+    if depth_pct <= _FVG_NEAR_EDGE_FRAC:  return "NEAR_EDGE"
+    if depth_pct <= _FVG_SHALLOW_FRAC:    return "SHALLOW_FILL"
+    if depth_pct <= _FVG_MIDPOINT_FRAC:   return "MIDPOINT"
+    if depth_pct <= _FVG_DEEP_FRAC:       return "DEEP_FILL"
+    return "FULL_FILL"
+
+def _fvg_bar_overlaps(zone: Dict, bar_low: float, bar_high: float) -> bool:
+    """True if the bar's range overlaps the FVG zone at all."""
+    return bar_low <= float(zone.get("upper", 0)) and bar_high >= float(zone.get("lower", 0))
 
 # ── Profitability helpers (reuse from profitability_engine) ───────────────────
 
@@ -511,13 +619,18 @@ class GhostResearchEngine:
         re_event_fn: Callable,
         instruments: List[str],
         max_variants: int = MAX_GHOST_VARIANTS_PER_OPPORTUNITY,
+        dc_registry_fn: Optional[Callable] = None,
     ) -> None:
-        self._get_db      = get_db_fn
-        self._get_can     = get_canonical_fn
-        self._get_bars    = get_bars_fn
-        self._re_event    = re_event_fn
-        self._instruments = list(instruments)
+        self._get_db       = get_db_fn
+        self._get_can      = get_canonical_fn
+        self._get_bars     = get_bars_fn
+        self._re_event     = re_event_fn
+        self._instruments  = list(instruments)
         self._max_variants = min(max_variants, MAX_GHOST_VARIANTS_HARD_CAP)
+        # Optional lazy getter for the DecisionRegistry — provided by app.py at boot.
+        # Called at opportunity-freeze time (never at init) so DC being initialised
+        # after GRE is safe. None = DC enrichment silently skipped (fail-open).
+        self._dc_registry_fn: Optional[Callable] = dc_registry_fn
 
         # Per-instrument last-seen OrbEngine state (for transition detection)
         self._last_orb_state:  Dict[str, str] = {i: "" for i in instruments}
@@ -533,6 +646,14 @@ class GhostResearchEngine:
         self._stats_ts:    float = 0.0
 
         self._log = logger.getChild("GRE")
+
+        # ── Phase 4: FVG_REVISIT tracking ─────────────────────────────────────
+        # Per research_fvg_id: was bar inside zone on the PREVIOUS bar?
+        self._fvg_inside_prev:   Dict[str, bool] = {}
+        # Per research_fvg_id: how many revisit sessions detected so far today?
+        self._fvg_revisit_count: Dict[str, int]  = {}
+        # Per "rfid|n": opportunity_id already created (prevents duplicates)
+        self._fvg_opp_created:   Dict[str, str]  = {}
 
     # ── Boot ─────────────────────────────────────────────────────────────────
 
@@ -580,9 +701,35 @@ class GhostResearchEngine:
         with self._lock:
             for row in rows:
                 d = dict(zip(cols, row))
+                # Mark FVG experiments so _process_open_experiments skips them
+                if str(d.get("entry_rule", "")).startswith("FVG_"):
+                    d["_fvg_family"] = True
                 self._open_results[d["result_id"]] = d
                 restored += 1
         self._log.info("GhostResearchEngine: restored %d active experiments", restored)
+
+        # Restore FVG revisit dedup state from today's DB records
+        try:
+            today = datetime.now(timezone.utc).date().isoformat()
+            cur.execute("""
+                SELECT research_fvg_id, revisit_id, opportunity_id,
+                       (extra_snapshot->>'fvg_revisit_number')::int AS revisit_n
+                FROM ghost_opportunities
+                WHERE strategy_family = %s AND trading_date = %s
+                  AND research_fvg_id IS NOT NULL
+            """, (STRATEGY_FAMILY_FVG, today))
+            fvg_rows = cur.fetchall()
+            with self._lock:
+                for rfid, _rev_id, opp_id, rn in fvg_rows:
+                    if rfid and rn is not None:
+                        opp_key = f"{rfid}|{rn}"
+                        self._fvg_opp_created[opp_key] = opp_id or ""
+                        prev = self._fvg_revisit_count.get(rfid, 0)
+                        if rn > prev:
+                            self._fvg_revisit_count[rfid] = rn
+            self._log.info("GRE: restored %d FVG revisit dedup entries", len(fvg_rows))
+        except Exception as exc:
+            self._log.debug("GRE FVG revisit restore (fail-open): %s", exc)
 
     # ── Main bar-close hook ───────────────────────────────────────────────────
 
@@ -651,6 +798,23 @@ class GhostResearchEngine:
             pass
 
         snapshot = self._build_snapshot(inst, orb, bar, price, canonical)
+
+        # ── Enrich snapshot with canonical Decision Contract state (FAIL-OPEN) ─
+        # The DC registry is provided lazily via _dc_registry_fn (app.py passes a
+        # lambda: globals().get("_DECISION_REGISTRY")).  Enrichment is IMMUTABLE —
+        # snapshot captures the DC state AT opportunity-freeze time; later DC
+        # transitions never touch this dict or the persisted ghost_opportunities row.
+        try:
+            if self._dc_registry_fn is not None:
+                _dc = self._dc_registry_fn()
+                if _dc is not None:
+                    _rec = _dc.get_record(inst)
+                    if _rec is not None:
+                        from decision_contract import enrich_ghost_snapshot as _egs  # lazy import
+                        snapshot = _egs(snapshot, _rec)
+        except Exception as _dc_enrich_exc:
+            self._log.debug("GRE DC enrich (%s): %s", inst, _dc_enrich_exc)
+
         ok = self._insert_opportunity(opp_id, inst, trading_date, direction, orb, snapshot)
         if not ok:
             return
@@ -787,9 +951,14 @@ class GhostResearchEngine:
                      max_chase_pct, current_price, current_atr, current_vwap, vwap_side,
                      vwap_distance_pct, trend_15m, trend_4h, trend_alignment,
                      cvd_direction, cvd_value, volume_value, relative_volume,
-                     structure_bos, structure_choch)
+                     structure_bos, structure_choch,
+                     dc_decision_id, dc_state, dc_reason_code, dc_verdict,
+                     dc_edge_score, dc_confidence, dc_qualified, dc_risk_status,
+                     dc_execution_mode, dc_execution_enabled, dc_armed,
+                     dc_parity_agree, dc_version)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                        %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                 ON CONFLICT (opportunity_id) DO NOTHING
                 RETURNING id
             """, (
@@ -813,6 +982,20 @@ class GhostResearchEngine:
                 snap.get("cvd_direction"), snap.get("cvd_value"),
                 snap.get("volume_value"), snap.get("relative_volume"),
                 snap.get("structure_bos"), snap.get("structure_choch"),
+                # ── Canonical Decision Contract enrichment (NULL when DC unavailable) ──
+                snap.get("canonical_decision_id"),
+                snap.get("canonical_decision_state"),
+                snap.get("canonical_reason_code"),
+                snap.get("live_verdict"),
+                snap.get("edge_score"),
+                snap.get("confidence"),
+                snap.get("qualification_state"),
+                snap.get("risk_status"),
+                snap.get("execution_mode"),
+                snap.get("execution_enabled"),
+                snap.get("armed"),
+                snap.get("parity_agree"),
+                snap.get("dc_version"),
             ))
             row = cur.fetchone()
             db.commit()
@@ -1107,8 +1290,10 @@ class GhostResearchEngine:
         bar_c  = _sn(bar.get("close") or price)
 
         with self._lock:
+            # FVG experiments (_fvg_family=True) are handled by on_fvg_bar_close; skip here
             result_ids = [rid for rid, rd in self._open_results.items()
-                         if rd.get("instrument") == inst]
+                         if rd.get("instrument") == inst
+                         and not rd.get("_fvg_family")]
 
         for result_id in result_ids:
             try:
@@ -1439,43 +1624,95 @@ class GhostResearchEngine:
 
     # ── API endpoints ─────────────────────────────────────────────────────────
 
-    def get_health(self) -> Dict:
+    def get_health(self, family: Optional[str] = None) -> Dict:
+        """
+        Returns GRE health summary.
+        Pass family='09:30_ORB' or 'FVG_REVISIT' to scope to a single research family.
+        Omit / pass None for the global (all-families) view.
+        """
         with self._lock:
-            open_count = len(self._open_results)
+            open_all = self._open_results
+            open_count = sum(1 for rd in open_all.values() if not family or rd.get("strategy_family") == family)
+            # For FVG: count by _fvg_family sentinel (may lack strategy_family in old restored rows)
+            if family == STRATEGY_FAMILY_FVG:
+                open_count = sum(1 for rd in open_all.values() if rd.get("_fvg_family"))
+            elif family == STRATEGY_FAMILY_ORB:
+                open_count = sum(1 for rd in open_all.values() if not rd.get("_fvg_family"))
+            else:
+                open_count = len(open_all)
+
         today = datetime.now(timezone.utc).date().isoformat()
+        fam_clause = "AND strategy_family=%s" if family else ""
+        fam_params = [family] if family else []
         try:
             db  = self._get_db()
             cur = db.cursor()
-            cur.execute("""
+            cur.execute(f"""
                 SELECT
-                    (SELECT COUNT(*) FROM ghost_opportunities WHERE trading_date=%s) AS opps_today,
-                    (SELECT COUNT(*) FROM ghost_experiments) AS total_experiments,
-                    (SELECT COUNT(*) FROM ghost_experiment_results WHERE status='COMPLETED') AS completed,
-                    (SELECT COUNT(*) FROM ghost_experiment_results
-                     WHERE result='NO_ENTRY') AS no_entry
-            """, (today,))
-            row = cur.fetchone()
+                    COUNT(*) FILTER (WHERE trading_date=%s) AS opps_today,
+                    COUNT(*) AS total_opps
+                FROM ghost_opportunities
+                WHERE 1=1 {fam_clause}
+            """, [today] + fam_params)
+            opp_row = cur.fetchone()
+
+            cur.execute(f"""
+                SELECT COUNT(*) FROM ghost_experiments WHERE 1=1 {fam_clause}
+            """, fam_params)
+            exp_row = cur.fetchone()
+
+            cur.execute(f"""
+                SELECT
+                    COUNT(*) FILTER (WHERE r.status='COMPLETED') AS completed,
+                    COUNT(*) FILTER (WHERE r.result='NO_ENTRY') AS no_entry
+                FROM ghost_experiment_results r
+                JOIN ghost_experiments e ON e.experiment_id = r.experiment_id
+                WHERE 1=1 {fam_clause.replace('strategy_family', 'e.strategy_family')}
+            """, fam_params)
+            res_row = cur.fetchone()
+
+            # Per-family breakdown (only in global view)
+            family_breakdown: Dict = {}
+            if not family:
+                cur.execute("""
+                    SELECT strategy_family,
+                           COUNT(*) FILTER (WHERE trading_date=%s) AS opps_today,
+                           COUNT(*) AS total_opps
+                    FROM ghost_opportunities
+                    GROUP BY strategy_family
+                """, [today])
+                for fam_r in cur.fetchall():
+                    family_breakdown[fam_r[0] or "UNKNOWN"] = {
+                        "opps_today": fam_r[1], "total_opps": fam_r[2],
+                    }
+
             return {
-                "gre_version":        GRE_VERSION,
-                "db_ready":           GhostResearchEngine.GRE_DB_READY,
-                "strategy":           STRATEGY_NAME,
-                "opportunities_today": row[0] if row else 0,
-                "total_experiments":   row[1] if row else 0,
-                "active_ghost_trades": open_count,
-                "completed":           row[2] if row else 0,
-                "no_entry_count":      row[3] if row else 0,
+                "gre_version":          GRE_VERSION,
+                "db_ready":             GhostResearchEngine.GRE_DB_READY,
+                "families":             [STRATEGY_FAMILY_ORB, STRATEGY_FAMILY_FVG],
+                "filter_family":        family,
+                "opportunities_today":  opp_row[0] if opp_row else 0,
+                "total_opportunities":  opp_row[1] if opp_row else 0,
+                "total_experiments":    exp_row[0] if exp_row else 0,
+                "active_ghost_trades":  open_count,
+                "completed":            res_row[0] if res_row else 0,
+                "no_entry_count":       res_row[1] if res_row else 0,
+                "family_breakdown":     family_breakdown,
             }
         except Exception as exc:
             return {"db_ready": False, "error": str(exc)}
 
-    def get_candidates(self, min_samples: int = 10) -> List[Dict]:
-        """Top research candidates sorted by net expectancy."""
+    def get_candidates(self, min_samples: int = 10,
+                       family: Optional[str] = None) -> List[Dict]:
+        """Top research candidates sorted by net expectancy.
+        Pass family='FVG_REVISIT' or '09:30_ORB' to scope to one research family."""
+        fam_clause = "AND o.strategy_family=%s" if family else ""
         try:
             db  = self._get_db()
             cur = db.cursor()
-            cur.execute("""
+            cur.execute(f"""
                 SELECT e.experiment_id, e.variant_name, e.evidence_state,
-                       o.instrument,
+                       o.instrument, o.strategy_family,
                        COUNT(r.result_id) FILTER (WHERE r.status='COMPLETED') AS closed,
                        COUNT(r.result_id) FILTER (WHERE r.result='NO_ENTRY') AS no_entry,
                        COUNT(r.result_id) FILTER (WHERE r.result='WIN') AS wins,
@@ -1490,11 +1727,13 @@ class GhostResearchEngine:
                 FROM ghost_experiments e
                 JOIN ghost_opportunities o ON o.opportunity_id=e.opportunity_id
                 LEFT JOIN ghost_experiment_results r ON r.experiment_id=e.experiment_id
-                GROUP BY e.experiment_id, e.variant_name, e.evidence_state, o.instrument
+                WHERE 1=1 {fam_clause}
+                GROUP BY e.experiment_id, e.variant_name, e.evidence_state,
+                         o.instrument, o.strategy_family
                 HAVING COUNT(r.result_id) FILTER (WHERE r.status='COMPLETED') >= %s
                 ORDER BY avg_net_r DESC NULLS LAST
                 LIMIT 50
-            """, (min_samples,))
+            """, ([family] if family else []) + [min_samples])
             rows = cur.fetchall()
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, r)) for r in rows]
@@ -1504,6 +1743,7 @@ class GhostResearchEngine:
 
     def get_experiments(self, instrument: Optional[str] = None,
                         variant: Optional[str] = None,
+                        family: Optional[str] = None,
                         limit: int = 100) -> List[Dict]:
         try:
             db  = self._get_db()
@@ -1514,6 +1754,8 @@ class GhostResearchEngine:
                 clauses.append("o.instrument=%s"); params.append(instrument)
             if variant:
                 clauses.append("e.variant_name=%s"); params.append(variant)
+            if family:
+                clauses.append("o.strategy_family=%s"); params.append(family)
             where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
             params.append(limit)
             cur.execute(f"""
@@ -1689,3 +1931,804 @@ class GhostResearchEngine:
         except Exception as exc:
             self._log.debug("GRE baseline_vs_variant: %s", exc)
             return []
+
+    # ═══════════════════════════════════════════════════════════════════════════
+    # Phase 4 — FVG_REVISIT Research Family
+    # ═══════════════════════════════════════════════════════════════════════════
+    #
+    # SAFETY CONTRACT
+    # ───────────────
+    # • Never calls execute_trade_gateway or any broker path.
+    # • Never modifies gate, scoring, sizing, or execution mode.
+    # • Results are shadow/research only and require mandatory human review.
+    # ═══════════════════════════════════════════════════════════════════════════
+
+    # ── Public entry point ────────────────────────────────────────────────────
+
+    def on_fvg_bar_close(
+        self,
+        inst:      str,
+        zones:     List[Dict],
+        bar:       Dict,
+        price:     float,
+        canonical: Optional[Dict] = None,
+    ) -> None:
+        """
+        Called from app.py _fvg_bar_close() after fvg_engine.process_bar_close().
+        Fail-open: any exception is caught and logged; live processing never blocked.
+        """
+        if not GhostResearchEngine.GRE_DB_READY:
+            return
+        try:
+            self._fvg_process_inst(inst, zones, bar, price, canonical or {})
+        except Exception as exc:
+            self._log.debug("GRE FVG bar-close (%s): %s", inst, exc)
+
+    # ── Per-instrument dispatch ───────────────────────────────────────────────
+
+    def _fvg_process_inst(
+        self,
+        inst:      str,
+        zones:     List[Dict],
+        bar:       Dict,
+        price:     float,
+        canonical: Dict,
+    ) -> None:
+        bar_low  = float(bar.get("low",  price))
+        bar_high = float(bar.get("high", price))
+        bar_ts   = bar.get("ts")
+
+        # Build lookup: research_fvg_id → zone (for open-experiment zone-status checks)
+        zones_by_rfid: Dict[str, Dict] = {}
+        for z in zones:
+            rfid = _fvg_research_id(
+                inst,
+                str(z.get("direction", "")),
+                z.get("bar_ts"),
+                float(z.get("upper", 0)),
+                float(z.get("lower", 0)),
+            )
+            zones_by_rfid[rfid] = z
+
+        # 1. Detect new revisit sessions and create ghost opportunities
+        for z in zones:
+            if z.get("status") not in ("ACTIVE", "TOUCHED"):
+                continue
+            try:
+                self._fvg_check_revisit(inst, z, bar_low, bar_high, bar_ts, price, canonical)
+            except Exception as exc:
+                self._log.debug("GRE FVG revisit-check (%s): %s", inst, exc)
+
+        # 2. Evaluate open FVG experiments against this bar
+        self._fvg_process_open_experiments(
+            inst, zones_by_rfid, bar, bar_ts, bar_low, bar_high, price, canonical,
+        )
+
+    # ── Revisit detection ─────────────────────────────────────────────────────
+
+    def _fvg_check_revisit(
+        self,
+        inst:      str,
+        zone:      Dict,
+        bar_low:   float,
+        bar_high:  float,
+        bar_ts:    Any,
+        price:     float,
+        canonical: Dict,
+    ) -> None:
+        upper = float(zone.get("upper", 0))
+        lower = float(zone.get("lower", 0))
+        rfid  = _fvg_research_id(
+            inst, str(zone.get("direction", "")), zone.get("bar_ts"), upper, lower,
+        )
+
+        inside_now = _fvg_bar_overlaps(zone, bar_low, bar_high)
+        was_inside = self._fvg_inside_prev.get(rfid, False)
+        self._fvg_inside_prev[rfid] = inside_now
+
+        # New revisit session: price just entered zone (was outside, now inside)
+        if not (inside_now and not was_inside):
+            return
+
+        revisit_n = self._fvg_revisit_count.get(rfid, 0) + 1
+        self._fvg_revisit_count[rfid] = revisit_n
+
+        opp_key = f"{rfid}|{revisit_n}"
+        if opp_key in self._fvg_opp_created:
+            return  # already created for this revisit session
+
+        opp_id   = _fvg_opportunity_id(inst, rfid, revisit_n, bar_ts)
+        self._fvg_opp_created[opp_key] = opp_id
+
+        revisit_id = _fvg_revisit_id(rfid, revisit_n, bar_ts)
+        depth_pct  = _fvg_depth_pct(zone, bar_low, bar_high)
+
+        snap = self._build_fvg_snapshot(
+            inst, zone, rfid, revisit_n, revisit_id,
+            bar_low, bar_high, bar_ts, price, depth_pct, canonical,
+        )
+
+        # DC enrichment (fail-open)
+        try:
+            if self._dc_registry_fn is not None:
+                _dc_inst = self._dc_registry_fn()
+                if _dc_inst is not None:
+                    _rec = _dc_inst.get_record(inst)
+                    if _rec is not None:
+                        from decision_contract import enrich_ghost_snapshot as _egs  # noqa: PLC0415
+                        snap = _egs(snap, _rec)
+        except Exception as exc:
+            self._log.debug("GRE FVG DC enrich (%s): %s", inst, exc)
+
+        ok = self._insert_fvg_opportunity(
+            opp_id, inst, zone, rfid, revisit_id, revisit_n, snap,
+        )
+        if not ok:
+            return
+
+        self._re_event("FVG_OPPORTUNITY_RECORDED", inst=inst, extra={
+            "opportunity_id": opp_id, "research_fvg_id": rfid,
+            "revisit_n": revisit_n, "depth_pct": round(depth_pct, 3),
+            "location": _fvg_classify_location(depth_pct),
+        })
+
+        n = self._create_fvg_variants(
+            opp_id, inst, zone, rfid, revisit_id, revisit_n, snap, depth_pct, price,
+        )
+        self._re_event("FVG_VARIANTS_CREATED", inst=inst, extra={
+            "opportunity_id": opp_id, "count": n,
+        })
+        self._log.info(
+            "GRE FVG [%s] opp=%s revisit#%d depth=%s variants=%d",
+            inst, opp_id, revisit_n, _fvg_classify_location(depth_pct), n,
+        )
+
+    # ── Snapshot builder ──────────────────────────────────────────────────────
+
+    def _build_fvg_snapshot(
+        self,
+        inst:       str,
+        zone:       Dict,
+        rfid:       str,
+        revisit_n:  int,
+        revisit_id: str,
+        bar_low:    float,
+        bar_high:   float,
+        bar_ts:     Any,
+        price:      float,
+        depth_pct:  float,
+        canonical:  Dict,
+    ) -> Dict:
+        upper = float(zone.get("upper", 0))
+        lower = float(zone.get("lower", 0))
+        gap   = upper - lower
+        tick  = _TICK_SIZE.get(inst, 0.25)
+        gap_ticks = int(round(gap / tick)) if tick > 0 else None
+
+        # ATR from canonical (try several key patterns used across engines)
+        atr: Optional[float] = _sn(
+            canonical.get("atr")
+            or (canonical.get("atr_d") or {}).get("atr")
+            or canonical.get("current_atr")
+        )
+        gap_atr = round(gap / atr, 4) if (atr and atr > 0) else None
+
+        # FVG age at revisit
+        age_seconds: Optional[int] = None
+        try:
+            created_str = zone.get("created_at")
+            if created_str and bar_ts:
+                from datetime import datetime  # noqa: PLC0415 (already imported at top)
+                created_epoch = datetime.fromisoformat(
+                    str(created_str).replace("Z", "+00:00")
+                ).timestamp()
+                age_seconds = int(bar_ts - created_epoch)
+        except Exception:
+            pass
+
+        # Canonical context blocks
+        trend  = canonical.get("trend")  or {}
+        cvd    = canonical.get("cvd")    or {}
+        volume = canonical.get("volume") or {}
+        vwap   = canonical.get("vwap")   or {}
+        struct = canonical.get("structure") or {}
+
+        vwap_val  = _sn(vwap.get("vwap") or vwap.get("value"))
+        vwap_side = _ss(vwap.get("side") or vwap.get("vwap_side"), "UNKNOWN")
+        vwap_dist: Optional[float] = None
+        if vwap_val and price and abs(price) > 0:
+            vwap_dist = round((price - vwap_val) / price * 100, 4)
+
+        extra: Dict[str, Any] = {
+            "fvg_gap_pts":              round(gap, 4),
+            "fvg_gap_ticks":            gap_ticks,
+            "fvg_gap_atr_ratio":        gap_atr,
+            "fvg_age_seconds":          age_seconds,
+            "fvg_prior_touch_count":    zone.get("touch_count", 0),
+            "fvg_interaction_depth":    round(depth_pct, 4),
+            "fvg_interaction_location": _fvg_classify_location(depth_pct),
+            "fvg_status_at_revisit":    zone.get("status"),
+            "fvg_upper":                upper,
+            "fvg_lower":                lower,
+            "fvg_midpoint":             float(zone.get("midpoint", (upper + lower) / 2)),
+            "fvg_revisit_number":       revisit_n,  # stored for restore dedup
+        }
+
+        return {
+            # Canonical snapshot
+            "current_price":      price,
+            "current_atr":        atr,
+            "current_vwap":       vwap_val,
+            "vwap_side":          vwap_side,
+            "vwap_distance_pct":  vwap_dist,
+            "trend_15m":          _ss(trend.get("trend_15m"), "UNKNOWN"),
+            "trend_4h":           _ss(trend.get("trend_4h"), "UNKNOWN"),
+            "trend_alignment":    _ss(trend.get("alignment") or trend.get("trend_alignment"), "UNKNOWN"),
+            "cvd_direction":      _ss(cvd.get("direction") or cvd.get("state"), "UNKNOWN"),
+            "cvd_value":          _sn(cvd.get("value")),
+            "volume_value":       _sn(volume.get("volume") or volume.get("value")),
+            "relative_volume":    _sn(volume.get("relative_volume") or volume.get("databento_rvol")),
+            "structure_bos":      bool(struct.get("bos") or struct.get("bullish_bos") or struct.get("bearish_bos")),
+            "structure_choch":    bool(struct.get("choch") or struct.get("choch_bullish") or struct.get("choch_bearish")),
+            # FVG identity (for reference in experiments)
+            "research_fvg_id":    rfid,
+            "revisit_id":         revisit_id,
+            "revisit_n":          revisit_n,
+            # Extra JSONB snapshot
+            "_extra_snapshot":    extra,
+        }
+
+    # ── Opportunity DB insert ─────────────────────────────────────────────────
+
+    def _insert_fvg_opportunity(
+        self,
+        opp_id:     str,
+        inst:       str,
+        zone:       Dict,
+        rfid:       str,
+        revisit_id: str,
+        revisit_n:  int,
+        snap:       Dict,
+    ) -> bool:
+        try:
+            db  = self._get_db()
+            cur = db.cursor()
+
+            direction     = "Long" if str(zone.get("direction", "")).upper() == "BULLISH" else "Short"
+            trading_date  = datetime.now(timezone.utc).date().isoformat()
+            source_fvg_id = str(zone.get("id") or zone.get("zone_id") or zone.get("fvg_id") or "")
+            extra         = snap.get("_extra_snapshot") or {}
+
+            cur.execute("""
+                INSERT INTO ghost_opportunities
+                    (opportunity_id, trading_date, instrument,
+                     strategy, strategy_family, strategy_version, config_version,
+                     orb_state, orb_event, direction, breakout_direction,
+                     source_fvg_id, research_fvg_id, revisit_id,
+                     current_price, current_atr, current_vwap, vwap_side, vwap_distance_pct,
+                     trend_15m, trend_4h, trend_alignment,
+                     cvd_direction, cvd_value, volume_value, relative_volume,
+                     structure_bos, structure_choch,
+                     extra_snapshot,
+                     dc_decision_id, dc_state, dc_reason_code, dc_verdict,
+                     dc_edge_score, dc_confidence, dc_qualified, dc_risk_status,
+                     dc_execution_mode, dc_execution_enabled, dc_armed,
+                     dc_parity_agree, dc_version)
+                VALUES (
+                    %s,%s,%s,
+                    %s,%s,%s,%s,
+                    %s,%s,%s,%s,
+                    %s,%s,%s,
+                    %s,%s,%s,%s,%s,
+                    %s,%s,%s,
+                    %s,%s,%s,%s,
+                    %s,%s,
+                    %s,
+                    %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s
+                )
+                ON CONFLICT (opportunity_id) DO NOTHING
+                RETURNING id
+            """, (
+                opp_id, trading_date, inst,
+                FVG_STRATEGY_NAME, STRATEGY_FAMILY_FVG, "FVG_RESEARCH_BASELINE_V1", "1.0",
+                "FVG_REVISIT", "FVG_REVISIT_OPPORTUNITY", direction, direction,
+                source_fvg_id or None, rfid, revisit_id,
+                snap.get("current_price"), snap.get("current_atr"),
+                snap.get("current_vwap"), snap.get("vwap_side"), snap.get("vwap_distance_pct"),
+                snap.get("trend_15m"), snap.get("trend_4h"), snap.get("trend_alignment"),
+                snap.get("cvd_direction"), snap.get("cvd_value"),
+                snap.get("volume_value"), snap.get("relative_volume"),
+                snap.get("structure_bos"), snap.get("structure_choch"),
+                json.dumps(
+                    {k: v for k, v in extra.items() if v is not None}, default=str,
+                ),
+                snap.get("canonical_decision_id"), snap.get("canonical_decision_state"),
+                snap.get("canonical_reason_code"), snap.get("live_verdict"),
+                snap.get("edge_score"), snap.get("confidence"),
+                snap.get("qualification_state"), snap.get("risk_status"),
+                snap.get("execution_mode"), snap.get("execution_enabled"), snap.get("armed"),
+                snap.get("parity_agree"), snap.get("dc_version"),
+            ))
+            row = cur.fetchone()
+            db.commit()
+            return row is not None
+        except Exception as exc:
+            self._log.warning("GRE FVG insert_opportunity (%s): %s", inst, exc)
+            return False
+
+    # ── Variant creation ──────────────────────────────────────────────────────
+
+    def _create_fvg_variants(
+        self,
+        opp_id:    str,
+        inst:      str,
+        zone:      Dict,
+        rfid:      str,
+        revisit_id: str,
+        revisit_n: int,
+        snap:      Dict,
+        depth_pct: float,
+        price:     float,
+    ) -> int:
+        direction = "Long" if str(zone.get("direction", "")).upper() == "BULLISH" else "Short"
+        upper = float(zone.get("upper", 0))
+        lower = float(zone.get("lower", 0))
+        tick  = _TICK_SIZE.get(inst, 0.25)
+
+        # Stop: beyond opposite FVG boundary + 2 ticks (deterministic per zone)
+        planned_stop = (lower - 2 * tick) if direction == "Long" else (upper + 2 * tick)
+        risk = abs(price - planned_stop) if planned_stop else None
+
+        def _tp(mult: float) -> Optional[float]:
+            if not risk or risk <= 0:
+                return None
+            return (price + mult * risk) if direction == "Long" else (price - mult * risk)
+
+        # Snapshot context used by filter_rules (for entry-time evaluation)
+        trend_15m = str(snap.get("trend_15m", "UNKNOWN")).upper()
+        cvd_dir   = str(snap.get("cvd_direction", "UNKNOWN")).upper()
+
+        # Common FVG identity anchors stored in filter_rules for use at entry time
+        _fvg_ctx: Dict = {
+            "_rfid":          rfid,
+            "_revisit_n":     revisit_n,
+            "_fvg_upper":     upper,
+            "_fvg_lower":     lower,
+            "_fvg_direction": str(zone.get("direction", "")),
+            "_trend_15m":     trend_15m,
+            "_cvd_direction": cvd_dir,
+        }
+
+        variants_cfg = [
+            {
+                "variant":    FvgVariant.BASELINE,
+                "entry_rule": "FVG_ZONE_TOUCH",
+                "filter":     {},
+                "tp_mult":    _FVG_BASELINE_TARGET_R,
+                "param":      {"tp_r": _FVG_BASELINE_TARGET_R, "baseline": True},
+            },
+            {
+                "variant":    FvgVariant.NEAR_EDGE_ENTRY,
+                "entry_rule": "FVG_NEAR_EDGE",
+                "filter":     {"max_depth_pct": _FVG_NEAR_EDGE_FRAC},
+                "tp_mult":    _FVG_BASELINE_TARGET_R,
+                "param":      {"entry_depth_max_pct": _FVG_NEAR_EDGE_FRAC,
+                               "tp_r": _FVG_BASELINE_TARGET_R},
+            },
+            {
+                "variant":    FvgVariant.MIDPOINT_ENTRY,
+                "entry_rule": "FVG_MIDPOINT",
+                "filter":     {"min_depth_pct": _FVG_MIDPOINT_MIN_PCT},
+                "tp_mult":    _FVG_BASELINE_TARGET_R,
+                "param":      {"entry_depth_min_pct": _FVG_MIDPOINT_MIN_PCT,
+                               "tp_r": _FVG_BASELINE_TARGET_R},
+            },
+            {
+                "variant":    FvgVariant.DEEP_FILL_ENTRY,
+                "entry_rule": "FVG_DEEP_FILL",
+                "filter":     {"min_depth_pct": _FVG_DEEP_FILL_MIN_PCT},
+                "tp_mult":    _FVG_BASELINE_TARGET_R,
+                "param":      {"entry_depth_min_pct": _FVG_DEEP_FILL_MIN_PCT,
+                               "tp_r": _FVG_BASELINE_TARGET_R},
+            },
+            {
+                "variant":      FvgVariant.FIRST_TOUCH_ONLY,
+                "entry_rule":   "FVG_ZONE_TOUCH",
+                "filter":       {"max_revisit_n": 1},
+                "tp_mult":      _FVG_BASELINE_TARGET_R,
+                "param":        {"max_revisit_n": 1, "tp_r": _FVG_BASELINE_TARGET_R},
+                "pre_no_entry": revisit_n > 1,
+            },
+            {
+                "variant":      FvgVariant.SECOND_TOUCH_ALLOWED,
+                "entry_rule":   "FVG_ZONE_TOUCH",
+                "filter":       {"max_revisit_n": 2},
+                "tp_mult":      _FVG_BASELINE_TARGET_R,
+                "param":        {"max_revisit_n": 2, "tp_r": _FVG_BASELINE_TARGET_R},
+                "pre_no_entry": revisit_n > 2,
+            },
+            {
+                "variant":    FvgVariant.TREND_REQUIRED,
+                "entry_rule": "FVG_ZONE_TOUCH",
+                "filter":     {"require_trend_align": True},
+                "tp_mult":    _FVG_BASELINE_TARGET_R,
+                "param":      {"require_15m_trend_alignment": True,
+                               "tp_r": _FVG_BASELINE_TARGET_R},
+            },
+            {
+                "variant":    FvgVariant.CVD_ALIGNED,
+                "entry_rule": "FVG_ZONE_TOUCH",
+                "filter":     {"require_cvd_align": True},
+                "tp_mult":    _FVG_BASELINE_TARGET_R,
+                "param":      {"require_cvd_alignment": True,
+                               "tp_r": _FVG_BASELINE_TARGET_R},
+            },
+            {
+                "variant":    FvgVariant.TP_1R,
+                "entry_rule": "FVG_ZONE_TOUCH",
+                "filter":     {},
+                "tp_mult":    1.0,
+                "param":      {"tp_r": 1.0},
+            },
+            {
+                "variant":    FvgVariant.TP_1_5R,
+                "entry_rule": "FVG_ZONE_TOUCH",
+                "filter":     {},
+                "tp_mult":    1.5,
+                "param":      {"tp_r": 1.5},
+            },
+        ]
+
+        created = 0
+        for cfg in variants_cfg[:self._max_variants]:
+            # Merge FVG identity + tp_mult into filter_rules for entry-time evaluation
+            filter_r = {**cfg["filter"], **_fvg_ctx, "tp_mult": cfg["tp_mult"]}
+            ok = self._insert_fvg_experiment_and_result(
+                opp_id, inst, direction,
+                cfg["variant"],
+                planned_stop, _tp(cfg["tp_mult"]),
+                cfg["entry_rule"], filter_r, cfg.get("param", {}),
+                pre_no_entry=cfg.get("pre_no_entry", False),
+            )
+            if ok:
+                created += 1
+        return created
+
+    # ── Experiment + result DB insert ─────────────────────────────────────────
+
+    def _insert_fvg_experiment_and_result(
+        self,
+        opp_id:       str,
+        inst:         str,
+        direction:    str,
+        variant:      str,
+        planned_stop: Optional[float],
+        planned_tp1:  Optional[float],
+        entry_rule:   str,
+        filter_rules: Dict,
+        param_diff:   Dict,
+        pre_no_entry: bool = False,
+    ) -> bool:
+        exp_id = _experiment_id(opp_id, variant)
+        res_id = _result_id(exp_id)
+        try:
+            db  = self._get_db()
+            cur = db.cursor()
+            tp_lbl = f"TP_{filter_rules.get('tp_mult', _FVG_BASELINE_TARGET_R):.1f}R"
+            cur.execute("""
+                INSERT INTO ghost_experiments
+                    (experiment_id, opportunity_id,
+                     strategy, strategy_family, strategy_version, config_version,
+                     experiment_family, variant_name, parameter_diff, entry_rule,
+                     confirmation_rule, stop_rule, target_rule, management_rule,
+                     filter_rules, simulated_slippage, simulated_commissions,
+                     planned_entry, planned_stop, planned_tp1, planned_tp2,
+                     planned_contracts)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (opportunity_id, variant_name) DO NOTHING
+                RETURNING experiment_id
+            """, (
+                exp_id, opp_id,
+                FVG_STRATEGY_NAME, STRATEGY_FAMILY_FVG, "FVG_RESEARCH_BASELINE_V1", "1.0",
+                STRATEGY_FAMILY_FVG, variant,
+                json.dumps(param_diff), entry_rule,
+                "FVG_BAR_CLOSE_INSIDE_ZONE",
+                "FVG_OPPOSITE_BOUNDARY_PLUS_2TICK",
+                tp_lbl, "FIXED",
+                json.dumps(filter_rules),
+                GHOST_SLIPPAGE_TICKS, GHOST_COMM_PER_SIDE_USD,
+                None, planned_stop, planned_tp1, None, None,
+            ))
+            if cur.fetchone() is None:
+                db.rollback()
+                return False
+
+            init_status = ResultStatus.COMPLETED if pre_no_entry else ResultStatus.WATCHING_ENTRY
+            init_result = OutcomeResult.NO_ENTRY  if pre_no_entry else None
+
+            cur.execute("""
+                INSERT INTO ghost_experiment_results
+                    (result_id, experiment_id, opportunity_id, status,
+                     entry_price, stop_price, tp1_price, tp2_price, result)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (experiment_id) DO NOTHING
+            """, (
+                res_id, exp_id, opp_id, init_status,
+                None, planned_stop, planned_tp1, None, init_result,
+            ))
+            db.commit()
+
+            if init_status != ResultStatus.COMPLETED:
+                with self._lock:
+                    self._open_results[res_id] = {
+                        "result_id":      res_id,
+                        "experiment_id":  exp_id,
+                        "opportunity_id": opp_id,
+                        "status":         init_status,
+                        "variant_name":   variant,
+                        "instrument":     inst,
+                        "direction":      direction,
+                        "entry_price":    None,
+                        "stop_price":     planned_stop,
+                        "tp1_price":      planned_tp1,
+                        "tp2_price":      None,
+                        "entry_rule":     entry_rule,
+                        "filter_rules":   filter_rules,
+                        "mfe_r": 0.0, "mae_r": 0.0,
+                        "mfe_price": None, "mae_price": None,
+                        "bars_held": 0, "last_bar_ts": None,
+                        "_fvg_family": True,   # sentinel: skip ORB _process_open_experiments
+                    }
+            return True
+        except Exception as exc:
+            self._log.warning("GRE FVG insert_experiment (%s %s): %s", variant, opp_id, exc)
+            return False
+
+    # ── Open FVG experiment evaluation ────────────────────────────────────────
+
+    def _fvg_process_open_experiments(
+        self,
+        inst:          str,
+        zones_by_rfid: Dict[str, Dict],
+        bar:           Dict,
+        bar_ts:        Any,
+        bar_low:       float,
+        bar_high:      float,
+        price:         float,
+        canonical:     Dict,
+    ) -> None:
+        bar_c = float(bar.get("close") or price)
+        with self._lock:
+            result_ids = [
+                rid for rid, rd in self._open_results.items()
+                if rd.get("instrument") == inst and rd.get("_fvg_family")
+            ]
+        for result_id in result_ids:
+            try:
+                self._fvg_process_one_experiment(
+                    result_id, inst, zones_by_rfid,
+                    bar_ts, bar_low, bar_high, bar_c, canonical,
+                )
+            except Exception as exc:
+                self._log.debug("GRE FVG process-experiment (%s): %s", result_id, exc)
+
+    def _fvg_process_one_experiment(
+        self,
+        result_id:     str,
+        inst:          str,
+        zones_by_rfid: Dict[str, Dict],
+        bar_ts:        Any,
+        bar_h:         Optional[float],
+        bar_l:         Optional[float],
+        bar_c:         float,
+        canonical:     Dict,
+    ) -> None:
+        with self._lock:
+            rd = self._open_results.get(result_id)
+            if rd is None:
+                return
+            rd = dict(rd)   # snapshot
+
+        status    = rd.get("status")
+        direction = rd.get("direction", "Long")
+        stop      = _sn(rd.get("stop_price"))
+        tp1       = _sn(rd.get("tp1_price"))
+        entry     = _sn(rd.get("entry_price"))
+        filter_r  = rd.get("filter_rules") or {}
+
+        rfid      = filter_r.get("_rfid", "")
+        revisit_n = filter_r.get("_revisit_n", 0)
+        fvg_upper = filter_r.get("_fvg_upper")
+        fvg_lower = filter_r.get("_fvg_lower")
+        fvg_dir   = filter_r.get("_fvg_direction", "BULLISH")
+
+        # ── WATCHING_ENTRY ────────────────────────────────────────────────────
+        if status in (ResultStatus.WATCHING_ENTRY, ResultStatus.PENDING):
+
+            # Check zone still exists / not invalidated
+            zone = zones_by_rfid.get(rfid)
+            zone_status = (zone or {}).get("status", "UNKNOWN")
+            if zone_status in ("MITIGATED", "FAILED", "EXPIRED"):
+                self._complete_experiment(
+                    result_id, exit_price=None, exit_reason="FVG_ZONE_GONE",
+                    result=OutcomeResult.INVALIDATED_BEFORE_ENTRY, exit_ts=_now_utc(),
+                )
+                return
+
+            # Time-based entry expiry
+            bars_waiting = (rd.get("bars_held") or 0) + 1
+            with self._lock:
+                rd2 = self._open_results.get(result_id)
+                if rd2:
+                    rd2["bars_held"]   = bars_waiting
+                    rd2["last_bar_ts"] = bar_ts
+            if bars_waiting > _FVG_MAX_WAITING_BARS:
+                self._complete_experiment(
+                    result_id, exit_price=None, exit_reason="FVG_ENTRY_EXPIRED",
+                    result=OutcomeResult.EXPIRED, exit_ts=_now_utc(),
+                )
+                return
+
+            # Check variant-specific entry condition
+            entered, entry_price = self._fvg_check_entry_condition(
+                rd.get("entry_rule", ""), direction, filter_r, canonical,
+                bar_l, bar_h, bar_c, fvg_upper, fvg_lower, fvg_dir, revisit_n,
+            )
+            if entered and entry_price is not None:
+                tp_mult = filter_r.get("tp_mult", _FVG_BASELINE_TARGET_R)
+                risk    = abs(entry_price - stop) if stop is not None else 0.0
+                actual_tp1 = (
+                    (entry_price + tp_mult * risk) if direction == "Long"
+                    else (entry_price - tp_mult * risk)
+                ) if risk > 0 else tp1
+                cost_r = _commission_r(inst, entry_price, stop) if stop else 0.0
+                self._enter_experiment(
+                    result_id, rd["experiment_id"], rd["opportunity_id"],
+                    entry_price, stop, actual_tp1, None,
+                    cost_r=cost_r, qualified_ts=_now_utc(),
+                )
+                with self._lock:
+                    rd3 = self._open_results.get(result_id)
+                    if rd3:
+                        rd3["tp1_price"] = actual_tp1
+
+        # ── ACTIVE ────────────────────────────────────────────────────────────
+        elif status == ResultStatus.ACTIVE:
+            if stop is None or bar_h is None or bar_l is None:
+                return
+
+            stop_hit = (
+                (direction == "Long"  and bar_l <= stop) or
+                (direction == "Short" and bar_h >= stop)
+            )
+            tp1_hit = bool(tp1 and (
+                (direction == "Long"  and bar_h >= tp1) or
+                (direction == "Short" and bar_l <= tp1)
+            ))
+
+            if stop_hit and tp1_hit:
+                # Same-bar ambiguity: conservative → stop wins
+                self._complete_experiment(
+                    result_id, exit_price=stop, exit_reason="STOP_HIT",
+                    result=OutcomeResult.LOSS, exit_ts=_now_utc(), ambiguous_bar=True,
+                )
+                return
+            if tp1_hit:
+                self._complete_experiment(
+                    result_id, exit_price=tp1, exit_reason="TP1_HIT",
+                    result=OutcomeResult.WIN, exit_ts=_now_utc(), tp1_hit=True,
+                )
+                return
+            if stop_hit:
+                self._complete_experiment(
+                    result_id, exit_price=stop, exit_reason="STOP_HIT",
+                    result=OutcomeResult.LOSS, exit_ts=_now_utc(),
+                )
+                return
+
+            # Track MFE / MAE while open
+            if entry is not None and stop is not None:
+                risk_pts = abs(entry - stop)
+                if risk_pts > 0:
+                    with self._lock:
+                        rd2 = self._open_results.get(result_id)
+                        if rd2:
+                            mfe_r, mae_r, mfe_p, mae_p = _update_mfe_mae(
+                                direction, bar_h, bar_l, entry, risk_pts,
+                                _sn(rd2.get("mfe_price")), _sn(rd2.get("mae_price")),
+                                rd2.get("mfe_r", 0.0) or 0.0,
+                                rd2.get("mae_r", 0.0) or 0.0,
+                            )
+                            rd2.update({
+                                "mfe_r": mfe_r, "mae_r": mae_r,
+                                "mfe_price": mfe_p, "mae_price": mae_p,
+                                "bars_held":   (rd2.get("bars_held") or 0) + 1,
+                                "last_bar_ts": bar_ts,
+                            })
+
+    # ── Variant-specific entry condition ──────────────────────────────────────
+
+    def _fvg_check_entry_condition(
+        self,
+        entry_rule: str,
+        direction:  str,
+        filter_r:   Dict,
+        canonical:  Dict,
+        bar_l:      Optional[float],
+        bar_h:      Optional[float],
+        bar_c:      float,
+        fvg_upper:  Optional[float],
+        fvg_lower:  Optional[float],
+        fvg_dir:    str,
+        revisit_n:  int,
+    ) -> Tuple[bool, Optional[float]]:
+        """
+        Evaluate variant-specific FVG entry condition.
+        Returns (entered, entry_price).  Entry price = bar CLOSE (conservative fill).
+        """
+        if bar_l is None or bar_h is None:
+            return False, None
+        if fvg_upper is None or fvg_lower is None:
+            return False, None
+
+        gap = max(fvg_upper - fvg_lower, 1e-9)
+
+        # How far INTO the zone does the close reach (0=entry edge, 1=full)
+        close_inside = fvg_lower <= bar_c <= fvg_upper
+        if fvg_dir.upper() == "BULLISH":
+            close_depth_pct = max(0.0, min(1.0, (fvg_upper - bar_c) / gap)) if close_inside else 0.0
+        else:
+            close_depth_pct = max(0.0, min(1.0, (bar_c - fvg_lower) / gap)) if close_inside else 0.0
+
+        # ── Pre-condition: revisit count gate ─────────────────────────────────
+        max_revisit = filter_r.get("max_revisit_n")
+        if max_revisit is not None and revisit_n > max_revisit:
+            return False, None
+
+        # ── Pre-condition: trend alignment ────────────────────────────────────
+        if filter_r.get("require_trend_align"):
+            cur_trend = str(
+                canonical.get("trend", {}).get("trend_15m", "")
+                or filter_r.get("_trend_15m", "")
+            ).upper()
+            if direction == "Long"  and "BULL" not in cur_trend:
+                return False, None
+            if direction == "Short" and "BEAR" not in cur_trend:
+                return False, None
+
+        # ── Pre-condition: CVD alignment ──────────────────────────────────────
+        if filter_r.get("require_cvd_align"):
+            cur_cvd = str(
+                canonical.get("cvd", {}).get("direction", "")
+                or filter_r.get("_cvd_direction", "")
+            ).upper()
+            if direction == "Long"  and ("BEAR" in cur_cvd or cur_cvd in ("SHORT", "NEGATIVE")):
+                return False, None
+            if direction == "Short" and ("BULL" in cur_cvd or cur_cvd in ("LONG", "POSITIVE")):
+                return False, None
+
+        # ── Rule-specific entry checks ────────────────────────────────────────
+
+        if entry_rule == "FVG_NEAR_EDGE":
+            max_d = filter_r.get("max_depth_pct", _FVG_NEAR_EDGE_FRAC)
+            if close_inside and close_depth_pct <= max_d:
+                return True, bar_c
+            return False, None
+
+        if entry_rule == "FVG_MIDPOINT":
+            min_d = filter_r.get("min_depth_pct", _FVG_MIDPOINT_MIN_PCT)
+            if close_inside and close_depth_pct >= min_d:
+                return True, bar_c
+            return False, None
+
+        if entry_rule == "FVG_DEEP_FILL":
+            min_d = filter_r.get("min_depth_pct", _FVG_DEEP_FILL_MIN_PCT)
+            if close_inside and close_depth_pct >= min_d:
+                return True, bar_c
+            return False, None
+
+        # FVG_ZONE_TOUCH (BASELINE and all filter-only variants): close inside zone
+        if close_inside:
+            return True, bar_c
+
+        return False, None

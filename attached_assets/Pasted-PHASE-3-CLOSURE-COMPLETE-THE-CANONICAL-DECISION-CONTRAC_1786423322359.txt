@@ -1,0 +1,546 @@
+PHASE 3 CLOSURE — COMPLETE THE CANONICAL DECISION CONTRACT WIRING
+
+The Canonical Decision Contract is implemented and shadow-operational.
+
+Do NOT start another major feature.
+
+Complete the remaining Phase 3 integration gaps, then perform one production publish and validation.
+
+This task must remain SHADOW / OBSERVABILITY ONLY.
+
+It must NOT change trading decisions or execution behavior.
+
+==================================================
+1. OBJECTIVE
+==================================================
+
+Close the remaining Decision Contract gaps so the system can trace the complete lifecycle:
+
+market conditions
+    ↓
+setup forming
+    ↓
+qualified / blocked
+    ↓
+risk approved
+    ↓
+entry requested
+    ↓
+execution requested
+    ↓
+order accepted/rejected
+    ↓
+position active
+    ↓
+closed
+
+The Decision Contract remains an observer.
+
+It does NOT become the authority over execution yet.
+
+==================================================
+2. GHOST RESEARCH ENRICHMENT
+==================================================
+
+Wire the existing Decision Contract enrichment helper into Ghost Research opportunity creation.
+
+The previously identified gap was:
+
+ghost research does not yet capture the canonical Decision Contract context at opportunity time.
+
+Find the intended helper/interface, including:
+
+enrich_ghost_snapshot()
+
+or the current equivalent if naming changed.
+
+At the moment a ghost opportunity is frozen, include:
+
+decision_id
+decision_state
+reason_codes
+decision_direction
+decision_strategy
+edge_score
+verdict
+qualified status
+blocking reason
+risk state
+execution eligibility
+arm state if applicable
+decision-state timestamp
+decision provenance/version
+
+Do not mutate the snapshot later.
+
+Ghost opportunity snapshots remain immutable.
+
+If Decision Contract state is unavailable:
+
+store UNKNOWN / null with explicit provenance.
+
+Do not block Ghost Research.
+
+==================================================
+3. EXECUTION REQUEST TRANSITIONS
+==================================================
+
+Wire Decision Contract observation into the actual execution-request seams.
+
+Audit both:
+
+AUTO EXECUTION PATH
+
+and
+
+MANUAL ENTER / LONG / SHORT PATH
+
+Find the authoritative functions currently responsible for requesting an order.
+
+The earlier audit identified expected hooks similar to:
+
+observe_entry_requested()
+
+observe_manual_requested()
+
+Use current actual method names if different.
+
+The Decision Contract must record that an execution was REQUESTED before transmission.
+
+This is observational only.
+
+Do NOT route the order through Decision Contract.
+
+==================================================
+4. AUTO-FIRE PATH
+==================================================
+
+At the authoritative auto-execution seam:
+
+record the transition immediately before the normal execution gateway request.
+
+Example conceptual flow:
+
+QUALIFIED
+    ↓
+RISK_APPROVED
+    ↓
+ENTRY_REQUESTED
+    ↓
+existing execution gateway
+
+Decision Contract observation must fail open.
+
+If recording fails:
+
+the existing execution path proceeds unchanged.
+
+==================================================
+5. MANUAL ENTRY PATH
+==================================================
+
+Manual ENTER / LONG / SHORT requests must also create a canonical transition.
+
+Record that the request originated from:
+
+MANUAL
+
+not:
+
+AUTO
+
+Preserve:
+
+instrument
+direction
+quantity
+strategy if available
+requested entry
+stop
+targets
+risk
+timestamp
+operator/manual origin
+
+Do not require READY for discretionary Trade Desk actions if the current system does not require it.
+
+Decision Contract records what happened.
+
+It must not silently change existing discretionary permissions.
+
+==================================================
+6. ORDER RESULT TRANSITIONS
+==================================================
+
+Audit whether Decision Contract already observes:
+
+ORDER_ACCEPTED
+ORDER_REJECTED
+POSITION_ACTIVE
+CLOSED
+
+If any are missing, wire observational hooks into the existing authoritative response paths.
+
+Do NOT create duplicate order-state logic.
+
+Reuse broker/gateway results.
+
+The contract should reflect reality reported by the actual execution system.
+
+==================================================
+7. CORRELATION IDs
+==================================================
+
+Preserve traceability across:
+
+decision_id
+ghost opportunity_id
+experiment_id when applicable
+journal/trade ID
+execution request ID
+broker/order ID when available
+
+Do not invent broker IDs.
+
+The goal is eventually to answer:
+
+“Show me everything that happened from the original setup to the completed trade.”
+
+==================================================
+8. TRANSITION VALIDITY
+==================================================
+
+Use the existing DecisionState / LEGAL_TRANSITIONS contract.
+
+Do not bypass illegal transitions simply to make tests pass.
+
+If real production behavior reveals a legitimate missing transition:
+
+document it,
+add it deliberately,
+add tests,
+and explain why it is valid.
+
+==================================================
+9. DO NOT CHANGE MONEY-PATH AUTHORITY
+==================================================
+
+This is critical.
+
+Decision Contract remains SHADOW.
+
+It must NOT become a new gate for:
+
+READY
+EARLY
+WAIT
+strategy selection
+risk
+position sizing
+execution
+TradersPost
+prop protection
+daily-loss protection
+arm state
+
+Existing production logic remains authoritative.
+
+==================================================
+10. DECISION PARITY
+==================================================
+
+For every observed live decision, continue comparing:
+
+canonical Decision Contract state
+
+against:
+
+existing production verdict / state.
+
+Track mismatches.
+
+Do not automatically “correct” the existing system yet.
+
+Expose mismatch reasons.
+
+==================================================
+11. API
+==================================================
+
+Verify /decision-state supports useful tracing by:
+
+instrument
+decision_id
+
+and can include:
+
+current state
+reason codes
+transition history
+source/origin
+manual vs auto
+parity status
+linked identifiers
+
+Do not expose secrets.
+
+==================================================
+12. RESEARCH LINK
+==================================================
+
+Verify a Ghost Research opportunity can now be traced back to the Decision Contract record active when the opportunity occurred.
+
+Example:
+
+ghost opportunity
+    → decision_id
+    → decision state/reasons
+    → ORB event
+    → canonical market snapshot
+
+This must be queryable/debuggable.
+
+==================================================
+13. TESTS
+==================================================
+
+Add tests for at minimum:
+
+ghost snapshot receives decision_id
+
+ghost snapshot receives decision state
+
+ghost snapshot immutable after future decision changes
+
+missing Decision Contract does not block Ghost Research
+
+AUTO qualification → ENTRY_REQUESTED observation
+
+MANUAL ENTER → manual request observation
+
+manual SHORT → correct direction
+
+Decision Contract observation failure does not prevent execution
+
+accepted order transition
+
+rejected order transition
+
+position-active transition if available
+
+closed transition if available
+
+decision/execution correlation ID preservation
+
+illegal transition rejected
+
+duplicate callback does not duplicate transition
+
+restart persistence
+
+four-instrument isolation
+
+existing live verdict parity unchanged
+
+==================================================
+14. REGRESSION
+==================================================
+
+Run:
+
+Decision Contract tests
+Ghost Research tests
+09:30 ORB tests
+canonical market-state tests
+structure dedup tests
+sweep dedup tests
+risk tests
+execution tests
+arm/safety tests
+prop tests
+
+And:
+
+PARITY
+SCALP GOLDEN
+DUAL-SIM
+BREAKOUT MODE
+
+Any NEW regression must be fixed.
+
+Keep pre-existing failures reported separately.
+
+==================================================
+15. PRODUCTION PUBLISH
+==================================================
+
+After all tests pass:
+
+publish ONE consolidated Phase 3 closure build.
+
+Verify production actually becomes ready.
+
+Then verify production DB contains:
+
+decision_records
+decision_transitions
+
+Do not assume schema/application success from build success alone.
+
+==================================================
+16. PRODUCTION BOOT VALIDATION
+==================================================
+
+Required production boot evidence:
+
+DecisionContract: DB tables ready
+
+DecisionContract: registry initialised
+
+four instruments restored/created
+
+no Decision Contract startup exception
+
+Ghost Research Engine started
+
+OrbEngine started in SHADOW
+
+Databento live
+
+==================================================
+17. PRODUCTION OBSERVATION
+==================================================
+
+After deployment generate/read normal system observations.
+
+Verify:
+
+MGC decision record
+MNQ decision record
+MES decision record
+MYM decision record
+
+Verify transitions are actually persisting.
+
+Verify /decision-state returns all four.
+
+Verify:
+
+parity_mismatch_count = 0
+
+or report any real mismatch precisely.
+
+==================================================
+18. SAFETY ASSERTIONS
+==================================================
+
+Explicitly prove:
+
+DECISION CONTRACT MONEY-PATH AUTHORITY = NO
+
+DECISION CONTRACT SHADOW ONLY = YES
+
+GHOST RESEARCH CAN MODIFY LIVE = NO
+
+09:30 ORB MODE = SHADOW
+
+09:30 ORB LIVE ORDERS = 0
+
+LIVE STRATEGY WEIGHTS CHANGED = NO
+
+LIVE EXECUTION LOGIC CHANGED = NO
+
+==================================================
+19. COMPLETION REPORT
+==================================================
+
+Return:
+
+PHASE 3 CLOSURE COMPLETE:
+YES/NO
+
+GHOST SNAPSHOT DECISION ENRICHMENT:
+PASS/FAIL
+
+DECISION_ID STORED IN GHOST OPPORTUNITY:
+YES/NO
+
+AUTO ENTRY REQUEST OBSERVED:
+YES/NO
+
+MANUAL ENTRY REQUEST OBSERVED:
+YES/NO
+
+ORDER ACCEPTED OBSERVED:
+YES/NO
+
+ORDER REJECTED OBSERVED:
+YES/NO
+
+POSITION ACTIVE OBSERVED:
+YES/NO/NOT AVAILABLE
+
+CLOSED OBSERVED:
+YES/NO/NOT AVAILABLE
+
+TRACEABILITY:
+
+decision_id →
+opportunity_id →
+experiment_id →
+journal/trade id →
+execution/order id
+
+State which links are operational.
+
+DECISION RECORDS IN PRODUCTION:
+
+MGC =
+MNQ =
+MES =
+MYM =
+
+TRANSITION ROW COUNT:
+
+PARITY MISMATCHES:
+
+DECISION CONTRACT TESTS:
+
+GHOST RESEARCH TESTS:
+
+ORB TESTS:
+
+TARGETED TESTS PASSED:
+
+NEW FAILURES:
+MUST = 0
+
+PRE-EXISTING FAILURES:
+list separately
+
+PARITY:
+PASS/FAIL
+
+SCALP GOLDEN:
+PASS/FAIL
+
+DUAL-SIM:
+PASS/FAIL
+
+BREAKOUT:
+PASS/FAIL
+
+PRODUCTION READY:
+YES/NO
+
+DATABENTO LIVE:
+YES/NO
+
+DECISION CONTRACT SHADOW ONLY:
+MUST = YES
+
+LIVE TRADING BEHAVIOR CHANGED:
+MUST = NO
+
+SAFE TO BEGIN NEXT ARCHITECTURE PHASE:
+YES/NO

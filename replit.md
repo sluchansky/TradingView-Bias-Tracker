@@ -1,51 +1,158 @@
-# [Project name]
+# AI Trading Partner — TradingView Webhook Server
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+An autonomous futures trading bot that receives TradingView alerts, scores each setup through a multi-layer analysis engine, executes trades via a configurable broker gateway, and surfaces everything in a real-time operator dashboard.
 
 ## Run & Operate
 
-- `pnpm --filter @workspace/api-server run dev` — run the API server (port 5000)
-- `pnpm run typecheck` — full typecheck across all packages
-- `pnpm run build` — typecheck + build all packages
-- `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
-- `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
-- Required env: `DATABASE_URL` — Postgres connection string
+### Development
+- `python artifacts/tradingview-webhook/app.py` — start the Flask trading engine (port 8000)
+- `pnpm --filter @workspace/api-server run dev` — start the Express API proxy (port 5000)
+- `pnpm --filter @workspace/home run dev` — start the operator dashboard (React/Vite)
+
+### Test suite
+```bash
+cd artifacts/tradingview-webhook
+python -m pytest tests/ -q            # Phase 8 suite (profitability, DC, GRE, MTF…)
+python -m pytest test_*.py -q         # all root-level tests
+python -m pytest -q                   # everything
+```
+
+### Smoke checks (run these before declaring any change done)
+```bash
+bash .local/state/check_parity.sh          # PARITY OK — registry/resolver must be byte-identical
+bash .local/state/check_scalp_golden.sh    # SCALP GOLDEN OK — byte-identical to baseline
+bash .local/state/check_dual_sim.sh        # DUAL-SIM SMOKE OK + node --check on served <script>
+bash .local/state/check_breakout_mode.sh   # BREAKOUT MODE SMOKE OK + node --check on served <script>
+```
+All four must pass before any change is considered complete.
+
+### Database
+Managed via Replit's built-in PostgreSQL. App boots with a no-DDL readiness probe; new tables must be created via the database tool (dev) or a re-publish schema diff (prod). The app never runs DDL at boot.
+
+### Deployment
+Single Reserved VM deployment. The `api-server` prod build supervises Flask + Express. The `home` artifact serves the operator dashboard at `/`. Deploy via Replit Publish UI (not `pnpm run build` alone).
 
 ## Stack
 
-- pnpm workspaces, Node.js 24, TypeScript 5.9
-- API: Express 5
-- DB: PostgreSQL + Drizzle ORM
-- Validation: Zod (`zod/v4`), `drizzle-zod`
-- API codegen: Orval (from OpenAPI spec)
-- Build: esbuild (CJS bundle)
+- **Trading engine:** Python 3 / Flask (`artifacts/tradingview-webhook/app.py`)
+- **API proxy:** Express 5 / Node.js 24 (`artifacts/api-server`)
+- **Operator dashboard:** React + Vite (`artifacts/home`)
+- **Market data:** Databento (live bars, trades) + Alpha Vantage (VIX)
+- **Broker gateway:** TradersPost / PickMyTrade (configurable via `EXECUTION_MODE` env var)
+- **Database:** PostgreSQL (Replit managed) — Drizzle ORM for the Node layer; raw psycopg2 for Python
+- **Alerts source:** TradingView Pine scripts (webhook POST to `/webhook`)
+- **Notifications:** Discord webhooks (per-channel: MNQ, MGC, journal, general)
+- **Instruments:** MGC (Micro Gold), MNQ (Micro Nasdaq), MES (Micro S&P), MYM (Micro Dow)
+- **Trading modes:** SCALP, SWING (env var `TRADING_MODE`; durable mode change requires re-publish)
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
-
-- **Trading Academy / AI Trading Library** (learning-only knowledge module): backend in `artifacts/tradingview-webhook/app.py` (`/academy/*` routes + `_academy_*` helpers); dashboard `#view-academy` tab in the same file's `/dashboard` HTML; proxy whitelist in `artifacts/api-server/src/routes/flask-proxy.ts`. Safety smoke: `.local/state/academy_smoke.py` via `bash .local/state/check_academy.sh`.
+| Thing | Location |
+|---|---|
+| **Main trading engine** | `artifacts/tradingview-webhook/app.py` (all Flask routes, signal scoring, gate logic, broker gateway) |
+| **Decision Contract** | `artifacts/tradingview-webhook/decision_contract.py` — shadow lifecycle state machine |
+| **Ghost Research Engine** | `artifacts/tradingview-webhook/ghost_research_engine.py` — ORB shadow experiment platform |
+| **Profitability Engine** | `artifacts/tradingview-webhook/profitability_engine.py` — ghost observation → net-R accounting |
+| **FVG Engine (Step A)** | `artifacts/tradingview-webhook/fvg_engine.py` — all-day FVG/IFVG scanner (shadow/display) |
+| **FVG Sequence Engine (Step B)** | `artifacts/tradingview-webhook/fvg_sequence_engine.py` — shadow state machine for FVG entry candidates |
+| **ORB Engine** | `artifacts/tradingview-webhook/orb_engine.py` — 09:30 ET Opening Range Breakout (shadow) |
+| **Canonical Market State** | `artifacts/tradingview-webhook/canonical_market_state.py` — shadow Databento VWAP/ATR/structure |
+| **Left Brain / Market Intelligence** | `artifacts/tradingview-webhook/left_brain_market_intelligence.py` |
+| **Databento data layer** | `artifacts/tradingview-webhook/databento_brain.py` |
+| **Volatility Intelligence** | `artifacts/tradingview-webhook/volatility_intelligence.py` — VIX via Alpha Vantage |
+| **Edge Ledger** | `artifacts/tradingview-webhook/edge_ledger.py` — frozen-signal accounting (Phase 8A) |
+| **Scalp Research** | `artifacts/tradingview-webhook/scalp_research.py` — research/display-only strategy lab |
+| **Scalp Live Sim** | `artifacts/tradingview-webhook/scalp_live_sim.py` — paper sim on live stream |
+| **Native Journal** | `artifacts/tradingview-webhook/` (helpers inside app.py: `_nj_*`) |
+| **TradeZella engine** | `artifacts/tradingview-webhook/tradezella_engine.py` + auto-seed script |
+| **Backtest engine** | `artifacts/tradingview-webhook/backtest_engine.py` + `bt_acquire.py`, `bt_baseline.py` |
+| **Trading Academy** | Inside `app.py` — `/academy/*` routes; `#view-academy` dashboard tab |
+| **Express proxy whitelist** | `artifacts/api-server/src/routes/flask-proxy.ts` |
+| **Dashboard auth / open paths** | `artifacts/api-server/src/middleware/dashboard-auth.ts` (`OPEN_PATHS`) |
+| **Operator dashboard** | `artifacts/home/` (React/Vite; talks to Express proxy at `/api/*`) |
+| **Smoke scripts** | `.local/state/check_*.sh` |
+| **Phase 8+ test suite** | `artifacts/tradingview-webhook/tests/` |
+| **All other tests** | `artifacts/tradingview-webhook/test_*.py` (root level) |
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+**One Flask app, one gateway.** All trading logic — scoring, gates, broker sends, journal, persistence — lives inside `artifacts/tradingview-webhook/app.py`. Express is only a reverse proxy and auth layer. Never bypass it; never add trading logic to Express.
+
+**Shadow-first for all new research systems.** Every new engine (Decision Contract, GRE, FVG, CanonicalState, MTF, Profitability, Edge Ledger) is SHADOW-ONLY when first deployed. It observes and logs but never gates, sizes, or triggers broker sends. Promotion to a live gate requires explicit operator approval and a new phase.
+
+**Fail-open for observability, fail-closed for money paths.** Research/display layers catch their own exceptions and return safe defaults. Execution gateway, prop guard, safety lock, and daily-loss cap are fail-CLOSED — an exception blocks the trade, never silently passes it.
+
+**App runs no DDL.** `app.py` contains zero `CREATE TABLE` statements. All schema changes go through the Replit database tool (dev) then a re-publish schema diff (prod). Boot does a no-DDL readiness probe and sets a `*_DB_READY` flag; features gate on that flag before touching the table.
+
+**Single execution gateway.** All live broker POSTs go through one function (`_send_broker_order` → `_traderspost_order`). `EXECUTION_MODE` selects `manual_only | paper | traderspost | pickmytrade`. Paper and manual_only modes never send or dedupe. Every mode preserves fail-closed money invariants.
+
+**SCALP vs SWING are full scoring profiles.** They share the same code path but read from `cfg()` for thresholds, ATR multipliers, edge bands, and gate behavior. Any scoring change must keep invariants for both modes and pass parity + scalp-golden smokes.
+
+**Arm state is non-persistent.** The auto-trade arm resets OFF on every restart and re-publish. This is intentional — the operator must explicitly re-arm after a deploy. There is no "auto-re-arm" path.
+
+**Per-instrument isolation throughout.** `ACTIVE_TRADES_BY_INST` (one slot per instrument, RLock), `ALERT_HISTORY` (shared deque, iterated via `list()` snapshot), `ALERT_HISTORY_BY_INST` for throttle. Every gate, zone check, and structure read is instrument-scoped. Cross-instrument leaks are actively tested.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+The operator dashboard (Brain UI) shows:
+- **Brain Hero / Orb Halo** — live conviction state with directional indicator
+- **Left Brain panels** — per-instrument signal breakdown (VWAP, structure, zones, CVD, volume)
+- **Right Brain** — bar-close scanner, strategy scan, setup status
+- **Main Brain** — cognitive overlay: debate (Bull/Bear/Judge), governor, memory review, game plan
+- **Live Chart** — Databento tick stream with FVG zone overlays and VWAP bands
+- **Trade Management** — active position guidance (HOLD / TAKE PARTIAL / MOVE STOP / CONSIDER EXIT)
+- **Research Health** — Ghost Research Engine status, event feed, live sim metrics
+- **Journal** — native trade journal with coaching drill-down, TradeZella import, eligibility tracking
+- **Academy** — learning-only knowledge module (sources → AI-extracted lessons → strategy cards)
+
+The operator can ENTER trades manually from the dashboard, arm/disarm the auto-execute engine, mute per-instrument alerts, switch focus between instruments, and adjust per-asset safety overrides — all without leaving the dashboard.
 
 ## User preferences
 
-_Populate as you build — explicit user instructions worth remembering across sessions._
+- **Completion standard:** every session's work must produce zero ILLEGAL TRANSITION or WARNING log lines from changed code paths, all four smokes must pass, and a production verification report must confirm the fix before the session closes.
+- **Shadow-first rule:** new engines are always SHADOW_ONLY at first deploy; live gating requires a separate explicit phase.
+- **Byte-identical baseline:** parity and golden smokes compare against a stored baseline; any change that alters behavior for the untouched mode (e.g. SWING change breaking SCALP golden) is a blocker.
+- **No speculative transitions:** DC LEGAL_TRANSITIONS only gets new pairs when actual production behavior demonstrates they occur — not because they seem theoretically possible.
+- **`node --check` on every served `<script>`:** JS-in-Python triple-quoted strings can silently produce malformed JS (backslash escapes, astral emoji). The dual-sim and breakout smokes run `node --check` on the served dashboard `<script>` after every change.
 
 ## Gotchas
 
-_Populate as you build — sharp edges, "always run X before Y" rules._
+- **Parity + four smokes must ALL pass before any change is complete.** Run `check_parity.sh`, `check_scalp_golden.sh`, `check_dual_sim.sh`, `check_breakout_mode.sh` after every non-trivial edit. A failing smoke means you broke the byte-identical baseline for one mode even if your target mode looks fine.
 
-- **Trading Academy is learning-only — never wire it into live trading.** The `/academy/*` module (sources → AI-extracted lessons → strategy cards → rules → validation → Q&A) is fully walled off from the gate/scoring/auto-execute/broker/sizing path, like `/backtest` and `/scalp-research`. Setting a strategy `APPROVED`/`active` records intent only; it does NOT place trades. Any change must keep the four strict goldens + parity byte-identical and pass `bash .local/state/check_academy.sh` (the money-path tripwire). Academy routes are owner-only: whitelisted in `flask-proxy.ts`, NEVER added to `dashboard-auth.ts` OPEN_PATHS.
+- **Flask routes must be added to the Express proxy whitelist or they 404.** The file is `artifacts/api-server/src/routes/flask-proxy.ts`. Every new `/route` in `app.py` needs a matching entry there. Debug 404s by curling `$REPLIT_DEV_DOMAIN/api/your-route` directly.
 
-- **Advisory overlays (Stalk Mode + Active Trade Thinking) are display-only — never let them touch the gate.** Two flag-gated layers (`STALK_MODE_ENABLED` / `ACTIVE_THINKING_ENABLED`, default ON) attach ABOVE the strict engine at the single `full_analysis` seam; flag-OFF the key is simply absent so the bot behaves exactly as today. Stalk Mode observes a forming setup pre-entry; Active Trade Thinking grades an open position and recommends one of HOLD / TAKE PARTIAL / MOVE STOP / WATCH CLOSELY / CONSIDER EXIT — **advisory only, no auto-exit**. Active Trade Thinking reuses `compute_manual_trade_management` (which mutates `min_r`/`max_r` on its input) so it MUST run on a `dict(trade)` copy and never mutate `ACTIVE_TRADES_BY_INST`. The strict goldens don't exercise overlay-ON; run `bash .local/state/check_stalk_active.sh` (money-path tripwire + no-mutation + node --check of the served dashboard script) after any change here.
+- **Express must forward the raw body for TradingView webhooks.** TradingView sends `Content-Type: text/plain`. If `express.json()` parses the body first, the proxy body is empty and all evals produce "0 evaluations." The proxy buffers raw bytes and forwards the client's original content-type.
+
+- **Dashboard auth lives in Express, not Flask.** `OPEN_PATHS` in `dashboard-auth.ts` controls what bypasses the password gate. Never lock `/`, `/ping`, `/webhook`, `/healthz`. Webhook routes (`/webhook/enter`, `/webhook/close`) MUST stay open — TradingView cannot send a password.
+
+- **JS-in-Python triple-quote escape trap.** Any `\n`, `\t`, or astral emoji inside a Python `"""..."""` string that gets served as `<script>` content will produce a literal newline / UTF-8 crash. Always use `\\n` inside those strings. `py_compile` won't catch it — run `node --check` on the *served* script (the smokes do this automatically).
+
+- **`compute_manual_trade_management` mutates its input.** It writes `min_r` and `max_r` onto the dict passed to it. Any caller that passes the live `ACTIVE_TRADES_BY_INST` entry directly will corrupt the active trade. Always pass `dict(trade)` (a shallow copy).
+
+- **Decision Contract is SHADOW-ONLY.** `decision_contract.py` observes every execution path but never gates broker transmission. `LEGAL_TRANSITIONS` only gains new pairs when production logs confirm the transition occurs — never speculatively. `OBSERVING → WAIT` was added in Phase 3.1 after confirmed log spam. The rule: if `validate_transition` logs `ILLEGAL TRANSITION`, audit first, then add the pair with a comment explaining why it is legitimate.
+
+- **GRE `dc_registry_fn` must be a lambda, not a direct reference.** The Decision Registry is created after the GRE is instantiated. Pass `dc_registry_fn=lambda: globals().get("_DECISION_REGISTRY")` so GRE looks up the registry at call time, not at boot.
+
+- **`arm_state` must include `execution_enabled=True` and `configured_mode` for `observe_full_analysis` to reach READY/EXECUTABLE.** `armed=False` → READY. `armed=True` + `execution_enabled=True` → EXECUTABLE. Missing either key routes to `BLOCKED_EXECUTION_MODE` in the DC record.
+
+- **The `strategy_trades` table stores raw TradingView symbols** (`MGC1!`) but the dashboard reads canonical names (`MGC`). Any per-symbol query must canonicalize via `_instrument_from_text`.
+
+- **Active trade persistence gap on managed-trade close.** Closing a managed trade must call `_persist_swing_thesis()` for `is_swing` trades, or they resurrect as OPEN on boot. `/stop-managing` flushes all three local position stores.
+
+- **Prod replica ≠ live deployment DB.** Running `executeSql(environment='production')` can show tables that the running deployment logs as "relation does not exist." Trust the deployment logs. Fix divergences by re-publishing, not by hand-migrating prod.
+
+- **`ALERT_HISTORY` deque must be read via `list()` snapshot.** The deque is shared and lock-free under the GIL. Readers must do `for item in list(ALERT_HISTORY):` — never iterate the live deque. Adding a lock is the wrong fix.
+
+- **Trading Academy is learning-only — never wire it into live trading.** The `/academy/*` module is fully walled off from the gate/scoring/auto-execute/broker/sizing path. Setting a strategy `APPROVED`/`active` records intent only; it does NOT place trades. Academy routes are owner-only; never add them to `OPEN_PATHS`.
+
+- **Advisory overlays (Stalk Mode + Active Trade Thinking) are display-only.** Flag-gated (`STALK_MODE_ENABLED` / `ACTIVE_THINKING_ENABLED`, default ON). Active Thinking must pass a `dict(trade)` copy and never touch `ACTIVE_TRADES_BY_INST`. The strict goldens don't exercise overlay-ON; run `bash .local/state/check_stalk_active.sh` after any change here.
+
+- **VWAP auto-fetch resumes after a grace window.** A manual VWAP push wins a short grace window, then auto-fetch resumes. The gate never trades on a stale VWAP; staleness is tracked per-instrument with a strict freshness window.
+
+- **Same-state DC observations are a no-op.** `_observe_full_analysis_inner` only writes a new `DecisionTransition` row when `current.state != can_state`. WAIT→WAIT and OBSERVING→OBSERVING are both in `LEGAL_TRANSITIONS` as self-transitions but create no history row.
 
 ## Pointers
 
-- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details
+- See the `pnpm-workspace` skill for workspace structure, TypeScript setup, and package details.
+- Memory index: `.agents/memory/MEMORY.md` — per-topic durable notes accumulated across sessions.
+- Pine script sources for webhooks (confirmation, sweep, volume, structure, CVD, zones, FVG/OB) are tracked in `.agents/memory/pine-webhook-source-scripts.md` — adding a new contract requires editing those scripts, not just `app.py`.

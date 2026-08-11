@@ -1,0 +1,1181 @@
+RESUME PHASE 2 — GHOST RESEARCH & EVIDENCE ENGINE
+
+The canonical source-cleanup detour is complete enough.
+
+Completed foundations now include:
+
+- canonical Databento market state
+- Databento/legacy VWAP comparison
+- canonical BOS/CHOCH/swing dedup
+- canonical liquidity-sweep dedup
+- upgraded four-instrument 09:30 ORB engine
+- 09:30 ORB production mode = SHADOW
+- 08:00 live ORB unchanged
+- scoring parity clean
+- scalp golden clean
+- sweep/structure duplicates cannot double-count live consumers
+
+DO NOT implement VWAP reclaim/rejection dedup in this task.
+
+That may be evaluated later only if evidence shows it causes a real scoring/setup duplication problem.
+
+NOW IMPLEMENT PHASE 2 GHOST RESEARCH.
+
+==================================================
+1. PILOT BASELINE
+==================================================
+
+The first research baseline is the REAL:
+
+orb_engine.py
+
+four-instrument 09:30 ORB.
+
+DO NOT:
+
+- recreate the ORB inside research
+- use compute_breakout_mode() as baseline
+- use the live 08:00 ORB as baseline
+
+The experiment engine observes the real 09:30 ORB's events and frozen configuration.
+
+09:30 ORB remains:
+
+SHADOW
+
+Live orders from it must remain:
+
+0
+
+==================================================
+2. AUDIT CURRENT INTERFACES FIRST
+==================================================
+
+Quickly verify after recent dedup work:
+
+- OrbEngine event/timeline interface
+- canonical_market_state snapshot interface
+- canonical BOS/CHOCH records
+- canonical sweep records
+- profitability_engine.py
+- ghost_observations
+- Edge Ledger
+- Research Health events
+
+Do not repeat the previous full architecture audit unless an interface materially changed.
+
+==================================================
+3. CREATE THE RESEARCH STORAGE
+==================================================
+
+Create:
+
+ghost_opportunities
+ghost_experiments
+ghost_experiment_results
+
+Use durable PostgreSQL storage.
+
+Add unique/idempotency constraints.
+
+==================================================
+4. GHOST OPPORTUNITY
+==================================================
+
+One row represents one legitimate 09:30 ORB market opportunity.
+
+Use immutable:
+
+opportunity_id
+
+Link:
+
+trading_date
+instrument
+strategy_version
+config_version
+ORB instance ID
+ORB event ID
+
+Opportunity snapshot becomes immutable after creation.
+
+No future bar may rewrite it.
+
+==================================================
+5. OPPORTUNITY BOUNDARY
+==================================================
+
+Do NOT create one on every bar.
+
+Use a genuine pre-gate OrbEngine breakout event.
+
+The research system must be able to capture:
+
+accepted opportunities
+
+and legitimate breakout opportunities later rejected by:
+
+confirmation
+trend
+VWAP
+CVD
+VIX
+max chase
+risk
+correlation
+prop rules
+daily loss
+position limit
+execution safety
+
+Random WAIT bars are not opportunities.
+
+Deduplicate repeated callbacks for the same ORB event.
+
+==================================================
+6. FREEZE FULL MARKET CONTEXT
+==================================================
+
+At opportunity time capture:
+
+instrument
+direction
+timestamp
+price
+
+ORB:
+state
+range high
+range low
+range width
+range duration
+lock time
+breakout threshold
+breakout direction
+breakout timestamp
+confirmation mode
+confirmation state
+configured buffer
+maximum chase
+distance from breakout
+
+CANONICAL STATE:
+15m trend
+4H trend
+trend alignment
+
+Databento VWAP
+VWAP side
+VWAP distance
+
+legacy VWAP when available
+legacy VWAP provenance
+
+ATR
+volatility regime
+
+volume
+relative volume
+
+delta
+CVD
+CVD direction
+
+canonical BOS
+canonical CHoCH
+canonical sweep state
+
+FVG
+zone state
+
+VIX context when available
+
+LIVE CONTEXT:
+edge score
+verdict
+confirmations
+blockers
+
+RISK CONTEXT:
+requested risk
+instrument budget
+group budget
+portfolio budget
+
+Preserve truthful source/provenance.
+
+UNKNOWN stays UNKNOWN.
+
+==================================================
+7. IMPORTANT DEDUP CONTRACT
+==================================================
+
+Research must consume CANONICAL structure and sweep records.
+
+Events explicitly marked:
+
+canonical = false
+
+must not independently create research opportunities or confirmations.
+
+One logical BOS = one research event.
+
+One logical CHoCH = one research event.
+
+One logical sweep = one research event.
+
+Do not discard the shadow record from diagnostic/audit views.
+
+==================================================
+8. BASELINE EXPERIMENT
+==================================================
+
+Every opportunity gets:
+
+BASELINE
+
+BASELINE must reproduce the exact frozen OrbEngine configuration active for that opportunity.
+
+Do not hardcode a separate ORB implementation.
+
+Store exact:
+
+strategy_version
+config_version
+confirmation mode
+buffer
+stop model
+target model
+filter modes
+management settings
+
+==================================================
+9. PILOT VARIANTS
+==================================================
+
+Maximum:
+
+10 variants per opportunity
+
+Hard ceiling:
+
+12
+
+Initial one-variable variants:
+
+BASELINE
+
+TOUCH
+
+CLOSE_AND_RETEST
+
+BUFFER_PLUS_2
+
+BUFFER_MINUS_2
+where valid
+
+TP_1R
+
+TP_1_5R
+
+TP_2R
+
+TREND_REQUIRED
+
+and one additional genuinely distinct single-variable variant chosen from the actual baseline configuration.
+
+If a proposed variant is identical to baseline, DO NOT create it.
+
+Document exactly what one parameter each variant changes.
+
+==================================================
+10. NO COMBINATORIAL EXPLOSION
+==================================================
+
+Do not initially test combinations such as:
+
+retest + 2R + trend + VIX
+
+One principal variable at a time.
+
+We need causal interpretability.
+
+==================================================
+11. ENTRY SIMULATION
+==================================================
+
+Use subsequent Databento data.
+
+An experiment is NOT automatically filled.
+
+Track:
+
+qualification timestamp
+entry trigger
+entry timestamp
+entry price
+
+Examples:
+
+CLOSE_AND_RETEST:
+breakout happens, but no valid retest
+→ NO_ENTRY
+
+TOUCH:
+price must actually touch its defined entry
+
+BUFFER variant:
+price must actually reach its experimental level
+
+==================================================
+12. NO_ENTRY
+==================================================
+
+NO_ENTRY is a first-class result.
+
+Store it.
+
+We need to measure:
+
+trades avoided
+losses avoided
+wins missed
+trade-frequency reduction
+
+==================================================
+13. RESULTS
+==================================================
+
+Store per experiment:
+
+entry
+stop
+TP1
+TP2
+
+exit timestamp
+exit price
+exit reason
+
+contracts
+
+gross P&L
+net P&L
+
+gross R
+net R
+cost R
+
+MFE
+MAE
+
+max favorable R
+max adverse R
+
+bars held
+minutes held
+
+TP1 hit
+TP2 hit
+stop hit
+
+result:
+
+WIN
+LOSS
+BREAKEVEN
+NO_ENTRY
+EXPIRED
+INVALID_DATA
+
+==================================================
+14. COSTS
+==================================================
+
+Reuse profitability_engine.py.
+
+Do not create a second cost model.
+
+Store:
+
+commission assumption
+slippage assumption
+
+and calculate:
+
+gross result
+net result
+
+Research conclusions should use NET results by default.
+
+==================================================
+15. SAME-BAR AMBIGUITY
+==================================================
+
+If both stop and target are touched within a bar:
+
+reuse the existing conservative outcome resolution policy.
+
+Record ambiguity.
+
+Never choose the favorable outcome merely because the bar contains both.
+
+==================================================
+16. REJECTED-OPPORTUNITY CLASSIFICATION
+==================================================
+
+Classify the reason a legitimate opportunity was rejected:
+
+MARKET
+CONFIRMATION
+CONTEXT_FILTER
+RISK
+PROP
+DAILY_LOSS
+POSITION_LIMIT
+EXECUTION_SAFETY
+DATA
+OTHER
+
+This is critical.
+
+A good setup rejected because the account had no remaining risk should not be counted as a bad strategy signal.
+
+==================================================
+17. STATISTICS
+==================================================
+
+Per:
+
+instrument
+strategy
+variant
+
+calculate:
+
+sample count
+entered count
+NO_ENTRY count
+
+wins
+losses
+breakeven
+
+win rate
+
+average R
+median R
+
+net expectancy
+
+profit factor
+
+gross P&L
+net P&L
+
+average winner
+average loser
+
+largest winner
+largest loser
+
+max drawdown
+
+average MAE
+average MFE
+
+standard deviation
+
+==================================================
+18. BASELINE VS VARIANT
+==================================================
+
+Every variant must be compared against its baseline.
+
+Show:
+
+baseline expectancy
+variant expectancy
+delta expectancy
+
+baseline win rate
+variant win rate
+
+baseline drawdown
+variant drawdown
+
+baseline MAE/MFE
+variant MAE/MFE
+
+baseline entered count
+variant entered count
+
+NO_ENTRY difference
+
+Do not label a variant superior based only on absolute performance.
+
+==================================================
+19. PAIRED OPPORTUNITY ANALYSIS
+==================================================
+
+Because experiments share opportunity_id, provide paired analysis.
+
+For opportunities where both variants entered:
+
+compare outcome directly.
+
+Also calculate:
+
+wins avoided
+losses avoided
+wins missed
+losses missed
+
+Example:
+
+CLOSE_AND_RETEST
+
+may produce higher expectancy but only take 60% of opportunities.
+
+We need to see both effects.
+
+==================================================
+20. BOOTSTRAP
+==================================================
+
+Implement bootstrap confidence intervals for NET expectancy.
+
+Heavy statistics must run OFF the live Databento processing path.
+
+Return:
+
+estimate
+CI low
+CI high
+confidence level
+sample count
+
+Use deterministic seeds in tests.
+
+==================================================
+21. MONTE CARLO
+==================================================
+
+Implement Monte Carlo drawdown simulation off-path.
+
+Suggested default:
+
+2000 simulations
+
+Return:
+
+median max drawdown
+p90 max drawdown
+p95 max drawdown
+worst simulated drawdown
+
+Use deterministic test seeds.
+
+==================================================
+22. EVIDENCE STATES
+==================================================
+
+Implement research-only:
+
+INSUFFICIENT_DATA
+OBSERVING
+PROMISING
+VALIDATING
+READY_FOR_REVIEW
+REJECTED
+RETIRED
+
+Basic sample progression may be:
+
+0–24 = INSUFFICIENT_DATA
+
+25–49 = OBSERVING
+
+50+ = eligible for deeper validation
+
+Sample count alone cannot create READY_FOR_REVIEW.
+
+==================================================
+23. READY_FOR_REVIEW GATE
+==================================================
+
+Consider:
+
+minimum sample count
+positive net expectancy
+profit factor
+bootstrap CI
+max drawdown
+Monte Carlo drawdown
+multiple trading days
+recent-vs-full stability
+parameter stability
+forward validation
+
+READY_FOR_REVIEW is informational only.
+
+==================================================
+24. FORWARD VALIDATION
+==================================================
+
+When a candidate qualifies for validation:
+
+freeze:
+
+strategy version
+config
+variant parameters
+instrument
+context constraints
+
+Create a forward-validation candidate.
+
+Future data may evaluate it.
+
+Future data may NOT retune that frozen version.
+
+Reuse Edge Ledger FORWARD_VALIDATION partition where appropriate.
+
+==================================================
+25. HUMAN APPROVAL
+==================================================
+
+Research may NEVER automatically:
+
+modify OrbEngine config
+change confirmation modes
+change breakout buffers
+change targets
+change strategy weights
+change risk
+enable LIVE_ALGORITHMIC
+change execution
+
+READY_FOR_REVIEW means:
+
+show the operator.
+
+Nothing more.
+
+==================================================
+26. LIVE LEARNING ISOLATION
+==================================================
+
+Ghost experiments must NOT write to:
+
+strategy_trades
+STRATEGY_WEIGHTS
+LEARNING_ANALYTICS
+_recompute_learning()
+
+Keep research and live learning separated.
+
+==================================================
+27. RESEARCH HEALTH
+==================================================
+
+Extend the existing research event stream with:
+
+ORB_OPPORTUNITY_RECORDED
+GHOST_VARIANTS_CREATED
+GHOST_EXPERIMENT_ENTERED
+GHOST_EXPERIMENT_NO_ENTRY
+GHOST_EXPERIMENT_COMPLETED
+EVIDENCE_STATE_CHANGED
+FORWARD_VALIDATION_STARTED
+READY_FOR_REVIEW
+
+Do not emit noisy per-poll spam.
+
+==================================================
+28. API
+==================================================
+
+Add/reuse endpoints for:
+
+ghost research health
+research candidates
+experiments
+opportunity detail
+candidate detail
+baseline vs variant comparison
+
+Use existing owner/security conventions.
+
+==================================================
+29. DASHBOARD
+==================================================
+
+Extend the existing Research / Coach area.
+
+Show:
+
+GHOST RESEARCH HEALTH
+
+opportunities today
+experiments generated
+active experiments
+completed
+NO_ENTRY count
+
+TOP RESEARCH CANDIDATES
+
+instrument
+variant
+samples
+net expectancy
+profit factor
+max drawdown
+evidence state
+
+BASELINE VS VARIANT
+
+RECENT EXPERIMENTS
+
+Clearly label everything:
+
+GHOST / RESEARCH
+
+Never make it resemble a live trade recommendation.
+
+==================================================
+30. CANDIDATE DRILL-DOWN
+==================================================
+
+Show:
+
+instrument
+strategy
+variant
+exact parameter diff
+
+samples
+entered
+NO_ENTRY
+
+win rate
+net expectancy
+profit factor
+
+average R
+median R
+
+max drawdown
+
+bootstrap CI
+Monte Carlo drawdown
+
+MAE
+MFE
+
+baseline comparison
+
+time-of-day breakdown
+
+15m trend breakdown
+4H trend breakdown
+
+VWAP aligned/conflicting
+
+CVD aligned/conflicting
+
+sweep present/absent
+
+VIX regime when available
+
+forward-validation status
+
+promotion blockers
+
+==================================================
+31. PERFORMANCE BUDGET
+==================================================
+
+Do NOT run heavy calculations on bar callbacks.
+
+Hot path should only do:
+
+event capture
+snapshot
+lightweight experiment state updates
+lightweight outcome updates
+
+Heavy:
+
+bootstrap
+Monte Carlo
+large aggregate queries
+
+must be off-path/on-demand/batched.
+
+==================================================
+32. FAIL OPEN
+==================================================
+
+Every research integration point must fail open.
+
+If research throws:
+
+log bounded error
+emit research-health error
+continue normal production processing
+
+Research failure cannot change:
+
+verdict
+scoring
+risk
+execution
+
+==================================================
+33. RESTART RECOVERY
+==================================================
+
+Persist active experiments.
+
+After restart restore:
+
+experiment state
+entry status
+stop
+targets
+MAE
+MFE
+bars held
+last processed bar
+
+Do not process old bars twice.
+
+==================================================
+34. IDEMPOTENCY
+==================================================
+
+Repeated callbacks for the same:
+
+ORB event
+opportunity
+bar
+experiment
+
+must not duplicate:
+
+opportunities
+variants
+entries
+results
+
+Use DB unique constraints/idempotency keys.
+
+==================================================
+35. LOOKAHEAD BIAS
+==================================================
+
+Explicitly test:
+
+opportunity snapshot cannot see future bars
+
+future bars cannot determine whether opportunity existed
+
+entry qualification only uses information available at that timestamp
+
+future bars only resolve outcomes AFTER experiment creation
+
+==================================================
+36. REPLAY DETERMINISM
+==================================================
+
+Same:
+
+opportunity
+variant config
+Databento bars
+
+must always produce identical:
+
+entry
+exit
+R
+MFE
+MAE
+outcome
+
+==================================================
+37. TESTS
+==================================================
+
+At minimum:
+
+opportunity creation
+opportunity dedup
+immutable snapshot
+
+canonical BOS dedup honored
+canonical CHOCH dedup honored
+canonical sweep dedup honored
+
+shadow duplicate cannot create extra research event
+
+per-instrument isolation
+per-session isolation
+
+baseline creation
+
+variant generation
+variant budget
+
+TOUCH
+CLOSE_OUTSIDE baseline
+CLOSE_AND_RETEST
+
+BUFFER_PLUS_2
+BUFFER_MINUS_2
+
+TP_1R
+TP_1_5R
+TP_2R
+
+NO_ENTRY
+
+stop hit
+target hit
+same-bar ambiguity
+
+commission
+slippage
+
+MAE
+MFE
+gross R
+net R
+
+rejected opportunity
+risk rejection classification
+
+lookahead prevention
+replay determinism
+restart recovery
+idempotent bar handling
+
+bootstrap determinism
+Monte Carlo determinism
+
+evidence-state transitions
+
+READY_FOR_REVIEW cannot modify live config
+
+forward-validation freeze
+
+research exception fail-open
+
+==================================================
+38. REGRESSION
+==================================================
+
+Run targeted relevant suites including:
+
+structure dedup
+sweep dedup
+09:30 OrbEngine
+canonical market state
+parity
+scalp golden
+dual-sim
+breakout
+risk
+execution
+prop protection
+arm/safety
+
+Record pre-existing repository-wide test failures separately.
+
+Do not falsely report an old baseline failure as a new regression.
+
+But:
+
+ANY NEW failure introduced by Phase 2 must be fixed.
+
+==================================================
+39. LIVE SAFETY
+==================================================
+
+At completion prove:
+
+09:30 ORB mode = SHADOW
+
+09:30 live orders = 0
+
+ghost broker orders = 0
+
+research has no broker-gateway call
+
+research cannot modify OrbEngine execution mode
+
+research cannot modify live strategy weights
+
+08:00 live ORB unchanged
+
+==================================================
+40. PILOT ONLY
+==================================================
+
+After tests pass:
+
+run Phase 2 during live market for:
+
+09:30 ORB only
+
+MGC
+MNQ
+MES
+MYM
+
+Do NOT add another strategy family yet.
+
+We first collect clean ORB evidence.
+
+==================================================
+41. COMPLETION REPORT
+==================================================
+
+Return:
+
+PHASE 2 IMPLEMENTED:
+YES/NO
+
+AUDIT REUSE CONFIRMED:
+
+NEW FILES:
+
+MODIFIED FILES:
+
+TABLES CREATED:
+
+09:30 ORB MODIFIED:
+YES/NO + exact reason
+
+08:00 LIVE ORB MODIFIED:
+MUST = NO
+
+09:30 ORB MODE:
+MUST = SHADOW
+
+OPPORTUNITY EVENT:
+
+CANONICAL STRUCTURE USED:
+YES/NO
+
+CANONICAL SWEEPS USED:
+YES/NO
+
+IMMUTABLE SNAPSHOT:
+PASS/FAIL
+
+OPPORTUNITIES RECORDED:
+
+VARIANTS PER OPPORTUNITY:
+
+EXPERIMENTS CREATED:
+
+EXPERIMENTS ENTERED:
+
+NO_ENTRY:
+
+COMPLETED:
+
+MGC EXPERIMENTS:
+MNQ EXPERIMENTS:
+MES EXPERIMENTS:
+MYM EXPERIMENTS:
+
+BASELINE STATS:
+
+VARIANT STATS:
+
+PAIRED COMPARISON:
+YES/NO
+
+BOOTSTRAP:
+YES/NO
+
+MONTE CARLO:
+YES/NO
+
+MAE/MFE:
+YES/NO
+
+EVIDENCE STATE MACHINE:
+YES/NO
+
+FORWARD VALIDATION:
+YES/NO
+
+HUMAN REVIEW REQUIRED:
+MUST = YES
+
+GHOST RESULTS FEED LIVE LEARNING:
+MUST = NO
+
+RESEARCH CAN CHANGE LIVE ORB CONFIG:
+MUST = NO
+
+FAIL OPEN:
+PASS/FAIL
+
+LOOKAHEAD:
+PASS/FAIL
+
+REPLAY DETERMINISM:
+PASS/FAIL
+
+RESTART RECOVERY:
+PASS/FAIL
+
+IDEMPOTENCY:
+PASS/FAIL
+
+NEW TESTS:
+
+TARGETED TESTS PASSED:
+
+NEW TEST FAILURES:
+MUST = 0
+
+PRE-EXISTING FULL-SUITE FAILURES:
+list separately
+
+STRUCTURE DEDUP:
+PASS/FAIL
+
+SWEEP DEDUP:
+PASS/FAIL
+
+09:30 ORB:
+PASS/FAIL
+
+SCORING PARITY:
+PASS/FAIL
+
+SCALP GOLDEN:
+PASS/FAIL
+
+EXECUTION PARITY:
+PASS/FAIL
+
+09:30 SHADOW ORDERS:
+MUST = 0
+
+GHOST BROKER ORDERS:
+MUST = 0
+
+LIVE TRADING BEHAVIOR CHANGED:
+MUST = NO
+
+SAFE TO RUN PHASE 2 DURING LIVE MARKET:
+YES/NO
+
+GIT COMMIT:

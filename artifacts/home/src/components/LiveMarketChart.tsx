@@ -801,6 +801,18 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       },
       crosshair:        { mode: CrosshairMode.Normal },
       rightPriceScale:  { borderColor: T.border },
+      // Display x-axis time labels in US Eastern time (ET) regardless of the
+      // server or browser timezone.  lightweight-charts stores bars as UTC
+      // epoch seconds (UTCTimestamp) so without this the x-axis shows UTC.
+      localization: {
+        timeFormatter: (ts: number) =>
+          new Date(ts * 1000).toLocaleTimeString("en-US", {
+            timeZone: "America/New_York",
+            hour:     "2-digit",
+            minute:   "2-digit",
+            hour12:   false,
+          }),
+      },
       timeScale: {
         borderColor:    T.border,
         timeVisible:    true,

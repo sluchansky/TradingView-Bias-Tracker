@@ -811,11 +811,22 @@ class DatabentoBrain:
             "ticker":            inst + "1!",
             "instrument":        inst,
             "instrument_source": "databento",
+            "source":            "databento",   # explicit feed-source tag
+            "canonical":         True,           # Databento events are always canonical
             "price":             float(price),
             "timestamp":         datetime.now(timezone.utc).isoformat(),
             "raw":               {"source": "databento_brain"},
         }
+        # Snapshot history BEFORE appending so on_databento_event can retroactively
+        # demote any TV entries that were marked canonical=True while Databento
+        # hadn't fired yet for the same logical bar-close event.
+        _history_snapshot = list(self._ah)
         self._ah.append(record)
+        try:
+            from structure_dedup import STRUCTURE_DEDUP as _SD  # noqa: PLC0415
+            _SD.on_databento_event(record, _history_snapshot)
+        except Exception:
+            pass
         logger.info("DatabentoBrain ▶ %s  %s @ %.4f", inst, alert_type, price)
         # Notify structure-signal callbacks for BOS/CHOCH and CONFIRMATION events
         # so app.py can enqueue a scored analysis without waiting for a TV webhook.

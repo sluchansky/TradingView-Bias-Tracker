@@ -440,6 +440,16 @@ export const BOT1_ROUTES = [
   "/ghost-research/opportunity/:opportunity_id",
   "/ghost-research/baseline-vs-variant",
   "/ghost-research/ready-for-review",
+  // Phase 3 Canonical Decision Contract — SHADOW/AUDIT-ONLY; owner-only; NOT in
+  // dashboard-auth OPEN_PATHS. Per-instrument canonical state machine records +
+  // transition history + parity-mismatch flags. NEVER touches gate, scoring,
+  // sizing, learning, or execution. Shadow mode only until explicitly promoted.
+  "/decision-state",
+  // Structure-event deduplication counters — DISPLAY/AUDIT-ONLY; owner-only; NOT in
+  // dashboard-auth OPEN_PATHS.  Reports since-restart cross-source dedup statistics
+  // (TV events received, Databento events produced, matched/deduped, fallbacks,
+  // conflicts). NEVER touches gate, scoring, sizing, learning, or execution.
+  "/structure-dedup-metrics",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

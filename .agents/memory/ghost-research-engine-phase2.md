@@ -36,6 +36,17 @@ BASELINE, TOUCH, CLOSE_AND_RETEST, BUFFER_PLUS_2, BUFFER_MINUS_2, TP_1R, TP_1_5R
 - **Evidence non-regression:** RETIRED/REJECTED/READY_FOR_REVIEW/VALIDATING protected — guard runs BEFORE sample-count thresholds
 - **App code:** Zero DDL; boot does no-DDL probe; `GRE_DB_READY = False` keeps it fully fail-open
 
+## DB table schemas (dev created 2026-08-11)
+
+- `ghost_opportunities` — 47 cols; PK `opportunity_id TEXT UNIQUE`; UNIQUE (opportunity_id)
+- `ghost_experiments` — 24 cols; PK `experiment_id TEXT UNIQUE`; UNIQUE (opportunity_id, variant_name)
+- `ghost_experiment_results` — 36 cols; PK `result_id TEXT UNIQUE`; UNIQUE (experiment_id)
+- All 3 must be created via DB tool (no DDL in app.py); production needs a re-publish schema-diff
+
+## OrbEngine `breakout_bar_ts` note
+
+`get_instrument_status()` does NOT expose `breakout_bar_ts` in its output dict (field exists in dataclass at line 255 but is not in the returned dict). GRE falls back to `bar.get("ts")` — fail-open, opportunity IDs use last bar ts not breakout bar ts. Acceptable.
+
 **Why:**
 - Completely isolated from gate/scoring/execution — NEVER a money path
 - All findings surface as `READY_FOR_REVIEW` alerts requiring deliberate human action

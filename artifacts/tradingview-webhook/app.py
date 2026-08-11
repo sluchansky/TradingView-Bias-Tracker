@@ -15,6 +15,7 @@ from zoneinfo import ZoneInfo
 from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response, send_file
 import requests
+from structure_dedup import STRUCTURE_DEDUP, STRUCTURE_TYPES as _SD_STRUCTURE_TYPES
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -3988,6 +3989,44 @@ def now_utc():
     return datetime.now(timezone.utc)
 
 
+# ── Source ownership guards (CVD / RVOL) ─────────────────────────────────────
+# Databento is the canonical writer for CVD and RVOL when it has written a
+# record within _DATABENTO_CANONICAL_STALE_SECS seconds (~5 completed 1m bars).
+# TradingView webhook paths MUST NOT overwrite canonical state when Databento is
+# active.  Fails OPEN: when Databento is absent or its last write has gone stale,
+# TradingView is the fallback writer so data always flows.
+_DATABENTO_CANONICAL_STALE_SECS = 300  # 5 min = ~5 bars
+
+
+def _databento_is_canonical(record: dict,
+                             max_stale_secs: int = _DATABENTO_CANONICAL_STALE_SECS) -> bool:
+    """Return True when *record* was written by Databento within the staleness window.
+
+    Args:
+        record: The current entry from CVD_BY_TICKER or RVOL_BY_TICKER for an
+                instrument.  Must contain ``source='databento'`` and a recent
+                ISO-8601 ``ts`` field to return True.
+        max_stale_secs: Seconds after the last Databento write before falling
+                        back to TradingView (default 300 = 5 minutes ≈ 5 bars).
+
+    Returns:
+        True  → Databento owns this field; TV must NOT overwrite.
+        False → Databento absent, stale, or source tag missing; TV may write.
+    """
+    if not isinstance(record, dict) or record.get("source") != "databento":
+        return False
+    ts_str = record.get("ts")
+    if not ts_str:
+        return False
+    try:
+        ts = datetime.fromisoformat(ts_str)
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)
+        return (datetime.now(timezone.utc) - ts).total_seconds() < max_stale_secs
+    except Exception:
+        return False
+
+
 # US Eastern time for DISPLAY only — storage stays UTC. ZoneInfo handles the
 # EST/EDT daylight-saving switch automatically (e.g. EDT in summer, EST in winter).
 ET_TZ = ZoneInfo("America/New_York")
@@ -4558,6 +4597,8 @@ def get_price_context(inst=None):
     all_supply_prices  = []
     all_demand_prices  = []
     for alert in list(ALERT_HISTORY):   # snapshot: webhook thread appends concurrently
+        if alert.get("canonical") is False:   # skip shadow/duplicate structure events
+            continue
         t = alert.get("alert_type", "")
         p = alert.get("price")
         if t not in ALERT_TYPES or p is None:
@@ -7122,6 +7163,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         latest = None
         for a in recent:
             if a.get("alert_type") != alert_type:
+                continue
+            if a.get("canonical") is False:   # skip shadow/duplicate structure events
                 continue
             if not ticker_scoped:
                 # CHOCH/BOS carry no symbol prefix — use the resolved instrument
@@ -10563,6 +10606,8 @@ def _strategy_signal_snapshot(inst):
         for a in recent:
             if a.get("alert_type") != alert_type:
                 continue
+            if a.get("canonical") is False:   # skip shadow/duplicate structure events
+                continue
             if not scoped:
                 a_inst = (a.get("instrument")
                           or _instrument_from_text(a.get("ticker"))
@@ -12833,6 +12878,8 @@ def _compute_score_source_attribution(inst, alert_history_snapshot, now_dt):
             for a in alert_history_snapshot:
                 at = a.get("alert_type", "")
                 if at not in alert_types:
+                    continue
+                if a.get("canonical") is False:   # skip shadow/duplicate events
                     continue
                 if not ticker_scoped:
                     a_inst = (a.get("instrument")
@@ -17166,6 +17213,8 @@ def _recent_smc_signals(inst, within_min=_SMC_RECENCY_MIN):
             return out
         cutoff = datetime.now(timezone.utc) - timedelta(minutes=within_min)
         for a in reversed(list(ALERT_HISTORY)):   # newest -> oldest
+            if a.get("canonical") is False:        # skip shadow/duplicate events
+                continue
             t = a.get("alert_type") or ""
             if not (t.endswith("FVG") or t.endswith("OB")):
                 continue
@@ -27772,6 +27821,18 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
 
     # V1 Expert Interface version field — additive, no behavior change.
     result["_version"] = "v1"
+
+    # ── Phase 3: Canonical Decision Contract observer — SHADOW ONLY ─────────
+    # Records the current canonical state and any transition into decision_records /
+    # decision_transitions tables for audit and dashboard. FAIL-OPEN: any exception
+    # here is swallowed so it cannot affect the authoritative result dict.
+    if DC_DB_READY and "_DECISION_REGISTRY" in globals():
+        try:
+            _arm_snap = dict(_ARM_STATE)
+            globals()["_DECISION_REGISTRY"].observe_full_analysis(active_ticker, result, _arm_snap)
+        except Exception as _dc_exc:
+            logger.debug("DecisionContract full_analysis observe (%s): %s", active_ticker, _dc_exc)
+
     return result
 
 
@@ -28572,6 +28633,8 @@ def _early_latest_ts(alert_history, alert_type, inst, ticker_scoped, cutoff):
     for a in alert_history:
         if a.get("alert_type") != alert_type:
             continue
+        if a.get("canonical") is False:    # skip shadow/duplicate sweep events
+            continue
         if not ticker_scoped:
             a_inst = (a.get("instrument")
                       or _instrument_from_text(a.get("ticker"))
@@ -28947,6 +29010,22 @@ def _fvg_bar_close(inst: str, price: float) -> None:
                     alerts_snap = []
                 _fse.process_bar_close(inst, bars, zones,
                                        cvd=cvd_snap, alert_history=alerts_snap)
+                # ── Phase 4: Ghost Research Engine (FVG_REVISIT) ─────────────
+                # Fail-open: any exception caught internally in on_fvg_bar_close.
+                # SAFETY: never calls broker path, never touches gate/scoring/sizing.
+                if "_GHOST_RESEARCH_ENGINE" in globals():
+                    try:
+                        _gre = globals()["_GHOST_RESEARCH_ENGINE"]
+                        _last_bar = bars[-1] if bars else {}
+                        _can: dict = {}
+                        try:
+                            from databento_brain import CANONICAL_BY_INST as _DCABI  # noqa: PLC0415
+                            _can = dict(_DCABI.get(inst) or {})
+                        except Exception:
+                            pass
+                        _gre.on_fvg_bar_close(inst, zones, _last_bar, price, _can)
+                    except Exception as _gre_fvg_exc:
+                        logger.debug("GRE FVG hook (%s): %s", inst, _gre_fvg_exc)
         except Exception as _fvg_exc:
             logger.debug("FVG bar-close (%s): %s", inst, _fvg_exc)
     threading.Thread(target=_run, daemon=True, name=f"fvg-scan-{inst}").start()
@@ -28977,6 +29056,19 @@ def _orb_bar_close(inst: str, price: float) -> None:
         _gre.on_bar_close(inst, _orb_status, price)
     except Exception as _gre_exc:
         logger.debug("GhostResearch bar-close (%s): %s", inst, _gre_exc)
+
+    # ── Phase 3: Canonical Decision Contract ORB observer — SHADOW ONLY ─────
+    # Feeds the current ORB state machine snapshot into the decision registry so
+    # QUALIFIED / EXECUTABLE transitions are tracked alongside full_analysis verdicts.
+    # FAIL-OPEN: any exception here is swallowed so it cannot block bar processing.
+    if DC_DB_READY and "_DECISION_REGISTRY" in globals():
+        try:
+            _orb_eng2 = globals().get("_ORB_ENGINE")
+            if _orb_eng2 is not None:
+                _orb_status2 = _orb_eng2.get_instrument_status(inst)
+                globals()["_DECISION_REGISTRY"].observe_orb_state(inst, _orb_status2)
+        except Exception as _dc_orb_exc:
+            logger.debug("DecisionContract ORB observe (%s): %s", inst, _dc_orb_exc)
 
 
 def _databento_bar_scan(inst: str, price: float) -> None:
@@ -32116,6 +32208,21 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
                 _resolve_decision_snapshot(inst=_dq_inst, mt=mt)
     except Exception as _dq_exc:
         logger.debug("DQ resolve fail-open: %s", _dq_exc)
+
+    # ── DC Phase 3: observe COMPLETED when managed trade closes — SHADOW / FAIL-OPEN
+    # Records that a position has closed. The instrument key falls back from
+    # "instrument" → "symbol" to cover all managed trade dict variants. FAIL-OPEN:
+    # the trade card + journal writes above have already committed; a DC hiccup
+    # changes nothing for the operator.
+    if DC_DB_READY and "_DECISION_REGISTRY" in globals():
+        try:
+            _dc_inst = mt.get("instrument") or mt.get("symbol")
+            if _dc_inst:
+                globals()["_DECISION_REGISTRY"].observe_completed(
+                    _dc_inst, reason=mt.get("result_label", ""))
+        except Exception as _dc_cmp_exc:
+            logger.debug("DecisionContract completed (%s): %s",
+                         mt.get("instrument") or mt.get("symbol"), _dc_cmp_exc)
 
     # ── SWING (flag-on) multi-day persistence: mark the thesis row closed so a
     # stopped/TP'd SWING trade is NOT resurrected as OPEN on the next boot (the
@@ -41714,10 +41821,11 @@ def get_main_brain_chart():
         if ts_epoch < chart_start_ts:
             continue
         structure_events.append({
-            "ts":     ts_epoch,
-            "type":   a_type,
-            "price":  ah.get("price"),
-            "source": ah.get("instrument_source", "webhook"),
+            "ts":        ts_epoch,
+            "type":      a_type,
+            "price":     ah.get("price"),
+            "source":    ah.get("source") or ah.get("instrument_source", "webhook"),
+            "canonical": ah.get("canonical", True),   # audit: shows shadow duplicates too
         })
 
     structure_events = structure_events[-200:]   # bounded
@@ -44146,6 +44254,8 @@ def compute_liquidity_sweep_focus(result):
         for a in reversed(list(ALERT_HISTORY)):
             if a.get("alert_type") != want:
                 continue
+            if a.get("canonical") is False:    # skip shadow/duplicate sweep events
+                continue
             a_inst = (a.get("instrument")
                       or _instrument_from_text(a.get("ticker"))
                       or _instrument_from_text(a.get("alert_type")))
@@ -45082,6 +45192,7 @@ MICRO_GHOST_WATCH_LOCK = threading.Lock()   # single-flight watcher cycles
 GHOST_OBS_DB_READY       = False
 EL_DB_READY              = False   # set by _check_edge_ledger_db_ready() — Phase 8A
 GRE_DB_READY             = False   # set by _check_gre_db_ready() — Phase 2 Ghost Research Engine
+DC_DB_READY              = False   # set by _check_dc_db_ready() — Phase 3 Canonical Decision Contract (shadow)
 GHOST_OBS_WATCH_LOCK     = threading.Lock()   # single-flight watcher cycle
 GHOST_OBS_COOLDOWN_SECS  = max(60, int(os.environ.get("GHOST_OBS_COOLDOWN_SECS", "300")))
 _GHOST_OBS_COOLDOWN      = {}                  # (inst, direction, strategy_short) → monotonic ts
@@ -45226,6 +45337,37 @@ def _check_gre_db_ready() -> None:
         logger.info("GhostResearchEngine: DB tables (ghost_opportunities/experiments/results) ready")
     except Exception as exc:
         logger.warning("GhostResearchEngine: DB probe failed (GRE disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _check_dc_db_ready() -> None:
+    """Probe Phase 3 Canonical Decision Contract tables and set DC_DB_READY.
+    FAIL-OPEN: missing tables / unavailable DB disables contract recording only.
+    Never touches gate, scoring, sizing, learning, or execution.
+    Tables: decision_records, decision_transitions
+    (created via DB tool / publish schema-diff; no DDL in app code).
+    SHADOW MODE ONLY — canonical record is for audit/dashboard until explicitly promoted.
+    """
+    global DC_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM decision_records LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM decision_transitions LIMIT 1")
+            cur.fetchone()
+        DC_DB_READY = True
+        logger.info("DecisionContract: DB tables (decision_records/decision_transitions) ready")
+    except Exception as exc:
+        logger.warning("DecisionContract: DB probe failed (shadow mode disabled): %s", exc)
     finally:
         try:
             conn.close()
@@ -53614,6 +53756,9 @@ def webhook():
     #    `rvol` (relative volume) value. RVOL NEVER gates a trade (see
     #    _rvol_adjustment); it only nudges the Edge Score. Stored per instrument so
     #    the gate/display can read the latest reading.
+    #    SOURCE OWNERSHIP: Databento is the canonical RVOL writer when active
+    #    (source='databento' + fresh ts).  TV values are silently dropped in that
+    #    case — they are less accurate than Databento's bar-computed RVOL.
     raw_rvol = data.get("rvol")
     if raw_rvol is not None:
         try:
@@ -53621,8 +53766,15 @@ def webhook():
         except (ValueError, TypeError):
             rvol_val = None
         if rvol_val is not None:
-            RVOL_BY_TICKER[resolved_inst] = {"value": rvol_val,
-                                             "ts": now_utc().isoformat()}
+            if _databento_is_canonical(RVOL_BY_TICKER.get(resolved_inst) or {}):
+                logger.debug("RVOL [%s]: TV field (value=%.2f) received; "
+                             "Databento is canonical — state write skipped",
+                             resolved_inst, rvol_val)
+            else:
+                # Databento not active or stale — TV is the fallback RVOL writer.
+                RVOL_BY_TICKER[resolved_inst] = {"value": rvol_val,
+                                                 "ts": now_utc().isoformat(),
+                                                 "source": "tradingview"}
 
     # ── Inbound HTF (1H/4H/1D) chart push (P3) — SWING display-only overlay ───────
     #    Recognised ONLY when the alert EXPLICITLY tags a higher-timeframe field
@@ -53661,6 +53813,13 @@ def webhook():
             cvd_val = float(raw_cvd) if raw_cvd is not None else None
         except (ValueError, TypeError):
             cvd_val = None
+        # ── Source ownership guard ────────────────────────────────────────────
+        # When Databento has written CVD within the staleness window it is the
+        # sole canonical writer.  TV alerts are acknowledged (shadow ack) but
+        # must NOT modify CVD_BY_TICKER — they would overwrite Databento's more
+        # reliable, tick-level-accurate state.  Fails open: if Databento is
+        # absent or stale TV acts as the fallback writer.
+        _tv_cvd_blocked = _databento_is_canonical(CVD_BY_TICKER.get(resolved_inst) or {})
         _prev_cvd = CVD_BY_TICKER.get(resolved_inst) or {}
         _prev_val = _prev_cvd.get("value")
         cvd_dir = None
@@ -53716,32 +53875,49 @@ def webhook():
                 pending_dir = signaled_state
                 _flip_note = "watch %d/2 -> %s" % (opp_count, signaled_state)
 
-        CVD_BY_TICKER[resolved_inst] = {
-            "state":                committed_state,
-            "value":                cvd_val,
-            "direction":            cvd_dir,
-            "ts":                   now_utc().isoformat(),
-            "pending_dir":          pending_dir,
-            "opposite_count":       opp_count,
-            "last_opposite_minute": last_opp_min,
-        }
-        _save_market_state("cvd::" + resolved_inst, CVD_BY_TICKER[resolved_inst])
-        logger.info("CVD update: %s signaled=%s committed=%s (%s, value=%s, dir=%s)",
-                    resolved_inst, signaled_state, committed_state, _flip_note, cvd_val, cvd_dir)
-        _record_diagnostic("%s | %s — CVD signaled %s, committed %s (%s) — data only, no scoring" % (
-            fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"),
-            resolved_inst, signaled_state, committed_state, _flip_note))
-        _data_only_resp = jsonify({
-            "status":             "cvd_updated",
-            "ticker":             resolved_inst,
-            "cvd_state":          committed_state,
-            "cvd_signaled":       signaled_state,
-            "cvd_pending":        pending_dir,
-            "cvd_opposite_count": opp_count,
-            "cvd_value":          cvd_val,
-            "cvd_direction":      cvd_dir,
-            "price":              parsed_price if parsed_price is not None else CURRENT_PRICE,
-        }), 200
+        if _tv_cvd_blocked:
+            # Databento is canonical — acknowledge the TV alert without touching
+            # CVD_BY_TICKER (state write skipped; raw alert NOT appended to history).
+            logger.debug("CVD [%s]: TV alert received (signaled=%s value=%s); "
+                         "Databento is canonical — state write skipped",
+                         resolved_inst, signaled_state, cvd_val)
+            _data_only_resp = jsonify({
+                "status":       "cvd_tv_shadow",
+                "ticker":       resolved_inst,
+                "cvd_signaled": signaled_state,
+                "cvd_value":    cvd_val,
+                "canonical":    "databento",
+                "price":        parsed_price if parsed_price is not None else CURRENT_PRICE,
+            }), 200
+        else:
+            # Databento not active or stale — TV is the fallback canonical CVD writer.
+            CVD_BY_TICKER[resolved_inst] = {
+                "state":                committed_state,
+                "value":                cvd_val,
+                "direction":            cvd_dir,
+                "ts":                   now_utc().isoformat(),
+                "pending_dir":          pending_dir,
+                "opposite_count":       opp_count,
+                "last_opposite_minute": last_opp_min,
+                "source":               "tradingview",
+            }
+            _save_market_state("cvd::" + resolved_inst, CVD_BY_TICKER[resolved_inst])
+            logger.info("CVD update: %s signaled=%s committed=%s (%s, value=%s, dir=%s)",
+                        resolved_inst, signaled_state, committed_state, _flip_note, cvd_val, cvd_dir)
+            _record_diagnostic("%s | %s — CVD signaled %s, committed %s (%s) — data only, no scoring" % (
+                fmt_et(now_utc(), "%Y-%m-%d %H:%M:%S ET"),
+                resolved_inst, signaled_state, committed_state, _flip_note))
+            _data_only_resp = jsonify({
+                "status":             "cvd_updated",
+                "ticker":             resolved_inst,
+                "cvd_state":          committed_state,
+                "cvd_signaled":       signaled_state,
+                "cvd_pending":        pending_dir,
+                "cvd_opposite_count": opp_count,
+                "cvd_value":          cvd_val,
+                "cvd_direction":      cvd_dir,
+                "price":              parsed_price if parsed_price is not None else CURRENT_PRICE,
+            }), 200
 
     # ── Volume-spike ingestion (VOLUME SPIKE) — one half of the +15 volume edge ──
     #    A volume spike is a momentary event, so we store only its arrival time and
@@ -53844,6 +54020,7 @@ def webhook():
                     "price":       parsed_price,
                     "timestamp":   _now_fe.isoformat(),
                     "source":      "fast_entry_bridge",
+                    "canonical":   True,   # bridge events are unique synthetic translations
                     "raw":         {"original_type": normalized},
                 })
                 logger.info("Fast-entry bridge: %s → %s (%s)",
@@ -53913,6 +54090,19 @@ def webhook():
         "timestamp":         now_utc().isoformat(),
         "raw":               data,
     }
+    # ── Structure-event source tagging + dedup ─────────────────────────────────
+    # Explicitly tag every TV alert with source='tradingview'.  For structure
+    # types (BOS/CHOCH/HH/HL/LH/LL), check whether a canonical Databento event
+    # already exists in ALERT_HISTORY for the same logical break; if so, mark
+    # this record as a shadow duplicate so gate consumers skip it.
+    # Fail-open: any exception falls back to canonical=True (preserves existing
+    # behaviour for all affected records).
+    try:
+        STRUCTURE_DEDUP.on_tv_event(record, list(ALERT_HISTORY))
+    except Exception as _sde:
+        logger.debug("structure_dedup.on_tv_event: %s", _sde)
+        record.setdefault("source",    "tradingview")
+        record.setdefault("canonical", True)
     LAST_ALERT_AT = datetime.now(timezone.utc)
     ALERT_HISTORY.append(record)
 
@@ -56006,6 +56196,14 @@ def traderspost_order():
         return jsonify({"status": "error",
                         "reason": f"contracts must be between 1 and {_max_contracts}."}), 400
 
+    # ── DC Phase 3: observe MANUAL_REQUESTED — SHADOW / FAIL-OPEN ───────────────
+    # Records that the operator manually requested entry via the dashboard ENTER
+    # button. Does NOT block or modify the execution path.
+    if DC_DB_READY and "_DECISION_REGISTRY" in globals():
+        try:
+            globals()["_DECISION_REGISTRY"].observe_manual_requested(instrument)
+        except Exception as _dc_mr_exc:
+            logger.debug("DecisionContract manual_requested (%s): %s", instrument, _dc_mr_exc)
     result, code = execute_trade_gateway(instrument, contracts, source="manual")
     # ── TFA: mark this setup as triggered via manual ENTER (DISPLAY-ONLY, FAIL-OPEN) ──
     try:
@@ -56574,6 +56772,16 @@ def manual_desk_order():
         return jsonify({"status": "error",
                         "reason": f"contracts must be between 1 and {_max_contracts}."}), 400
 
+    # ── DC Phase 3: observe MANUAL_REQUESTED (manual desk) — SHADOW / FAIL-OPEN ─
+    # Records that the operator fired a discretionary market order from the manual
+    # desk (bypasses setup gate). Does NOT block or modify the execution path.
+    if DC_DB_READY and "_DECISION_REGISTRY" in globals():
+        try:
+            globals()["_DECISION_REGISTRY"].observe_manual_requested(
+                instrument, direction=direction)
+        except Exception as _dc_md_exc:
+            logger.debug("DecisionContract manual_desk_requested (%s): %s",
+                         instrument, _dc_md_exc)
     result, code = execute_trade_gateway(instrument, contracts,
                                          source="manual_desk", direction=direction)
     # Send-before-track: only start LOCAL tracking after a CONFIRMED LIVE send or PAPER
@@ -57644,6 +57852,12 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
 
     if 200 <= resp.status_code < 300:
         _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
+        # ── DC Phase 3: observe ORDER_ACCEPTED on broker 2xx — SHADOW / FAIL-OPEN ──
+        if "_DECISION_REGISTRY" in globals():
+            try:
+                globals()["_DECISION_REGISTRY"].observe_order_accepted(instrument)
+            except Exception:
+                pass  # fail-open: order is already confirmed sent
         # Populate broker_out with any order/signal IDs from the response (fail-open).
         if broker_out is not None:
             try:
@@ -57655,6 +57869,13 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
     elif 400 <= resp.status_code < 500:
         _release()
         _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
+        # ── DC Phase 3: observe ORDER_REJECTED on broker 4xx — SHADOW / FAIL-OPEN ──
+        if "_DECISION_REGISTRY" in globals():
+            try:
+                globals()["_DECISION_REGISTRY"].observe_order_rejected(
+                    instrument, f"Broker {resp.status_code}: {resp.text[:100]}")
+            except Exception:
+                pass  # fail-open
         logger.warning("%s rejected order (no order placed): %s %s", provider_label, resp.status_code, resp.text[:300])
         return {"status": "error",
                         "reason": f"{provider_label} rejected the order ({resp.status_code}): {resp.text[:200]}",
@@ -60840,6 +61061,14 @@ def _maybe_auto_execute(inst, allow_stack=False, setup_key=None, source="auto",
         # entry; None (every legacy caller) keeps the exact legacy behaviour.
         _gw_contracts = AUTO_TRADE_CONTRACTS if contracts_override is None \
             else int(contracts_override)
+        # ── DC Phase 3: observe ENTRY_REQUESTED — SHADOW / FAIL-OPEN ───────────
+        # Records that an auto-execution was submitted to the gateway before any
+        # broker call is made. Does NOT block or modify the execution path.
+        if DC_DB_READY and "_DECISION_REGISTRY" in globals():
+            try:
+                globals()["_DECISION_REGISTRY"].observe_entry_requested(inst, source=source)
+            except Exception as _dc_er_exc:
+                logger.debug("DecisionContract entry_requested (%s): %s", inst, _dc_er_exc)
         result, code = execute_trade_gateway(inst, _gw_contracts, source=source)
         status = (result or {}).get("status")
         if status in ("sent", "simulated"):
@@ -62310,6 +62539,23 @@ html[data-theme=retro] .th-bar-wrap{background:#0a1a0a}
 .adc-chip.warn{background:rgba(245,158,11,.1);border-color:rgba(245,158,11,.3);color:#fde68a}
 .adc-bw{height:5px;background:rgba(255,255,255,.06);border-radius:3px;overflow:hidden;margin-top:3px}
 .adc-bf{height:100%;border-radius:3px;transition:width .3s}
+/* ── Desk ADC mini panel ──────────────────────────────────────────────────── */
+.dsk-adc-top{display:flex;align-items:center;gap:8px;margin-bottom:8px}
+.dsk-adc-verdict{font-size:13px;font-weight:800;letter-spacing:.8px;text-transform:uppercase;padding:3px 11px;border-radius:6px;background:rgba(107,114,128,.12);color:#6b7280;flex-shrink:0}
+.dsk-adc-edge{font-size:12px;font-weight:700;color:#9aa3b2;margin-left:auto}
+.dsk-adc-strategy{font-size:11px;color:#9aa3b2;margin-bottom:6px;letter-spacing:.3px}
+.dsk-adc-reason{font-size:11.5px;color:#b0b8cc;line-height:1.55;padding:6px 8px;border-radius:6px;background:rgba(255,255,255,.04);margin:4px 0 6px}
+.dsk-adc-note{font-size:11px;color:#7d8499;font-style:italic;line-height:1.5;padding:6px 0 0;border-top:1px solid rgba(255,255,255,.06);margin-top:4px}
+/* ── Desk Story mini panel ───────────────────────────────────────────────── */
+.dsk-story-current{font-size:12px;color:#c4cbe6;line-height:1.55;margin-bottom:8px}
+.dsk-story-timeline{display:flex;flex-direction:column;gap:5px;margin-bottom:6px}
+.dsk-story-seg{padding:6px 9px;border-radius:6px;background:rgba(255,255,255,.04);border-left:2px solid rgba(255,255,255,.10)}
+.dsk-story-seg-hd{display:flex;align-items:center;gap:5px;margin-bottom:3px}
+.dsk-story-seg-icon{font-size:11px;line-height:1}
+.dsk-story-seg-label{font-size:10px;font-weight:700;letter-spacing:.8px;color:#6b7280;text-transform:uppercase}
+.dsk-story-seg-sum{font-size:11.5px;color:#9aa3b2;line-height:1.4}
+.dsk-story-seg-ev{font-size:10.5px;color:#6b7280;margin-top:2px;line-height:1.4;font-style:italic}
+.dsk-story-expect{font-size:11px;color:#7d8499;font-style:italic;line-height:1.45;padding:5px 0 0;border-top:1px solid rgba(255,255,255,.06);margin-top:4px}
 /* ── Phase 3: Analysis / Journal / Controls group panels ── */
 .grp-details{margin-bottom:2px}
 .grp-summary{list-style:none;display:flex;align-items:center;gap:6px;padding:8px 10px;cursor:pointer;user-select:none;border-radius:8px;background:rgba(255,255,255,.03);border:1px solid rgba(255,255,255,.05);font-size:10px;font-weight:700;letter-spacing:1.2px;text-transform:uppercase;color:#9aa3b2;transition:background .15s}
@@ -62872,6 +63118,28 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
     <button class="btn" id="mo-send" style="width:100%;background:rgba(28,36,70,.85);border:1px solid rgba(100,120,200,.32);color:#b8c0e0;font-weight:700" onclick="sendManualOrder()">🚀 SEND MARKET ORDER</button>
     <div style="margin-top:6px;color:#505878;font-size:11px;text-align:center">Bypasses the setup gate · keeps all risk &amp; safety limits</div>
   </div>
+  <!-- ── Mini: AI Decision Center — condensed verdict + thesis for trading desk ── -->
+  <div class="mod" id="mod-desk-adc" data-cat="primary">
+    <div class="mod-h" onclick="toggleMod(this)">&#x1F9E0; AI Decision Center<span class="mod-cat cat-primary">PRIMARY</span></div>
+    <div class="dsk-adc-top">
+      <div class="dsk-adc-verdict" id="dsk-adc-verdict">WAIT</div>
+      <span class="dsk-adc-edge" id="dsk-adc-edge">&#8212;</span>
+    </div>
+    <div class="dsk-adc-strategy" id="dsk-adc-strategy">&#8212;</div>
+    <div class="dsk-adc-reason" id="dsk-adc-reason">Awaiting signal data.</div>
+    <div id="dsk-adc-wait"></div>
+    <div class="dsk-adc-note" id="dsk-adc-note" style="display:none"></div>
+  </div>
+
+  <!-- ── Mini: Session Story — narrative + timeline for trading desk ── -->
+  <div class="mod" id="mod-desk-story" data-cat="primary">
+    <div class="mod-h" onclick="toggleMod(this)">&#x1F4D6; Session Story<span class="mod-cat cat-primary">PRIMARY</span></div>
+    <div class="dsk-story-current" id="dsk-story-current">Awaiting session data.</div>
+    <div id="dsk-story-segments"></div>
+    <div class="dsk-story-expect" id="dsk-story-expect" style="display:none"></div>
+    <div id="dsk-story-memory"></div>
+  </div>
+
   <!-- ════ Data Feed Status — alert timing + Databento VWAP/ATR/CVD/structure
        (DISPLAY-ONLY; never gates trades unless DATA_STALENESS_GATE_ENABLED=1). ════ -->
   <div class="mod" id="mod-data-feed" data-cat="primary">
@@ -65812,6 +66080,8 @@ function renderModules(d){
   var bk = getBrain(d);
   try{ renderMainBrain(d); }catch(e){}
   try{ renderAiDecisionCenter(d); }catch(e){}
+  try{ renderDeskADC(d); }catch(e){}
+  try{ renderDeskStory(d); }catch(e){}
   try{ renderAnalysisGroups(d); }catch(e){}
   try{ renderJournalGroups(d); }catch(e){}
   try{ renderControlsGroups(d); }catch(e){}
@@ -68361,6 +68631,140 @@ function renderMBNarrative(d){
     noteEl.textContent=note?('Analyst Note: '+note):'\u2014';
   }
 }
+
+// ── renderDeskADC: compact AI Decision Center for the trading desk Overview ──
+// Reads the same /status poll fields as renderAiDecisionCenter; DISPLAY-ONLY.
+function renderDeskADC(d) {
+  var mod = document.getElementById('mod-desk-adc');
+  if (!mod) return;
+  var bk  = getBrain(d);
+  var v   = bk.decision.verdict || 'WAIT';
+  var edge= bk.score.value;
+  var se  = (d && d.strategy_engine)  || {};
+  var a   = (d && d.analyst)          || {};
+  var n   = (d && d.market_narrative) || {};
+  var nb  = n.notebook || {};
+  var gp  = a.game_plan || {};
+
+  // ── Verdict pill ─────────────────────────────────────────────────────────
+  var vEl = document.getElementById('dsk-adc-verdict');
+  if (vEl) {
+    var vTxt='WAIT', vCol='#6b7280', vBg='rgba(107,114,128,.12)';
+    if (v.indexOf('LONG')  >= 0) { vTxt='LONG READY';  vCol='#22c55e'; vBg='rgba(34,197,94,.12)'; }
+    else if (v.indexOf('SHORT') >= 0) { vTxt='SHORT READY'; vCol='#ef4444'; vBg='rgba(239,68,68,.12)'; }
+    else if (v.indexOf('EARLY') >= 0) { vTxt='EARLY';       vCol='#f59e0b'; vBg='rgba(245,158,11,.12)'; }
+    vEl.textContent = vTxt; vEl.style.color = vCol; vEl.style.background = vBg;
+  }
+
+  // ── Edge score ───────────────────────────────────────────────────────────
+  var edgeEl = document.getElementById('dsk-adc-edge');
+  if (edgeEl) {
+    edgeEl.textContent = edge != null ? 'Edge\u00a0' + Math.round(edge) : '\u2014';
+    if (edge != null) edgeEl.style.color = edge >= 70 ? '#22c55e' : edge >= 50 ? '#f59e0b' : '#9aa3b2';
+  }
+
+  // ── Active strategy ───────────────────────────────────────────────────────
+  var stEl = document.getElementById('dsk-adc-strategy');
+  if (stEl) {
+    var snm = se.active_strategy || '', sdir = se.direction || '';
+    if (snm) { stEl.textContent = snm + (sdir ? ' \u00b7 ' + sdir : ''); stEl.style.color = '#e2e8f0'; }
+    else     { stEl.textContent = 'No qualified strategy'; stEl.style.color = '#6b7280'; }
+  }
+
+  // ── Top reason ────────────────────────────────────────────────────────────
+  var rEl = document.getElementById('dsk-adc-reason');
+  if (rEl) rEl.textContent = (bk.reasons.top && bk.reasons.top.length ? bk.reasons.top[0] : '')
+                            || (a.market_story) || 'Awaiting signal data.';
+
+  // ── Waiting-for list (only when not READY) ───────────────────────────────
+  var wEl = document.getElementById('dsk-adc-wait');
+  if (wEl) {
+    var isReady = v.indexOf('READY') >= 0;
+    var h = '';
+    if (!isReady) {
+      var wf = ((gp.next_opportunity && gp.next_opportunity.waiting_for) || []).filter(Boolean);
+      if (!wf.length && nb.trade_instructions) wf = (nb.trade_instructions.wait_for || []);
+      if (wf.length) {
+        h += '<div style="font-size:10px;color:#6b7280;letter-spacing:.8px;margin:6px 0 3px;text-transform:uppercase">Waiting for</div>';
+        wf.slice(0, 3).forEach(function(w) {
+          h += '<div style="font-size:11px;color:#9aa3b2;line-height:1.5">\u00b7\u00a0' + _adcEsc(w) + '</div>';
+        });
+      }
+    }
+    wEl.innerHTML = h;
+  }
+
+  // ── Analyst note (italic footer) ─────────────────────────────────────────
+  var nEl = document.getElementById('dsk-adc-note');
+  if (nEl) {
+    var note = nb.analyst_note || '';
+    nEl.textContent = note; nEl.style.display = note ? '' : 'none';
+  }
+}
+
+// ── renderDeskStory: compact Session Story for the trading desk Overview ──
+// Reads market_narrative (segments, current, expectation, notebook) from /status.
+// DISPLAY-ONLY + FAIL-OPEN.
+function renderDeskStory(d) {
+  var mod = document.getElementById('mod-desk-story');
+  if (!mod) return;
+  var n  = (d && d.market_narrative) || null;
+  var nb = (n && n.notebook)         || null;
+
+  // ── Current narrative sentence ───────────────────────────────────────────
+  var curEl = document.getElementById('dsk-story-current');
+  if (curEl) curEl.textContent = (n && n.current) || 'Awaiting session data.';
+
+  // ── Session segments timeline ─────────────────────────────────────────────
+  var segEl = document.getElementById('dsk-story-segments');
+  if (segEl) {
+    var segs = (n && n.segments) || [];
+    var h = '';
+    if (segs.length) {
+      var DOTS = { 'Overnight': '\u25CF', 'London': '\u25D1', 'NY Open': '\u25B6', 'NY Session': '\u25A0' };
+      h = '<div class="dsk-story-timeline">';
+      segs.forEach(function(s) {
+        var dot = DOTS[s.segment] || '\u2022';
+        h += '<div class="dsk-story-seg">';
+        h += '<div class="dsk-story-seg-hd"><span class="dsk-story-seg-icon">' + dot + '</span>';
+        h += '<span class="dsk-story-seg-label">' + _adcEsc(s.segment || '') + '</span></div>';
+        h += '<div class="dsk-story-seg-sum">' + _adcEsc(s.summary || 'quiet') + '</div>';
+        if (s.events && s.events.length) {
+          h += '<div class="dsk-story-seg-ev">' + s.events.slice(0, 2).map(function(e) {
+            return _adcEsc(e);
+          }).join(' &middot; ') + '</div>';
+        }
+        h += '</div>';
+      });
+      h += '</div>';
+    } else {
+      h = '<div style="font-size:11px;color:#4b5563;padding:4px 0 6px">Events will appear as the session develops.</div>';
+    }
+    segEl.innerHTML = h;
+  }
+
+  // ── Expectation ───────────────────────────────────────────────────────────
+  var expEl = document.getElementById('dsk-story-expect');
+  if (expEl) {
+    var exp = (n && n.expectation) || '';
+    expEl.textContent = exp; expEl.style.display = exp ? '' : 'none';
+  }
+
+  // ── Key memory bullets ────────────────────────────────────────────────────
+  var memEl = document.getElementById('dsk-story-memory');
+  if (memEl) {
+    var mem = (nb && nb.key_memory) || [];
+    var h2 = '';
+    if (mem.length) {
+      h2 += '<div style="font-size:10px;color:#6b7280;letter-spacing:.8px;margin:6px 0 3px;text-transform:uppercase">Key memory</div>';
+      mem.slice(0, 2).forEach(function(m) {
+        h2 += '<div style="font-size:11px;color:#9aa3b2;line-height:1.5">\u00b7\u00a0' + _adcEsc(m) + '</div>';
+      });
+    }
+    memEl.innerHTML = h2;
+  }
+}
+
 function renderDataFeed(d){
   const mod=document.getElementById('mod-data-feed'); if(!mod) return;
   const df=(d&&d.data_feed)||null;
@@ -70716,7 +71120,7 @@ async function ttFetchOverride(){
 const CP_TV_SYMBOLS = { MNQ:'OANDA:NAS100USD', MGC:'OANDA:XAUUSD', MES:'OANDA:SPX500USD', MYM:'OANDA:US30USD' };
 const CP_SYM_NOTE = { MNQ:'Nasdaq proxy for MNQ', MGC:'Gold spot proxy for MGC', MES:'S&P proxy for MES', MYM:'Dow proxy for MYM' };
 const CP_TFS = ['1','5','15','60'];
-let cpSym='MNQ', cpTf='5', cpFollow=true, cpLoadedKey=null;
+let cpSym='MNQ', cpTf='1', cpFollow=true, cpLoadedKey=null;
 try {
   const cs=localStorage.getItem('cpSym'); if (cs && CP_TV_SYMBOLS[cs]) cpSym=cs;
   const ct=localStorage.getItem('cpTf');  if (ct && CP_TFS.indexOf(ct)>=0) cpTf=ct;
@@ -71818,7 +72222,9 @@ var _liveNavSections = {
     'mod-brain',          // Main Brain compact hub
     'mod-dual-brain',     // Left Brain (Analyzer) / Right Brain (Executor)
     'mod-real-results',   // Real Account Results
-    'mod-hvsessions'      // High-Volume Session Windows
+    'mod-hvsessions',     // High-Volume Session Windows
+    'mod-desk-adc',       // AI Decision Center mini (trading desk)
+    'mod-desk-story'      // Session Story mini (trading desk)
     // mod-data-feed moved to analysis section (Phase 3B: raw alert data is diagnostic)
   ],
   // Brain: ONE consolidated AI Decision Center card
@@ -77134,6 +77540,24 @@ def fvg_summary_endpoint():
         return jsonify({"ok": False, "error": str(exc)}), 200
 
 
+@app.route("/structure-dedup-metrics", methods=["GET"])
+def structure_dedup_metrics_endpoint():
+    """Structure-event deduplication counters (DISPLAY/AUDIT-ONLY; owner-only).
+    Returns since-restart counters: TV events received, Databento events produced,
+    matched/deduped cross-source events, TV fallbacks, conflicts.
+    NEVER touches gate, scoring, sizing, learning, or execution."""
+    try:
+        metrics = STRUCTURE_DEDUP.get_metrics()
+        return jsonify({
+            "ok":      True,
+            "metrics": metrics,
+            "note":    "Counters reset on server restart.",
+        }), 200
+    except Exception as exc:
+        logger.error("/structure-dedup-metrics error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/fvg/sequences", methods=["GET"])
 def fvg_sequences_endpoint():
     """FVG/IFVG shadow sequence states per instrument (SHADOW/DISPLAY-ONLY).
@@ -77878,6 +78302,81 @@ def route_ghost_research_ready_for_review():
             conn.close()
         except Exception:
             pass
+
+
+@app.route("/decision-state", methods=["GET"])
+def route_decision_state():
+    """Phase 3 Canonical Decision Contract — shadow state dashboard (DISPLAY-ONLY).
+    SHADOW MODE ONLY: records are for audit and dashboard — NEVER gates, sizes,
+    or sends broker orders.  All behaviour changes require deliberate operator action.
+    Owner-only; auth enforced at Express /api edge (Basic Auth + CSRF).
+    No @_owner_required here — the decorator is defined later in the file;
+    Express-level auth is sufficient (same pattern as ghost-research routes).
+
+    Query params:
+      instrument=<MGC|MNQ|…>   — filter to a single instrument
+      decision_id=<uuid>        — fetch one record by ID
+      transitions=1             — include full transition history for each record
+      mismatches=1              — return only records with parity_mismatch flag
+    """
+    if not DC_DB_READY:
+        return jsonify({"ok": True, "shadow_mode": True, "ready": False,
+                        "reason": "Decision contract DB not ready (tables may not exist yet)"})
+    registry = globals().get("_DECISION_REGISTRY")
+    if registry is None:
+        return jsonify({"ok": True, "shadow_mode": True, "ready": False,
+                        "reason": "DecisionRegistry not initialised (boot error or LEARNING_DB_ENABLED off)"})
+
+    inst_filter    = request.args.get("instrument", "").strip().upper() or None
+    decision_id    = request.args.get("decision_id", "").strip() or None
+    want_trans     = request.args.get("transitions", "0") == "1"
+    want_mismatch  = request.args.get("mismatches", "0") == "1"
+
+    try:
+        # get_all_states() returns Dict[str, Optional[Dict]] keyed by instrument
+        states_by_inst = registry.get_all_states()
+        records_list   = [v for v in states_by_inst.values() if v is not None]
+
+        # Filter by decision_id (fetch one record's full history)
+        if decision_id:
+            matched = [s for s in records_list if s.get("decision_id") == decision_id]
+            if not matched:
+                return jsonify({"ok": False, "error": f"decision_id {decision_id!r} not found"}), 404
+            out = matched[0]
+            if want_trans:
+                out["transitions"] = registry.get_history(out.get("instrument", ""), limit=50)
+            return jsonify({"ok": True, "shadow_mode": True, "ready": True, "record": out})
+
+        # Filter by instrument
+        if inst_filter:
+            records_list = [s for s in records_list if s.get("instrument") == inst_filter]
+
+        # Filter to mismatches only
+        if want_mismatch:
+            records_list = [s for s in records_list if not s.get("parity_agree", True)]
+
+        # Optionally attach transition history per record
+        if want_trans:
+            for s in records_list:
+                s["transitions"] = registry.get_history(s.get("instrument", ""), limit=20)
+
+        # Summary counters
+        summary: dict = {}
+        for s in records_list:
+            state = s.get("state", "UNKNOWN")
+            summary[state] = summary.get(state, 0) + 1
+
+        return jsonify({
+            "ok":          True,
+            "shadow_mode": True,
+            "ready":       True,
+            "count":       len(records_list),
+            "summary":     summary,
+            "records":     records_list,
+        })
+    except Exception as exc:
+        logger.warning("DecisionContract /decision-state error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
 
 
 @app.route("/research-events", methods=["GET"])
@@ -80711,6 +81210,9 @@ if __name__ == "__main__":
                 get_bars_fn      = lambda inst: list(_GRE_BARS.get(inst, [])),
                 re_event_fn      = _re_event,
                 instruments      = ASSETS,
+                # Lazy getter: returns DecisionRegistry when available (initialised
+                # after GRE at boot, so must be resolved at call time not at init).
+                dc_registry_fn   = lambda: globals().get("_DECISION_REGISTRY"),
             )
             globals()["_GHOST_RESEARCH_ENGINE"] = _GHOST_RESEARCH_ENGINE
             _GHOST_RESEARCH_ENGINE.boot()
@@ -80743,6 +81245,26 @@ if __name__ == "__main__":
                 logger.info("CanonicalMarketState: shadow engine started + bar-close callback registered")
         except Exception as _cms_exc:
             logger.warning("CanonicalMarketState: boot error (non-critical): %s", _cms_exc)
+    # ── Phase 3: Canonical Decision Contract — SHADOW / AUDIT ONLY ──────────
+    # Initialises the in-memory DecisionRegistry that accumulates per-instrument
+    # canonical states from full_analysis() and _orb_bar_close() hooks.
+    # NEVER touches gate, scoring, sizing, learning, or execution.
+    # All records are shadow-only until explicitly promoted by operator action.
+    _check_dc_db_ready()
+    if DC_DB_READY:
+        try:
+            from decision_contract import DecisionRegistry as _DCReg  # noqa: PLC0415
+            _DECISION_REGISTRY = _DCReg(
+                get_db_fn     = get_db_connection,
+                re_event_fn   = _re_event,
+                instruments   = ASSETS,
+                shadow_mode   = True,
+            )
+            globals()["_DECISION_REGISTRY"] = _DECISION_REGISTRY
+            _DECISION_REGISTRY.boot()   # sets DecisionRegistry.DC_DB_READY (class var) for persistence
+            logger.info("DecisionContract: Phase 3 shadow registry initialised (%d instruments)", len(ASSETS))
+        except Exception as _dc_boot_exc:
+            logger.warning("DecisionContract: boot error (non-critical, fail-open): %s", _dc_boot_exc)
     if EVAL_HEARTBEAT_ENABLED:
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:

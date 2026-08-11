@@ -1,0 +1,241 @@
+PHASE 2 LIVE VALIDATION — GHOST RESEARCH ENGINE
+
+Do not add new research features yet.
+
+Validate the newly deployed Ghost Research & Evidence Engine using the live Databento feed.
+
+1. Confirm live opportunity capture
+
+For MGC, MNQ, MES, MYM report:
+
+- bars received
+- opportunities detected
+- opportunities accepted into research
+- opportunities rejected
+- exact rejection reasons
+- experiments spawned
+- active experiments
+- completed experiments
+
+2. Confirm context snapshot quality
+
+Inspect at least 5 real ghost opportunities if available.
+
+For each verify that the stored entry-time context includes:
+
+- instrument
+- timestamp
+- strategy
+- direction
+- candidate entry
+- stop
+- targets
+- live verdict at the time
+- edge score
+- blockers
+- VWAP
+- 15m trend
+- 4H trend
+- trend alignment
+- ATR / volatility regime
+- RVOL / volume
+- CVD/delta
+- structure state
+- BOS / CHoCH
+- liquidity sweep state
+- FVG state
+- zone state
+- ORB state
+- session/time-of-day
+
+For any field not available, store UNKNOWN/UNAVAILABLE with source/provenance.
+Do not silently substitute zero.
+
+3. Verify rejected opportunities are stored
+
+Research must not only study trades the live engine would take.
+
+Confirm the system captures useful rejected/blocked setups where appropriate so later analysis can answer whether a gate helped or hurt.
+
+Examples:
+
+- edge below threshold
+- trend misalignment
+- CVD conflict
+- VWAP conflict
+- zone missing
+- max chase
+- volatility condition
+- session restriction
+
+Do not bypass live gates or create live orders.
+These are research observations only.
+
+4. Verify baseline vs variants
+
+For several real opportunities, confirm the baseline and configured variants are evaluated from the SAME market event.
+
+The variant must change only the intended parameter.
+
+Example:
+
+baseline:
+CLOSE_OUTSIDE + 1R
+
+variant:
+CLOSE_AND_RETEST + 1R
+
+must not accidentally also change:
+- direction
+- session
+- underlying market state
+- risk model
+- unrelated filters
+
+5. Verify outcome tracking
+
+Confirm ghost positions correctly detect:
+
+- entry reached
+- stop hit
+- TP hit
+- partial outcome if supported
+- unresolved/expired
+- max favorable excursion
+- max adverse excursion
+- R result
+- duration
+
+Check ambiguous same-bar stop/target cases.
+
+Use the existing deterministic rule and document it.
+
+6. Verify evidence statistics
+
+Confirm candidate/experiment evidence includes:
+
+- sample count
+- win rate
+- average R
+- median R
+- expectancy
+- profit factor
+- max drawdown
+- MAE
+- MFE
+- bootstrap confidence interval
+- Monte Carlo drawdown estimate
+
+Confirm statistics do not produce misleading values with tiny samples.
+
+7. Verify promotion/review gate
+
+Inspect the exact conditions required for:
+
+READY_FOR_REVIEW
+
+Report:
+
+- minimum sample count
+- expectancy requirement
+- confidence interval requirement
+- drawdown requirement
+- stability requirement
+- non-regression requirement
+- any other gates
+
+Confirm:
+
+READY_FOR_REVIEW does NOT change live trading.
+
+It only creates an operator research alert.
+
+8. Verify duplicate isolation
+
+The same opportunity must not generate duplicate experiments because of:
+
+- repeated bar callbacks
+- server restart
+- repeated alerts
+- dashboard polling
+
+Verify idempotency keys.
+
+9. Verify restart persistence
+
+Restart the application once.
+
+Confirm:
+
+- completed research remains persisted
+- active experiments restore correctly
+- duplicate opportunities are not recreated
+- evidence counters remain correct
+
+10. Verify performance
+
+Measure approximate:
+
+- Ghost engine processing time per bar
+- DB writes per opportunity
+- active experiment count
+- memory impact
+
+Research must not materially delay the live bar-processing path.
+
+If research becomes slow, queue or isolate it rather than slowing live trading.
+
+11. SAFETY REGRESSION
+
+Run:
+
+- full Ghost Research tests
+- canonical state tests
+- scoring parity
+- Scalp Golden
+- ORB regression
+- risk tests
+- execution gateway tests
+- arm/safety tests
+- prop protection tests
+
+Confirm:
+
+LIVE TRADING BEHAVIOR CHANGED: NO
+
+12. FINAL REPORT
+
+Return:
+
+GHOST ENGINE LIVE: YES/NO
+LIVE DATABENTO BARS RECEIVED: YES/NO
+
+MGC OPPORTUNITIES:
+MNQ OPPORTUNITIES:
+MES OPPORTUNITIES:
+MYM OPPORTUNITIES:
+
+ACTIVE EXPERIMENTS:
+COMPLETED EXPERIMENTS:
+
+REJECTED OPPORTUNITIES STORED: YES/NO
+CONTEXT SNAPSHOT COMPLETE: YES/NO
+BASELINE/VARIANT ISOLATION: PASS/FAIL
+OUTCOME TRACKING: PASS/FAIL
+STATISTICS: PASS/FAIL
+READY_FOR_REVIEW GATE: PASS/FAIL
+RESTART RESTORE: PASS/FAIL
+DUPLICATE PROTECTION: PASS/FAIL
+
+AVG RESEARCH PROCESSING TIME PER BAR:
+MAX RESEARCH PROCESSING TIME PER BAR:
+
+TESTS PASSED:
+TESTS FAILED:
+
+SCORING PARITY: PASS/FAIL
+SCALP GOLDEN: PASS/FAIL
+
+LIVE TRADING BEHAVIOR CHANGED: YES/NO
+
+SAFE TO BEGIN PHASE 3 DECISION CONTRACT: YES/NO

@@ -13,6 +13,7 @@ import { LiveMarketChart } from '../components/LiveMarketChart';
 import { normalizeMainBrainPayload } from '../lib/mainBrainNormalizer';
 import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
 import { audioManager, SoundEvent } from '../lib/audioManager';
+import { loadQueue, saveQueue, upsertAlert } from '../lib/globalAlerts';
 import {
   rankCandidates, getPlanFromRecord, getRankingReasons,
   isActionableVerdict,
@@ -12627,6 +12628,23 @@ export default function MainBrain() {
       const dateLabel = new Intl.DateTimeFormat('en-US', {
         timeZone: 'America/New_York', weekday: 'short', month: 'short', day: 'numeric',
       }).format(new Date()).toUpperCase();
+
+      // Push a persistent dock entry so the alert queue shows why the bell rang.
+      // Uses the same localStorage queue as GlobalAlertDock — survives navigation.
+      try {
+        const bellId = `MARKET_OPEN|${dateLabel}`;
+        const entry = {
+          id:           bellId,
+          type:         'SYSTEM_SAFETY' as const,
+          instrument:   'MARKET',
+          timestamp:    Date.now(),
+          acknowledged: false,
+          isShadow:     false,
+          label:        `MARKET OPEN  ·  9:30 AM ET`,
+          sublabel:     dateLabel,
+        };
+        saveQueue(upsertAlert(loadQueue(), entry));
+      } catch {/* noop — dock entry is advisory only */}
 
       setOpeningBell({ firedAt: Date.now(), dateLabel });
     };

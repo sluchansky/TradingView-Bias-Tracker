@@ -1,0 +1,259 @@
+NEXT CONSOLIDATION TASK — BOS / CHOCH DUPLICATE STRUCTURE EVENTS
+
+Objective:
+
+Eliminate duplicate BOS/CHOCH influence when the same structural event is observed by both TradingView and Databento.
+
+Do NOT remove TradingView structure alerts entirely yet.
+
+Do NOT change structure thresholds, scoring weights, READY/EARLY/WAIT logic, execution, risk, or broker behavior.
+
+We are only eliminating duplicate representations of the same logical event.
+
+1. AUDIT EXACT STRUCTURE TYPES
+
+Identify every structure-related alert/event currently entering ALERT_HISTORY.
+
+Include at minimum:
+
+BOS
+CHOCH
+HH
+HL
+LH
+LL
+
+Also identify any aliases such as:
+
+CHOCH SUPPLY
+CHOCH DEMAND
+BOS SUPPLY
+BOS DEMAND
+BULLISH BOS
+BEARISH BOS
+etc.
+
+Produce a normalization table:
+
+RAW EVENT NAME
+NORMALIZED STRUCTURE TYPE
+DIRECTION
+SOURCE
+INSTRUMENT
+CURRENT CONSUMERS
+
+2. ADD TRUE SOURCE TAGGING
+
+Every TradingView structure event must explicitly carry:
+
+source = "tradingview"
+
+Every Databento-derived structure event must explicitly carry:
+
+source = "databento"
+
+Do not infer source later from missing fields if it can be recorded at ingestion.
+
+Preserve existing metadata.
+
+3. CREATE A STRUCTURE EVENT IDENTITY
+
+Define a deterministic logical identity for structure events.
+
+Use appropriate fields such as:
+
+instrument
+normalized event type
+direction
+timeframe
+structural level / break level
+bar timestamp
+
+Do not rely on raw alert text alone.
+
+Suggested logical key:
+
+instrument
++ normalized_structure_type
++ direction
++ timeframe
++ rounded_structural_level
++ event_bar_timestamp
+
+Use instrument tick size when normalizing price.
+
+4. DEDUP WINDOW
+
+When TradingView and Databento both report what appears to be the same logical structure event, only one canonical event may influence downstream structure consumers.
+
+Do not simply deduplicate all BOS events occurring near each other.
+
+Require enough agreement to avoid deleting genuinely separate breaks.
+
+Use:
+
+same instrument
+same normalized structure type
+same direction
+compatible timeframe
+price/level within defined tick tolerance
+time within a defined bar/time window
+
+Document the exact tolerance.
+
+Do not invent a large arbitrary window.
+
+Prefer the smallest safe window based on current bar cadence.
+
+5. DATABENTO IS CANONICAL WHEN MATCHED
+
+When a TradingView structure event matches a fresh Databento structure event:
+
+Databento event = canonical
+TradingView event = shadow/duplicate
+
+Keep the TV event available for audit if useful, but mark:
+
+duplicate_of = <canonical event id>
+canonical = false
+source = tradingview
+
+The Databento event should show:
+
+canonical = true
+source = databento
+
+6. FAIL-OPEN FALLBACK
+
+If there is no matching fresh Databento structure event, TradingView may remain usable as legacy fallback.
+
+Do not cause structure to disappear because Databento is stale/unavailable.
+
+Required behavior:
+
+fresh matching Databento event:
+    Databento canonical
+    TV shadow
+
+no Databento match:
+    existing TradingView behavior allowed
+
+This keeps the migration safe.
+
+7. _recent_smc_signals()
+
+Update the downstream reader so duplicate/shadow structure events cannot be counted twice.
+
+It should consume only:
+
+canonical events
+or valid unmatched legacy fallback events
+
+It must ignore records explicitly marked duplicate/shadow for scoring influence.
+
+Do NOT otherwise change the scoring calculation.
+
+8. EVENT HISTORY
+
+Preserve raw/audit visibility.
+
+If both sources observed the event, diagnostics should still be able to show:
+
+Databento observed BOS
+TradingView observed BOS
+MATCHED / DUPLICATE
+
+We want to remove duplicate influence, not erase evidence.
+
+9. METRICS
+
+Track:
+
+TV structure events received
+Databento structure events produced
+matched cross-source events
+TV fallback events
+unmatched Databento events
+deduped events
+potential conflict events
+
+A conflict means sources disagree materially on:
+
+direction
+event type
+level
+or timing
+
+Do not automatically resolve major conflicts beyond the defined canonical/fallback rules.
+
+10. TEST CASES
+
+Add tests for:
+
+same BOS from TV + Databento → counted once
+same CHOCH from TV + Databento → counted once
+different directions → not deduped
+different instruments → not deduped
+different structural levels beyond tolerance → not deduped
+events outside time window → not deduped
+Databento stale → TV fallback works
+Databento unavailable → TV fallback works
+repeated TV webhook → deduped
+repeated Databento callback → deduped
+HH/HL/LH/LL behavior remains correct
+_recent_smc_signals() ignores shadow duplicates
+source tags preserved
+scoring parity preserved
+
+11. SAFETY
+
+Run:
+
+canonical market state tests
+decision contract tests
+ghost research tests
+ORB tests
+FVG tests
+structure tests
+scoring parity
+Scalp Golden
+
+Confirm:
+
+LIVE TRADING BEHAVIOR CHANGED: NO
+
+except removal of duplicate representation of the same structure signal.
+
+Do not alter thresholds or weights to compensate.
+
+12. FINAL REPORT
+
+Return:
+
+STRUCTURE TYPES AUDITED:
+
+TRADINGVIEW SOURCE TAGGING: PASS/FAIL
+DATABENTO SOURCE TAGGING: PASS/FAIL
+
+BOS DEDUP ACTIVE: YES/NO
+CHOCH DEDUP ACTIVE: YES/NO
+HH/HL/LH/LL DEDUP ACTIVE: YES/NO
+
+DEDUP MATCH RULE:
+TIME TOLERANCE:
+PRICE/TICK TOLERANCE:
+
+TV STRUCTURE EVENTS RECEIVED:
+DATABENTO STRUCTURE EVENTS:
+MATCHED EVENTS:
+TV FALLBACK EVENTS:
+CONFLICT EVENTS:
+
+CAN DUPLICATE BOS AFFECT SCORING: YES/NO
+CAN DUPLICATE CHOCH AFFECT SCORING: YES/NO
+
+PARITY: PASS/FAIL
+SCALP GOLDEN: PASS/FAIL
+LIVE TRADING BEHAVIOR CHANGED: YES/NO
+
+NEXT DUPLICATE SOURCE TO REMOVE:

@@ -70,7 +70,12 @@
 - [LIVE 2-contract runner + trade-mgmt suite](live-two-contract-runner.md) — flag-gated default-OFF; runner fires only after primary 2xx; RUNNER_MODE trail|be_2r; primary TP forced to 1R for be_2r; node --check the SERVED dashboard <script>.
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
+- [Canonical Decision Contract Phase 3](decision-contract-phase3.md) — shadow-only typed state machine; 5 app.py hooks; 166 tests; DC_DB_READY flag; /decision-state route; never gates.
+- [Decision Contract boot flags](decision-contract-boot-flags.md) — TWO separate DC_DB_READY flags; registry.boot() must be called or persistence silently skips; get_all_states() returns Dict not list.
+- [Signal source ownership](signal-source-ownership.md) — CVD/RVOL now Databento-only via _databento_is_canonical guard; FVG already clean; BOS/sweep/VWAP/zones still dual or legacy.
 - [Ghost Research Engine Phase 2](ghost-research-engine-phase2.md) — 10-variant shadow experiment platform; OrbEngine BREAKOUT_DETECTED hook; bootstrap CI + Monte Carlo; evidence state machine; 118 tests; GRE_DB_READY flag; 7 Flask routes + proxy whitelist; RESEARCH_READY_FOR_REVIEW dock alert.
+- [GRE Phase 4 — FVG_REVISIT Research Family](gre-phase4-fvg-revisit.md) — FVG_REVISIT as Research Family #2; strategy_family/strategy SEPARATE fields; deterministic rfid/revisit_id; 10 variants; 86 tests; prod DB apply still needed.
+- [DC Phase 3 Closure](dc-phase3-closure.md) — 6 execution hooks wired; GRE DC enrichment; 13 ghost_opportunities DC columns; 6 new legal transitions (scalp path); get_record() + observe_order_accepted/rejected added; 45 tests.
 - [Profitability Engine Phase 1](profitability-engine-phase1.md) — ghost_observations table; ghost fires BEFORE _maybe_auto_execute; 69 tests; conservative stop-first resolution; net_r = gross_r − cost_r.
 - [Edge Ledger Phase 8A](edge-ledger-phase8a.md) — frozen-signal accounting; 5 integration points; EL_DB_READY flag; 55 tests; display-only, learning engine unchanged.
 - [Ops Readiness Phase 8B](ops-readiness-phase8b.md) — _re_event ring-buffer; 7 hooks; /research-health + /research-events; Research Engine Health panel; 35 tests; JS-in-Python backslash trap.

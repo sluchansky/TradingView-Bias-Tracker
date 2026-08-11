@@ -1,0 +1,539 @@
+NEXT TASK — CANONICAL SWEEP EVENT DEDUPLICATION
+
+The BOS / CHOCH / swing canonical dedup framework is complete.
+
+Now extend the SAME canonical/shadow framework to LIQUIDITY SWEEP events.
+
+This is a targeted source-normalization task.
+
+DO NOT begin Phase 2 Ghost Research yet.
+
+We want clean canonical structure + sweep evidence before research starts learning from these events.
+
+DO NOT change strategy logic, thresholds, edge-score weights, risk, execution, ORB behavior, TradersPost, arm state, prop protection, or Databento ingestion.
+
+==================================================
+1. AUDIT FIRST
+==================================================
+
+Before modifying code, identify every sweep producer and every sweep consumer.
+
+Audit all raw sweep event names from:
+
+- TradingView webhook paths
+- DatabentoBrain
+- any fast-entry/synthetic path
+- any scalp/research-only detectors
+
+Determine exact event naming.
+
+Examples may include:
+
+MNQ BULLISH SWEEP
+MNQ BEARISH SWEEP
+MGC BULLISH SWEEP
+MGC BEARISH SWEEP
+MES BULLISH SWEEP
+MES BEARISH SWEEP
+MYM BULLISH SWEEP
+MYM BEARISH SWEEP
+
+Do not assume those are the only forms.
+
+Produce:
+
+RAW TYPE
+NORMALIZED FAMILY
+DIRECTION
+INSTRUMENT
+SOURCE
+PRODUCER
+LIVE CONSUMERS
+RESEARCH CONSUMERS
+
+==================================================
+2. EXTEND THE EXISTING DEDUP ENGINE
+==================================================
+
+Reuse:
+
+structure_dedup.py
+
+Do NOT build a second unrelated dedup system.
+
+If appropriate, rename/internalize concepts so the module can safely represent:
+
+STRUCTURE
+SWEEP
+
+without breaking existing APIs.
+
+Avoid a broad refactor unless actually required.
+
+Existing BOS/CHOCH behavior must remain unchanged.
+
+==================================================
+3. CANONICAL SWEEP CONTRACT
+==================================================
+
+Normalize every legitimate sweep event to:
+
+family = SWEEP
+
+instrument =
+MGC / MNQ / MES / MYM
+
+direction =
+BULLISH / BEARISH
+
+source =
+databento / tradingview / synthetic / other
+
+canonical =
+true / false
+
+duplicate_of =
+event identity/timestamp where applicable
+
+conflict =
+true / false
+
+Do not erase the original raw alert_type.
+
+Preserve it for auditability.
+
+==================================================
+4. SOURCE PRIORITY
+==================================================
+
+Use the same principle already implemented for structure:
+
+When Databento and TradingView represent the SAME logical sweep:
+
+Databento:
+canonical = true
+
+TradingView:
+canonical = false
+duplicate_of = Databento event
+
+If TradingView sweep arrives and no matching Databento event exists within the valid matching window:
+
+TradingView remains:
+
+canonical = true
+
+as fallback.
+
+TradingView must NOT simply disappear because Databento is preferred.
+
+==================================================
+5. MATCH RULE
+==================================================
+
+Determine the appropriate matching rule from actual sweep generation behavior.
+
+At minimum require:
+
+same instrument
+same direction
+same normalized SWEEP family
+
+Then evaluate:
+
+time tolerance
+price/level tolerance
+
+Do NOT blindly inherit 90 seconds / 10 ticks without checking whether it makes sense for sweep detection.
+
+If the existing structure tolerance is appropriate, document why.
+
+If sweep events need a different tolerance, implement a sweep-specific configuration.
+
+==================================================
+6. PRICE / LEVEL MATCHING
+==================================================
+
+Sweep dedup should use the most meaningful available level.
+
+Prefer, where available:
+
+swept liquidity level
+event price
+bar high/low that caused sweep
+
+rather than unrelated last-price snapshots.
+
+If one producer lacks a comparable price:
+
+fail open according to the existing canonical framework.
+
+Do not fabricate a price.
+
+==================================================
+7. DIRECTION CONFLICT
+==================================================
+
+Detect cases such as:
+
+Databento:
+MNQ BULLISH SWEEP
+
+TradingView:
+MNQ BEARISH SWEEP
+
+within the logical matching interval.
+
+These are not duplicates.
+
+Mark:
+
+conflict = true
+
+and preserve both for diagnostics.
+
+Do not allow the existence of an opposite-direction event to silently shadow the other event.
+
+==================================================
+8. UPDATE LIVE CONSUMERS
+==================================================
+
+Audit every live consumer of sweep state.
+
+The previous report identified:
+
+has_bull_sweep
+has_bear_sweep
+_latest_ts()
+_has()
+
+and potentially other consumers.
+
+Update every MONEY-PATH consumer so that:
+
+if record.get("canonical") is False:
+    ignore it
+
+But:
+
+records with no canonical field from unrelated/old data must retain existing fail-open behavior unless there is a very strong reason otherwise.
+
+Do not accidentally turn missing metadata into suppression.
+
+==================================================
+9. EDGE SCORE
+==================================================
+
+Verify whether liquidity sweep contributes:
+
+- points
+- gate eligibility
+- direction
+- blockers
+- strategy qualification
+
+For the SAME logical market sweep reported by Databento + TradingView:
+
+it must count ONCE.
+
+Explicitly test this.
+
+Example:
+
+One bullish sweep from both sources
+
+must not:
+
+double score
+double freshness
+double confirmation
+extend eligibility twice
+create two candidate events
+
+==================================================
+10. STRATEGY CONSUMERS
+==================================================
+
+Audit specifically:
+
+LIQUIDITY_SWEEP_REVERSAL
+
+and any other strategy using sweep signals.
+
+Verify duplicate sweeps cannot:
+
+- create duplicate setups
+- refresh the strategy timer artificially
+- alter strategy priority
+- generate duplicate ghost observations
+- create duplicate live execution attempts
+
+==================================================
+11. CHART / DIAGNOSTICS
+==================================================
+
+Keep both source observations visible in diagnostics.
+
+For example:
+
+Databento BULLISH SWEEP
+CANONICAL
+
+TradingView BULLISH SWEEP
+MATCHED / SHADOW
+
+Do not delete raw TradingView history.
+
+The operator should be able to see that both systems observed the same event.
+
+==================================================
+12. METRICS
+==================================================
+
+Extend:
+
+GET /structure-dedup-metrics
+
+or rename to a broader endpoint only if backwards compatibility is preserved.
+
+Expose separate counters for:
+
+STRUCTURE:
+TV received
+Databento received
+matched
+fallback
+conflict
+
+SWEEPS:
+TV received
+Databento received
+matched
+fallback
+conflict
+
+Also expose:
+
+duplicates suppressed from live consumers
+
+Do not combine structure and sweep totals in a way that hides which subsystem is causing mismatches.
+
+==================================================
+13. EVENT IDENTITY
+==================================================
+
+If practical, generate a stable logical dedup/event key.
+
+Suggested inputs:
+
+instrument
+family
+direction
+normalized event time/bar
+price/level bucket
+
+Do not depend solely on Python object identity.
+
+This will later help Phase 2 avoid duplicate opportunities.
+
+==================================================
+14. HISTORICAL RECORDS
+==================================================
+
+Do NOT mass-rewrite production ALERT_HISTORY or historical tables.
+
+This task applies canonical metadata going forward.
+
+If older rows lack:
+
+canonical
+source
+duplicate_of
+
+consumers must handle that safely.
+
+==================================================
+15. FAIL OPEN
+==================================================
+
+Dedup failure must never stop production analysis.
+
+If structure/sweep dedup throws:
+
+log a bounded error
+continue processing using safe fallback semantics
+
+One malformed alert must not break the webhook path.
+
+==================================================
+16. TESTS
+==================================================
+
+Add tests for:
+
+TradingView bullish sweep alone
+TradingView bearish sweep alone
+
+Databento bullish sweep alone
+Databento bearish sweep alone
+
+Databento first → TV duplicate
+TV first → Databento duplicate
+
+same event within time tolerance
+outside time tolerance
+
+same direction but outside price tolerance
+
+opposite-direction conflict
+
+MGC tick scaling
+MNQ tick scaling
+MES tick scaling
+MYM tick scaling
+
+missing price fail-open
+
+duplicate sweep counts once in edge score
+
+duplicate sweep counts once in gate freshness
+
+duplicate does not create duplicate LIQUIDITY_SWEEP_REVERSAL opportunity
+
+fallback TV sweep still affects live system when Databento event is absent
+
+Databento canonical remains usable when TV is absent
+
+chart retains both source records
+
+metrics count matches/fallback/conflicts correctly
+
+existing BOS dedup behavior remains identical
+
+==================================================
+17. REGRESSION
+==================================================
+
+Run:
+
+full test suite
+parity
+scalp golden
+dual-sim
+breakout
+09:30 ORB tests
+canonical market-state tests
+
+Assert unchanged:
+
+verdict
+edge_score
+direction
+blockers
+trade plan
+quantity
+risk
+execution payload
+
+for logically equivalent inputs.
+
+==================================================
+18. LIVE OBSERVATION
+==================================================
+
+After restart, keep the metrics active.
+
+Do NOT declare real-world source agreement proven merely because tests pass.
+
+Report actual since-restart counts:
+
+TV sweep events
+Databento sweep events
+matched events
+fallback events
+conflicts
+
+If all are still zero because of market conditions, state that clearly.
+
+==================================================
+19. COMPLETION REPORT
+==================================================
+
+Return:
+
+SWEEP TYPES AUDITED:
+
+TRADINGVIEW SWEEP SOURCE TAGGING:
+PASS/FAIL
+
+DATABENTO SWEEP SOURCE TAGGING:
+PASS/FAIL
+
+BULLISH SWEEP DEDUP:
+YES/NO
+
+BEARISH SWEEP DEDUP:
+YES/NO
+
+MATCH RULE:
+
+TIME TOLERANCE:
+
+PRICE/TICK TOLERANCE:
+
+MGC:
+MNQ:
+MES:
+MYM:
+
+SWEEP MONEY-PATH CONSUMERS UPDATED:
+
+LIQUIDITY_SWEEP_REVERSAL VERIFIED:
+YES/NO
+
+CAN DUPLICATE SWEEP AFFECT EDGE SCORE:
+YES/NO
+
+CAN DUPLICATE SWEEP AFFECT GATE:
+YES/NO
+
+CAN DUPLICATE SWEEP CREATE DUPLICATE SETUP:
+YES/NO
+
+TV SWEEPS SINCE RESTART:
+
+DATABENTO SWEEPS SINCE RESTART:
+
+MATCHED SWEEPS:
+
+TV FALLBACK SWEEPS:
+
+CONFLICT SWEEPS:
+
+STRUCTURE DEDUP REGRESSION:
+PASS/FAIL
+
+TOTAL TESTS:
+PASSED:
+FAILED:
+
+PARITY:
+PASS/FAIL
+
+SCALP GOLDEN:
+PASS/FAIL
+
+09:30 ORB:
+PASS/FAIL
+
+LIVE TRADING BEHAVIOR CHANGED:
+YES/NO
+
+BROKER/EXECUTION CODE MODIFIED:
+MUST = NO
+
+NEXT DUPLICATE SIGNAL SOURCE:
+identify it, but do not implement it in this task
+
+SAFE TO BEGIN PHASE 2 GHOST RESEARCH:
+YES/NO

@@ -1,0 +1,285 @@
+PHASE 4 ARCHITECTURE CORRECTION — APPLY BEFORE CONTINUING
+
+The Phase 4 audit is approved with TWO required corrections.
+
+Do not stop the Phase 4 implementation, but apply these before completing it.
+
+==================================================
+1. DO NOT OVERLOAD "strategy" AS "strategy_family"
+==================================================
+
+The audit proposed:
+
+ghost_opportunities.strategy doubles as family tag
+
+DO NOT do that.
+
+We are building a multi-family research platform and need explicit separation.
+
+Add:
+
+strategy_family
+
+as a first-class field.
+
+Required initial values:
+
+09:30_ORB
+FVG_REVISIT
+
+Keep:
+
+strategy
+
+for the actual strategy/baseline identity.
+
+Examples:
+
+strategy_family = 09:30_ORB
+strategy = CASH_OPEN_ORB_V2
+
+or current exact ORB strategy identity.
+
+FVG:
+
+strategy_family = FVG_REVISIT
+strategy = FVG_RESEARCH_BASELINE_V1
+
+Do not make:
+
+strategy = FVG_REVISIT
+
+unless that genuinely is the strategy name.
+
+==================================================
+2. DATABASE MIGRATION
+==================================================
+
+Add strategy_family where needed to:
+
+ghost_opportunities
+ghost_experiments
+
+If ghost_experiment_results obtains family through its experiment relationship, do not duplicate it unnecessarily.
+
+Backfill existing ORB records safely:
+
+strategy_family = '09:30_ORB'
+
+Do not destroy or rewrite existing strategy values.
+
+Add indexes appropriate for common research queries such as:
+
+strategy_family
+instrument
+variant/evidence state where applicable
+
+Migration must be backward compatible.
+
+==================================================
+3. API / STATISTICS
+==================================================
+
+All Ghost Research APIs and statistical grouping must be capable of explicitly filtering/grouping by:
+
+strategy_family
+
+Examples:
+
+ALL
+09:30_ORB
+FVG_REVISIT
+
+Do not infer family from strategy text.
+
+==================================================
+4. DETERMINISTIC FVG RESEARCH ID
+==================================================
+
+The authoritative FVG engine currently uses:
+
+uuid4()
+
+That is acceptable for its runtime implementation, but Ghost Research must NOT rely on that random UUID as its sole replay identity.
+
+Preserve the original engine ID as:
+
+source_fvg_id
+
+Then derive a stable research identity from immutable creation attributes.
+
+Use a deterministic hash/versioned key based on appropriate fields such as:
+
+instrument
+direction
+creation bar timestamp
+upper boundary
+lower boundary
+FVG engine/version
+
+Example conceptual field:
+
+research_fvg_id
+
+This same historical FVG replayed from the same Databento bars must receive the SAME research_fvg_id.
+
+Do not include mutable fields such as:
+
+touch_count
+mitigation
+current status
+
+in the creation identity.
+
+==================================================
+5. REVISIT IDENTITY
+==================================================
+
+One FVG can have multiple legitimate revisits.
+
+Use a separate deterministic:
+
+revisit_id
+
+Based on:
+
+research_fvg_id
+revisit number and/or canonical revisit bar timestamp
+strategy version
+
+Repeated processing of the same physical revisit must produce the same revisit_id.
+
+A genuinely later revisit must receive a different revisit_id.
+
+==================================================
+6. KEEP BOTH IDENTITIES
+==================================================
+
+For provenance retain:
+
+source_fvg_id
+research_fvg_id
+revisit_id
+
+This lets us answer:
+
+Which live FVG object produced this?
+Which logical FVG was it?
+Which interaction with that FVG produced this experiment?
+
+==================================================
+7. EXTRA_SNAPSHOT
+==================================================
+
+Using extra_snapshot JSONB for FVG-specific contextual fields is fine.
+
+However, do NOT hide core query/identity fields only inside JSONB.
+
+At minimum these should be first-class/queryable:
+
+strategy_family
+strategy
+opportunity_id
+instrument
+direction
+source_fvg_id
+research_fvg_id
+revisit_id
+
+Use JSONB for additional FVG context.
+
+==================================================
+8. TIMEZONE FIX VALIDATION
+==================================================
+
+The chart timezone change should explicitly use:
+
+America/New_York
+
+not merely the browser's local timezone.
+
+Verify visually that:
+
+UTC 05:30 displays as 01:30 ET during EDT
+
+and verify a winter timestamp correctly reflects EST.
+
+Confirm BOTH:
+
+x-axis tick labels
+bar/status timestamp display
+
+show ET.
+
+Do not assume the formatter change worked without a rendered check.
+
+==================================================
+9. REQUIRED NEW TESTS
+==================================================
+
+Add tests proving:
+
+existing ORB row backfills strategy_family=09:30_ORB
+
+ORB strategy value itself is preserved
+
+FVG row has strategy_family=FVG_REVISIT
+
+FVG strategy=FVG_RESEARCH_BASELINE_V1 if no prior production baseline exists
+
+same FVG replay → same research_fvg_id
+
+different FVG → different research_fvg_id
+
+same revisit callback → same revisit_id / no duplicate
+
+later legitimate revisit → different revisit_id
+
+random source uuid changing does not change logical research_fvg_id for identical historical FVG
+
+family API filter returns only requested family
+
+ORB statistics remain unchanged after migration
+
+==================================================
+10. CONTINUE PHASE 4
+==================================================
+
+After applying these corrections, continue the existing Phase 4 implementation exactly as planned.
+
+Do not add a third research family.
+
+Completion report must include:
+
+STRATEGY_FAMILY FIRST-CLASS FIELD:
+YES/NO
+
+ORB EXISTING RECORDS BACKFILLED:
+YES/NO
+
+ORB ORIGINAL STRATEGY PRESERVED:
+YES/NO
+
+FVG STRATEGY FAMILY:
+FVG_REVISIT
+
+FVG STRATEGY:
+[exact value]
+
+SOURCE FVG ID PRESERVED:
+YES/NO
+
+DETERMINISTIC RESEARCH FVG ID:
+YES/NO
+
+DETERMINISTIC REVISIT ID:
+YES/NO
+
+REPLAY IDENTITY:
+PASS/FAIL
+
+ET CHART AXIS:
+PASS/FAIL
+
+ET STATUS TIMESTAMP:
+PASS/FAIL
