@@ -427,6 +427,7 @@ export const BOT1_ROUTES = [
   // Phase 8C: Gate Effectiveness Audit endpoints (DISPLAY/MEASUREMENT-ONLY; owner-only).
   // Never touches gate, scoring, sizing, learning, arm state, or execution.
   "/gate-effectiveness",
+  "/gate-effectiveness/validate-wiring",
   "/gate-effectiveness/missed-winners",
   "/gate-effectiveness/saved-losses",
   // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).

@@ -65392,9 +65392,16 @@ function doResetSafetyLock() {}
         <option value="Long">Long</option><option value="Short">Short</option>
       </select>
       <span class="bt-mini" id="ge-evidence-badge" style="margin-left:4px;padding:2px 8px;border-radius:10px"></span>
+      <span class="bt-mini" id="ge-collector-status" style="margin-left:4px;color:var(--muted)"></span>
+      <button class="bt-btn" onclick="geValidateWiring()" style="margin-left:8px;font-size:11px">🔌 Validate Wiring</button>
+      <span class="bt-mini" id="ge-validate-result" style="margin-left:6px"></span>
     </div>
     <div id="ge-header" style="display:none">
       <div id="ge-header-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px;margin-bottom:10px"></div>
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Observations by Instrument</div>
+        <div id="ge-inst-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:6px"></div>
+      </div>
       <div style="margin-bottom:10px">
         <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Gate Summary (Completed outcomes)</div>
         <div id="ge-summary-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:6px"></div>
@@ -74430,6 +74437,13 @@ function geLoad(){
     geRenderComponents(d.components||[]);
     geRenderMissed(d.missed_winners||[]);
     geRenderSaved(d.saved_losses||[]);
+    // Collector status
+    var cs=document.getElementById('ge-collector-status');
+    if(cs&&d.summary){
+      var s=d.summary;
+      if(s.last_recorded_at)cs.textContent='Collector: ACTIVE | Last decision: '+s.last_recorded_at;
+      else cs.textContent='Collector: ACTIVE | No gate decisions recorded yet today';
+    }
   }).catch(function(){if(msg){msg.className='bt-msg error';msg.textContent='Could not load gate effectiveness data.';}});
 }
 function geKv(label,val,color){
@@ -74448,10 +74462,25 @@ function geRenderHeader(s){
     geKv('Baseline',s.baseline_version||'—')+
     geKv('Start',s.observation_start?(s.observation_start||'').slice(0,10):'—')+
     geKv('Total Observations',s.total_observations||0)+
-    geKv('Approved',s.total_approved||0,'#22c55e')+
-    geKv('Blocked',s.total_blocked||0,'#f59e0b')+
+    geKv('READY (Approved)',s.total_approved||0,'#22c55e')+
+    geKv('BLOCKED',s.total_blocked||0,'#f59e0b')+
     geKv('Completed Outcomes',s.completed_outcomes||0)+
     geKv('Pending',s.pending_outcomes||0,'#6b7280');
+  // Per-instrument breakdown
+  var instGrid=document.getElementById('ge-inst-grid');
+  if(instGrid){
+    var bi=s.by_instrument||{};
+    var insts=['MGC','MNQ','MES','MYM'];
+    instGrid.innerHTML=insts.map(function(i){
+      var d=bi[i]||{blocked:0,allowed:0,total:0};
+      var label=i+': '+d.total+' obs ('+d.blocked+' blocked, '+d.allowed+' READY)';
+      var color=d.total===0?'var(--muted)':d.allowed>0?'#22c55e':'#f59e0b';
+      return '<div style="background:var(--inset);border-radius:6px;padding:6px 10px;display:flex;justify-content:space-between;align-items:center">'
+        +'<span style="font-size:11px;font-weight:600">'+i+'</span>'
+        +'<span style="font-size:11px;color:'+color+'">'+label.split(': ')[1]+'</span>'
+        +'</div>';
+    }).join('');
+  }
 }
 function geRenderSummary(s){
   var g=document.getElementById('ge-summary-grid');
@@ -74580,6 +74609,16 @@ function geRenderSaved(records){
   }).join('');
 }
 
+function geValidateWiring(){
+  var el=document.getElementById('ge-validate-result');
+  if(el){el.style.color='var(--muted)';el.textContent='Running wiring test…';}
+  api('/gate-effectiveness/validate-wiring','POST').then(function(d){
+    if(!el)return;
+    var pass=d.verdict==='PASS';
+    el.style.color=pass?'#22c55e':'#ef4444';
+    el.textContent=d.verdict+': blocked='+d.verified_blocked+' allowed='+d.verified_allowed+(d.error?' err:'+d.error:'');
+  }).catch(function(e){if(el){el.style.color='#ef4444';el.textContent='Error: '+e;}});
+}
 function rehLoad(){
   var msg=document.getElementById('reh-msg');
   if(msg)msg.textContent='';
@@ -78701,6 +78740,22 @@ def route_gate_effectiveness():
     except Exception as exc:
         logger.debug("route_gate_effectiveness: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/validate-wiring", methods=["POST"])
+def route_gate_validate_wiring():
+    """Synthetic end-to-end wiring validation — Phase 8C.
+    Owner-only (Express dashboard auth).  Dev/prod safe: never sends orders,
+    reserves risk, or touches execution.  Injects 1 BLOCKED + 1 ALLOWED
+    synthetic record through the recorder→DB path, reads them back, then
+    deletes them.  Returns PASS/FAIL verdict.
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        clean = request.args.get("clean", "true").lower() != "false"
+        return jsonify(_ge.validate_wiring(clean_up=clean))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc), "verdict": "FAIL"}), 500
 
 
 @app.route("/gate-effectiveness/missed-winners", methods=["GET"])

@@ -34,8 +34,9 @@ _BLOCKED_DEDUP_HOURS       = 1     # 1-hour time-bucket for BLOCKED dedup
 _CONSERVATIVE_STOP_FIRST   = True  # when both stop + target hit in same bar → record as stop
 
 # Maintained by boot() — follows the GHOST_OBS_DB_READY pattern
-GATE_AUDIT_DB_READY = False
-_WATCHER_LOCK       = threading.Lock()
+GATE_AUDIT_DB_READY  = False
+_WATCHER_LOCK        = threading.Lock()
+_LAST_RECORDED_AT: Optional[datetime] = None   # updated after every successful INSERT
 
 
 # ── DB helper ─────────────────────────────────────────────────────────────────
@@ -89,6 +90,29 @@ def _comp(val: Any) -> str:
     return "PASS" if bool(val) else "FAIL"
 
 
+def _scalar_str(val: Any) -> Optional[str]:
+    """Coerce any value to a short string psycopg2 can insert, or None.
+
+    Handles the cases where full_analysis returns a structured dict for
+    session_state, trend_alignment, etc.  Dicts are collapsed to their
+    most informative string key (window / label / status / str repr).
+    """
+    if val is None:
+        return None
+    if isinstance(val, str):
+        return val[:120] if val else None
+    if isinstance(val, (int, float, bool)):
+        return str(val)
+    if isinstance(val, dict):
+        # Prefer the most human-readable field
+        for key in ("window", "label", "status", "name", "regime"):
+            v = val.get(key)
+            if v is not None and isinstance(v, str):
+                return v[:120]
+        return str(val)[:120]
+    return str(val)[:120]
+
+
 def _extract(result: dict) -> dict:
     """Pull all audit-relevant fields from a full_analysis result dict.
     Returns a flat dict of normalized values.  Never raises."""
@@ -107,6 +131,23 @@ def _extract(result: dict) -> dict:
                 direction = ready_direction(verdict)
             except Exception:
                 pass
+        # Fallback 1: parse from strict_reason — it often reads "Short WAIT — ..."
+        # or "Long WAIT — ..."; this is the main source when strict_direction is None
+        # and verdict has no directional prefix (bare "WAIT").
+        if not direction:
+            sr = result.get("strict_reason") or ""
+            sr_lower = sr.lower()
+            if sr_lower.startswith("long"):
+                direction = "Long"
+            elif sr_lower.startswith("short"):
+                direction = "Short"
+        # Fallback 2: use the first key of the directions dict if exactly one side
+        # is present — avoids recording conflicted/neutral markets as BLOCKED.
+        if not direction:
+            dirs = result.get("directions") or {}
+            dir_keys = [k for k in dirs if k in ("Long", "Short")]
+            if len(dir_keys) == 1:
+                direction = dir_keys[0]
         direction = direction or "Unknown"
 
         trade_plan = result.get("trade_plan") or {}
@@ -182,10 +223,12 @@ def _extract(result: dict) -> dict:
             "comp_zone":        _comp(conf.get("zone_mitigated") or conf.get("zone_valid")),
             "atr_pts":          vol.get("atr_pts"),
             "vwap_value":       result.get("vwap"),
-            "cvd_direction":    result.get("cvd_state") or result.get("cvd_direction"),
-            "trend_alignment":  result.get("trend_alignment"),
+            # session_state / trend_alignment may be dicts in the live result;
+            # _scalar_str collapses them to a readable string psycopg2 can INSERT.
+            "cvd_direction":    _scalar_str(result.get("cvd_state") or result.get("cvd_direction")),
+            "trend_alignment":  _scalar_str(result.get("trend_alignment")),
             "volatility_regime":vol.get("regime") or vol.get("label"),
-            "session":          result.get("session_state") or result.get("session"),
+            "session":          _scalar_str(result.get("session_state") or result.get("session")),
         }
     except Exception as exc:
         logger.debug("gate_effectiveness _extract: %s", exc)
@@ -245,9 +288,20 @@ def _record(result: dict, instrument: str, mode: str) -> None:
         # Skip low-signal BLOCKED (no candidate, no score) — avoids recording
         # pure-WAIT market periods with no setup whatsoever.
         if score < MIN_EDGE_TO_RECORD_BLOCKED and not info["primary_blocker"]:
+            logger.debug(
+                "GATE_AUDIT_TRACE instrument=%s direction=%s mode=%s "
+                "decision=BLOCKED recorder_called=false reason=low_signal_no_blocker "
+                "edge_score=%s min=%s",
+                instrument, direction, mode, score, MIN_EDGE_TO_RECORD_BLOCKED,
+            )
             return
 
     if direction in (None, "Unknown") and gate_verdict == "BLOCKED":
+        logger.debug(
+            "GATE_AUDIT_TRACE instrument=%s direction=Unknown mode=%s "
+            "decision=BLOCKED recorder_called=false reason=no_directional_candidate",
+            instrument, mode,
+        )
         return   # no candidate direction — nothing to attribute
 
     # ── Canonicalize instrument ──
@@ -344,6 +398,15 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                 initial_status,
             ))
         conn.commit()
+        logger.info(
+            "GATE_AUDIT_TRACE instrument=%s direction=%s mode=%s "
+            "decision=%s recorder_called=true audit_id=%s edge=%s blocker=%s",
+            inst, direction, mode, gate_verdict, audit_id,
+            score, info["primary_blocker"],
+        )
+        # Update last-recorded timestamp for collector-status display
+        global _LAST_RECORDED_AT
+        _LAST_RECORDED_AT = datetime.now(timezone.utc)
     except Exception:
         try:
             conn.rollback()
@@ -700,6 +763,7 @@ def get_summary() -> dict:
                     MIN(recorded_at)                                                     AS start_ts
                 FROM gate_audit_log
                 WHERE baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
             """, (BASELINE_VERSION,))
             row = cur.fetchone()
             approved  = int(row[0] or 0)
@@ -707,6 +771,26 @@ def get_summary() -> dict:
             completed = int(row[2] or 0)
             pending   = int(row[3] or 0)
             start_ts  = row[4].isoformat() if row[4] else None
+
+            # Per-instrument breakdown
+            cur.execute("""
+                SELECT
+                    instrument,
+                    COUNT(*) FILTER (WHERE gate_verdict = 'BLOCKED')                    AS blocked,
+                    COUNT(*) FILTER (WHERE gate_verdict IN ('ALLOWED','EARLY_ALLOWED')) AS allowed,
+                    COUNT(*)                                                             AS total
+                FROM gate_audit_log
+                WHERE baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
+                GROUP BY instrument
+                ORDER BY instrument
+            """, (BASELINE_VERSION,))
+            by_instrument = {
+                r[0]: {"blocked": int(r[1] or 0),
+                        "allowed": int(r[2] or 0),
+                        "total":   int(r[3] or 0)}
+                for r in cur.fetchall()
+            }
 
             # Expectancy: approved
             cur.execute("""
@@ -744,6 +828,10 @@ def get_summary() -> dict:
         if approved_exp is not None and blocked_exp is not None:
             gate_improvement = round(approved_exp - blocked_exp, 3)
 
+        last_rec = (
+            _LAST_RECORDED_AT.strftime("%H:%M:%S UTC")
+            if _LAST_RECORDED_AT else None
+        )
         return {
             "available":         True,
             "baseline_version":  BASELINE_VERSION,
@@ -753,6 +841,8 @@ def get_summary() -> dict:
             "total_observations": approved + blocked,
             "completed_outcomes": completed,
             "pending_outcomes":  pending,
+            "collector_active":  True,
+            "last_recorded_at":  last_rec,
             "approved": {
                 "n":         approved_n,
                 "expectancy": round(approved_exp, 3) if approved_exp is not None else None,
@@ -765,10 +855,121 @@ def get_summary() -> dict:
             },
             "gate_improvement": gate_improvement,
             "evidence_status": _evidence_status(approved_n + blocked_n),
+            "by_instrument":   by_instrument,
         }
     except Exception as exc:
         logger.debug("gate_effectiveness get_summary: %s", exc)
         return {"available": False, "error": str(exc)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def validate_wiring(clean_up: bool = True) -> dict:
+    """Synthetic end-to-end wiring validation.
+
+    Injects one BLOCKED and one ALLOWED synthetic record through the exact
+    same recorder → DB path used by live full_analysis, then reads them back
+    via get_summary(), and optionally deletes them.
+
+    Returns a dict with counts before/after and pass/fail verdict.
+    NEVER sends an order, touches execution state, risk, or broker.
+    Safe to call in dev or prod.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return {"ok": False, "error": "GATE_AUDIT_DB_READY is False — table not applied",
+                "verdict": "FAIL"}
+
+    SYNTH_PREFIX = "SYNTHETIC_WIRING_"
+    synth_blocked = SYNTH_PREFIX + "BLOCKED"
+    synth_allowed = SYNTH_PREFIX + "ALLOWED"
+    now = datetime.now(timezone.utc)
+
+    conn = _learning_conn()
+    if conn is None:
+        return {"ok": False, "error": "db_unavailable", "verdict": "FAIL"}
+
+    inserted = []
+    try:
+        with conn.cursor() as cur:
+            # Count before
+            cur.execute("SELECT COUNT(*) FROM gate_audit_log WHERE baseline_version=%s",
+                        (BASELINE_VERSION,))
+            count_before = int((cur.fetchone() or [0])[0])
+
+            # Insert synthetic BLOCKED
+            cur.execute("""
+                INSERT INTO gate_audit_log
+                    (audit_id, baseline_version, recorded_at, last_seen_at,
+                     instrument, direction, mode, signal_time,
+                     edge_score, grade, gate_verdict, full_verdict,
+                     primary_blocker, all_blockers, outcome_status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (audit_id) DO UPDATE SET last_seen_at=EXCLUDED.last_seen_at
+            """, (synth_blocked, BASELINE_VERSION, now, now,
+                  "MNQ", "Long", "SCALP", now,
+                  20, "WAIT", "BLOCKED", "WAIT",
+                  "SYNTHETIC_TEST", json.dumps(["SYNTHETIC_TEST"]),
+                  "NO_GEOMETRY"))
+            inserted.append(synth_blocked)
+
+            # Insert synthetic ALLOWED
+            cur.execute("""
+                INSERT INTO gate_audit_log
+                    (audit_id, baseline_version, recorded_at, last_seen_at,
+                     instrument, direction, mode, signal_time,
+                     edge_score, grade, gate_verdict, full_verdict,
+                     primary_blocker, all_blockers, outcome_status)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                ON CONFLICT (audit_id) DO UPDATE SET last_seen_at=EXCLUDED.last_seen_at
+            """, (synth_allowed, BASELINE_VERSION, now, now,
+                  "MNQ", "Long", "SCALP", now,
+                  80, "A", "ALLOWED", "LONG READY",
+                  None, json.dumps([]),
+                  "NO_GEOMETRY"))
+            inserted.append(synth_allowed)
+
+        conn.commit()
+
+        # Read them back
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT audit_id, gate_verdict FROM gate_audit_log WHERE audit_id = ANY(%s)",
+                (inserted,)
+            )
+            found = {row[0]: row[1] for row in cur.fetchall()}
+
+            cur.execute("SELECT COUNT(*) FROM gate_audit_log WHERE baseline_version=%s",
+                        (BASELINE_VERSION,))
+            count_after = int((cur.fetchone() or [0])[0])
+
+        verified_blocked = found.get(synth_blocked) == "BLOCKED"
+        verified_allowed = found.get(synth_allowed) == "ALLOWED"
+
+        if clean_up:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM gate_audit_log WHERE audit_id = ANY(%s)", (inserted,))
+            conn.commit()
+
+        return {
+            "ok":               verified_blocked and verified_allowed,
+            "count_before":     count_before,
+            "count_after":      count_after,
+            "synthetic_records": len(found),
+            "verified_blocked": verified_blocked,
+            "verified_allowed": verified_allowed,
+            "cleaned_up":       clean_up,
+            "verdict":          "PASS" if (verified_blocked and verified_allowed) else "FAIL",
+        }
+    except Exception as exc:
+        logger.warning("gate_effectiveness validate_wiring: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return {"ok": False, "error": str(exc), "verdict": "FAIL"}
     finally:
         try:
             conn.close()
