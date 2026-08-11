@@ -196,7 +196,7 @@ class FvgVariant:
     MIDPOINT_ENTRY       = "MIDPOINT_ENTRY"
     DEEP_FILL_ENTRY      = "DEEP_FILL_ENTRY"
     FIRST_TOUCH_ONLY     = "FIRST_TOUCH_ONLY"
-    SECOND_TOUCH_ALLOWED = "SECOND_TOUCH_ALLOWED"
+    SECOND_TOUCH_ONLY    = "SECOND_TOUCH_ONLY"
     TREND_REQUIRED       = "TREND_REQUIRED"
     CVD_ALIGNED          = "CVD_ALIGNED"
     TP_1R                = "TP_1R"
@@ -208,7 +208,7 @@ FVG_ALL_VARIANTS: List[str] = [
     FvgVariant.MIDPOINT_ENTRY,
     FvgVariant.DEEP_FILL_ENTRY,
     FvgVariant.FIRST_TOUCH_ONLY,
-    FvgVariant.SECOND_TOUCH_ALLOWED,
+    FvgVariant.SECOND_TOUCH_ONLY,
     FvgVariant.TREND_REQUIRED,
     FvgVariant.CVD_ALIGNED,
     FvgVariant.TP_1R,
@@ -807,6 +807,11 @@ class GhostResearchEngine:
                         prev = self._fvg_revisit_count.get(rfid, 0)
                         if rn > prev:
                             self._fvg_revisit_count[rfid] = rn
+                        # Assume price was inside at shutdown for every zone seen today.
+                        # This prevents a restart-while-inside from incorrectly minting
+                        # a new revisit.  If price left before restart, the very next bar
+                        # will flip inside_now=False and clear the flag correctly.
+                        self._fvg_inside_prev[rfid] = True
             self._log.info("GRE: restored %d FVG revisit dedup entries", len(fvg_rows))
         except Exception as exc:
             self._log.debug("GRE FVG revisit restore (fail-open): %s", exc)
@@ -2420,12 +2425,12 @@ class GhostResearchEngine:
                 "pre_no_entry": revisit_n > 1,
             },
             {
-                "variant":      FvgVariant.SECOND_TOUCH_ALLOWED,
+                "variant":      FvgVariant.SECOND_TOUCH_ONLY,
                 "entry_rule":   "FVG_ZONE_TOUCH",
-                "filter":       {"max_revisit_n": 2},
+                "filter":       {"min_revisit_n": 2, "max_revisit_n": 2},
                 "tp_mult":      _FVG_BASELINE_TARGET_R,
-                "param":        {"max_revisit_n": 2, "tp_r": _FVG_BASELINE_TARGET_R},
-                "pre_no_entry": revisit_n > 2,
+                "param":        {"min_revisit_n": 2, "max_revisit_n": 2, "tp_r": _FVG_BASELINE_TARGET_R},
+                "pre_no_entry": revisit_n != 2,
             },
             {
                 "variant":    FvgVariant.TREND_REQUIRED,
@@ -2761,6 +2766,9 @@ class GhostResearchEngine:
             close_depth_pct = max(0.0, min(1.0, (bar_c - fvg_lower) / gap)) if close_inside else 0.0
 
         # ── Pre-condition: revisit count gate ─────────────────────────────────
+        min_revisit = filter_r.get("min_revisit_n")
+        if min_revisit is not None and revisit_n < min_revisit:
+            return False, None
         max_revisit = filter_r.get("max_revisit_n")
         if max_revisit is not None and revisit_n > max_revisit:
             return False, None

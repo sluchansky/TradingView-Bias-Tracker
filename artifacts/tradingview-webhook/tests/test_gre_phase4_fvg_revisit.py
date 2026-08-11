@@ -114,7 +114,7 @@ class TestFvgConstants(unittest.TestCase):
     def test_all_fvg_variant_names_present(self):
         expected = {
             "BASELINE", "NEAR_EDGE_ENTRY", "MIDPOINT_ENTRY", "DEEP_FILL_ENTRY",
-            "FIRST_TOUCH_ONLY", "SECOND_TOUCH_ALLOWED", "TREND_REQUIRED",
+            "FIRST_TOUCH_ONLY", "SECOND_TOUCH_ONLY", "TREND_REQUIRED",
             "CVD_ALIGNED", "TP_1R", "TP_1_5R",
         }
         self.assertEqual(set(FVG_ALL_VARIANTS), expected)
@@ -1411,6 +1411,366 @@ class TestEtTimestampNormalization(unittest.TestCase):
 
     def test_none_returns_zero(self):
         self.assertEqual(_canonical_ts_fvg(None), 0)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 15 — Phase 4.2 §1: Variant gate semantics
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFvgVariantSemantics(unittest.TestCase):
+    """
+    Phase 4.2 §1.
+    Proves:
+      BASELINE         — accepts any revisit_n
+      FIRST_TOUCH_ONLY — accepts revisit_n == 1 only
+      SECOND_TOUCH_ONLY — accepts revisit_n == 2 only
+      No non-baseline variant is behaviourally identical to BASELINE.
+    """
+
+    def _engine(self):
+        engine, _db, _cur = _mock_gre(["MNQ"])
+        return engine
+
+    def _eval(self, engine, variant_filter, revisit_n, entry_rule="FVG_ZONE_TOUCH",
+              upper=2000.0, lower=1990.0):
+        """Call _fvg_check_entry_condition with price inside zone."""
+        bar_c = (upper + lower) / 2.0   # guaranteed inside
+        entered, _ = engine._fvg_check_entry_condition(
+            entry_rule=entry_rule,
+            direction="Long",
+            filter_r=variant_filter,
+            canonical={},
+            bar_l=bar_c - 0.25,
+            bar_h=bar_c + 0.25,
+            bar_c=bar_c,
+            fvg_upper=upper,
+            fvg_lower=lower,
+            fvg_dir="BULLISH",
+            revisit_n=revisit_n,
+        )
+        return entered
+
+    # ── BASELINE ──────────────────────────────────────────────────────────────
+    def test_baseline_enters_on_revisit_n_1(self):
+        self.assertTrue(self._eval(self._engine(), {}, revisit_n=1))
+
+    def test_baseline_enters_on_revisit_n_2(self):
+        self.assertTrue(self._eval(self._engine(), {}, revisit_n=2))
+
+    def test_baseline_enters_on_later_revisit(self):
+        self.assertTrue(self._eval(self._engine(), {}, revisit_n=5))
+
+    # ── FIRST_TOUCH_ONLY ─────────────────────────────────────────────────────
+    def test_first_touch_only_permits_n_1(self):
+        self.assertTrue(self._eval(self._engine(), {"max_revisit_n": 1}, revisit_n=1))
+
+    def test_first_touch_only_rejects_n_2(self):
+        self.assertFalse(self._eval(self._engine(), {"max_revisit_n": 1}, revisit_n=2))
+
+    def test_first_touch_only_rejects_n_3(self):
+        self.assertFalse(self._eval(self._engine(), {"max_revisit_n": 1}, revisit_n=3))
+
+    # ── SECOND_TOUCH_ONLY ────────────────────────────────────────────────────
+    _STO = {"min_revisit_n": 2, "max_revisit_n": 2}
+
+    def test_second_touch_only_permits_n_2(self):
+        self.assertTrue(self._eval(self._engine(), self._STO, revisit_n=2))
+
+    def test_second_touch_only_rejects_n_1(self):
+        self.assertFalse(self._eval(self._engine(), self._STO, revisit_n=1))
+
+    def test_second_touch_only_rejects_n_3(self):
+        self.assertFalse(self._eval(self._engine(), self._STO, revisit_n=3))
+
+    def test_second_touch_only_rejects_n_4(self):
+        self.assertFalse(self._eval(self._engine(), self._STO, revisit_n=4))
+
+    # ── Non-equivalence proofs ────────────────────────────────────────────────
+    def test_second_touch_only_differs_from_baseline_at_n_1(self):
+        eng = self._engine()
+        self.assertTrue(self._eval(eng, {}, revisit_n=1))
+        self.assertFalse(self._eval(eng, self._STO, revisit_n=1))
+
+    def test_second_touch_only_differs_from_baseline_at_n_3(self):
+        eng = self._engine()
+        self.assertTrue(self._eval(eng, {}, revisit_n=3))
+        self.assertFalse(self._eval(eng, self._STO, revisit_n=3))
+
+    def test_second_touch_only_in_all_variants(self):
+        self.assertIn(FvgVariant.SECOND_TOUCH_ONLY, FVG_ALL_VARIANTS)
+
+    def test_second_touch_allowed_removed_from_all_variants(self):
+        self.assertNotIn("SECOND_TOUCH_ALLOWED", FVG_ALL_VARIANTS)
+
+    def test_variant_count_still_10(self):
+        self.assertEqual(len(FVG_ALL_VARIANTS), 10)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 16 — Phase 4.2 §2: MIDPOINT_ENTRY boundary at 50%
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestMidpointEntryBoundary(unittest.TestCase):
+    """
+    Phase 4.2 §2.
+    Depth scale (BULLISH): 0% = close at upper edge, 100% = close at lower edge.
+    Midpoint = 50% = close at (upper+lower)/2.
+    _FVG_MIDPOINT_MIN_PCT must be 0.50.
+
+    Tick-valid zone: upper=2000.00, lower=1000.00 (gap=1000 pts, MNQ tick=0.25).
+    Exact midpoint close = 1500.00 → depth = (2000-1500)/1000 = 0.5000.
+    One tick above midpoint = 1500.25 → depth = 0.49975 < 0.50 (rejects).
+    One tick below midpoint = 1499.75 → depth = 0.50025 > 0.50 (accepts).
+    """
+
+    _UPPER = 2000.00
+    _LOWER = 1000.00   # gap = 1000 pts
+
+    def _engine(self):
+        engine, _db, _cur = _mock_gre(["MNQ"])
+        return engine
+
+    def _eval_midpoint(self, engine, bar_c):
+        entered, _ = engine._fvg_check_entry_condition(
+            entry_rule="FVG_MIDPOINT",
+            direction="Long",
+            filter_r={"min_depth_pct": _FVG_MIDPOINT_MIN_PCT},
+            canonical={},
+            bar_l=bar_c - 0.25,
+            bar_h=bar_c + 0.25,
+            bar_c=bar_c,
+            fvg_upper=self._UPPER,
+            fvg_lower=self._LOWER,
+            fvg_dir="BULLISH",
+            revisit_n=1,
+        )
+        return entered
+
+    def test_midpoint_min_pct_constant_is_50_percent(self):
+        """_FVG_MIDPOINT_MIN_PCT must be 0.50, not 0.60."""
+        self.assertAlmostEqual(_FVG_MIDPOINT_MIN_PCT, 0.50, places=5)
+
+    def test_close_at_exact_midpoint_enters(self):
+        """bar_c=1500.00 → depth=0.5000 → enters (>= 0.50)."""
+        self.assertTrue(self._eval_midpoint(self._engine(), bar_c=1500.00))
+
+    def test_close_one_tick_above_midpoint_does_not_enter(self):
+        """bar_c=1500.25 → depth=0.49975 < 0.50 → does not enter."""
+        self.assertFalse(self._eval_midpoint(self._engine(), bar_c=1500.25))
+
+    def test_close_one_tick_below_midpoint_enters(self):
+        """bar_c=1499.75 → depth=0.50025 > 0.50 → enters."""
+        self.assertTrue(self._eval_midpoint(self._engine(), bar_c=1499.75))
+
+    def test_close_deep_in_zone_enters(self):
+        """bar_c near lower boundary: depth >> 50%."""
+        self.assertTrue(self._eval_midpoint(self._engine(), bar_c=1050.00))
+
+    def test_close_near_entry_edge_does_not_enter(self):
+        """bar_c near upper boundary: depth ~1% < 50%."""
+        self.assertFalse(self._eval_midpoint(self._engine(), bar_c=1990.00))
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# SECTION 17 — Phase 4.2 §3+4: Restart revisit integrity
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class TestFvgRestartRevisitIntegrity(unittest.TestCase):
+    """
+    Phase 4.2 §3+4.
+
+    Sequence A–H:
+      A. FVG zone exists.
+      B. First revisit → revisit_n=1, opportunity A, 10 variants.
+      C. All experiments completed.
+      D. GhostResearchEngine restarted (new instance, same DB snapshot).
+      E. Price still inside zone → NO new opportunity.
+      F. Price exits zone.
+      G. Price re-enters → revisit_n=2, new opp B, same rfid, new revisit_id.
+      H. Restart again → next callback does not relabel as n=1.
+
+    §4: 10 variants from one revisit = ONE revisit count (not incremented per experiment).
+    """
+
+    def _make_spy_engine(self, restore_fvg_rows=None):
+        """
+        GhostResearchEngine with spy DB and configurable FVG restore rows.
+
+        _restore_active_experiments() is NOT called in __init__ — it is called
+        via boot().  This factory calls it explicitly (matching the established
+        test pattern at test_restore_marks_fvg_by_entry_rule) with a prepared
+        fetchall.side_effect list so the two internal fetchall calls succeed:
+          [0] main experiment restore query → [] (no open experiments)
+          [1] FVG revisit dedup restore query → restore_fvg_rows
+        """
+        inserted_opps = []
+        inserted_exps = []
+        db  = MagicMock()
+        cur = MagicMock()
+
+        def mock_execute(sql, params=()):
+            s = str(sql).strip()
+            if "INSERT INTO ghost_opportunities" in s:
+                inserted_opps.append(params)
+                cur.fetchone.return_value = ("row",)
+            elif "INSERT INTO ghost_experiments" in s:
+                inserted_exps.append(params)
+                cur.fetchone.return_value = ("exp_row",)
+            elif "INSERT INTO ghost_experiment_results" in s:
+                cur.fetchone.return_value = None
+            elif "UPDATE ghost_experiment_results" in s:
+                cur.fetchone.return_value = None
+            else:
+                cur.fetchone.return_value = None
+
+        cur.execute.side_effect = mock_execute
+        cur.fetchone.return_value = ("row",)
+        cur.fetchall.return_value = []
+        cur.description = []
+        db.cursor.return_value = cur
+
+        engine = GhostResearchEngine(
+            get_db_fn=lambda: db,
+            get_canonical_fn=lambda inst: {},
+            get_bars_fn=lambda inst: [],
+            re_event_fn=lambda *a, **kw: None,
+            instruments=["MNQ"],
+        )
+        GhostResearchEngine.GRE_DB_READY = True
+
+        # Simulate boot() restore with the provided DB snapshot.
+        # Side-effect list consumed in order by _restore_active_experiments:
+        #   call[0] → main experiment query (no open rows)
+        #   call[1] → FVG dedup query (restore_fvg_rows)
+        cur.fetchall.side_effect = [[], list(restore_fvg_rows or [])]
+        cur.description = []
+        engine._restore_active_experiments()
+
+        # Reset for bar-processing phase (fetchall no longer needed)
+        cur.fetchall.side_effect = None
+        cur.fetchall.return_value = []
+
+        return engine, inserted_opps, inserted_exps
+
+    def test_restart_after_completed_revisit_full_sequence(self):
+        """Full A–H restart integrity sequence."""
+        upper, lower = 21342.50, 21340.25
+        bar_ts_zone  = 1700000000
+        zone = _zone("BULLISH", upper=upper, lower=lower, bar_ts=bar_ts_zone,
+                     status="ACTIVE", zone_id="zone-rst-001")
+        rfid = _fvg_research_id("MNQ", "BULLISH", bar_ts_zone, upper, lower)
+
+        # ── A+B: First engine — price enters zone (revisit_n=1) ───────────────
+        engine1, opps1, exps1 = self._make_spy_engine()
+
+        bar_outside = _bar(ts=bar_ts_zone + 60,
+                           l=upper + 5.0, h=upper + 10.0, c=upper + 7.0)
+        engine1.on_fvg_bar_close("MNQ", [zone], bar_outside, upper + 7.0, {})
+        self.assertEqual(len(opps1), 0, "A: no opportunity before revisit")
+
+        bar_ts_rev1 = bar_ts_zone + 120
+        bar_enter1 = _bar(ts=bar_ts_rev1, l=lower + 0.5,
+                          h=upper + 1.0, c=upper - 0.5)
+        engine1.on_fvg_bar_close("MNQ", [zone], bar_enter1, upper - 0.5, {})
+        self.assertEqual(len(opps1), 1, "B: exactly one opportunity on first revisit")
+        self.assertEqual(len(exps1), 10, "B: 10 variants from first revisit")
+
+        opp1_id      = engine1._fvg_opp_created.get(f"{rfid}|1")
+        revisit_id_1 = _fvg_revisit_id(rfid, 1, bar_ts_rev1)
+        self.assertIsNotNone(opp1_id, "B: opp1_id populated")
+
+        # ── C: Complete all FVG experiments ───────────────────────────────────
+        with engine1._lock:
+            done = [k for k, v in engine1._open_results.items()
+                    if v.get("_fvg_family")]
+            for k in done:
+                del engine1._open_results[k]
+        self.assertEqual(
+            sum(1 for v in engine1._open_results.values() if v.get("_fvg_family")),
+            0, "C: all FVG experiments completed"
+        )
+
+        # ── D: Restart — engine2 restores from DB with revisit_n=1 row ────────
+        restore1 = [(rfid, revisit_id_1, opp1_id, 1)]
+        engine2, opps2, exps2 = self._make_spy_engine(restore_fvg_rows=restore1)
+
+        self.assertEqual(engine2._fvg_revisit_count.get(rfid), 1,
+            "D: _fvg_revisit_count restored to 1")
+        self.assertIn(f"{rfid}|1", engine2._fvg_opp_created,
+            "D: _fvg_opp_created has rfid|1")
+        self.assertTrue(engine2._fvg_inside_prev.get(rfid, False),
+            "D: _fvg_inside_prev set True for zone seen today")
+
+        # ── E: Price still inside zone → NO new opportunity ───────────────────
+        bar_still = _bar(ts=bar_ts_rev1 + 60, l=lower + 0.5,
+                         h=upper - 0.1, c=upper - 0.3)
+        engine2.on_fvg_bar_close("MNQ", [zone], bar_still, upper - 0.3, {})
+        self.assertEqual(len(opps2), 0,
+            "E: restart while inside must NOT mint a new opportunity")
+
+        # ── F: Price exits zone ────────────────────────────────────────────────
+        bar_exit = _bar(ts=bar_ts_rev1 + 120,
+                        l=upper + 1.0, h=upper + 5.0, c=upper + 3.0)
+        engine2.on_fvg_bar_close("MNQ", [zone], bar_exit, upper + 3.0, {})
+        self.assertEqual(len(opps2), 0, "F: exiting zone must not create opportunity")
+
+        # ── G: Second physical revisit → revisit_n=2 ──────────────────────────
+        bar_ts_rev2 = bar_ts_rev1 + 180
+        bar_enter2 = _bar(ts=bar_ts_rev2, l=lower + 0.5,
+                          h=upper + 0.5, c=upper - 0.25)
+        engine2.on_fvg_bar_close("MNQ", [zone], bar_enter2, upper - 0.25, {})
+        self.assertEqual(len(opps2), 1, "G: second revisit creates one new opportunity")
+
+        self.assertIn(f"{rfid}|2", engine2._fvg_opp_created,
+            "G: _fvg_opp_created has rfid|2")
+        opp2_id      = engine2._fvg_opp_created[f"{rfid}|2"]
+        revisit_id_2 = _fvg_revisit_id(rfid, 2, bar_ts_rev2)
+        self.assertNotEqual(revisit_id_1, revisit_id_2,
+            "G: new revisit_id for second physical revisit")
+
+        opp2_str = str(opps2[0])
+        self.assertIn(rfid, opp2_str,
+            "G: same research_fvg_id — same physical FVG zone")
+
+        # ── H: Second restart → revisit_n=2 preserved, next bar not n=1 ───────
+        restore2 = [
+            (rfid, revisit_id_1, opp1_id, 1),
+            (rfid, revisit_id_2, opp2_id, 2),
+        ]
+        engine3, opps3, _ = self._make_spy_engine(restore_fvg_rows=restore2)
+
+        self.assertEqual(engine3._fvg_revisit_count.get(rfid), 2,
+            "H: _fvg_revisit_count restored to 2 after second restart")
+        self.assertTrue(engine3._fvg_inside_prev.get(rfid, False),
+            "H: _fvg_inside_prev set True after second restart")
+
+        bar_still2 = _bar(ts=bar_ts_rev2 + 60, l=lower + 0.5,
+                          h=upper - 0.1, c=upper - 0.25)
+        engine3.on_fvg_bar_close("MNQ", [zone], bar_still2, upper - 0.25, {})
+        self.assertEqual(len(opps3), 0,
+            "H: second restart while inside must NOT create n=3 opportunity")
+
+    def test_ten_variants_one_revisit_count(self):
+        """
+        Phase 4.2 §4: 10 variants from one revisit = ONE revisit count.
+        _fvg_revisit_count must not increment per experiment.
+        """
+        upper, lower = 21342.50, 21340.25
+        zone = _zone("BULLISH", upper=upper, lower=lower, bar_ts=1700000000)
+        rfid = _fvg_research_id("MNQ", "BULLISH", 1700000000, upper, lower)
+
+        engine, opps, exps = self._make_spy_engine()
+
+        bar_out   = _bar(ts=1700000060, l=upper + 5, h=upper + 10, c=upper + 7)
+        engine.on_fvg_bar_close("MNQ", [zone], bar_out, upper + 7, {})
+
+        bar_enter = _bar(ts=1700000120, l=lower + 0.5, h=upper + 1, c=upper - 0.5)
+        engine.on_fvg_bar_close("MNQ", [zone], bar_enter, upper - 0.5, {})
+
+        self.assertEqual(len(opps), 1, "10 variants from one revisit = ONE opportunity")
+        self.assertEqual(len(exps), 10, "One revisit → 10 experiments")
+        self.assertEqual(engine._fvg_revisit_count.get(rfid), 1,
+            "revisit_count = 1, never incremented per experiment")
 
 
 if __name__ == "__main__":
