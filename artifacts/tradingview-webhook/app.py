@@ -28952,6 +28952,33 @@ def _fvg_bar_close(inst: str, price: float) -> None:
     threading.Thread(target=_run, daemon=True, name=f"fvg-scan-{inst}").start()
 
 
+def _orb_bar_close(inst: str, price: float) -> None:
+    """Feed the 09:30 ORB Engine on every Databento 1m bar close.
+    SHADOW / DISPLAY-ONLY — NEVER calls execute_trade_gateway, never touches
+    gate, scoring, sizing, or the 08:00 INTRADAY_BY_TICKER state.
+
+    Also feeds the Phase 2 Ghost Research Engine (fail-open, after ORB)."""
+    if "_ORB_ENGINE" not in globals():
+        return
+    try:
+        engine = globals()["_ORB_ENGINE"]
+        engine.on_bar_close(inst, price)
+    except Exception as _orb_exc:
+        logger.debug("ORB bar-close (%s): %s", inst, _orb_exc)
+    # ── Phase 2 Ghost Research Engine ────────────────────────────────────────
+    # Called AFTER OrbEngine so it can read the updated orb_status snapshot.
+    # Completely fail-open — any exception is caught inside the GRE itself.
+    if "_GHOST_RESEARCH_ENGINE" not in globals():
+        return
+    try:
+        _gre = globals()["_GHOST_RESEARCH_ENGINE"]
+        _orb_eng = globals()["_ORB_ENGINE"]
+        _orb_status = _orb_eng.get_instrument_status(inst)
+        _gre.on_bar_close(inst, _orb_status, price)
+    except Exception as _gre_exc:
+        logger.debug("GhostResearch bar-close (%s): %s", inst, _gre_exc)
+
+
 def _databento_bar_scan(inst: str, price: float) -> None:
     """Proactive scanner: check for a READY setup at every Databento 1m bar close.
 
@@ -45054,6 +45081,7 @@ MICRO_GHOST_WATCH_LOCK = threading.Lock()   # single-flight watcher cycles
 # Table: ghost_observations (created via DB tool / publish schema-diff; no DDL).
 GHOST_OBS_DB_READY       = False
 EL_DB_READY              = False   # set by _check_edge_ledger_db_ready() — Phase 8A
+GRE_DB_READY             = False   # set by _check_gre_db_ready() — Phase 2 Ghost Research Engine
 GHOST_OBS_WATCH_LOCK     = threading.Lock()   # single-flight watcher cycle
 GHOST_OBS_COOLDOWN_SECS  = max(60, int(os.environ.get("GHOST_OBS_COOLDOWN_SECS", "300")))
 _GHOST_OBS_COOLDOWN      = {}                  # (inst, direction, strategy_short) → monotonic ts
@@ -45166,6 +45194,38 @@ def _check_ghost_obs_db_ready():
     except Exception as exc:
         logger.warning("ProfitabilityEngine: ghost_observations table unavailable "
                        "(ghost logging disabled): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _check_gre_db_ready() -> None:
+    """Probe Phase 2 Ghost Research Engine tables and set GRE_DB_READY.
+    FAIL-OPEN: missing tables / unavailable DB disables research recording only.
+    Never touches gate, scoring, sizing, learning, or execution.
+    Tables: ghost_opportunities, ghost_experiments, ghost_experiment_results
+    (created via DB tool / publish schema-diff; no DDL in app code).
+    """
+    global GRE_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM ghost_opportunities LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM ghost_experiments LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM ghost_experiment_results LIMIT 1")
+            cur.fetchone()
+        GRE_DB_READY = True
+        logger.info("GhostResearchEngine: DB tables (ghost_opportunities/experiments/results) ready")
+    except Exception as exc:
+        logger.warning("GhostResearchEngine: DB probe failed (GRE disabled): %s", exc)
     finally:
         try:
             conn.close()
@@ -64122,34 +64182,11 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
 <!-- 9:30 ET Breakout Mode (display-only advisory; flag-gated). Fed by d.breakout_mode;
      the renderer hides this whole panel when the block is absent (flag OFF). -->
 <div class="mod" id="mod-breakout" data-cat="experimental" style="display:none">
-  <div class="mod-h">🚀 9:30 Breakout Mode <span id="bo-mode" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-experimental">EXPERIMENTAL</span></div>
-  <div class="se-top">
-    <div class="gstat"><div class="l">Entry Status</div><div class="v" id="bo-status">—</div></div>
-    <div class="gstat"><div class="l">Break</div><div class="v" id="bo-dir">—</div></div>
-    <div class="gstat"><div class="l">Quality</div><div class="v" id="bo-quality">—</div></div>
-    <div class="gstat"><div class="l">Setup</div><div class="v" id="bo-kind">—</div></div>
-  </div>
-  <div class="se-top">
-    <div class="gstat"><div class="l">OR High</div><div class="v" id="bo-orhigh">—</div></div>
-    <div class="gstat"><div class="l">OR Low</div><div class="v" id="bo-orlow">—</div></div>
-    <div class="gstat"><div class="l">Long Target</div><div class="v" id="bo-longrr">—</div></div>
-    <div class="gstat"><div class="l">Short Target</div><div class="v" id="bo-shortrr">—</div></div>
-  </div>
-  <div class="se-reason" id="bo-reason"></div>
-  <div class="se-missing" id="bo-confirms"></div>
-  <div class="se-bias-h">Suggested Plan</div>
-  <div class="se-bias">
-    <div class="gstat"><div class="l">Entry</div><div class="v" id="bo-entry">—</div></div>
-    <div class="gstat"><div class="l">Stop</div><div class="v" id="bo-stop">—</div></div>
-    <div class="gstat"><div class="l">TP1</div><div class="v" id="bo-tp1">—</div></div>
-    <div class="gstat"><div class="l">TP2</div><div class="v" id="bo-tp2">—</div></div>
-    <div class="gstat"><div class="l">Runner</div><div class="v" id="bo-runner">—</div></div>
-  </div>
-  <div class="se-bias-h">Failure Risk <span id="bo-faillevel" style="font-size:10px;letter-spacing:1px"></span></div>
-  <div class="se-missing" id="bo-failreasons"></div>
-  <div class="se-bias-h">Trade Management</div>
-  <div class="se-list" id="bo-mgmt"></div>
-  <div class="se-fid" id="bo-fid"></div>
+  <div class="mod-h">🚀 09:30 ORB Engine <span id="orb-global-badge" style="font-size:10px;color:#6b7280;letter-spacing:1px"></span><span class="mod-cat cat-experimental">SHADOW</span></div>
+  <div id="orb-portfolio-bar" style="font-size:10px;color:#6b7280;margin-bottom:8px;padding:4px 8px;background:rgba(255,255,255,.04);border-radius:4px"></div>
+  <div id="orb-instruments-grid"></div>
+  <div id="orb-timeline-feed" style="margin-top:10px"></div>
+  <div style="font-size:10px;color:#4b5563;margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,.06)">Shadow only — no orders transmitted. 08:00 ORB engine is independent and untouched.</div>
 </div>
 
 <!-- Swing Mode V2 — HTF swing scoring + lifecycle (DISPLAY-ONLY; flag-gated) -->
@@ -70989,92 +71026,168 @@ function renderSwingV2(d){
 
 // 9:30 ET Breakout Mode panel — fed by d.breakout_mode (compute_breakout_mode).
 // DISPLAY-ONLY; the whole panel is hidden when the block is absent (flag OFF).
+// ── 09:30 ORB Engine Dashboard — 4-instrument shadow view ────────────────
+// Replaces the old single-instrument advisory renderBreakoutMode.
+// Data comes from a dedicated /api/orb/status poll (independent of /status).
+// SHADOW mode only — no order transmission, no gate interaction.
+
 function renderBreakoutMode(d){
-  const mod = document.getElementById('mod-breakout');
-  if (!mod) return;
-  const bo = (d && d.breakout_mode) || null;
-  if (!bo){ mod.style.display='none'; return; }
-  mod.style.display='';
-
-  const modeEl = document.getElementById('bo-mode');
-  if (modeEl) modeEl.textContent = bo.active ? '· ACTIVE' : '· INACTIVE';
-
-  // Entry status
-  const stEl=document.getElementById('bo-status');
-  if (stEl){
-    const st = bo.entry_status || 'WAIT';
-    stEl.textContent = st;
-    stEl.style.color = st.indexOf('READY')===0 ? (st.indexOf('LONG')>=0 ? '#22c55e' : '#ef4444') : '#eab308';
-  }
-  // Break direction
-  const dirEl=document.getElementById('bo-dir');
-  if (dirEl){
-    const dr = bo.break_direction || 'None';
-    dirEl.textContent = dr;
-    dirEl.style.color = dr==='Long' ? '#22c55e' : dr==='Short' ? '#ef4444' : '#6b7280';
-  }
-  // Quality
-  const qEl=document.getElementById('bo-quality');
-  if (qEl){
-    const q = Number(bo.quality_score||0);
-    qEl.textContent = q ? (q+'/100') : '—';
-    qEl.style.color = q>=70 ? '#22c55e' : q>=50 ? '#eab308' : '#6b7280';
-  }
-  _modTxt('bo-kind', (bo.setup_kind && bo.setup_kind!=='None') ? bo.setup_kind : '—');
-  _modTxt('bo-orhigh', bo.or_high!=null ? Number(bo.or_high).toFixed(2) : '—');
-  _modTxt('bo-orlow',  bo.or_low!=null  ? Number(bo.or_low).toFixed(2)  : '—');
-  function rrTxt(v){ return v!=null ? ('1:'+v) : '—'; }
-  _modTxt('bo-longrr',  rrTxt(bo.long_target_potential));
-  _modTxt('bo-shortrr', rrTxt(bo.short_target_potential));
-
-  // Reason
-  const reEl=document.getElementById('bo-reason'); if (reEl) reEl.textContent = bo.reason || '';
-
-  // Confirmation chips
-  const cEl=document.getElementById('bo-confirms');
-  if (cEl){
-    const cs = bo.confirmations || [];
-    cEl.innerHTML = cs.map(function(c){
-      const ok = !!c.met;
-      const col = ok ? 'background:#0f2417;border-color:#1b3a26;color:#7fe9a3' : '';
-      return '<span class="se-chip" style="'+col+'">'+(ok?'\u2713 ':'\u2717 ')+_modEsc(c.label)+'</span>';
-    }).join('');
-  }
-
-  // Suggested plan
-  const pl = bo.plan || null;
-  _modTxt('bo-entry',  pl && pl.entry!=null  ? Number(pl.entry).toFixed(2)  : '—');
-  _modTxt('bo-stop',   pl && pl.stop!=null   ? Number(pl.stop).toFixed(2)   : '—');
-  _modTxt('bo-tp1',    pl && pl.tp1!=null    ? Number(pl.tp1).toFixed(2)    : '—');
-  _modTxt('bo-tp2',    pl && pl.tp2!=null    ? Number(pl.tp2).toFixed(2)    : '—');
-  _modTxt('bo-runner', pl && pl.runner!=null ? Number(pl.runner).toFixed(2) : '—');
-
-  // Failure level + reasons
-  const flEl=document.getElementById('bo-faillevel');
-  if (flEl){
-    const fl = bo.failure_level || 'None';
-    flEl.textContent = '· '+fl;
-    flEl.style.color = fl==='High' ? '#ef4444' : fl==='Elevated' ? '#f59e0b' : fl==='Low' ? '#eab308' : '#6b7280';
-  }
-  const frEl=document.getElementById('bo-failreasons');
-  if (frEl){
-    const fr = bo.failure_reasons || [];
-    frEl.innerHTML = fr.length
-      ? fr.map(function(x){ return '<span class="se-chip" style="border-color:#5b2330;color:#f4a3b0">'+_modEsc(x)+'</span>'; }).join('')
-      : '<span class="se-chip" style="background:#0f2417;border-color:#1b3a26;color:#7fe9a3">\u2713 No failure flags</span>';
-  }
-
-  // Management
-  const mEl=document.getElementById('bo-mgmt');
-  if (mEl){
-    const mg = bo.management || [];
-    mEl.innerHTML = mg.map(function(x){ return '<div class="se-row"><div class="nm">'+_modEsc(x)+'</div></div>'; }).join('');
-  }
-
-  // Fidelity caveat
-  const fdEl=document.getElementById('bo-fid');
-  if (fdEl) fdEl.textContent = bo.note || 'Display-only. Opening range from price ticks; gate stays authoritative.';
+  // Old advisory data (compute_breakout_mode) is retired.
+  // The mod-breakout panel is now fully owned by renderOrbPanel().
+  // Keep this stub so existing callers in the main poll don't error.
 }
+
+(function _initOrbPoll(){
+  var _orbPollTimer = null;
+  var _orbPollInterval = 5000; // ms
+
+  function _orbStateColor(state){
+    if (!state) return '#6b7280';
+    if (state === 'POSITION_ACTIVE' || state === 'POSITION_MANAGING') return '#22c55e';
+    if (state === 'QUALIFIED' || state === 'RISK_RESERVED') return '#a3e635';
+    if (state === 'WATCHING_BREAKOUT' || state === 'RANGE_LOCKED') return '#60a5fa';
+    if (state === 'BUILDING_RANGE') return '#93c5fd';
+    if (state.indexOf('BLOCKED') === 0) return '#ef4444';
+    if (state === 'EXPIRED') return '#6b7280';
+    if (state === 'BREAKOUT_MISSED') return '#f59e0b';
+    if (state === 'BREAKOUT_DETECTED' || state === 'CONFIRMATION_PENDING') return '#fbbf24';
+    if (state === 'DATA_INVALID') return '#ef4444';
+    return '#9ca3af';
+  }
+
+  function _orbStateBadge(state){
+    var col = _orbStateColor(state);
+    var label = (state || 'UNKNOWN').replace(/_/g,' ');
+    return '<span style="display:inline-block;padding:1px 6px;border-radius:3px;font-size:9px;letter-spacing:.8px;font-weight:600;border:1px solid '+col+'40;color:'+col+';background:'+col+'14">'+_modEsc(label)+'</span>';
+  }
+
+  function _orbFmt(v, dp){
+    if (v == null) return '\u2014';
+    return Number(v).toFixed(dp != null ? dp : 2);
+  }
+
+  function _orbInstCard(inst, s){
+    if (!s) return '';
+    var state = s.state || 'DISABLED';
+    var col   = _orbStateColor(state);
+    var rangeHtml = '';
+    if (s.range_locked && s.or_high != null){
+      rangeHtml = '<div style="display:flex;gap:12px;margin-top:4px;font-size:10px;color:#9ca3af">'
+        +'<span>H '+_orbFmt(s.or_high,2)+'</span>'
+        +'<span>L '+_orbFmt(s.or_low,2)+'</span>'
+        +'<span>W '+_orbFmt(s.or_width,2)+'</span>'
+        +'<span style="color:#6b7280">lock '+_modEsc(s.lock_time_et||'')+'</span>'
+        +'</div>';
+    }
+    var planHtml = '';
+    if (s.entry != null){
+      var dir = s.breakout_direction || '';
+      var dCol = dir === 'LONG' ? '#22c55e' : '#ef4444';
+      planHtml = '<div style="margin-top:5px;padding:5px 7px;background:rgba(255,255,255,.03);border-radius:4px;font-size:10px">'
+        +'<span style="color:'+dCol+';font-weight:600;margin-right:6px">'+_modEsc(dir)+'</span>'
+        +'<span style="color:#9ca3af">Entry </span><span style="color:#e2e8f0">'+_orbFmt(s.entry,2)+'</span>'
+        +' <span style="color:#9ca3af">Stop </span><span style="color:#f87171">'+_orbFmt(s.stop,2)+'</span>'
+        +' <span style="color:#9ca3af">TP1 </span><span style="color:#86efac">'+_orbFmt(s.tp1,2)+'</span>'
+        +' <span style="color:#9ca3af">TP2 </span><span style="color:#86efac">'+_orbFmt(s.tp2,2)+'</span>'
+        +(s.contracts ? ' <span style="color:#6b7280">'+s.contracts+'c</span>' : '')
+        +(s.risk_dollars ? ' <span style="color:#6b7280">$'+_orbFmt(s.risk_dollars,0)+'</span>' : '')
+        +'</div>';
+    }
+    var blockHtml = '';
+    if (s.block_reason){
+      blockHtml = '<div style="font-size:9px;color:#ef4444;margin-top:3px">'+_modEsc(s.block_reason.replace(/_/g,' '))+'</div>';
+    }
+    return '<div style="padding:7px 9px;border:1px solid rgba(255,255,255,.08);border-radius:6px;margin-bottom:6px;border-left:2px solid '+col+'">'
+      +'<div style="display:flex;justify-content:space-between;align-items:center">'
+      +'<span style="font-size:11px;font-weight:600;color:#e2e8f0">'+_modEsc(inst)+'</span>'
+      +_orbStateBadge(state)
+      +'</div>'
+      +rangeHtml+planHtml+blockHtml
+      +'</div>';
+  }
+
+  function renderOrbPanel(data){
+    var mod = document.getElementById('mod-breakout');
+    if (!mod) return;
+    if (!data || !data.ok){
+      // Engine not booted or error — keep panel hidden unless it was already shown
+      return;
+    }
+    mod.style.display = '';
+
+    // Global badge
+    var badge = document.getElementById('orb-global-badge');
+    if (badge){
+      var gm = (data.global_mode || 'SHADOW');
+      badge.textContent = '\u00b7 ' + gm;
+      badge.style.color = gm === 'SHADOW' ? '#60a5fa' : gm === 'PAPER' ? '#a3e635' : '#6b7280';
+    }
+
+    // Portfolio bar
+    var pb = document.getElementById('orb-portfolio-bar');
+    if (pb && data.portfolio){
+      var p = data.portfolio;
+      pb.textContent = 'Positions: '+p.active_positions+'/'+p.max_positions
+        +' \u2502 Index risk: $'+_orbFmt(p.active_index_risk,0)+'/$'+_orbFmt(p.max_index_risk,0)
+        +' \u2502 Metals risk: $'+_orbFmt(p.active_metals_risk,0)+'/$'+_orbFmt(p.max_metals_risk,0);
+    }
+
+    // Instruments grid
+    var grid = document.getElementById('orb-instruments-grid');
+    if (grid && data.instruments){
+      var instruments = ['MGC','MNQ','MES','MYM'];
+      grid.innerHTML = instruments.map(function(i){
+        return _orbInstCard(i, data.instruments[i]);
+      }).join('');
+    }
+
+    // Recent timeline (last 6 events)
+    var tl = document.getElementById('orb-timeline-feed');
+    if (tl){
+      var events = [];
+      if (data.instruments){
+        ['MGC','MNQ','MES','MYM'].forEach(function(i){
+          var ist = data.instruments[i];
+          if (ist && ist.timeline_events){
+            ist.timeline_events.slice(-3).forEach(function(ev){ events.push(ev); });
+          }
+        });
+      }
+      events.sort(function(a,b){ return (b.ts||'').localeCompare(a.ts||''); });
+      events = events.slice(0, 6);
+      if (events.length){
+        tl.innerHTML = '<div style="font-size:9px;color:#6b7280;letter-spacing:.8px;margin-bottom:4px">TIMELINE</div>'
+          + events.map(function(ev){
+            var inst  = ev.instrument || '';
+            var etype = (ev.event_type || '').replace(/_/g,' ');
+            var ts    = (ev.ts||'').replace('T',' ').replace(/\\..*/,'').replace('+00:00','').slice(11,16);
+            var col   = _orbStateColor(ev.event_type);
+            return '<div style="display:flex;gap:6px;font-size:10px;padding:2px 0;border-bottom:1px solid rgba(255,255,255,.04)">'
+              +'<span style="color:#4b5563;min-width:34px">'+_modEsc(ts)+'</span>'
+              +'<span style="color:#6b7280;min-width:30px">'+_modEsc(inst)+'</span>'
+              +'<span style="color:'+col+'">'+_modEsc(etype)+'</span>'
+              +'</div>';
+          }).join('');
+      } else {
+        tl.innerHTML = '';
+      }
+    }
+  }
+
+  function _fetchOrbStatus(){
+    fetch('/api/orb/status').then(function(r){ return r.ok ? r.json() : null; }).then(function(data){
+      if (data) renderOrbPanel(data);
+    }).catch(function(){});
+    _orbPollTimer = setTimeout(_fetchOrbStatus, _orbPollInterval);
+  }
+
+  // Start the ORB poll when the DOM is ready
+  if (document.readyState === 'loading'){
+    document.addEventListener('DOMContentLoaded', function(){ setTimeout(_fetchOrbStatus, 500); });
+  } else {
+    setTimeout(_fetchOrbStatus, 500);
+  }
+})();
 
 // Market Intelligence panel — fed by d.market_intelligence (compute_market_intelligence).
 // DISPLAY-ONLY; the whole panel is hidden when the block is absent (master flag OFF).
@@ -77054,6 +77167,101 @@ def fvg_sequences_endpoint():
         return jsonify({"ok": False, "error": str(exc)}), 200
 
 
+@app.route("/orb/status", methods=["GET"])
+def route_orb_status():
+    """09:30 ORB Engine — full four-instrument status snapshot.
+    SHADOW / DISPLAY-ONLY — never touches gate, scoring, sizing, or execution.
+    Auth handled by Express proxy (no OPEN_PATHS entry needed — same pattern
+    as /fvg/sequences and /research-health)."""
+    if "_ORB_ENGINE" not in globals():
+        return jsonify({"ok": False, "enabled": False, "reason": "engine_not_booted"}), 200
+    try:
+        engine = globals()["_ORB_ENGINE"]
+        return jsonify({"ok": True, **engine.get_all_status()}), 200
+    except Exception as exc:
+        logger.warning("/orb/status error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
+@app.route("/orb/status/<inst>", methods=["GET"])
+def route_orb_status_inst(inst):
+    """09:30 ORB Engine — single-instrument status snapshot."""
+    if "_ORB_ENGINE" not in globals():
+        return jsonify({"ok": False, "reason": "engine_not_booted"}), 200
+    try:
+        engine = globals()["_ORB_ENGINE"]
+        data   = engine.get_instrument_status(inst.upper())
+        return jsonify({"ok": True, **data}), 200
+    except Exception as exc:
+        logger.warning("/orb/status/%s error: %s", inst, exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
+@app.route("/orb/config", methods=["GET"])
+def route_orb_config_get():
+    """09:30 ORB Engine — read current configuration."""
+    if "_ORB_ENGINE" not in globals():
+        return jsonify({"ok": False, "reason": "engine_not_booted"}), 200
+    try:
+        engine = globals()["_ORB_ENGINE"]
+        return jsonify({"ok": True, "config": engine.get_config()}), 200
+    except Exception as exc:
+        logger.warning("/orb/config GET error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
+@app.route("/orb/config", methods=["POST"])
+def route_orb_config_post():
+    """09:30 ORB Engine — update configuration (owner-only via Express auth).
+    Only accepts a JSON patch dict; validates range_duration_min ∈ {5,10,15,30}."""
+    if "_ORB_ENGINE" not in globals():
+        return jsonify({"ok": False, "reason": "engine_not_booted"}), 200
+    try:
+        patch  = request.get_json(force=True) or {}
+        engine = globals()["_ORB_ENGINE"]
+        result = engine.set_config(patch)
+        return jsonify({"ok": True, "config": result}), 200
+    except ValueError as ve:
+        return jsonify({"ok": False, "error": str(ve)}), 400
+    except Exception as exc:
+        logger.warning("/orb/config POST error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
+@app.route("/orb/timeline", methods=["GET"])
+def route_orb_timeline():
+    """09:30 ORB Engine — event timeline (all instruments or one).
+    Query params: inst (optional), limit (default 100)."""
+    if "_ORB_ENGINE" not in globals():
+        return jsonify({"ok": False, "reason": "engine_not_booted"}), 200
+    try:
+        inst   = (request.args.get("inst") or "").upper().strip() or None
+        limit  = int(request.args.get("limit", 100))
+        engine = globals()["_ORB_ENGINE"]
+        events = engine.get_timeline(inst=inst, limit=limit)
+        return jsonify({"ok": True, "events": events, "count": len(events)}), 200
+    except Exception as exc:
+        logger.warning("/orb/timeline error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
+@app.route("/orb/shadow-trades", methods=["GET"])
+def route_orb_shadow_trades():
+    """09:30 ORB Engine — historical shadow trade records from Postgres.
+    Query params: inst (optional), limit (default 100)."""
+    if "_ORB_ENGINE" not in globals():
+        return jsonify({"ok": False, "reason": "engine_not_booted"}), 200
+    try:
+        inst   = (request.args.get("inst") or "").upper().strip() or None
+        limit  = int(request.args.get("limit", 100))
+        engine = globals()["_ORB_ENGINE"]
+        trades = engine.get_shadow_trades_from_db(instrument=inst, limit=limit)
+        return jsonify({"ok": True, "trades": trades, "count": len(trades)}), 200
+    except Exception as exc:
+        logger.warning("/orb/shadow-trades error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
+
+
 @app.route("/profitability/summary", methods=["GET"])
 def route_profitability_summary():
     """Edge Ledger — aggregated stats per strategy × instrument (RESEARCH / DISPLAY-ONLY).
@@ -77522,7 +77730,154 @@ def route_research_health():
         and dup_total == 0
     )
 
+    # ── Phase 2 Ghost Research Engine status ──────────────────────────────────
+    gre_health: dict = {"db_ready": GRE_DB_READY, "engine_running": False}
+    if GRE_DB_READY and "_GHOST_RESEARCH_ENGINE" in globals():
+        try:
+            gre_health = globals()["_GHOST_RESEARCH_ENGINE"].get_health()
+        except Exception as _gre_h_exc:
+            gre_health["error"] = str(_gre_h_exc)
+    out["ghost_research_engine"] = gre_health
+
     return jsonify(out)
+
+
+@app.route("/ghost-research/health", methods=["GET"])
+def route_ghost_research_health():
+    """Ghost Research Engine operational health — Phase 2 (DISPLAY-ONLY).
+    Auth handled by Express proxy. NOT in OPEN_PATHS.
+    NEVER touches gate, scoring, sizing, learning, or execution.
+    """
+    if not GRE_DB_READY or "_GHOST_RESEARCH_ENGINE" not in globals():
+        return jsonify({"ok": True, "db_ready": False, "engine_running": False,
+                        "reason": "GRE not initialised (DB not ready or engine not started)"})
+    try:
+        return jsonify({"ok": True, **globals()["_GHOST_RESEARCH_ENGINE"].get_health()})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
+
+@app.route("/ghost-research/candidates", methods=["GET"])
+def route_ghost_research_candidates():
+    """Top research candidates ranked by net expectancy — Phase 2 (DISPLAY-ONLY).
+    Auth handled by Express proxy. NOT in OPEN_PATHS.
+    """
+    if not GRE_DB_READY or "_GHOST_RESEARCH_ENGINE" not in globals():
+        return jsonify({"ok": True, "candidates": [], "reason": "GRE not initialised"})
+    try:
+        min_s = int(request.args.get("min_samples", 10))
+        cands = globals()["_GHOST_RESEARCH_ENGINE"].get_candidates(min_samples=min_s)
+        return jsonify({"ok": True, "candidates": cands, "count": len(cands)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
+
+@app.route("/ghost-research/experiments", methods=["GET"])
+def route_ghost_research_experiments():
+    """List ghost experiments with optional filters — Phase 2 (DISPLAY-ONLY).
+    Query params: instrument, variant, limit (default 100).
+    Auth handled by Express proxy. NOT in OPEN_PATHS.
+    """
+    if not GRE_DB_READY or "_GHOST_RESEARCH_ENGINE" not in globals():
+        return jsonify({"ok": True, "experiments": []})
+    try:
+        inst    = request.args.get("instrument", "").strip().upper() or None
+        variant = request.args.get("variant", "").strip() or None
+        limit   = min(500, int(request.args.get("limit", 100)))
+        exps = globals()["_GHOST_RESEARCH_ENGINE"].get_experiments(
+            instrument=inst, variant=variant, limit=limit)
+        return jsonify({"ok": True, "experiments": exps, "count": len(exps)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
+
+@app.route("/ghost-research/candidate/<experiment_id>", methods=["GET"])
+def route_ghost_research_candidate(experiment_id: str):
+    """Drill-down detail for one experiment including bootstrap CI and Monte Carlo — Phase 2 (DISPLAY-ONLY).
+    Auth handled by Express proxy. NOT in OPEN_PATHS.
+    """
+    if not GRE_DB_READY or "_GHOST_RESEARCH_ENGINE" not in globals():
+        return jsonify({"ok": False, "error": "GRE not initialised"})
+    try:
+        detail = globals()["_GHOST_RESEARCH_ENGINE"].get_candidate(experiment_id)
+        return jsonify({"ok": True, **detail})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
+
+@app.route("/ghost-research/opportunity/<opportunity_id>", methods=["GET"])
+def route_ghost_research_opportunity(opportunity_id: str):
+    """Full opportunity snapshot with all variant statuses — Phase 2 (DISPLAY-ONLY).
+    Auth handled by Express proxy. NOT in OPEN_PATHS.
+    """
+    if not GRE_DB_READY or "_GHOST_RESEARCH_ENGINE" not in globals():
+        return jsonify({"ok": False, "error": "GRE not initialised"})
+    try:
+        opp = globals()["_GHOST_RESEARCH_ENGINE"].get_opportunity(opportunity_id)
+        return jsonify({"ok": True, "opportunity": opp})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
+
+@app.route("/ghost-research/baseline-vs-variant", methods=["GET"])
+def route_ghost_research_baseline_vs_variant():
+    """Paired baseline vs variant comparison table — Phase 2 (DISPLAY-ONLY).
+    Query param: instrument (optional filter).
+    Auth handled by Express proxy. NOT in OPEN_PATHS.
+    """
+    if not GRE_DB_READY or "_GHOST_RESEARCH_ENGINE" not in globals():
+        return jsonify({"ok": True, "comparison": []})
+    try:
+        inst = request.args.get("instrument", "").strip().upper() or None
+        rows = globals()["_GHOST_RESEARCH_ENGINE"].get_baseline_vs_variant(instrument=inst)
+        return jsonify({"ok": True, "comparison": rows, "count": len(rows)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+
+
+@app.route("/ghost-research/ready-for-review", methods=["GET"])
+def route_ghost_research_ready_for_review():
+    """Experiments that have reached READY_FOR_REVIEW evidence state.
+    Consumed by the GlobalAlertDock poller.  DISPLAY-ONLY.
+    Auth handled by Express proxy. NOT in OPEN_PATHS.
+    IMPORTANT: this endpoint reports a RESEARCH finding only — it NEVER
+    auto-modifies OrbEngine config, live weights, or execution behaviour.
+    Any application of research findings requires deliberate operator action.
+    """
+    if not GRE_DB_READY or not LEARNING_DB_ENABLED:
+        return jsonify({"ok": True, "experiments": []})
+    conn = _learning_conn()
+    if not conn:
+        return jsonify({"ok": True, "experiments": []})
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT e.experiment_id, e.variant_name, e.evidence_state,
+                       o.instrument, o.direction, o.trading_date,
+                       r.net_r, r.entry_timestamp
+                FROM ghost_experiments e
+                JOIN ghost_opportunities o ON o.opportunity_id=e.opportunity_id
+                LEFT JOIN ghost_experiment_results r ON r.experiment_id=e.experiment_id
+                WHERE e.evidence_state='READY_FOR_REVIEW'
+                ORDER BY r.entry_timestamp DESC NULLS LAST
+                LIMIT 20
+            """)
+            rows = cur.fetchall()
+            cols = [d[0] for d in cur.description]
+            results = []
+            for row in rows:
+                d = dict(zip(cols, row))
+                d["trading_date"] = d["trading_date"].isoformat() if d.get("trading_date") else None
+                d["entry_timestamp"] = d["entry_timestamp"].isoformat() if d.get("entry_timestamp") else None
+                results.append(d)
+        return jsonify({"ok": True, "experiments": results, "count": len(results)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 @app.route("/research-events", methods=["GET"])
@@ -80203,6 +80558,7 @@ if __name__ == "__main__":
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
         _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
         _check_ghost_obs_db_ready()                # probe ghost_observations (no DDL; created via DB tool/publish diff) — PROFITABILITY ENGINE PHASE 1, RESEARCH/DISPLAY-ONLY
+        _check_gre_db_ready()                      # probe ghost_opportunities/experiments/results (no DDL; created via DB tool/publish diff) — PHASE 2 GHOST RESEARCH ENGINE, RESEARCH/DISPLAY-ONLY
         _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
@@ -80320,6 +80676,47 @@ if __name__ == "__main__":
             ).start()
         except Exception as _mtf_reg_exc:
             logger.warning("MTFTrend: callback registration failed — %s", _mtf_reg_exc)
+    # ── 09:30 ORB Algorithmic Engine — SHADOW / DISPLAY-ONLY ─────────────────
+    # Four-instrument independent state machine.  Runs in SHADOW mode by default.
+    # NEVER calls execute_trade_gateway.  NEVER touches INTRADAY_BY_TICKER,
+    # BREAKOUT_OR_BY_TICKER, or any live state.  Fail-open throughout.
+    if DATABENTO_ENABLED and "_DATABENTO_BRAIN" in globals():
+        try:
+            import orb_engine as _orb_mod                            # noqa: PLC0415
+            from databento_brain import DATABENTO_BARS_BY_INST as _ORB_DB_BARS  # noqa: PLC0415
+            _ORB_ENGINE = _orb_mod.OrbEngine(
+                assets      = ASSETS,
+                get_db_fn   = get_db_connection,
+                get_bars_fn = lambda inst: list(_ORB_DB_BARS.get(inst, [])),
+            )
+            globals()["_ORB_ENGINE"] = _ORB_ENGINE
+            _ORB_ENGINE.boot()
+            globals()["_DATABENTO_BRAIN"].register_bar_close_callback(_orb_bar_close)
+            logger.info("OrbEngine: 09:30 ORB shadow engine started + bar-close callback registered")
+        except Exception as _orb_boot_exc:
+            logger.warning("OrbEngine: boot error (non-critical, fail-open): %s", _orb_boot_exc)
+    # ── Phase 2 Ghost Research Engine — SHADOW / RESEARCH ONLY ──────────────
+    # Observes the OrbEngine's BREAKOUT_DETECTED transitions and runs up to 10
+    # ghost experiment variants per opportunity. Never touches gate, scoring,
+    # sizing, learning, or execution. All findings require human review.
+    # FAIL-OPEN: if GRE_DB_READY is False, the hook in _orb_bar_close is a no-op.
+    if DATABENTO_ENABLED and GRE_DB_READY and "_ORB_ENGINE" in globals():
+        try:
+            import ghost_research_engine as _gre_mod  # noqa: PLC0415
+            import canonical_market_state as _gre_cms  # noqa: PLC0415
+            from databento_brain import DATABENTO_BARS_BY_INST as _GRE_BARS  # noqa: PLC0415
+            _GHOST_RESEARCH_ENGINE = _gre_mod.GhostResearchEngine(
+                get_db_fn        = get_db_connection,
+                get_canonical_fn = _gre_cms.get_canonical_market_state,
+                get_bars_fn      = lambda inst: list(_GRE_BARS.get(inst, [])),
+                re_event_fn      = _re_event,
+                instruments      = ASSETS,
+            )
+            globals()["_GHOST_RESEARCH_ENGINE"] = _GHOST_RESEARCH_ENGINE
+            _GHOST_RESEARCH_ENGINE.boot()
+            logger.info("GhostResearchEngine: Phase 2 research engine started (10 variant families)")
+        except Exception as _gre_boot_exc:
+            logger.warning("GhostResearchEngine: boot error (non-critical, fail-open): %s", _gre_boot_exc)
     # ── Canonical Market State Engine — SHADOW / OBSERVATION ONLY ────────────
     # Registers a bar-close callback so every closed Databento 1m bar is fed
     # into the shadow VWAP / ATR / structure / sweep calculators.

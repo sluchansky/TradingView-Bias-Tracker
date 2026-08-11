@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef } from "react";
-import { AlertToastOverlay } from "../components/AlertToastOverlay";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type TradePlan = {
@@ -1104,7 +1103,6 @@ export default function Cockpit() {
           </div>
         </div>
       )}
-      <AlertToastOverlay ticker={activeTicker} />
     </div>
   );
 }

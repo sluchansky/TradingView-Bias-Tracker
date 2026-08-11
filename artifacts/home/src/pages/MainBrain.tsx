@@ -12447,6 +12447,16 @@ export default function MainBrain() {
     setTicker(t); try { localStorage.setItem('mb_ticker', t); } catch {}
   };
 
+  // Listen for ticker-switch events from GlobalAlertDock (when operator clicks an alert)
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const inst = (e as CustomEvent<string>).detail;
+      if (inst && typeof inst === 'string') handleSetTicker(inst);
+    };
+    window.addEventListener('mb:ticker', handler);
+    return () => window.removeEventListener('mb:ticker', handler);
+  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+
   // Redirect unknown section segments to the root overview (replace so the invalid
   // URL is removed from browser history rather than pushed as a new entry).
   const [, navigate] = useLocation();
@@ -12674,24 +12684,13 @@ export default function MainBrain() {
     if (isConnected)    prevFetchOkRef.current = true;
     if (isDisconnected) prevFetchOkRef.current = false;
 
-    // READY_TO_TRADE — highest priority: fires only on NOT_READY → READY transition.
-    // prevActionableRef starts null so the very first READY payload also fires.
+    // READY_TO_TRADE — play sound on NOT_READY → READY transition.
+    // The visual pill is handled by the App-level GlobalAlertDock (persistent,
+    // never auto-dismisses). We keep the sound here but skip the BellToast visual
+    // to avoid a duplicate pill on this page.
     if (isActionable && prevActionableRef.current !== true) {
       audioManager.play(SoundEvent.READY_TO_TRADE);
-      const inst  = safeStr((p.market as Record<string, unknown>)?.instrument, '');
-      const cp    = (p.candidate_preview ?? {}) as Record<string, unknown>;
-      const dir   = safeStr(cp.direction ?? verdict.direction, '');
-      const eb    = (p.edge_breakdown   ?? {}) as Record<string, unknown>;
-      const score = safeNum(eb.score ?? eb.total_score);
-      const strat = safeStr(sc.selected_strategy, '');
-      const parts = ([dir, score != null ? `Edge ${score}` : null, strat || null] as (string|null)[]).filter(Boolean);
-      nextToast = {
-        key:      Date.now(),
-        icon:     '🔔',
-        label:    `${inst ? inst + '  ' : ''}READY TO TRADE`,
-        sublabel: parts.join('  ·  '),
-        color:    T.green,
-      };
+      // intentionally no nextToast assignment — App-level pill shows this
     }
     prevActionableRef.current = isActionable;
 

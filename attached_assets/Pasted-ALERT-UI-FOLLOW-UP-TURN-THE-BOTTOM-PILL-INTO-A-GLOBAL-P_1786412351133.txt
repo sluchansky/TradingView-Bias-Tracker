@@ -1,0 +1,450 @@
+ALERT UI FOLLOW-UP — TURN THE BOTTOM PILL INTO A GLOBAL PERSISTENT ALERT DOCK
+
+The current App-level READY pill is a good start, but it still does not satisfy the operator goal.
+
+The operator eventually does not want to constantly monitor the engine/dashboard.
+
+The home page must become the central place where important trading alerts appear.
+
+DO NOT change trading logic, scoring, execution, or broker behavior.
+
+This task is UI/alert-routing only.
+
+==================================================
+1. DO NOT TRACK ONLY THE SELECTED INSTRUMENT
+==================================================
+
+The global alert component must monitor ALL FOUR instruments simultaneously:
+
+MGC
+MNQ
+MES
+MYM
+
+Do not use localStorage selected ticker as the alert eligibility filter.
+
+The selected ticker may affect what opens when an alert is clicked, but it must NOT determine which alerts can appear.
+
+Example:
+
+Operator is viewing MGC.
+
+MNQ becomes READY.
+
+The MNQ alert MUST still appear.
+
+==================================================
+2. ALERTS MUST SURVIVE READY → WAIT
+==================================================
+
+Do NOT automatically remove an alert just because the underlying setup returns to WAIT.
+
+Once a new actionable alert has fired, preserve it until one of these occurs:
+
+- operator acknowledges/dismisses it
+- operator opens the alert and marks it seen
+- alert expires according to a clearly defined age policy
+
+Default behavior:
+
+alerts remain until acknowledged.
+
+The live market state changing afterward must not erase the evidence that the alert happened.
+
+==================================================
+3. USE AN ALERT QUEUE, NOT ONE SINGLE TOAST
+==================================================
+
+Create a small global alert queue.
+
+If multiple instruments alert close together, do not overwrite the previous one.
+
+Example:
+
+09:43 MNQ READY
+09:44 MES READY
+09:45 MGC ORB QUALIFIED
+
+All three must remain accessible.
+
+Suggested compact display:
+
+[ 🔔 3 ALERTS ] [ latest alert summary ]
+
+Click/tap expands the alert drawer.
+
+Maximum visible compact cards can be limited, but the queue must preserve the recent alerts.
+
+==================================================
+4. ALERT TYPES
+==================================================
+
+Support at minimum:
+
+LIVE_READY
+
+Meaning:
+existing production system reaches READY.
+
+09:30_ORB_SHADOW_QUALIFIED
+
+Meaning:
+new four-instrument 09:30 ORB reaches QUALIFIED in SHADOW mode.
+
+09:30_ORB_BREAKOUT_MISSED
+
+Optional informational alert.
+
+POSITION_MANAGEMENT
+
+Existing active-trade warning/management event if already available.
+
+SYSTEM_SAFETY
+
+Examples:
+daily cap reached
+prop block
+Databento stale
+execution disabled when operator expects execution
+
+Do not mix low-value diagnostic spam into the operator alert stream.
+
+==================================================
+5. CLEARLY DISTINGUISH SHADOW FROM LIVE
+==================================================
+
+This is critical.
+
+A shadow ORB alert must NEVER look like a live-order confirmation.
+
+Example:
+
+MNQ
+09:30 ORB
+SHADOW QUALIFIED
+LONG
+
+not:
+
+TRADE ENTERED
+
+unless an actual broker order was transmitted.
+
+Use prominent:
+
+SHADOW
+
+labeling.
+
+==================================================
+6. ALERT CARD CONTENT
+==================================================
+
+For a LIVE READY alert show:
+
+instrument
+direction
+strategy
+edge score
+timestamp
+
+entry
+stop
+target(s)
+
+major confirmation summary
+
+For a 09:30 ORB SHADOW alert show:
+
+instrument
+direction
+
+ORB state
+confirmation mode
+
+range high
+range low
+
+breakout level
+
+planned entry
+planned stop
+TP1
+TP2
+
+planned contracts
+
+15m trend
+4H trend
+VWAP context
+CVD context
+VIX context if available
+
+blocker if qualified state later failed
+
+timestamp
+
+mode = SHADOW
+
+==================================================
+7. HOME PAGE INTEGRATION
+==================================================
+
+The global alert dock must appear on:
+
+Main Brain home page /
+Dashboard
+Analysis
+Scanner
+Trade Desk
+Execution
+Journal
+Coach
+Alerts
+and any other primary SPA route
+
+Mount it once at the highest App layout level.
+
+Do not create duplicate alert components per page.
+
+==================================================
+8. CLICK BEHAVIOR
+==================================================
+
+Clicking an alert should:
+
+1. switch the active instrument to that alert's instrument
+2. open/show the relevant detail area
+
+LIVE_READY:
+open Main Brain for that instrument
+
+09:30_ORB_SHADOW_QUALIFIED:
+open the 9:30 ORB section/panel for that instrument
+
+Do not automatically execute anything.
+
+==================================================
+9. SOUND
+==================================================
+
+Keep the existing READY sound.
+
+Also allow a distinct but restrained sound for:
+
+09:30 ORB SHADOW QUALIFIED
+
+Do not play sounds repeatedly every polling cycle.
+
+Sound only on a NEW alert event.
+
+Deduplicate using a stable alert/event ID.
+
+==================================================
+10. DEDUPLICATION
+==================================================
+
+A READY state persisting for 5 minutes must create ONE alert, not one every poll.
+
+Use a stable identity such as:
+
+instrument
+strategy
+direction
+setup/event ID
+qualified timestamp
+
+Likewise the ORB engine should expose/use its immutable ORB instance/event identity.
+
+A state transition may create a new alert only when it represents a genuinely new event.
+
+==================================================
+11. PERSISTENCE
+==================================================
+
+Do not rely only on component state.
+
+At minimum persist acknowledged/unacknowledged alert IDs in browser storage so navigation or refresh does not erase them.
+
+If an existing server-side alert/event store can safely be reused, prefer it for durable cross-device history.
+
+Do not create a new heavy persistence system if one already exists.
+
+==================================================
+12. MOBILE / DESKTOP
+==================================================
+
+Desktop:
+
+compact dock centered or bottom-right with expandable drawer.
+
+Mobile:
+
+full-width compact bottom alert bar above browser/navigation controls.
+
+It must not cover important ENTER/CLOSE buttons.
+
+==================================================
+13. 09:30 ORB INTEGRATION
+==================================================
+
+The new OrbEngine already exposes:
+
+/orb/status
+/orb/timeline
+/orb/shadow-trades
+
+Reuse those outputs.
+
+Do NOT change OrbEngine trading logic.
+
+The alert UI may observe state transitions such as:
+
+BREAKOUT_DETECTED
+CONFIRMATION_PENDING
+QUALIFIED
+BREAKOUT_MISSED
+BLOCKED_*
+
+Primary audible/persistent trade-style notification should occur on:
+
+QUALIFIED
+
+in SHADOW mode.
+
+Do not transmit any order.
+
+==================================================
+14. ALERT HISTORY
+==================================================
+
+The expanded drawer should show recent alerts newest first.
+
+For each show:
+
+time
+instrument
+type
+direction
+strategy
+LIVE / SHADOW
+acknowledged/unacknowledged
+
+Include:
+
+CLEAR ACKNOWLEDGED
+
+but do not provide a one-click delete-all that can accidentally erase unseen alerts.
+
+==================================================
+15. EXISTING MAIN BRAIN BELL
+==================================================
+
+Keep the existing sound/event system where useful.
+
+Avoid duplicate visual alerts.
+
+There should be ONE global visual alert authority:
+
+GlobalAlertDock
+
+or equivalent existing naming convention.
+
+==================================================
+16. SAFETY
+==================================================
+
+This task MUST NOT change:
+
+READY logic
+EARLY logic
+WAIT logic
+edge score
+strategy selection
+ORB qualification
+risk
+position sizing
+execution
+TradersPost
+arm state
+prop protection
+daily loss
+broker payloads
+
+UI only.
+
+==================================================
+17. TESTS
+==================================================
+
+Test:
+
+MNQ READY while viewing MGC → MNQ alert appears
+
+MES + MNQ simultaneous alerts → both retained
+
+READY → WAIT → alert remains until acknowledged
+
+refresh page → unseen alert remains
+
+navigation between pages → alert remains
+
+dismiss one alert → others remain
+
+same READY event polled repeatedly → only one alert
+
+new READY event later → new alert created
+
+ORB SHADOW QUALIFIED → clearly labeled SHADOW alert
+
+ORB SHADOW alert → zero broker calls
+
+click MNQ alert → selected instrument becomes MNQ
+
+Main Brain does not display duplicate visual toast
+
+sound plays once per unique event
+
+==================================================
+FINAL REPORT
+==================================================
+
+GLOBAL ALERT DOCK: YES/NO
+
+MONITORS:
+MGC =
+MNQ =
+MES =
+MYM =
+
+TRACKS ALL INSTRUMENTS REGARDLESS OF SELECTED TICKER: YES/NO
+
+READY ALERT SURVIVES RETURN TO WAIT: YES/NO
+
+MULTIPLE ALERT QUEUE: YES/NO
+
+PERSISTS ACROSS NAVIGATION: YES/NO
+
+PERSISTS ACROSS REFRESH: YES/NO
+
+LIVE READY ALERTS: YES/NO
+
+09:30 ORB SHADOW QUALIFIED ALERTS: YES/NO
+
+SHADOW CLEARLY LABELED: YES/NO
+
+DUPLICATE ALERT PREVENTION: YES/NO
+
+CLICK ALERT SWITCHES INSTRUMENT: YES/NO
+
+BROKER/EXECUTION CODE MODIFIED: YES/NO
+MUST = NO
+
+LIVE TRADING BEHAVIOR CHANGED: YES/NO
+MUST = NO
+
+SHADOW ORDERS TRANSMITTED:
+MUST = 0
+
+TESTS PASSED:
+TESTS FAILED:

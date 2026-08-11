@@ -427,6 +427,19 @@ export const BOT1_ROUTES = [
   // VWAP/ATR/structure/CVD/RVOL/trend snapshot with source-comparison metadata.
   // All six selectors default to "legacy" — no promotion is possible this phase.
   "/canonical-market-state",
+  // Phase 2 Ghost Research Engine — RESEARCH/DISPLAY-ONLY; owner-only; NOT in
+  // dashboard-auth OPEN_PATHS. Observes OrbEngine BREAKOUT_DETECTED transitions,
+  // creates up to 10 ghost experiment variants per opportunity, and tracks
+  // outcomes on real Databento bars. NEVER touches gate, scoring, sizing,
+  // learning weights, or execution. All READY_FOR_REVIEW findings require
+  // deliberate human operator action before any live change.
+  "/ghost-research/health",
+  "/ghost-research/candidates",
+  "/ghost-research/experiments",
+  "/ghost-research/candidate/:experiment_id",
+  "/ghost-research/opportunity/:opportunity_id",
+  "/ghost-research/baseline-vs-variant",
+  "/ghost-research/ready-for-review",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

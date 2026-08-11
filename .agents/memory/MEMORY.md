@@ -70,6 +70,7 @@
 - [LIVE 2-contract runner + trade-mgmt suite](live-two-contract-runner.md) — flag-gated default-OFF; runner fires only after primary 2xx; RUNNER_MODE trail|be_2r; primary TP forced to 1R for be_2r; node --check the SERVED dashboard <script>.
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
+- [Ghost Research Engine Phase 2](ghost-research-engine-phase2.md) — 10-variant shadow experiment platform; OrbEngine BREAKOUT_DETECTED hook; bootstrap CI + Monte Carlo; evidence state machine; 118 tests; GRE_DB_READY flag; 7 Flask routes + proxy whitelist; RESEARCH_READY_FOR_REVIEW dock alert.
 - [Profitability Engine Phase 1](profitability-engine-phase1.md) — ghost_observations table; ghost fires BEFORE _maybe_auto_execute; 69 tests; conservative stop-first resolution; net_r = gross_r − cost_r.
 - [Edge Ledger Phase 8A](edge-ledger-phase8a.md) — frozen-signal accounting; 5 integration points; EL_DB_READY flag; 55 tests; display-only, learning engine unchanged.
 - [Ops Readiness Phase 8B](ops-readiness-phase8b.md) — _re_event ring-buffer; 7 hooks; /research-health + /research-events; Research Engine Health panel; 35 tests; JS-in-Python backslash trap.

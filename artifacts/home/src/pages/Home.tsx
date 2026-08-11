@@ -1,7 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import LordPiggingtonAvatar from '../components/avatar/LordPiggingtonAvatar';
 import AvatarAura from '../components/avatar/AvatarAura';
-import { AlertToastOverlay } from '../components/AlertToastOverlay';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const BULL = '#22c55e'; const BEAR = '#ef4444'; const AMB = '#f59e0b';
@@ -4922,7 +4921,6 @@ export default function Home() {
         </div>
 
       </div>
-      <AlertToastOverlay ticker={ticker} />
     </div>
   );
 }
