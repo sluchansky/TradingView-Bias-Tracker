@@ -419,6 +419,11 @@ export const BOT1_ROUTES = [
   // Never touches gate, scoring, sizing, learning, or execution.
   "/research-health",
   "/research-events",
+  // Phase 8C: Gate Effectiveness Audit endpoints (DISPLAY/MEASUREMENT-ONLY; owner-only).
+  // Never touches gate, scoring, sizing, learning, arm state, or execution.
+  "/gate-effectiveness",
+  "/gate-effectiveness/missed-winners",
+  "/gate-effectiveness/saved-losses",
   // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).
   // Returns 4H/15M trend states from Databento 1m bar resampling.
   "/market/trend-alignment",

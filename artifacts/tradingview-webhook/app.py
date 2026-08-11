@@ -27833,6 +27833,17 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         except Exception as _dc_exc:
             logger.debug("DecisionContract full_analysis observe (%s): %s", active_ticker, _dc_exc)
 
+    # ── Phase 8C: Gate Effectiveness Audit — SHADOW/DISPLAY ONLY ────────────
+    # Records every meaningful gate decision (ALLOWED and BLOCKED) with full
+    # component breakdown for counterfactual outcome tracking.  FAIL-OPEN.
+    # NEVER reads or writes gate state, arm state, or execution path.
+    if GATE_AUDIT_DB_READY:
+        try:
+            import gate_effectiveness as _ge_fa  # noqa: PLC0415
+            _ge_fa.record_gate_decision(result, active_ticker, TRADING_MODE)
+        except Exception as _ge_fa_exc:
+            logger.debug("GateEffectiveness full_analysis (%s): %s", active_ticker, _ge_fa_exc)
+
     return result
 
 
@@ -45193,6 +45204,7 @@ GHOST_OBS_DB_READY       = False
 EL_DB_READY              = False   # set by _check_edge_ledger_db_ready() — Phase 8A
 GRE_DB_READY             = False   # set by _check_gre_db_ready() — Phase 2 Ghost Research Engine
 DC_DB_READY              = False   # set by _check_dc_db_ready() — Phase 3 Canonical Decision Contract (shadow)
+GATE_AUDIT_DB_READY      = False   # set by _check_gate_audit_db_ready() — Phase 8C Gate Effectiveness Audit
 GHOST_OBS_WATCH_LOCK     = threading.Lock()   # single-flight watcher cycle
 GHOST_OBS_COOLDOWN_SECS  = max(60, int(os.environ.get("GHOST_OBS_COOLDOWN_SECS", "300")))
 _GHOST_OBS_COOLDOWN      = {}                  # (inst, direction, strategy_short) → monotonic ts
@@ -45405,6 +45417,24 @@ def _check_edge_ledger_db_ready():
             conn.close()
         except Exception:
             pass
+
+
+def _check_gate_audit_db_ready() -> None:
+    """Probe gate_audit_log and set GATE_AUDIT_DB_READY.
+    FAIL-OPEN: missing table / unavailable DB disables audit recording only.
+    Never touches gate, scoring, sizing, learning, or execution.
+    Table: gate_audit_log (created via DB tool / apply db_gate_effectiveness_schema.sql; no DDL).
+    Phase 8C Gate Effectiveness Audit — DISPLAY/MEASUREMENT ONLY.
+    """
+    global GATE_AUDIT_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    try:
+        import gate_effectiveness as _ge_probe  # noqa: PLC0415
+        _ge_probe.check_gate_audit_db_ready()
+        GATE_AUDIT_DB_READY = _ge_probe.GATE_AUDIT_DB_READY
+    except Exception as exc:
+        logger.warning("GateEffectiveness: boot probe failed: %s", exc)
 
 
 # ── Phase 8B: Research Events Ring Buffer (DISPLAY-ONLY) ─────────────────────
@@ -65343,6 +65373,58 @@ function doResetSafetyLock() {}
     </div>
   </div>
 
+  <!-- ── Phase 8C: Gate Effectiveness Audit panel ─────────────────────── -->
+  <div class="mod" id="mod-gate-audit" data-cat="research">
+    <div class="mod-h">🔬 Gate Effectiveness Audit <span class="bt-mini">Phase 8C — MEASURE FIRST, CHANGE SECOND</span><span class="mod-cat cat-experimental">MEASUREMENT ONLY</span></div>
+    <div class="bt-mini" style="margin-bottom:8px">
+      Records every gate decision (ALLOWED and BLOCKED) with full component breakdown.
+      Tracks counterfactual outcomes for blocked trades.
+      <b>Display/measurement only — never influences gate, execution, or risk.</b>
+    </div>
+    <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap;margin-bottom:10px">
+      <button class="bt-btn" onclick="geLoad()">🔄 Load / Refresh</button>
+      <select id="ge-filter-inst" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:3px;font-size:12px">
+        <option value="">All instruments</option>
+        <option>MNQ</option><option>MGC</option><option>MES</option><option>MYM</option>
+      </select>
+      <select id="ge-filter-dir" style="background:var(--inset);border:1px solid var(--border);color:var(--text);padding:3px 6px;border-radius:3px;font-size:12px">
+        <option value="">Both directions</option>
+        <option value="Long">Long</option><option value="Short">Short</option>
+      </select>
+      <span class="bt-mini" id="ge-evidence-badge" style="margin-left:4px;padding:2px 8px;border-radius:10px"></span>
+    </div>
+    <div id="ge-header" style="display:none">
+      <div id="ge-header-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(110px,1fr));gap:6px;margin-bottom:10px"></div>
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Gate Summary (Completed outcomes)</div>
+        <div id="ge-summary-grid" style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:6px"></div>
+      </div>
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Rule Effectiveness</div>
+        <div class="bt-scroll" style="overflow-x:auto"><table id="ge-rules-table" style="font-size:11px;border-collapse:collapse;width:100%"></table></div>
+      </div>
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Edge Score Distribution</div>
+        <div class="bt-scroll" style="overflow-x:auto"><table id="ge-edge-table" style="font-size:11px;border-collapse:collapse;width:100%"></table></div>
+      </div>
+      <div style="margin-bottom:10px">
+        <div style="font-size:11px;font-weight:600;color:var(--muted);text-transform:uppercase;margin-bottom:6px">Component Effectiveness (PASS vs FAIL)</div>
+        <div class="bt-scroll" style="overflow-x:auto"><table id="ge-comp-table" style="font-size:11px;border-collapse:collapse;width:100%"></table></div>
+      </div>
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-bottom:6px">
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#f59e0b;margin-bottom:6px">&#9888; Top Missed Winners (blocked but would have profited)</div>
+          <div id="ge-missed-list" style="font-size:11px"></div>
+        </div>
+        <div>
+          <div style="font-size:11px;font-weight:600;color:#22c55e;margin-bottom:6px">&#10003; Top Saved Losses (gate prevented these)</div>
+          <div id="ge-saved-list" style="font-size:11px"></div>
+        </div>
+      </div>
+    </div>
+    <div class="bt-msg" id="ge-msg" style="margin-top:6px"></div>
+  </div>
+
 </div><!-- /#view-research -->
 
 <div id="view-academy" style="display:none">
@@ -74329,6 +74411,175 @@ function rehCloseInspector(){
   if(el)el.style.display='none';
 }
 var _rehTimer=null;
+// ── Phase 8C: Gate Effectiveness Audit JS ────────────────────────────────────
+function geLoad(){
+  var msg=document.getElementById('ge-msg');
+  var hdr=document.getElementById('ge-header');
+  if(msg){msg.className='bt-msg';msg.textContent='Loading…';}
+  var inst=(document.getElementById('ge-filter-inst')||{value:''}).value;
+  var dir =(document.getElementById('ge-filter-dir') ||{value:''}).value;
+  var qs='?instrument='+encodeURIComponent(inst)+'&direction='+encodeURIComponent(dir);
+  api('/gate-effectiveness'+qs).then(function(d){
+    if(!d.ok){if(msg){msg.className='bt-msg error';msg.textContent=d.error||'Error';}return;}
+    if(msg)msg.textContent='';
+    if(hdr)hdr.style.display='';
+    geRenderHeader(d.summary||{});
+    geRenderSummary(d.summary||{});
+    geRenderRules(d.rules||[]);
+    geRenderEdge(d.edge_buckets||[]);
+    geRenderComponents(d.components||[]);
+    geRenderMissed(d.missed_winners||[]);
+    geRenderSaved(d.saved_losses||[]);
+  }).catch(function(){if(msg){msg.className='bt-msg error';msg.textContent='Could not load gate effectiveness data.';}});
+}
+function geKv(label,val,color){
+  return '<div style="background:var(--inset);border-radius:6px;padding:8px 10px">'
+    +'<div style="font-size:10px;color:var(--muted);margin-bottom:2px">'+label+'</div>'
+    +'<div style="font-size:16px;font-weight:700;color:'+(color||'var(--text)')+'">'+val+'</div></div>';
+}
+function geRenderHeader(s){
+  var g=document.getElementById('ge-header-grid');
+  if(!g)return;
+  var badge=document.getElementById('ge-evidence-badge');
+  var ev=s.evidence_status||'ANECDOTAL';
+  var bc={'ANECDOTAL':'#6b7280','EARLY':'#f59e0b','MODERATE':'#3b82f6','STRONGER_EVIDENCE':'#22c55e'};
+  if(badge){badge.textContent=ev.replace('_',' ');badge.style.background=(bc[ev]||'#6b7280')+'33';badge.style.color=bc[ev]||'#6b7280';}
+  g.innerHTML=
+    geKv('Baseline',s.baseline_version||'—')+
+    geKv('Start',s.observation_start?(s.observation_start||'').slice(0,10):'—')+
+    geKv('Total Observations',s.total_observations||0)+
+    geKv('Approved',s.total_approved||0,'#22c55e')+
+    geKv('Blocked',s.total_blocked||0,'#f59e0b')+
+    geKv('Completed Outcomes',s.completed_outcomes||0)+
+    geKv('Pending',s.pending_outcomes||0,'#6b7280');
+}
+function geRenderSummary(s){
+  var g=document.getElementById('ge-summary-grid');
+  if(!g)return;
+  var ap=s.approved||{};var bl=s.blocked||{};
+  var gi=s.gate_improvement;
+  var giColor=gi===null||gi===undefined?'var(--text)':gi>0?'#22c55e':'#ef4444';
+  g.innerHTML=
+    geKv('Approved Expectancy',(ap.expectancy!=null?ap.expectancy.toFixed(3):'—')+'R','#22c55e')+
+    geKv('Blocked Expectancy (CF)',(bl.expectancy!=null?bl.expectancy.toFixed(3):'—')+'R','#f59e0b')+
+    geKv('Gate Improvement',(gi!=null?(gi>0?'+':'')+gi.toFixed(3):'—')+'R',giColor)+
+    geKv('Approved PF',ap.profit_factor!=null?ap.profit_factor.toFixed(2):'—')+
+    geKv('Blocked CF PF',bl.profit_factor!=null?bl.profit_factor.toFixed(2):'—')+
+    geKv('Approved N',ap.n||0)+
+    geKv('Blocked Completed N',bl.n||0);
+}
+function geRenderRules(rules){
+  var t=document.getElementById('ge-rules-table');
+  if(!t)return;
+  if(!rules.length){t.innerHTML='<tr><td colspan="8" style="padding:8px;color:var(--muted);text-align:center">No completed blocked outcomes yet — keep observing.</td></tr>';return;}
+  var th='<tr style="background:var(--inset)">'
+    +'<th style="padding:4px 8px;text-align:left">Rule</th>'
+    +'<th style="padding:4px 8px;text-align:right">Blocks</th>'
+    +'<th style="padding:4px 8px;text-align:right">Blocked&#8203;Winners</th>'
+    +'<th style="padding:4px 8px;text-align:right">Blocked&#8203;Losers</th>'
+    +'<th style="padding:4px 8px;text-align:right">Missed R</th>'
+    +'<th style="padding:4px 8px;text-align:right">Avoided R</th>'
+    +'<th style="padding:4px 8px;text-align:right">Net Gate R</th>'
+    +'<th style="padding:4px 8px">Evidence</th></tr>';
+  var rows=rules.map(function(r){
+    var net=r.net_gate_value_r||0;
+    var nc=net>0?'#22c55e':net<0?'#ef4444':'var(--text)';
+    return '<tr>'
+      +'<td style="padding:3px 8px;font-family:monospace;font-size:10px">'+aiEsc(r.rule||'—')+'</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+r.n_blocks+'</td>'
+      +'<td style="padding:3px 8px;text-align:right;color:#f59e0b">'+r.blocked_winners+'</td>'
+      +'<td style="padding:3px 8px;text-align:right;color:#22c55e">'+r.blocked_losers+'</td>'
+      +'<td style="padding:3px 8px;text-align:right;color:#ef4444">'+((r.missed_profit_r||0).toFixed(2))+'R</td>'
+      +'<td style="padding:3px 8px;text-align:right;color:#22c55e">'+((r.avoided_loss_r||0).toFixed(2))+'R</td>'
+      +'<td style="padding:3px 8px;text-align:right;font-weight:700;color:'+nc+'">'+net.toFixed(2)+'R</td>'
+      +'<td style="padding:3px 8px;font-size:10px;color:var(--muted)">'+aiEsc(r.evidence_status||'')+'</td></tr>';
+  });
+  t.innerHTML='<thead>'+th+'</thead><tbody>'+rows.join('')+'</tbody>';
+}
+function geRenderEdge(buckets){
+  var t=document.getElementById('ge-edge-table');
+  if(!t)return;
+  if(!buckets.length){t.innerHTML='<tr><td colspan="10" style="padding:8px;color:var(--muted);text-align:center">No completed outcomes yet.</td></tr>';return;}
+  var th='<tr style="background:var(--inset)">'
+    +'<th style="padding:4px 8px;text-align:left">Score</th>'
+    +'<th style="padding:4px 8px;text-align:left">Verdict</th>'
+    +'<th style="padding:4px 8px;text-align:right">N</th>'
+    +'<th style="padding:4px 8px;text-align:right">Win%</th>'
+    +'<th style="padding:4px 8px;text-align:right">Avg R</th>'
+    +'<th style="padding:4px 8px;text-align:right">Total R</th>'
+    +'<th style="padding:4px 8px;text-align:right">TP1%</th>'
+    +'<th style="padding:4px 8px;text-align:right">Stop%</th>'
+    +'<th style="padding:4px 8px;text-align:right">Avg MFE</th>'
+    +'<th style="padding:4px 8px">Evidence</th></tr>';
+  var rows=buckets.map(function(b){
+    var avgR=b.avg_r||0;var rc=avgR>0?'#22c55e':avgR<0?'#ef4444':'var(--text)';
+    return '<tr>'
+      +'<td style="padding:3px 8px;font-weight:600">'+b.bucket+'</td>'
+      +'<td style="padding:3px 8px;font-size:10px">'+b.verdict+'</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+b.n+'</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+(b.win_rate!=null?(b.win_rate*100).toFixed(0)+'%':'—')+'</td>'
+      +'<td style="padding:3px 8px;text-align:right;color:'+rc+'">'+avgR.toFixed(2)+'R</td>'
+      +'<td style="padding:3px 8px;text-align:right;color:'+rc+'">'+(b.total_r||0).toFixed(2)+'R</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+(b.tp1_rate!=null?(b.tp1_rate*100).toFixed(0)+'%':'—')+'</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+(b.stop_rate!=null?(b.stop_rate*100).toFixed(0)+'%':'—')+'</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+(b.avg_mfe||0).toFixed(2)+'R</td>'
+      +'<td style="padding:3px 8px;font-size:10px;color:var(--muted)">'+aiEsc(b.evidence_status||'')+'</td></tr>';
+  });
+  t.innerHTML='<thead>'+th+'</thead><tbody>'+rows.join('')+'</tbody>';
+}
+function geRenderComponents(comps){
+  var t=document.getElementById('ge-comp-table');
+  if(!t)return;
+  if(!comps.length){t.innerHTML='<tr><td colspan="7" style="padding:8px;color:var(--muted);text-align:center">No completed outcomes yet.</td></tr>';return;}
+  var th='<tr style="background:var(--inset)">'
+    +'<th style="padding:4px 8px;text-align:left">Component</th>'
+    +'<th style="padding:4px 8px;text-align:left">Signal</th>'
+    +'<th style="padding:4px 8px;text-align:right">N</th>'
+    +'<th style="padding:4px 8px;text-align:right">Win%</th>'
+    +'<th style="padding:4px 8px;text-align:right">Avg R</th>'
+    +'<th style="padding:4px 8px;text-align:right">Avg MFE</th>'
+    +'<th style="padding:4px 8px">Evidence</th></tr>';
+  var rows=comps.map(function(c){
+    var avgR=c.avg_r||0;var rc=avgR>0?'#22c55e':avgR<0?'#ef4444':'var(--text)';
+    var sc=c.signal==='PASS'?'#22c55e':'#ef4444';
+    return '<tr>'
+      +'<td style="padding:3px 8px;font-weight:600">'+aiEsc(c.component||'—')+'</td>'
+      +'<td style="padding:3px 8px;color:'+sc+'">'+c.signal+'</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+c.n+'</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+(c.win_rate!=null?(c.win_rate*100).toFixed(0)+'%':'—')+'</td>'
+      +'<td style="padding:3px 8px;text-align:right;color:'+rc+'">'+avgR.toFixed(2)+'R</td>'
+      +'<td style="padding:3px 8px;text-align:right">'+(c.avg_mfe||0).toFixed(2)+'R</td>'
+      +'<td style="padding:3px 8px;font-size:10px;color:var(--muted)">'+aiEsc(c.evidence_status||'')+'</td></tr>';
+  });
+  t.innerHTML='<thead>'+th+'</thead><tbody>'+rows.join('')+'</tbody>';
+}
+function geRenderMissed(records){
+  var el=document.getElementById('ge-missed-list');
+  if(!el)return;
+  if(!records.length){el.innerHTML='<div style="color:var(--muted);padding:6px 0">No missed winners yet.</div>';return;}
+  el.innerHTML=records.slice(0,10).map(function(r,i){
+    return '<div style="padding:5px 0;border-bottom:1px solid var(--border)">'
+      +'<span style="font-weight:600">'+(i+1)+'. '+aiEsc(r.instrument||'')+'</span> '
+      +'<span style="color:var(--muted);font-size:10px">'+aiEsc((r.timestamp||'').slice(0,10))+'</span> '
+      +'<span style="color:#f59e0b;font-weight:600">+'+((r.final_r||0).toFixed(2))+'R</span>'
+      +'<div style="font-size:10px;color:var(--muted)">Edge '+r.edge_score+' | '+aiEsc(r.direction||'')
+      +' | Blocked by: <b>'+aiEsc(r.primary_blocker||'—')+'</b></div></div>';
+  }).join('');
+}
+function geRenderSaved(records){
+  var el=document.getElementById('ge-saved-list');
+  if(!el)return;
+  if(!records.length){el.innerHTML='<div style="color:var(--muted);padding:6px 0">No saved losses yet.</div>';return;}
+  el.innerHTML=records.slice(0,10).map(function(r,i){
+    return '<div style="padding:5px 0;border-bottom:1px solid var(--border)">'
+      +'<span style="font-weight:600">'+(i+1)+'. '+aiEsc(r.instrument||'')+'</span> '
+      +'<span style="color:var(--muted);font-size:10px">'+aiEsc((r.timestamp||'').slice(0,10))+'</span> '
+      +'<span style="color:#ef4444;font-weight:600">'+((r.final_r||0).toFixed(2))+'R</span>'
+      +'<div style="font-size:10px;color:var(--muted)">Edge '+r.edge_score+' | '+aiEsc(r.direction||'')
+      +' | Prevented by: <b>'+aiEsc(r.primary_blocker||'—')+'</b></div></div>';
+  }).join('');
+}
+
 function rehLoad(){
   var msg=document.getElementById('reh-msg');
   if(msg)msg.textContent='';
@@ -78419,6 +78670,61 @@ def route_research_events():
     })
 
 
+# ── Phase 8C: Gate Effectiveness Audit routes ─────────────────────────────────
+# DISPLAY/MEASUREMENT ONLY.  Auth handled by Express proxy.  NOT in OPEN_PATHS.
+# NEVER touches gate, scoring, sizing, learning, arm state, or broker.
+
+@app.route("/gate-effectiveness", methods=["GET"])
+def route_gate_effectiveness():
+    """Gate Effectiveness Audit master summary — Phase 8C.
+    Returns baseline metadata + high-level ALLOWED vs BLOCKED expectancy.
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        inst = request.args.get("instrument", "").strip().upper() or None
+        direction = request.args.get("direction", "").strip() or None
+        return jsonify({
+            "ok": True,
+            "summary":        _ge.get_summary(),
+            "rules":          _ge.get_rule_effectiveness(instrument=inst, direction=direction),
+            "edge_buckets":   _ge.get_edge_bucket_stats(),
+            "components":     _ge.get_component_stats(),
+            "missed_winners": _ge.get_missed_winners(limit=20),
+            "saved_losses":   _ge.get_saved_losses(limit=20),
+            "breakdown":      _ge.get_breakdown(instrument=inst, direction=direction),
+            "baseline_file":  "gate_baseline_2026_08_11.json",
+            "note": (
+                "Phase 8C Gate Effectiveness Audit — MEASURE FIRST, CHANGE SECOND. "
+                "Display/measurement only. Never touches gate, execution, or risk."
+            ),
+        })
+    except Exception as exc:
+        logger.debug("route_gate_effectiveness: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/missed-winners", methods=["GET"])
+def route_gate_missed_winners():
+    """Top blocked opportunities that would have been profitable — Phase 8C."""
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        limit = min(100, max(1, int(request.args.get("limit", 20))))
+        return jsonify({"ok": True, "records": _ge.get_missed_winners(limit=limit)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/saved-losses", methods=["GET"])
+def route_gate_saved_losses():
+    """Worst blocked opportunities the gate successfully prevented — Phase 8C."""
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        limit = min(100, max(1, int(request.args.get("limit", 20))))
+        return jsonify({"ok": True, "records": _ge.get_saved_losses(limit=limit)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/volatility-intelligence", methods=["GET"])
 def volatility_intelligence_endpoint():
     """Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY).
@@ -81059,6 +81365,7 @@ if __name__ == "__main__":
         _check_ghost_obs_db_ready()                # probe ghost_observations (no DDL; created via DB tool/publish diff) — PROFITABILITY ENGINE PHASE 1, RESEARCH/DISPLAY-ONLY
         _check_gre_db_ready()                      # probe ghost_opportunities/experiments/results (no DDL; created via DB tool/publish diff) — PHASE 2 GHOST RESEARCH ENGINE, RESEARCH/DISPLAY-ONLY
         _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
+        _check_gate_audit_db_ready()               # probe gate_audit_log (no DDL; apply db_gate_effectiveness_schema.sql) — PHASE 8C Gate Effectiveness Audit, DISPLAY/MEASUREMENT-ONLY
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
         _check_hysteresis_thesis_db_ready()        # probe hysteresis_thesis (no DDL; created via DB tool/publish diff) — THESIS PHASE 2 persistence
@@ -81099,6 +81406,17 @@ if __name__ == "__main__":
         threading.Timer(0, _live_runner_watch_loop).start()  # LIVE 2-contract runner watcher (own timer); only started when the feature is enabled, and itself inert unless armed
     if AUTO_EXIT_ENABLED:
         threading.Timer(0, _auto_exit_watch_loop).start()  # AUTO EARLY-EXIT watcher (own timer); inert unless owner-ARMED via /auto-exit (arm resets OFF each restart); live sends only on the LIVE traderspost instance, paper closes locally
+    # ── Phase 8C: Gate Effectiveness counterfactual watcher ───────────────────
+    # Self-rescheduling timer that resolves PENDING blocked-opportunity records
+    # against live bar history (MFE/MAE/TP/stop).  DISPLAY/MEASUREMENT ONLY —
+    # never touches gate, scoring, arm state, broker, or execution.
+    if GATE_AUDIT_DB_READY:
+        try:
+            import gate_effectiveness as _ge_start  # noqa: PLC0415
+            threading.Timer(30, _ge_start.schedule_watcher).start()
+            logger.info("GateEffectiveness: counterfactual watcher scheduled (30s delay)")
+        except Exception as _ge_start_exc:
+            logger.warning("GateEffectiveness: watcher start failed: %s", _ge_start_exc)
     # ── Databento Brain — real-time market data feed ──────────────────────────
     # Set DATABENTO_ENABLED=1 + DATABENTO_API_KEY secret to activate.
     # Default OFF → byte-identical; TV webhook alerts keep working normally.

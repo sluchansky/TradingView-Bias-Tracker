@@ -1,0 +1,105 @@
+{
+  "_comment": "GATE_BASELINE_2026_08_11 — immutable control snapshot. Do NOT edit. Any future change creates a new baseline identifier.",
+  "baseline_id": "GATE_BASELINE_2026_08_11",
+  "captured_at": "2026-08-11T00:00:00Z",
+  "capture_note": "Frozen at start of Gate Effectiveness Audit. Measurement-only phase — no gate rules changed.",
+
+  "mode_at_capture": "SCALP",
+
+  "edge_components": {
+    "BOS_CONFIRMED":       20,
+    "CHOCH_CONFIRMED":     20,
+    "VWAP_CONFIRMATION":   15,
+    "LIQUIDITY_SWEEP":     15,
+    "VOLUME_CONFIRMATION": 15,
+    "CVD_AGREEMENT":       15,
+    "SESSION_BONUS":       10,
+    "MAX_SCORE":           110
+  },
+
+  "rvol_soft_adjustment": {
+    "rvol_ge_1_5":  10,
+    "rvol_1_0_to_1_49": 0,
+    "rvol_lt_1_0": -5,
+    "unknown": 0
+  },
+
+  "scalp_thresholds": {
+    "EDGE_EARLY_THRESHOLD": 50,
+    "EDGE_FULL_READY_THRESHOLD": 60,
+    "EDGE_STRONG_THRESHOLD": 75,
+    "EDGE_SETUP_BUILDING_THRESHOLD": null
+  },
+
+  "swing_thresholds": {
+    "EDGE_READY_THRESHOLD": 85,
+    "EDGE_FULL_READY_THRESHOLD": 85,
+    "EDGE_STRONG_THRESHOLD": 85,
+    "EDGE_SETUP_BUILDING_THRESHOLD": null,
+    "NOTE": "SWING has no EARLY band — both floors equal 85 (A+ required)"
+  },
+
+  "grade_thresholds": {
+    "A_PLUS": 85,
+    "A":      70,
+    "B":      50,
+    "WAIT":   0
+  },
+
+  "scalp_hard_gates": {
+    "GATE_REQUIRE_ZONE":      true,
+    "GATE_REQUIRE_VWAP":      true,
+    "GATE_REQUIRE_STRUCTURE": true,
+    "GATE_REQUIRE_LOCATION":  false,
+    "GATE_CVD_HARD":          false,
+    "GATE_SOFT_MODIFIERS":    true,
+    "MIN_CONFIRMATIONS":      0,
+    "CONFLICT_SCORE_AWARE":   true,
+    "NOTE": "CVD is a soft -10 Edge penalty in SCALP, not a hard veto"
+  },
+
+  "swing_hard_gates": {
+    "GATE_REQUIRE_ZONE":      true,
+    "GATE_REQUIRE_VWAP":      true,
+    "GATE_REQUIRE_STRUCTURE": true,
+    "GATE_REQUIRE_LOCATION":  false,
+    "GATE_CVD_HARD":          true,
+    "GATE_SOFT_MODIFIERS":    false,
+    "MIN_CONFIRMATIONS":      0,
+    "CONFLICT_SCORE_AWARE":   false,
+    "NOTE": "CVD is a HARD veto in SWING"
+  },
+
+  "downstream_vetoes": {
+    "ANALYST_GATE_ENABLED":        false,
+    "PRO_REVIEW_GATE_ENABLED":     false,
+    "TRADE_DEBATE_GATE_ENABLED":   false,
+    "LEARNING_GATE_ENABLED":       false,
+    "LEARNING_SCORE_INFLUENCE":    true,
+    "ENTRY_QUALITY_GATE_ENABLED":  true,
+    "ENTRY_QUALITY_MIN_SCORE":     70,
+    "ENTRY_QUALITY_OVERRIDE_EDGE": 90,
+    "TREND_BRAKE_ENABLED":         false,
+    "SWING_HTF_ENABLED":           false,
+    "NOTE": "Entry Quality veto is DEFAULT ON (demote-only)"
+  },
+
+  "rr_model": {
+    "SCALP_TP1_R":   1.0,
+    "SCALP_TP2_R":   1.5,
+    "SCALP_RUNNER_R": 2.0,
+    "SCALP_RUNNER_MIN_EDGE": 75,
+    "SWING_MIN_RR":  2.0,
+    "SWING_STOP_ATR_MULT": 1.5,
+    "SWING_STOP_ATR_MULT_HIGH": 2.0
+  },
+
+  "safety_constants": {
+    "CONFLICT_WINDOW_MIN":  10,
+    "VOLUME_SPIKE_TTL_MIN": 20,
+    "EDGE_SCORE_MAX":       110
+  },
+
+  "instruments_active": ["MNQ", "MGC"],
+  "instruments_tracked": ["MNQ", "MGC", "MES", "MYM"]
+}

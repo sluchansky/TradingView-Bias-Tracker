@@ -3,9 +3,6 @@
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
-- [Main Brain population wiring](main-brain-population-wiring.md) — normalizeMainBrainPayload() is the single bridge; 29 schema mismatches; voice=dict extract narration; active_trades/alerts are bare lists; coach.weight_updated is boolean.
-- [Left Brain thesis staleness & key mismatch](lb-thesis-staleness.md) — MGC gets ~1 bar/overnight (vs 127 MNQ); key bug lastUpdatedAt vs last_updated_at; diagnosis block added; ThesisPanel shows 4 states.
-- [Flask zombie-prevention guards](flask-zombie-prevention.md) — 3 os._exit guards (SIGTERM + sys.excepthook + app.run() finally) stop non-daemon Timer threads from keeping zombie Flask alive.
 - [Databento MGC overnight silence + partial-flush fix](databento-mgc-overnight-silence.md) — MGC has 0 Databento records overnight (genuine COMEX silence); partial-flush daemon closes stale low-volume bars within 70s; thread-safety via _partial_lock.
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
@@ -24,7 +21,7 @@
 - [No-signals = structure gate](no-signals-alert-config-gap.md) — "0 signals" usually = no structure alert; structure = ANY-ONE of CHOCH/BOS/HH/HL/LH/LL (shared, needs a `ticker`); diagnose via gate_debug/strict_reason.
 - [Dashboard auth edge & open paths](dashboard-auth-edge.md) — auth lives in Express; never lock /, /ping, /webhook, /healthz; webhook ENTER/CLOSE intentionally OPEN (TradingView can't send a password).
 - [Volatility monitor gate](volatility-monitor-gate.md) — per-instrument ATR-ratio FAIL-OPEN; SWING hard-gates BLOCK→WAIT; SCALP DISPLAY-ONLY + fail-open extreme-ratio>3.0 DEMOTE brake; single get_volatility feeds gate+brake+display.
-- [Cockpit Mode JS-in-Python escape trap](cockpit-mode-escape-bug.md) — JS string literals in Python triple-quotes: `\n`/`\t`/astral emoji → raw newline / UTF-8 500; fix with `\\n`; py_compile misses it — node --check the SERVED <script>.
+- [JS-in-Python escape trap](cockpit-mode-escape-bug.md) — `\n`/`\t`/astral emoji in JS inside Python triple-quotes → raw newline/UTF-8 500; fix with `\\n`; py_compile misses it — node --check the SERVED `<script>`.
 - [Multi-strategy engine](strategy-engine.md) — regime→strategy (fixed priority); ORB replaced Exhaustion Fade; display's ONLY money-path effect = sanctioned ORB 1:4 retarget; closed-override needs key parity.
 - [Adaptive Learning Engine](adaptive-learning-engine.md) — Postgres per-strategy analytics DISPLAY-ONLY (never gate/sizing/dedupe/traderspost), fail-open, weights 0.65–1.35; best-hours bucket on opened_at; no in-app DDL.
 - [Learning Engine v2](learning-engine-v2.md) — Governor/Memory/25-trade report display-only; sole money-path = flag-gated demote-only veto (READY→WAIT, default OFF); governor uses RAW win-rates.
@@ -40,10 +37,8 @@
 - [Dual-timeframe SCALP engine](dual-tf-engine.md) — flag-gated DUAL_TF_ENGINE: READY = standing bias + ≥2 distinct confirms (CVD/sweep/volume ONLY — VWAP/DELTA never count) within 10s; flag-OFF byte-identical needs dormant guard.
 - [Golden session-bonus pin](golden-session-bonus-flakiness.md) — goldens PINNED to fixed 03:00 ET (bonus 0); uniform ±10 score drift = pin reverted (restore, don't rebaseline); parity always clock-independent.
 - [SCALP auto-execute trigger timing](scalp-auto-execute-trigger.md) — SCALP auto fires on LIVE is_actionable (EARLY 50-59 INCLUDED half-size); AUTO_FIRED_KEYS EARLY≡FULL same zone = one entry; SCALP STACKS bounded by daily cap; STOP_HIT re-arms.
-- [Pine webhook source scripts](pine-webhook-source-scripts.md) — confirmation/sweep/volume/structure/cvd/zones/fvg_ob come from repo-owned Pine scripts; adding a contract needs editing them too, not just app.py registry.
 - [SWING HTF data layer](swing-htf-data-layer.md) — _swing_htf_enabled() master gate; auto-computed 1H/4H(resampled)/Daily bias+levels in HTF_STATE_BY_INST; compute_swing_context() stable schema fail-OPEN; SCALP+flag-off byte-identical.
 - [Per-instrument open-position isolation](per-instrument-active-trade-isolation.md) — ACTIVE_TRADES_BY_INST (one slot per instrument, RLock); _resolve_active_trade explicit bad ticker→400; ALERT_HISTORY stays SHARED+widened.
-- [ALERT_HISTORY deque race](alert-history-deque-race.md) — shared deque is lock-free; readers MUST iterate a list() snapshot (atomic under GIL), never the live deque; a lock is the wrong fix.
 - [Per-asset safety controls](per-asset-safety-controls.md) — safety_cfg resolves RUNTIME DB-backed overrides→registry→defaults through ONE gateway; fail-closed money path; full-replace POST can clear the kill switch; maxLossesPerDay=5.
 - [Instrument rollout surfaces](instrument-rollout-surfaces.md) — adding a contract spans many lockstep surfaces; BT_SPECS MUST byte-match live INSTRUMENT_SPECS or stop parity breaks; price-only auto-detect fails closed → filename/dropdown is primary.
 - [Advisor auto-trade review gate](advisor-auto-trade-gate.md) — opt-in GLOBAL gate on AUTO exec only (default-OFF); FAIL-CLOSED when ON via `reviewed` marker in BOTH analyst returns; never touches base gate/manual ENTER.
@@ -77,6 +72,7 @@
 - [GRE Phase 4 — FVG_REVISIT Research Family](gre-phase4-fvg-revisit.md) — FVG_REVISIT as Research Family #2; strategy_family/strategy SEPARATE fields; deterministic rfid/revisit_id; 10 variants; 86 tests; prod DB apply still needed.
 - [DC Phase 3 Closure](dc-phase3-closure.md) — 6 execution hooks wired; GRE DC enrichment; 13 ghost_opportunities DC columns; 6 new legal transitions (scalp path); get_record() + observe_order_accepted/rejected added; 45 tests.
 - [Profitability Engine Phase 1](profitability-engine-phase1.md) — ghost_observations table; ghost fires BEFORE _maybe_auto_execute; 69 tests; conservative stop-first resolution; net_r = gross_r − cost_r.
+- [Gate Effectiveness Audit Phase 8C](gate-effectiveness-audit.md) — MEASURE-ONLY; gate_audit_log records ALLOWED+BLOCKED; counterfactual watcher; 34 tests; prod table not yet applied (task #164).
 - [Edge Ledger Phase 8A](edge-ledger-phase8a.md) — frozen-signal accounting; 5 integration points; EL_DB_READY flag; 55 tests; display-only, learning engine unchanged.
 - [Ops Readiness Phase 8B](ops-readiness-phase8b.md) — _re_event ring-buffer; 7 hooks; /research-health + /research-events; Research Engine Health panel; 35 tests; JS-in-Python backslash trap.
 - [FVG Engine Step A](fvg-engine-step-a.md) — all-day FVG/IFVG scanner (shadow/display-only); 3 engine bugs documented; IFVG direction semantics; fixture ATR ratio trap; `@_owner_required` undefined before line 75400.
