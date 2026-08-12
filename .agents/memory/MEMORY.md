@@ -2,7 +2,7 @@
 
 - [INTRADAY_TREND strategy](intraday-trend-strategy.md) — MODES["INTRADAY_TREND"]=dict(MODES["SWING"]); MNQ-only; 3 gates; panel reuses mod-swingdiag; full_analysis wiring pattern.
 - [INTRADAY_TREND Phase 2 gaps](intraday-trend-phase2.md) — 7 ghost columns, 8 new helpers, confirmation/structural-stop/sizing/daily-cap/mgmt gaps closed; 105 tests in test_intraday_trend_phase2.py; prod schema needs Publish.
-
+- [INTRADAY_TREND dedicated plan engine](intraday-trend-plan-engine.md) — build_intraday_trade_plan() fully separated from SWING; structural stop only, targets from real session levels ≥2R, 15:15 cutoff, chase gate; _swing_htf_enabled() SWING-only.
 
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 
@@ -152,7 +152,6 @@
 - [Observability / eval-metrics heartbeat](observability-eval-metrics.md) — diagnostic heartbeat re-eval + counters; must stay full_analysis+_record_eval_metrics only; COUNTERS_LOCK never inside EVAL_METRICS_LOCK; WAIT reason is strict_reason not reason.
 - [EARLY intrabar pre-READY alert](early-pre-ready-alert.md) — display-only ⚡EARLY fires on sweep+structure before candle-close; never touches gate; fire-once dedupe; READY owns the signal.
 - [Per-instrument structure isolation](instrument-structure-isolation.md) — suspected cross-instrument BOS/CHOCH leak DISPROVEN; all 3 structure readers share a_inst!=inst filter; diagnose by replaying real webhooks + rebasing timestamps.
-- [Scalp live paper-sim](scalp-live-sim.md) — research strategies PAPER-simulated on live stream, walled off (default-OFF flag); SHORT R must be (entry-exit)/risk or signs invert silently; watcher live-gate must be INSIDE self-rescheduling loop.
 - [Analyst professional game-plan](analyst-game-plan.md) — DISPLAY-ONLY nested analyst["game_plan"] NOT a top-level block; fail-open; flows to /status via wholesale analyst pass; own smoke not goldens.
 - [Potential-plan sweep+VWAP gate](potential-plan-sweep-vwap.md) — potential_plan generates on sweep+vwap_confirmed (not only structure_confirmed); display-only, goldens byte-identical.
 - [Dashboard display modules: equity & news](display-modules-equity-news.md) — equity curve (today, no backfill) + ForexFactory news are /status-fed DISPLAY-ONLY; news must NEVER feed the gate.

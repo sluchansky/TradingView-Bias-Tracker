@@ -1243,7 +1243,7 @@ def _swing_htf_enabled(mode=None):
     never enter any SWING-HTF path because the mode check fails first.
     """
     m = (mode or TRADING_MODE)
-    if m not in ("SWING", "INTRADAY_TREND"):
+    if m != "SWING":
         return False
     if os.environ.get("SWING_HTF_ENABLED", "").strip() == "0":
         return False
@@ -6781,7 +6781,7 @@ def _it_setup_family(confluences, direction, price=None, levels=None, vwap=None)
 
 
 # Configurable INTRADAY_TREND time boundaries (env-overridable)
-_IT_LAST_ENTRY_DEFAULT = "14:30"   # no new entries at/after this ET time
+_IT_LAST_ENTRY_DEFAULT = "15:15"   # no new entries at/after this ET time
 _IT_FORCE_FLAT_DEFAULT  = "15:55"  # positions must be flat by this ET time
 
 # Recognised INTRADAY_TREND setup families.  Any family not in this set is
@@ -6815,11 +6815,17 @@ def _it_time_restriction(et_now=None):
       ok=False   entry blocked (state = ENTRY_BLOCKED or FORCE_FLAT)
 
     Env config:
-      IT_LAST_NEW_ENTRY_TIME  (default 14:30 ET)
-      IT_FORCE_FLAT_TIME      (default 15:55 ET)
+      INTRADAY_NEW_ENTRY_CUTOFF_ET  (default 15:15 ET)  ← preferred name
+      IT_LAST_NEW_ENTRY_TIME        (legacy alias, same default)
+      IT_FORCE_FLAT_TIME            (default 15:55 ET)
     """
     try:
-        last_h, last_m = _it_parse_time("IT_LAST_NEW_ENTRY_TIME", _IT_LAST_ENTRY_DEFAULT)
+        # Support new preferred env var; fall back to legacy alias, then default.
+        _cutoff_raw = (os.environ.get("INTRADAY_NEW_ENTRY_CUTOFF_ET", "").strip()
+                       or os.environ.get("IT_LAST_NEW_ENTRY_TIME", "").strip()
+                       or _IT_LAST_ENTRY_DEFAULT)
+        last_h, last_m = _it_parse_time("IT_LAST_NEW_ENTRY_TIME",
+                                        _cutoff_raw)
         flat_h, flat_m = _it_parse_time("IT_FORCE_FLAT_TIME",     _IT_FORCE_FLAT_DEFAULT)
         t  = et_now if et_now is not None else now_utc().astimezone(ET_TZ)
         hm = t.hour * 60 + t.minute
@@ -7510,6 +7516,451 @@ def _it_daily_trade_count(instrument="MNQ"):
                 return (int(row[0]) if row else 0, cap)
     except Exception:
         return (-1, cap)
+
+
+# ── INTRADAY_TREND dedicated plan-builder constants ────────────────────────────
+_IT_MIN_RR_DEFAULT    = 2.0   # minimum qualifying R:R (env: MIN_INTRADAY_RR)
+_IT_MAX_CHASE_ATR     = 1.5   # max entry-drift = this × ATR (env: IT_MAX_CHASE_ATR_MULT)
+_IT_EXPIRY_MINUTES    = {     # setup staleness by family (minutes)
+    "LIQUIDITY_SWEEP_REVERSAL": 30,
+    "BREAKOUT_RETEST":          45,
+    "TREND_PULLBACK":           60,
+}
+_IT_ATR_STOP_MIN_FRAC = 0.3   # stop < this × ATR → too tight / noise-level
+_IT_ATR_STOP_MAX_FRAC = 4.0   # stop > this × ATR → exceeds intraday expectations
+
+
+def _it_find_tp1(direction, entry, risk, levels, tick):
+    """Return the nearest intraday structural level between 0.75R and 1.5R from
+    entry (snapped to tick grid).  Fallback: 1.25R manufactured target.
+
+    PURE, FAIL-OPEN.
+    """
+    lv   = levels or {}
+    lo_r = 0.75 * risk
+    hi_r = 1.5  * risk
+
+    level_keys = (
+        "session_high", "session_low",
+        "opening_range_high", "opening_range_low",
+        "overnight_high", "overnight_low",
+        "london_high", "london_low",
+    )
+    all_lvls = []
+    for k in level_keys:
+        v = lv.get(k)
+        if v is not None:
+            all_lvls.append(float(v))
+    all_lvls.extend([float(x) for x in (lv.get("major_15m_swing_highs") or [])])
+    all_lvls.extend([float(x) for x in (lv.get("major_15m_swing_lows")  or [])])
+
+    candidates = []
+    if direction == "Long":
+        for v in all_lvls:
+            dist = v - entry
+            if lo_r <= dist <= hi_r:
+                candidates.append(v)
+        raw = min(candidates) if candidates else (entry + 1.25 * risk)
+    else:
+        for v in all_lvls:
+            dist = entry - v
+            if lo_r <= dist <= hi_r:
+                candidates.append(v)
+        raw = max(candidates) if candidates else (entry - 1.25 * risk)
+
+    if tick:
+        raw = round(round(raw / tick) * tick, 10)
+    return round(raw, 2)
+
+
+def _it_select_intraday_target(direction, entry, risk, levels, tick, min_rr=None):
+    """Scan intraday session levels for the nearest structural target >= min_rr.
+
+    Does NOT manufacture a target from entry ± N×risk.  Returns
+    (tp2, tp1, target_label, rr_achieved) or None when no qualifying real
+    level exists.  Callers must surface IT_INSUFFICIENT_RR when None is
+    returned — never fall back to ATR-derived targets.
+
+    Candidates are real session key levels + today's 3-bar pivot swings.
+    'Nearest' = closest level on the correct side that still provides
+    the minimum R:R from entry.
+
+    PURE, FAIL-OPEN (returns None on any error).
+    """
+    try:
+        if min_rr is None:
+            try:
+                min_rr = float(os.environ.get("MIN_INTRADAY_RR",
+                                              str(_IT_MIN_RR_DEFAULT)))
+            except (TypeError, ValueError):
+                min_rr = _IT_MIN_RR_DEFAULT
+
+        lv   = levels or {}
+        need = min_rr * risk   # minimum reward distance
+
+        LONG_NAMED = [
+            ("session_high",       lv.get("session_high")),
+            ("opening_range_high", lv.get("opening_range_high")),
+            ("overnight_high",     lv.get("overnight_high")),
+            ("london_high",        lv.get("london_high")),
+            ("asia_high",          lv.get("asia_high")),
+            ("prior_high",         lv.get("prior_high")),
+        ]
+        SHORT_NAMED = [
+            ("session_low",        lv.get("session_low")),
+            ("opening_range_low",  lv.get("opening_range_low")),
+            ("overnight_low",      lv.get("overnight_low")),
+            ("london_low",         lv.get("london_low")),
+            ("asia_low",           lv.get("asia_low")),
+            ("prior_low",          lv.get("prior_low")),
+        ]
+
+        candidates = []   # (level, label, rr_achieved)
+        if direction == "Long":
+            for label, v in LONG_NAMED:
+                if v is None:
+                    continue
+                v = float(v)
+                if v <= entry:
+                    continue
+                reward = v - entry
+                if reward >= need:
+                    candidates.append((v, label, round(reward / risk, 2)))
+            for sw in sorted([float(x) for x in (lv.get("major_15m_swing_highs") or [])]):
+                if sw <= entry:
+                    continue
+                reward = sw - entry
+                if reward >= need:
+                    candidates.append((sw, "swing_high", round(reward / risk, 2)))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: x[0])          # nearest first (lowest)
+            tp2, label, rr = candidates[0]
+
+        else:   # Short
+            for label, v in SHORT_NAMED:
+                if v is None:
+                    continue
+                v = float(v)
+                if v >= entry:
+                    continue
+                reward = entry - v
+                if reward >= need:
+                    candidates.append((v, label, round(reward / risk, 2)))
+            for sw in sorted([float(x) for x in (lv.get("major_15m_swing_lows") or [])],
+                             reverse=True):
+                if sw >= entry:
+                    continue
+                reward = entry - sw
+                if reward >= need:
+                    candidates.append((sw, "swing_low", round(reward / risk, 2)))
+            if not candidates:
+                return None
+            candidates.sort(key=lambda x: x[0], reverse=True)   # nearest (highest)
+            tp2, label, rr = candidates[0]
+
+        # Snap TP2 to tick grid
+        if tick:
+            tp2 = round(round(tp2 / tick) * tick, 10)
+        tp2 = round(tp2, 2)
+        tp1 = _it_find_tp1(direction, entry, risk, lv, tick)
+        return (tp2, tp1, label, rr)
+
+    except Exception:
+        return None
+
+
+def build_intraday_trade_plan(direction, ticker, current_price,
+                               nearest_supply, nearest_demand,
+                               volatility=None, vwap=None, it_ctx=None, **_):
+    """Dedicated INTRADAY_TREND trade plan builder.
+
+    Entirely independent of the SWING plan builder and SWING HTF targeting.
+
+    Stop:    derived from _it_structural_stop (session key levels + family
+             logic) — never ATR×multiplier as the primary stop.
+    Targets: nearest real intraday session level that provides >= MIN_INTRADAY_RR
+             (default 2.0R).  IT_INSUFFICIENT_RR is returned when no real level
+             qualifies — targets are NEVER manufactured from entry ± N×ATR.
+    TP1:     first meaningful intraday objective (nearest structural level at
+             0.75R–1.5R, else 1.25R fallback for the display only).
+
+    Requires it_ctx from compute_intraday_trend_context (pre-computed before
+    this call).  When it_ctx is None (shadow paths, potential-plan with no
+    prior context) returns IT_UNAVAILABLE so callers surface WAIT cleanly.
+
+    Returns the same schema dict as build_strict_trade_plan so all downstream
+    consumers (dashboard, execution gateway, ghost observations) are unaffected.
+
+    FAIL-CLOSED on any unhandled error.
+    """
+    spec = spec_for(ticker)
+    inst = instrument_of(ticker)
+    tick = spec["tick_size"]
+    pv   = spec["point_value"]
+
+    def no_plan(reason, code=None):
+        return {
+            "trade_plan": False, "reason": reason,
+            "direction": direction, "instrument": inst, "point_value": pv,
+            "entry_zone": None, "stop_loss": None,
+            "target1": None, "target2": None, "rr": None, "rr_num": None,
+            "target3": None, "be_level": None, "partial_level": None,
+            "runner_target": None, "risk_points": None, "reward_points": None,
+            "max_invalidation": None, "management": None,
+            "atr_pts": None, "atr_multiplier": None, "atr_stop": None,
+            "structure_stop": None, "calculated_stop": None,
+            "min_stop_ticks": None, "tick_size": tick,
+            "stop_distance_ticks": None, "risk_dollars_per_contract": None,
+            "nearest_demand": nearest_demand, "nearest_supply": nearest_supply,
+            "volatility_regime": None, "volatility_label": None,
+            "stop_valid": False, "stop_invalid_reason": reason,
+            "min_floor_applied": None,
+            # IT-specific fields
+            "it_plan": True, "it_veto_code": code,
+            "setup_family": None, "stop_reason": None, "target_reason": None,
+            "session": None, "intraday_bias": None, "confidence": None,
+            "expires_at": None, "entry_reason": None,
+            "invalidation_level": None, "recommended_contracts": 0,
+        }
+
+    try:
+        # ── Instrument gate (MNQ-only) ──────────────────────────────────────
+        if inst != "MNQ":
+            return no_plan(
+                f"IT_INSTRUMENT_BLOCKED: INTRADAY TREND is MNQ-only ({inst}).",
+                "IT_INSTRUMENT_BLOCKED")
+
+        # ── it_ctx required ─────────────────────────────────────────────────
+        # The dedicated builder depends on the pre-computed intraday context
+        # (setup family, structural stop, confirmation status, session levels).
+        # Shadow paths and early potential-plan calls that haven't computed it
+        # yet surface IT_UNAVAILABLE rather than silently falling back to SWING.
+        if not isinstance(it_ctx, dict):
+            return no_plan(
+                "IT_UNAVAILABLE: Intraday context not yet computed — "
+                "will appear on next analysis cycle.",
+                "IT_UNAVAILABLE")
+
+        ctx = it_ctx
+
+        # ── ATR for sanity bounds ────────────────────────────────────────────
+        vol    = volatility or {}
+        atr_raw = vol.get("atr_pts")
+        try:
+            atr_f = float(atr_raw) if atr_raw is not None else 0.0
+        except (TypeError, ValueError):
+            atr_f = 0.0
+
+        # ── Session / time gate ──────────────────────────────────────────────
+        if not ctx.get("time_ok", True):
+            return no_plan(
+                ctx.get("time_reason")
+                or "IT_SESSION_BLOCKED: Time restriction active.",
+                "IT_SESSION_BLOCKED")
+
+        # ── Setup family gate ────────────────────────────────────────────────
+        setup_family = ctx.get("setup_family")
+        if not setup_family or setup_family not in _IT_KNOWN_FAMILIES:
+            return no_plan(
+                "IT_NO_VALID_SETUP: No recognised INTRADAY TREND setup family. "
+                "Waiting for LIQUIDITY_SWEEP_REVERSAL / BREAKOUT_RETEST / "
+                "TREND_PULLBACK to develop.",
+                "IT_NO_VALID_SETUP")
+
+        # ── Structure confirmation gate ──────────────────────────────────────
+        if not ctx.get("confirmation_complete", False):
+            miss = ctx.get("confirmation_missing") or []
+            reason = miss[0] if miss else "Setup confirmation incomplete."
+            return no_plan(f"IT_STRUCTURE_FAIL: {reason}", "IT_STRUCTURE_FAIL")
+
+        # ── Structural stop ─────────────────────────────────────────────────
+        # Use the pre-validated stop from context — never default to ATR.
+        if not ctx.get("structural_stop_valid"):
+            return no_plan(
+                "IT_STRUCTURE_FAIL: Structural stop unavailable or invalid. "
+                "Cannot size position safely without a valid structural "
+                "invalidation level.",
+                "IT_STRUCTURE_FAIL")
+
+        sl_level = float(ctx["structural_stop_level"])
+        sl_pts   = float(ctx["structural_stop_pts"])
+        sl_src   = ctx.get("structural_stop_source") or "structural level"
+
+        p = float(current_price)
+
+        if direction == "Long" and sl_level >= p:
+            return no_plan(
+                f"IT_STRUCTURE_FAIL: Stop ({sl_level:.2f}) is above entry ({p:.2f}) "
+                "for a Long.",
+                "IT_STRUCTURE_FAIL")
+        if direction == "Short" and sl_level <= p:
+            return no_plan(
+                f"IT_STRUCTURE_FAIL: Stop ({sl_level:.2f}) is below entry ({p:.2f}) "
+                "for a Short.",
+                "IT_STRUCTURE_FAIL")
+
+        risk = sl_pts
+        if risk <= 0:
+            return no_plan("IT_STRUCTURE_FAIL: Zero risk distance.", "IT_STRUCTURE_FAIL")
+
+        # ATR sanity bounds — reject obviously microscopic / absurdly wide stops
+        if atr_f > 0:
+            if risk < _IT_ATR_STOP_MIN_FRAC * atr_f:
+                return no_plan(
+                    f"IT_STRUCTURE_FAIL: Structural stop too tight "
+                    f"({risk:.1f}pts < {_IT_ATR_STOP_MIN_FRAC}×ATR="
+                    f"{_IT_ATR_STOP_MIN_FRAC * atr_f:.1f}pts). Likely a stale "
+                    "or noise level.",
+                    "IT_STRUCTURE_FAIL")
+            if risk > _IT_ATR_STOP_MAX_FRAC * atr_f:
+                return no_plan(
+                    f"IT_STRUCTURE_FAIL: Structural stop too wide "
+                    f"({risk:.1f}pts > {_IT_ATR_STOP_MAX_FRAC}×ATR="
+                    f"{_IT_ATR_STOP_MAX_FRAC * atr_f:.1f}pts). Exceeds intraday "
+                    "expectations.",
+                    "IT_STRUCTURE_FAIL")
+
+        # ── Entry zone ───────────────────────────────────────────────────────
+        buf = spec["stop_buf"]
+        if direction == "Long":
+            anchor = nearest_demand if nearest_demand is not None else (vwap or p)
+        else:
+            anchor = nearest_supply if nearest_supply is not None else (vwap or p)
+        # Snap to tick grid
+        entry = round(round(float(anchor) / tick) * tick, 10)
+        lo    = entry - buf / 2
+        hi    = entry + buf / 2
+
+        # ── Chase gate ───────────────────────────────────────────────────────
+        chase_mult = float(os.environ.get("IT_MAX_CHASE_ATR_MULT",
+                                           str(_IT_MAX_CHASE_ATR)))
+        if atr_f > 0:
+            chase_dist = abs(p - entry)
+            if chase_dist > chase_mult * atr_f:
+                return no_plan(
+                    f"IT_MAX_CHASE: Price ({p:.2f}) is {chase_dist:.1f}pts from "
+                    f"intended entry ({entry:.2f}). "
+                    f"Max chase = {chase_mult}×ATR = {chase_mult * atr_f:.1f}pts. "
+                    "Setup already in motion — do not chase.",
+                    "IT_MAX_CHASE")
+
+        # ── Structural target selection ──────────────────────────────────────
+        # Merge daily HTF levels (prior_high/low, swing levels) with today's
+        # session levels so target scanning covers the full structural picture.
+        sess_levels   = ctx.get("session_levels") or {}
+        merged_levels = dict(ctx.get("daily_levels") or {})
+        merged_levels.update({k: v for k, v in sess_levels.items()
+                               if v is not None and k not in
+                               ("major_15m_swing_highs", "major_15m_swing_lows")})
+        merged_levels["major_15m_swing_highs"] = (
+            sess_levels.get("major_15m_swing_highs") or [])
+        merged_levels["major_15m_swing_lows"] = (
+            sess_levels.get("major_15m_swing_lows") or [])
+
+        min_rr = float(os.environ.get("MIN_INTRADAY_RR", str(_IT_MIN_RR_DEFAULT)))
+        tgt_result = _it_select_intraday_target(
+            direction, entry, risk, merged_levels, tick, min_rr=min_rr)
+
+        if tgt_result is None:
+            return no_plan(
+                f"IT_INSUFFICIENT_RR: No intraday structural level provides "
+                f"≥{min_rr}R reward from entry {entry:.2f} "
+                f"(stop {risk:.1f}pts). Cannot manufacture a target — "
+                "waiting for a more favourable entry location.",
+                "IT_INSUFFICIENT_RR")
+
+        tp2, tp1, target_label, rr_num = tgt_result
+
+        # Derived rewards
+        if direction == "Long":
+            reward2 = tp2 - entry
+            reward1 = max(tp1 - entry, 0.0)
+        else:
+            reward2 = entry - tp2
+            reward1 = max(entry - tp1, 0.0)
+
+        if reward2 <= 0:
+            return no_plan("IT_INSUFFICIENT_RR: TP2 target is not beyond entry.",
+                           "IT_INSUFFICIENT_RR")
+
+        # ── Setup expiration ─────────────────────────────────────────────────
+        expire_min = _IT_EXPIRY_MINUTES.get(setup_family, 45)
+        try:
+            expires_at = (now_utc()
+                          + timedelta(minutes=expire_min)).isoformat()
+        except Exception:
+            expires_at = None
+
+        # ── Risk sizing (advisory contracts) ─────────────────────────────────
+        contracts, risk_dollars = _it_risk_sizing(risk, inst)
+
+        # ── Build output dict in build_strict_trade_plan schema ──────────────
+        def fmt(v):
+            return f"{float(v):.2f}"
+
+        rr1_num = round(reward1 / risk, 2) if (risk > 0 and reward1 > 0) else 0.0
+        rr_str  = f"TP1 {rr1_num:g}:1 / TP2 {rr_num:g}:1"
+
+        return {
+            "trade_plan":    True,
+            "reason":        (f"{inst} {direction} — INTRADAY TREND {rr_num:g}:1 R:R "
+                              f"to {target_label} ({tp2:.2f}), structural stop "
+                              f"({risk:.1f}pts — {sl_src})."),
+            "direction":     direction,
+            "instrument":    inst,
+            "point_value":   pv,
+            "entry_zone":    f"{fmt(lo)}–{fmt(hi)}",
+            "stop_loss":     fmt(sl_level),
+            "target1":       fmt(tp1),
+            "target2":       fmt(tp2),
+            "rr":            rr_str,
+            "rr_num":        rr_num,
+            "target3":       None,
+            "be_level":      (fmt(entry + 0.5 * risk) if direction == "Long"
+                              else fmt(entry - 0.5 * risk)),
+            "partial_level": fmt(tp1),
+            "runner_target": None,
+            "risk_points":   round(risk, 2),
+            "reward_points": round(reward2, 2),
+            "max_invalidation": fmt(sl_level),
+            "management":    None,
+            "atr_pts":       atr_raw,
+            "atr_multiplier": None,
+            "atr_stop":      None,
+            "structure_stop":   fmt(sl_level),
+            "calculated_stop":  fmt(sl_level),
+            "min_stop_ticks":   None,
+            "tick_size":        tick,
+            "stop_distance_ticks": (round(risk / tick) if tick else None),
+            "risk_dollars_per_contract": risk_dollars,
+            "nearest_demand":   nearest_demand,
+            "nearest_supply":   nearest_supply,
+            "volatility_regime": vol.get("regime"),
+            "volatility_label":  vol.get("label"),
+            "stop_valid":        True,
+            "stop_invalid_reason": None,
+            "min_floor_applied": None,
+            # IT-specific
+            "it_plan":        True,
+            "it_veto_code":   None,
+            "setup_family":   setup_family,
+            "stop_reason":    sl_src,
+            "target_reason":  target_label,
+            "session":        ctx.get("session"),
+            "intraday_bias":  ctx.get("trend_alignment"),
+            "confidence":     ctx.get("alignment_score"),
+            "expires_at":     expires_at,
+            "entry_reason":   (f"{setup_family} at "
+                               f"{ctx.get('location_quality', 'key level')} — "
+                               f"{ctx.get('setup_family_reason', '')}").rstrip(" —"),
+            "invalidation_level":    fmt(sl_level),
+            "recommended_contracts": contracts,
+        }
+
+    except Exception as exc:
+        return no_plan(f"INTRADAY TREND plan builder error: {exc}",
+                       "IT_UNAVAILABLE")
 
 
 def compute_it_trade_management(active_trade, current_price, it_ctx=None, et_now=None):
@@ -9870,8 +10321,12 @@ def _dynamic_stop_plan(direction, entry, nearest_demand, nearest_supply,
 def build_strict_trade_plan(direction, ticker, current_price,
                             nearest_supply, nearest_demand,
                             volatility=None, mode=None, vwap=None, edge_score=None,
-                            swing_context=None):
+                            swing_context=None, it_ctx=None):
     """Single-target plan per instrument at a FIXED 1:1 risk:reward.
+
+    INTRADAY_TREND ROUTING: when mode == "INTRADAY_TREND" this function immediately
+    delegates to build_intraday_trade_plan, which uses structural stops and real
+    session-level targets.  All SCALP / SWING logic below is untouched.
 
     SWING EXCEPTION (P4, master-flag-gated): when `_swing_htf_enabled(mode)` AND a
     `swing_context` dict is supplied, the plan is NOT 1:1 — it requires a real
@@ -9896,6 +10351,13 @@ def build_strict_trade_plan(direction, ticker, current_price,
     the wrong side of entry, or (SWING only) the calculated stop is below the
     instrument minimum (see `_dynamic_stop_plan`).
     """
+    # ── INTRADAY_TREND: delegate to dedicated builder ─────────────────────────
+    # SCALP and SWING logic below is completely bypassed for IT.
+    if (mode or TRADING_MODE) == "INTRADAY_TREND":
+        return build_intraday_trade_plan(
+            direction, ticker, current_price, nearest_supply, nearest_demand,
+            volatility=volatility, vwap=vwap, it_ctx=it_ctx)
+
     spec = spec_for(ticker)
     inst = instrument_of(ticker)
     buf, pv = spec["stop_buf"], spec["point_value"]
@@ -27456,12 +27918,30 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     }
     _authoritative_eb = _analysis_edge_breakdown(_eb_pre)
 
+    # ── Pre-compute INTRADAY_TREND context BEFORE the plan builder ─────────────
+    # build_intraday_trade_plan requires a pre-computed it_ctx (setup family,
+    # structural stop, confirmation status, session levels).  Computing it here —
+    # before build_strict_trade_plan is called — ensures the dedicated IT plan
+    # builder receives real structural data rather than falling through to SWING.
+    # SCALP and SWING are completely unaffected (_it_ctx stays None for them).
+    _it_ctx = None
+    if (TRADING_MODE == "INTRADAY_TREND" and strict_direction
+            and strict_label in ("Strong Trade", "Possible Trade")):
+        try:
+            _it_ctx = compute_intraday_trend_context(
+                active_ticker, current_price, confluences=confluences,
+                swing_ctx=swing_ctx, trade_plan=None,
+                direction=strict_direction)
+        except Exception:
+            _it_ctx = None
+
     if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
         trade_plan = build_strict_trade_plan(
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
             volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
             edge_score=_authoritative_eb["score"],
             swing_context=swing_ctx,
+            it_ctx=_it_ctx,
         )
         if trade_plan["trade_plan"]:
             # EARLY READY (SCALP Edge 50-59) is actionable but half size / lower
@@ -27588,16 +28068,27 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # ── INTRADAY TREND entry MONEY-PATH vetoes ─────────────────────────────────
     # INTRADAY_TREND-only, DEMOTE-ONLY.  Runs independently of (and after) the
     # SWING HTF gate so SCALP / SWING stay byte-identical.  FAIL-CLOSED.
-    # Gates: (1) MNQ-only, (2) time restriction, (3) MID_RANGE location.
-    # _it_ctx is initialised here so the result attachment later can reuse it
-    # without a second compute call even when the veto path didn't fire.
-    _it_ctx = None
+    # _it_ctx was pre-computed above (before build_strict_trade_plan) so the same
+    # structural context drives both the IT plan geometry AND the gate logic — no
+    # risk of drift between two separate compute calls.  When the pre-compute
+    # failed (_it_ctx is None) a safety fallback recomputes with the plan result.
+    _iv = []
     if TRADING_MODE == "INTRADAY_TREND" and is_actionable(verdict) and strict_direction:
         try:
-            _it_ctx = compute_intraday_trend_context(
-                active_ticker, current_price, confluences=confluences,
-                swing_ctx=swing_ctx, trade_plan=trade_plan,
-                direction=strict_direction)
+            if _it_ctx is None:
+                # Safety fallback: pre-compute failed — recompute now with plan.
+                _it_ctx = compute_intraday_trend_context(
+                    active_ticker, current_price, confluences=confluences,
+                    swing_ctx=swing_ctx, trade_plan=trade_plan,
+                    direction=strict_direction)
+            elif isinstance(_it_ctx, dict) and trade_plan.get("it_plan"):
+                # Update projected R/points so the display block reflects the
+                # actual IT plan R:R rather than a pre-plan placeholder.
+                try:
+                    _it_ctx["projected_points"] = trade_plan.get("reward_points")
+                    _it_ctx["projected_r"]      = trade_plan.get("rr_num")
+                except Exception:
+                    pass
             _iv = _it_entry_veto_reasons(
                 _it_ctx, trade_plan, strict_direction, active_ticker)
         except Exception as exc:
@@ -28246,6 +28737,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 _d, active_ticker, current_price, nearest_supply, nearest_demand,
                 volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
                 swing_context=swing_ctx,
+                it_ctx=_it_ctx if _d == strict_direction else None,
             )
             if _pp.get("trade_plan"):
                 potential_plan = _pp

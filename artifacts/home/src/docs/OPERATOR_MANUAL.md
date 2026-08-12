@@ -428,15 +428,16 @@ INTRADAY TREND is a specialized mode designed to capture large intraday directio
 
 | Parameter | Value | Notes |
 |-----------|-------|-------|
-| R:R target | **1:3** (same as SWING) | Targets large moves; TP = 3R from entry |
-| Minimum edge to fire | **80** (inherits SWING) | Same strict threshold |
+| R:R target | **≥ 2.0** (minimum) | Target selected from the nearest real session level ≥ 2R away; no manufactured targets |
+| Minimum edge to fire | **80** | Same strict threshold as the main gate |
 | Instruments | **MNQ only** | Hard gate — all other symbols blocked |
-| Max risk per trade | **$500** (inherits SWING) | Env `MAX_RISK_DOLLARS_PER_TRADE` overrides |
-| Last new entry time | **14:30 ET** | No new entries at or after this time |
+| Max risk per trade | **$500** | Env `MAX_RISK_DOLLARS_PER_TRADE` overrides |
+| Last new entry time | **15:15 ET** | No new entries at or after this time; env `INTRADAY_NEW_ENTRY_CUTOFF_ET` overrides |
 | Force flat time | **15:55 ET** | All open ghost positions force-closed |
 | Daily trade cap | **2 trades** | Env `MAX_INTRADAY_TREND_TRADES_PER_DAY` overrides |
-| Stop type | **Structural stop** | Computed from session key levels, NOT ATR-based |
-| Stop validity | **Hard gate** | Invalid or unavailable stop = hard block (never defaults) |
+| Stop type | **Structural stop** | Sourced directly from `it_ctx` key levels — never ATR-based |
+| Stop validity | **Hard gate** | Invalid or unavailable stop = hard block; ATR sanity bounds 0.3×–4× applied |
+| Chase gate | **1.5× ATR** | Entry blocked when price has moved > 1.5× ATR from the entry zone anchor |
 | Session cap check | **Fail-closed** | If DB is down and count can't be verified, entries are blocked |
 
 ### 9.3 INTRADAY TREND Sessions
@@ -496,28 +497,42 @@ If none of these three families are detected, the status shows **WAITING_FOR_SET
 
 ### 9.6 INTRADAY TREND Gate Sequence
 
-The full gate sequence is stricter than SCALP and different from SWING:
+The full gate sequence is stricter than SCALP and completely separate from SWING:
 
 1. **MNQ-only** — hard block immediately if instrument is not MNQ
-2. **Time restriction** — no entries at or after 14:30 ET; no entries at or after 15:55 ET (force-flat period)
+2. **Time restriction** — no entries at or after 15:15 ET; no entries at or after 15:55 ET (force-flat period)
 3. **Location quality** — price must be at or near a key session level (KEY_LEVEL or ZONE_CONFLUENCE); MID_RANGE entries are blocked
 4. **Setup family recognised** — must be one of the three families above; UNKNOWN or no family = WAITING_FOR_SETUP
 5. **Confirmation sequence complete** — all required signals for the detected family must be confirmed (not just started)
-6. **Structural stop valid** — the computed stop must be finite, positive, and on the correct side of price; a bad or unavailable stop is a hard block
-7. **Daily trade cap not reached** — if the DB cannot be reached to verify today's count, the gate fails closed (this is deliberate — uncertainty about the cap is treated as cap-reached)
+6. **Structural stop valid** — the computed stop must be finite, positive, on the correct side of price, and within ATR sanity bounds (0.3×–4× ATR); a bad or unavailable stop is a hard block
+7. **Chase gate** — entry blocked when the current price has moved more than 1.5× ATR away from the intended entry zone anchor (demand/supply zone or VWAP); prevents chasing after the move has already happened
+8. **Target available** — at least one real session level must be ≥ 2R away in the trade direction; no qualifying level = blocked with `IT_INSUFFICIENT_RR`
+9. **Daily trade cap not reached** — if the DB cannot be reached to verify today's count, the gate fails closed (this is deliberate — uncertainty about the cap is treated as cap-reached)
 
 ### 9.7 INTRADAY TREND — Structural Stop
 
-Unlike SCALP/SWING which use ATR-based stops, INTRADAY TREND computes a **structural stop** from session key levels:
-- **Long entry**: stop is set below the most recent key support level (overnight low, OR low, or pullback swing low)
-- **Short entry**: stop is set above the most recent key resistance level (overnight high, OR high, or pullback swing high)
+Unlike SCALP/SWING which use ATR-based stops, INTRADAY TREND computes a **structural stop** exclusively from session key levels in `it_ctx`. ATR is never used to manufacture a stop:
+- **Long entry**: stop below the most recent key support level (overnight low, OR low, or pullback swing low)
+- **Short entry**: stop above the most recent key resistance level (overnight high, OR high, or pullback swing high)
 
-This structural stop is checked for validity before any entry is accepted:
+This structural stop is validated before any entry is accepted:
 - Must be a finite number (not None or zero)
-- Must be on the correct side of current price (stop below price for Long; above for Short)
-- Must produce a positive, reasonable risk distance
+- Must be on the correct side of current price (below price for Long; above for Short)
+- Must fall within ATR sanity bounds: minimum 0.3× ATR, maximum 4× ATR — stops outside this window suggest a data error
 
-If these conditions are not met, the blocker will show **BLOCKED_INVALID_STOP** and no entry fires. The system will never default to a fallback stop or assume "1 contract is safe enough" — no valid stop = no trade.
+If these conditions are not met, the blocker shows **IT_STRUCTURE_FAIL** and no entry fires. The system will never fall back to an ATR-estimated stop or assume a default risk distance — no valid structural stop = no trade.
+
+### 9.7a Setup Expiration
+
+Each setup family has a built-in expiration window after which the setup is considered stale:
+
+| Family | Expiration |
+|--------|-----------|
+| LIQUIDITY_SWEEP_REVERSAL | **30 minutes** |
+| BREAKOUT_RETEST | **45 minutes** |
+| TREND_PULLBACK | **60 minutes** |
+
+Once a setup expires, the `expires_at` timestamp passes and the engine looks for a fresh setup. This prevents the system from holding a "stale" setup context and entering on a move that has already played out.
 
 ### 9.8 EOD Force-Flat (15:55 ET)
 
