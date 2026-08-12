@@ -985,10 +985,11 @@ MODES = {
         # multiplier applies in HIGH_CAUTION / HIGH_BLOCK regimes).
         "STOP_ATR_MULT":            2.5,
         "STOP_ATR_MULT_HIGH":       3.0,
-        # Per-trade dollar ceiling raised from $50 → $100 to match the wider 2.5×ATR
-        # stops (MNQ at 2.5×ATR ≈ $71/contract; $50 cap would block MNQ as over_cap).
+        # Per-trade dollar ceiling raised from $100 → $200 to match the wider 2.5×ATR
+        # stops (MNQ at 2.5×ATR ≈ 50-75 pts ≈ $100-$150/contract; $100 cap was too
+        # tight and produced 0-contract over_cap outcomes for most MNQ setups).
         # Env MAX_RISK_DOLLARS_PER_TRADE still overrides. SWING keeps $500.
-        "MAX_RISK_DOLLARS":         100,
+        "MAX_RISK_DOLLARS":         200,
         # Faster READY re-check / re-post cadence (seconds) so the probability tracks
         # fresh moves. SWING keeps 300. Env TRADE_READY_INTERVAL still overrides.
         "TRADE_READY_INTERVAL_SEC": 120,
@@ -1545,7 +1546,7 @@ ASSETS = {
             # SCALP minimum-stop FLOOR: a calc stop tighter than this is WIDENED up to
             # the floor (SWING rejects, SCALP widens). Hardcoded literal (NOT env-
             # tunable) so a stale legacy MGC_SCALP_MIN_STOP_* secret can never change
-            # money behavior. 3 pts = $30 risk (under the $50 SCALP per-trade cap).
+            # money behavior. 3 pts = $30 risk (under the $200 SCALP per-trade cap).
             "scalp_min_stop_ticks": 30,
             "scalp_min_stop_pts": 3.0,
             "mitig_tol_pts": _spec_float_env("MGC_MITIG_TOL_PTS", 12.0),
@@ -1574,7 +1575,7 @@ ASSETS = {
             "min_stop_pts": _spec_float_env("MNQ_MIN_STOP_PTS", 20.0),
             # SCALP minimum-stop FLOOR (WIDEN, never reject — see MGC). Hardcoded literal
             # (NOT env-tunable) so a stale legacy MNQ_SCALP_MIN_STOP_* secret can never
-            # change money behavior. 12 pts = $24 risk (under the $50 SCALP per-trade cap).
+            # change money behavior. 12 pts = $24 risk (under the $200 SCALP per-trade cap).
             "scalp_min_stop_ticks": 48,
             "scalp_min_stop_pts": 12.0,
             "mitig_tol_pts": _spec_float_env("MNQ_MITIG_TOL_PTS", 15.0),
@@ -1891,11 +1892,11 @@ TRADERSPOST_MAX_CONTRACTS = max(1, int(os.environ.get("TRADERSPOST_MAX_CONTRACTS
 # Absolute per-trade risk ceiling (USD). BOTH the displayed sizing and the (only)
 # money-moving path cap risk at this; a setup whose SINGLE-contract risk already
 # exceeds it (stop too wide for the account) is SKIPPED, never forced through at one
-# contract over the cap. Mode-aware: SCALP $50 / SWING $250 on the $50k account; env
+# contract over the cap. Mode-aware: SCALP $200 / SWING $500; env
 # MAX_RISK_DOLLARS_PER_TRADE overrides both.
 def max_risk_cap():
     """Absolute per-trade risk ceiling (USD). Env MAX_RISK_DOLLARS_PER_TRADE wins;
-    otherwise the active mode's MAX_RISK_DOLLARS (SCALP 50 / SWING 250). BOTH the
+    otherwise the active mode's MAX_RISK_DOLLARS (SCALP 200 / SWING 500). BOTH the
     displayed sizing and the money path read this, so they never diverge."""
     _env = os.environ.get("MAX_RISK_DOLLARS_PER_TRADE")
     if _env is not None:
@@ -63126,7 +63127,7 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
     # setup is SKIPPED rather than forced through over-cap — identical rule for the
     # manual button and hands-free auto execution. Clamp (never round up). Reduced-
     # conviction setups (BOS-only Attempt / EARLY tier) size down via _setup_risk_mult.
-    # Dual-TF entries are full-size (1:1, $100-capped below); the Edge structure_class
+    # Dual-TF entries are full-size (1:1, $200-capped below); the Edge structure_class
     # reduced-size modifier applies only to the Edge-verdict auto/manual paths.
     if source == "dual_tf":
         _size_mult = 1.0
@@ -82081,9 +82082,9 @@ def _review_user_risk_cap(mode):
         except (TypeError, ValueError):
             pass
     try:
-        return max(1, int(MODES.get(mode, {}).get("MAX_RISK_DOLLARS", 100)))
+        return max(1, int(MODES.get(mode, {}).get("MAX_RISK_DOLLARS", 200)))
     except (TypeError, ValueError):
-        return 100
+        return 200
 
 
 def _review_trade_idea(payload):
