@@ -1,0 +1,87 @@
+Do not Publish yet. Make four final safety corrections to INTRADAY_TREND only. Do not alter SCALP, ORB, Databento ingestion, canonical risk calculations, or unrelated execution behavior.
+
+1. INVALID STRUCTURAL STOP MUST FAIL CLOSED
+
+Current test behavior says zero stop distance results in 1 contract.
+
+Change this.
+
+If INTRADAY_TREND cannot calculate a valid structural stop, including:
+
+stop is None
+stop distance <= 0
+non-finite stop
+invalid entry/stop relationship
+required structural invalidation unavailable
+
+then:
+
+READY -> WAIT/BLOCKED_INVALID_STOP
+
+No position sizing request may be sent.
+
+Never default to 1 contract because stop information is invalid.
+
+Add tests proving no execution path can proceed with an invalid structural stop.
+
+2. DAILY TRADE CAP MUST FAIL CLOSED ON THE MONEY PATH
+
+Diagnostics may show count unavailable if the DB is temporarily unavailable.
+
+But INTRADAY_TREND execution qualification must not assume the daily trade cap is clear when trade count cannot be determined.
+
+If the count cannot be verified:
+
+BLOCKED_DAILY_COUNT_UNAVAILABLE
+
+SHADOW diagnostics can continue running and recording the opportunity.
+
+Do not globally change other strategies' DB behavior.
+
+3. RECOGNIZED SETUP + COMPLETED CONFIRMATION REQUIRED
+
+INTRADAY_TREND may only become READY for:
+
+LIQUIDITY_SWEEP_REVERSAL
+BREAKOUT_RETEST
+TREND_PULLBACK
+
+If setup_family is None/unknown:
+
+WAITING_FOR_SETUP
+
+It may continue collecting diagnostics but must not become executable.
+
+Then require that family's confirmation sequence to be complete before READY.
+
+Unknown/unrecognized setup must never fail open into execution.
+
+4. FORCE-FLAT FAILURE MUST BE VISIBLE AND RETRIED
+
+Keep exception protection so the heartbeat cannot crash.
+
+However, if an INTRADAY_TREND position cannot be closed at/after 15:55 ET:
+
+log CRITICAL/ERROR
+set visible state such as FORCE_CLOSE_PENDING or RECOVERY_REQUIRED
+retry closing on subsequent watchdog/heartbeat cycles
+expose the failure in diagnostics/status
+never silently mark the position successfully closed
+
+Add a test where the first close attempt throws an exception and the next watchdog cycle retries successfully.
+
+Run:
+
+full INTRADAY_TREND suite
+PARITY
+SCALP GOLDEN
+DUAL-SIM
+BREAKOUT MODE
+
+Leave:
+
+INTRADAY_TREND = SHADOW
+
+Do not enable PAPER or LIVE.
+
+Stop after reporting test results.

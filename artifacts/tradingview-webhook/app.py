@@ -1154,6 +1154,14 @@ MODES = {
     },
 }
 
+# INTRADAY_TREND is an in-place rename of SWING.  It reuses the FULL SWING
+# profile (same HTF layer, risk engine, edge thresholds, stop geometry).
+# MNQ-only enforcement and intraday time restrictions live in the IT veto;
+# the display name on the dashboard is updated in the JS renderer.
+# Historical records written with mode="SWING" remain readable because the
+# MODES dict still has a "SWING" key.
+MODES["INTRADAY_TREND"] = dict(MODES["SWING"])
+
 TRADING_MODE = os.environ.get("TRADING_MODE", "SCALP").upper()
 if TRADING_MODE not in MODES:
     TRADING_MODE = "SCALP"
@@ -6521,6 +6529,1348 @@ def compute_swing_context(instrument, price):
     except Exception as exc:  # display must never break on bad data
         logger.warning("compute_swing_context error for %s: %s", instrument, exc)
     return ctx
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# INTRADAY TREND — session / location / directional-context / setup engine
+# ─────────────────────────────────────────────────────────────────────────────
+# All helpers are PURE (no state mutation), FAIL-OPEN for display, and called
+# only when TRADING_MODE == "INTRADAY_TREND".  The entry veto
+# (_it_entry_veto_reasons) is FAIL-CLOSED on the money path.
+#
+# Strategy: detect the primary MNQ directional move for the day (100–300+pt
+# potential) from one of three setup families:
+#   A — LIQUIDITY_SWEEP_REVERSAL  (sweep of key level → rejection → structure)
+#   B — BREAKOUT_RETEST           (break → acceptance → failed-reclaim retest)
+#   C — TREND_PULLBACK            (established trend, pullback to VWAP/structure)
+#
+# Default shadow — INTRADAY_TREND = SHADOW.  Live execution not enabled.
+# MNQ-only.  Max 2 trades/day.  No entries after 14:30 ET.  Flat by 15:55 ET.
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _it_session_et(et_now=None):
+    """Classify the current intraday session for INTRADAY_TREND (America/New_York).
+
+    Returns a dict: ``session`` (canonical label), ``session_short`` (3-5 chars),
+    ``et_hour``, ``et_minute``.  FAIL-OPEN → session='UNKNOWN' on any error.
+
+    Session boundaries (ET minutes since midnight):
+      ASIA          18:00–24:00 (prior day)   ≡ hm >= 1080
+      LONDON        00:00–07:00               hm < 420
+      US_PREMARKET  07:00–09:30               420 <= hm < 570
+      NY_OPEN       09:30–10:30               570 <= hm < 630
+      NY_SESSION    10:30–14:30               630 <= hm < 870
+      LATE_SESSION  14:30–16:00               870 <= hm < 960
+      CLOSED        16:00–18:00               960 <= hm < 1080
+    """
+    try:
+        t = et_now if et_now is not None else now_utc().astimezone(ET_TZ)
+        h, m = t.hour, t.minute
+        hm = h * 60 + m
+        if hm < 420:
+            session, short = "LONDON",       "LDN"
+        elif hm < 570:
+            session, short = "US_PREMARKET", "PRE"
+        elif hm < 630:
+            session, short = "NY_OPEN",      "OPEN"
+        elif hm < 870:
+            session, short = "NY_SESSION",   "NY"
+        elif hm < 960:
+            session, short = "LATE_SESSION", "LATE"
+        elif hm < 1080:
+            session, short = "CLOSED",       "CLSD"
+        else:
+            session, short = "ASIA",         "ASIA"
+        return {"session": session, "session_short": short,
+                "et_hour": h, "et_minute": m}
+    except Exception:
+        return {"session": "UNKNOWN", "session_short": "?",
+                "et_hour": None, "et_minute": None}
+
+
+def _it_location_quality(price, levels, atr, vwap=None):
+    """Score the INTRADAY_TREND entry location quality.
+
+    Returns a dict: ``quality`` in {EXCELLENT, GOOD, POOR, MID_RANGE},
+    ``level_hit`` (nearest key-level label), ``dist_pts``, and ``reason``.
+
+    Rules (ATR fractions):
+      EXCELLENT  <= 0.25 × ATR from a prior-day H/L/C, or <= 0.20 × ATR from VWAP
+      GOOD       <= 0.50 × ATR from a swing H/L or operator-pushed level
+      POOR       0.50–1.0 × ATR from any key level
+      MID_RANGE  no key level within 1.0 × ATR
+    """
+    _neutral = {"quality": "MID_RANGE", "level_hit": None,
+                "dist_pts": None, "reason": "No key level within range."}
+    try:
+        if price is None:
+            return _neutral
+        atr_f = float(atr) if atr else 0.0
+        if atr_f <= 0:
+            return _neutral
+
+        # VWAP proximity — EXCELLENT when within 0.20×ATR
+        if vwap is not None:
+            try:
+                vdist = abs(float(price) - float(vwap))
+                if vdist <= 0.20 * atr_f:
+                    return {"quality": "EXCELLENT", "level_hit": "VWAP",
+                            "dist_pts": round(vdist, 2),
+                            "reason": f"At VWAP ({float(vwap):.2f}). Premium location."}
+                elif vdist <= 0.50 * atr_f:
+                    return {"quality": "GOOD", "level_hit": "VWAP",
+                            "dist_pts": round(vdist, 2),
+                            "reason": f"Near VWAP ({float(vwap):.2f}). Good location."}
+            except (TypeError, ValueError):
+                pass
+
+        # Key levels: tier = "P" (prior-day) or "S" (swing/chart)
+        candidates = []
+        if isinstance(levels, dict):
+            for key in ("prior_high", "prior_low", "prior_close"):
+                v = levels.get(key)
+                if v is not None:
+                    lbl = {"prior_high": "Prior day high",
+                           "prior_low":  "Prior day low",
+                           "prior_close": "Prior day close"}[key]
+                    candidates.append((float(v), lbl, "P"))
+            for v in levels.get("swing_highs", []):
+                candidates.append((float(v), "Swing high", "S"))
+            for v in levels.get("swing_lows", []):
+                candidates.append((float(v), "Swing low", "S"))
+            for v in levels.get("chart_levels", []):
+                candidates.append((float(v), "Key level", "S"))
+
+        if not candidates:
+            return _neutral
+
+        best_lp, best_lb, best_tier, best_d = None, None, None, float("inf")
+        for lp, lb, tier in candidates:
+            d = abs(float(price) - lp)
+            if d < best_d:
+                best_lp, best_lb, best_tier, best_d = lp, lb, tier, d
+
+        ratio = best_d / atr_f
+        if best_tier == "P":
+            if ratio <= 0.25:
+                q, desc = "EXCELLENT", f"At {best_lb} ({best_lp:.2f}). Premium location."
+            elif ratio <= 0.50:
+                q, desc = "GOOD",      f"Near {best_lb} ({best_lp:.2f}). Good location."
+            elif ratio <= 1.00:
+                q, desc = "POOR",      f"Approaching {best_lb} ({best_lp:.2f}), {best_d:.1f} pts away."
+            else:
+                q, desc = "MID_RANGE", f"Mid-range. {best_lb} is {best_d:.1f} pts away (>{atr_f:.1f} ATR)."
+        else:  # swing/chart level
+            if ratio <= 0.50:
+                q, desc = "GOOD",      f"At {best_lb} ({best_lp:.2f}). Good location."
+            elif ratio <= 1.00:
+                q, desc = "POOR",      f"Near {best_lb} ({best_lp:.2f}), {best_d:.1f} pts away."
+            else:
+                q, desc = "MID_RANGE", f"Mid-range. {best_lb} is {best_d:.1f} pts away (>{atr_f:.1f} ATR)."
+
+        return {"quality": q, "level_hit": best_lb,
+                "dist_pts": round(best_d, 2), "reason": desc}
+    except Exception:
+        return _neutral
+
+
+def _it_directional_context(htf_state, price, vwap, confluences=None):
+    """Build INTRADAY_TREND multi-timeframe directional context.
+
+    Returns trend_4h, trend_1h (from HTF_STATE_BY_INST), trend_15m (from
+    BOS/CHOCH structure in confluences), trend_5m (price vs VWAP + CVD),
+    trend_alignment (STRONG_BULLISH / BULLISH / MIXED / BEARISH / STRONG_BEARISH),
+    and alignment_score (-4..+4).  All FAIL-OPEN.
+    """
+    ctx = {
+        "trend_4h": "NEUTRAL", "trend_1h": "NEUTRAL",
+        "trend_15m": "NEUTRAL", "trend_5m": "NEUTRAL",
+        "trend_alignment": "MIXED", "alignment_score": 0,
+    }
+    try:
+        def _bias(b):
+            if b in ("bull", "bullish"):  return "BULLISH"
+            if b in ("bear", "bearish"):  return "BEARISH"
+            return "NEUTRAL"
+
+        if isinstance(htf_state, dict):
+            ctx["trend_4h"] = _bias((htf_state.get("4H") or {}).get("bias"))
+            ctx["trend_1h"] = _bias((htf_state.get("1H") or {}).get("bias"))
+
+        c = confluences or {}
+        # 15m: structure confirmed in a direction gives the clearest 15m read
+        if c.get("structure_confirmed") and c.get("direction"):
+            ctx["trend_15m"] = "BULLISH" if c["direction"] == "Long" else "BEARISH"
+        elif c.get("direction"):
+            ctx["trend_15m"] = "BULLISH" if c["direction"] == "Long" else "BEARISH"
+
+        # 5m: price vs VWAP side
+        if price is not None and vwap is not None:
+            try:
+                p, v = float(price), float(vwap)
+                if p > v:   ctx["trend_5m"] = "BULLISH"
+                elif p < v: ctx["trend_5m"] = "BEARISH"
+            except (TypeError, ValueError):
+                pass
+
+        score_map = {"BULLISH": 1, "BEARISH": -1, "NEUTRAL": 0}
+        score = sum(score_map.get(ctx[k], 0)
+                    for k in ("trend_4h", "trend_1h", "trend_15m", "trend_5m"))
+        ctx["alignment_score"] = score
+        if score >= 3:   ctx["trend_alignment"] = "STRONG_BULLISH"
+        elif score >= 1: ctx["trend_alignment"] = "BULLISH"
+        elif score <= -3:ctx["trend_alignment"] = "STRONG_BEARISH"
+        elif score <= -1:ctx["trend_alignment"] = "BEARISH"
+        else:            ctx["trend_alignment"] = "MIXED"
+    except Exception:
+        pass
+    return ctx
+
+
+def _it_setup_family(confluences, direction, price=None, levels=None, vwap=None):
+    """Identify which INTRADAY_TREND setup family is developing.
+
+    Returns (family, reason) where family is one of:
+      "LIQUIDITY_SWEEP_REVERSAL"  — swept a key level then rejected + structure
+      "BREAKOUT_RETEST"           — break of key S/R, accepted, failed-reclaim retest
+      "TREND_PULLBACK"            — established trend + pullback to VWAP/structure
+      None                        — no clear setup family yet
+
+    PURE, FAIL-OPEN, never raises.
+    """
+    try:
+        c = confluences or {}
+        sweep    = bool(c.get("liquidity_sweep"))
+        structure= bool(c.get("structure_confirmed"))
+        vwap_c   = bool(c.get("vwap_confirmed"))
+        bos_choch= bool(c.get("bos") or c.get("choch"))
+        dir_lbl  = "bearish" if direction == "Short" else "bullish"
+
+        # A: Liquidity Sweep Reversal — swept level AND structure confirms reversal
+        if sweep and structure:
+            return ("LIQUIDITY_SWEEP_REVERSAL",
+                    f"Liquidity sweep with {dir_lbl} structure confirmation. "
+                    "Failed reclaim pattern developing.")
+
+        # B: Breakout + Retest — BOS/CHOCH + VWAP confirms acceptance, no fresh sweep
+        if bos_choch and vwap_c and not sweep:
+            return ("BREAKOUT_RETEST",
+                    f"{dir_lbl.capitalize()} structure break with VWAP-confirmed acceptance. "
+                    "Watching for failed reclaim retest.")
+
+        # C: Trend Pullback — VWAP pullback + structure still intact
+        if vwap_c and structure:
+            return ("TREND_PULLBACK",
+                    f"Pullback to VWAP with {dir_lbl} structure intact. "
+                    "Watching for continuation signal.")
+
+        # Partial / forming
+        if sweep:
+            return ("LIQUIDITY_SWEEP_REVERSAL",
+                    "Sweep detected. Awaiting structure confirmation to qualify.")
+        if bos_choch:
+            return ("BREAKOUT_RETEST",
+                    "Structure break detected. Awaiting VWAP-confirmed retest.")
+        if vwap_c:
+            return ("TREND_PULLBACK",
+                    "VWAP pullback. Awaiting structure confirmation.")
+
+        return (None, "No setup family identified. Building intraday context.")
+    except Exception:
+        return (None, "Setup family detection unavailable.")
+
+
+# Configurable INTRADAY_TREND time boundaries (env-overridable)
+_IT_LAST_ENTRY_DEFAULT = "14:30"   # no new entries at/after this ET time
+_IT_FORCE_FLAT_DEFAULT  = "15:55"  # positions must be flat by this ET time
+
+# Recognised INTRADAY_TREND setup families.  Any family not in this set is
+# treated as UNKNOWN → WAITING_FOR_SETUP, never executable.
+_IT_KNOWN_FAMILIES = frozenset(
+    {"LIQUIDITY_SWEEP_REVERSAL", "BREAKOUT_RETEST", "TREND_PULLBACK"})
+
+# In-memory EOD force-close failure state.  Populated when the watchdog
+# cannot close open IT ghost positions so the failure is visible in
+# diagnostics and retried on the next heartbeat cycle.
+# Schema: {key: {"error": str, "timestamp": str}}
+_IT_FORCE_CLOSE_PENDING: dict = {}
+
+
+def _it_parse_time(env_key, default_str):
+    """Parse an HH:MM ET time from env; return (hour, minute). FAIL-OPEN."""
+    raw = os.environ.get(env_key, "").strip() or default_str
+    try:
+        h, m = raw.split(":")
+        return int(h), int(m)
+    except Exception:
+        h, m = default_str.split(":")
+        return int(h), int(m)
+
+
+def _it_time_restriction(et_now=None):
+    """Check INTRADAY_TREND time-based entry restrictions.
+
+    Returns (ok: bool, state: str, reason: str|None).
+      ok=True    entry is permitted
+      ok=False   entry blocked (state = ENTRY_BLOCKED or FORCE_FLAT)
+
+    Env config:
+      IT_LAST_NEW_ENTRY_TIME  (default 14:30 ET)
+      IT_FORCE_FLAT_TIME      (default 15:55 ET)
+    """
+    try:
+        last_h, last_m = _it_parse_time("IT_LAST_NEW_ENTRY_TIME", _IT_LAST_ENTRY_DEFAULT)
+        flat_h, flat_m = _it_parse_time("IT_FORCE_FLAT_TIME",     _IT_FORCE_FLAT_DEFAULT)
+        t  = et_now if et_now is not None else now_utc().astimezone(ET_TZ)
+        hm = t.hour * 60 + t.minute
+        if hm >= flat_h * 60 + flat_m:
+            return (False, "FORCE_FLAT",
+                    f"Past {flat_h:02d}:{flat_m:02d} ET — INTRADAY TREND positions "
+                    "must be flat. No new entries.")
+        if hm >= last_h * 60 + last_m:
+            return (False, "ENTRY_BLOCKED",
+                    f"Past {last_h:02d}:{last_m:02d} ET — insufficient time for a "
+                    "large intraday move. No new entries.")
+        return (True, "OK", None)
+    except Exception:
+        return (True, "OK", None)   # FAIL-OPEN — never block on parse error
+
+
+def _it_projected_move(entry, target, risk, direction):
+    """Projected move in MNQ points and as an R-multiple.
+
+    Returns (projected_points, projected_r) or (None, None) on bad input.
+    """
+    try:
+        e, tgt, r = float(entry), float(target), float(risk)
+        if r <= 0:
+            return (None, None)
+        pts = (tgt - e) if direction == "Long" else (e - tgt)
+        if pts <= 0:
+            return (None, None)
+        return (round(pts, 1), round(pts / r, 2))
+    except (TypeError, ValueError):
+        return (None, None)
+
+
+def compute_intraday_trend_context(instrument, price, confluences=None,
+                                    swing_ctx=None, trade_plan=None,
+                                    direction=None, et_now=None):
+    """Full INTRADAY_TREND context — session, location, direction, setup family,
+    confirmation sequence, structural stop, risk sizing, daily trade count,
+    and advisory trade management.
+
+    Fail-OPEN, never raises, returns a stable schema.  Reuses the already-
+    computed swing_ctx (HTF data layer) so no redundant fetch occurs.
+    """
+    inst = instrument_of(instrument) if instrument else instrument
+    ctx = {
+        "enabled":              True,
+        "instrument":           inst,
+        "mode":                 "INTRADAY_TREND",
+        "price":                price,
+        # HTF mirrors (for dashboard parity with swing_diagnostics)
+        "bias_1h":              None, "bias_4h": None, "bias_daily": None,
+        "complete":             False, "stale":   True,
+        "daily_levels":         {},
+        # IT-specific
+        "session":              None,  "session_short": None,
+        "location_quality":     None,  "location_level": None,
+        "location_dist_pts":    None,  "location_reason": None,
+        "trend_4h":             "NEUTRAL", "trend_1h":  "NEUTRAL",
+        "trend_15m":            "NEUTRAL", "trend_5m":  "NEUTRAL",
+        "trend_alignment":      "MIXED",   "alignment_score": 0,
+        "setup_family":         None,  "setup_family_reason": None,
+        "time_ok":              True,  "time_state": "OK", "time_reason": None,
+        "projected_points":     None,  "projected_r": None,
+        # Phase 2 additions
+        "session_levels":        {},
+        "structural_stop_level": None, "structural_stop_pts": None,
+        "structural_stop_source": None,
+        "confirmation_complete": False,
+        "confirmation_steps":    [],
+        "confirmation_missing":  [],
+        "structural_stop_valid":  False,
+        "recommended_contracts": 0,    # 0 = stop not yet validated; display only
+        "risk_dollars":          None,
+        "daily_trade_count":     -1,   # -1 = unavailable (fail-closed default)
+        "daily_trade_cap":       2,
+        "mgmt_action":           None, "mgmt_action_reason": None,
+        "mgmt_current_r":        None, "mgmt_be_recommended": False,
+        "mgmt_partial_at_1r5":   False, "mgmt_trail_active": False,
+        "mgmt_force_flat":       False,
+        "status":               "BUILDING_CONTEXT",
+        "reason":               "Gathering intraday context.",
+    }
+    try:
+        t = et_now if et_now is not None else now_utc().astimezone(ET_TZ)
+
+        # Session
+        sess = _it_session_et(t)
+        ctx["session"]       = sess["session"]
+        ctx["session_short"] = sess["session_short"]
+
+        # Time restriction
+        tok, tstate, treason = _it_time_restriction(t)
+        ctx["time_ok"]    = tok
+        ctx["time_state"] = tstate
+        ctx["time_reason"]= treason
+
+        # HTF mirrors from swing_ctx (same data the gate used)
+        sc = swing_ctx if isinstance(swing_ctx, dict) else {}
+        ctx["bias_1h"]      = sc.get("bias_1h")
+        ctx["bias_4h"]      = sc.get("bias_4h")
+        ctx["bias_daily"]   = sc.get("bias_daily")
+        ctx["complete"]     = bool(sc.get("complete"))
+        ctx["stale"]        = bool(sc.get("stale", True))
+        ctx["daily_levels"] = sc.get("daily_levels") or {}
+
+        # Per-instrument HTF state for directional context
+        htf_state = (HTF_STATE_BY_INST.get(inst) or {}) if inst else {}
+
+        # VWAP / ATR from trade plan (best available)
+        vwap = None
+        atr  = None
+        if isinstance(trade_plan, dict):
+            vwap = trade_plan.get("vwap")
+            atr  = trade_plan.get("atr_pts")
+        if atr is None:
+            atr = sc.get("atr_1h") or sc.get("atr_4h")
+
+        # Directional context (4H / 1H / 15m / 5m)
+        dir_ctx = _it_directional_context(htf_state, price, vwap, confluences)
+        ctx.update(dir_ctx)
+
+        # ── Phase 2: session key-levels from live bar history ───────────────
+        sess_levels = _it_compute_session_levels(inst, t)
+        ctx["session_levels"] = sess_levels
+
+        # Merged levels: HTF daily levels + live session levels
+        merged_levels = dict(ctx["daily_levels"])
+        merged_levels.update({k: v for k, v in sess_levels.items() if v is not None
+                               and k not in ("major_15m_swing_highs",
+                                             "major_15m_swing_lows")})
+        merged_levels["swing_highs"] = merged_levels.get("swing_highs", []) + sess_levels.get("major_15m_swing_highs", [])
+        merged_levels["swing_lows"]  = merged_levels.get("swing_lows", []) + sess_levels.get("major_15m_swing_lows", [])
+
+        # Location quality (uses merged levels for better key-level coverage)
+        loc = _it_location_quality(price, merged_levels, atr, vwap)
+        ctx["location_quality"]  = loc["quality"]
+        ctx["location_level"]    = loc.get("level_hit")
+        ctx["location_dist_pts"] = loc.get("dist_pts")
+        ctx["location_reason"]   = loc.get("reason")
+
+        # Setup family
+        fam, fam_r = _it_setup_family(confluences, direction, price,
+                                       merged_levels, vwap)
+        ctx["setup_family"]        = fam
+        ctx["setup_family_reason"] = fam_r
+
+        # ── Phase 2: confirmation sequence ─────────────────────────────────
+        confirmed, steps, miss = _it_confirmation_complete(
+            fam, confluences, direction, ctx.get("alignment_score", 0))
+        ctx["confirmation_complete"] = confirmed
+        ctx["confirmation_steps"]    = steps
+        ctx["confirmation_missing"]  = miss
+
+        # ── Phase 2: structural stop ───────────────────────────────────────
+        sl, sl_pts, sl_src = _it_structural_stop(
+            fam, confluences, direction, price, merged_levels, atr)
+        ctx["structural_stop_level"]  = sl
+        ctx["structural_stop_pts"]    = sl_pts
+        ctx["structural_stop_source"] = sl_src
+
+        # Validate stop: must be a finite positive distance on the correct
+        # side of the current price.  Invalid stop → no sizing, BLOCKED.
+        try:
+            _sl_f   = float(sl)   if sl   is not None else None
+            _pts_f  = float(sl_pts) if sl_pts is not None else None
+            stop_valid = (
+                _sl_f is not None and _pts_f is not None
+                and _pts_f > 0
+                and math.isfinite(_sl_f)
+                and math.isfinite(_pts_f)
+            )
+            if stop_valid and price is not None and direction:
+                if direction == "Long"  and _sl_f >= float(price):
+                    stop_valid = False
+                elif direction == "Short" and _sl_f <= float(price):
+                    stop_valid = False
+        except Exception:
+            stop_valid = False
+        ctx["structural_stop_valid"] = stop_valid
+
+        # ── Phase 2: advisory risk sizing from structural stop ─────────────
+        # recommended_contracts = 0 when stop is invalid (never size without a
+        # valid structural stop).  This is display-only; the veto gate is the
+        # actual money-path guard.
+        if stop_valid:
+            contracts, risk_d = _it_risk_sizing(sl_pts, inst or "MNQ")
+        else:
+            contracts, risk_d = (0, None)
+        ctx["recommended_contracts"] = contracts
+        ctx["risk_dollars"]          = risk_d
+
+        # ── Phase 2: daily trade count ─────────────────────────────────────
+        daily_count, daily_cap = _it_daily_trade_count(inst or "MNQ")
+        ctx["daily_trade_count"] = daily_count
+        ctx["daily_trade_cap"]   = daily_cap
+
+        # Projected move (from trade plan geometry)
+        if (isinstance(trade_plan, dict) and trade_plan.get("trade_plan")
+                and direction in ("Long", "Short")):
+            entry  = trade_plan.get("entry_zone")
+            target = (trade_plan.get("target1") or trade_plan.get("target2"))
+            risk   = (trade_plan.get("risk_pts")
+                      or trade_plan.get("stop_dist_pts")
+                      or trade_plan.get("atr_pts"))
+            if entry and target and risk:
+                pts, r = _it_projected_move(entry, target, risk, direction)
+                ctx["projected_points"] = pts
+                ctx["projected_r"]      = r
+
+        # ── Phase 2: advisory trade management (active trade only) ─────────
+        try:
+            active = (ACTIVE_TRADES_BY_INST.get(inst) or {}) if inst else {}
+            if active and price:
+                mgmt = compute_it_trade_management(active, price, ctx, t)
+                ctx["mgmt_action"]         = mgmt.get("action")
+                ctx["mgmt_action_reason"]  = mgmt.get("action_reason")
+                ctx["mgmt_current_r"]      = mgmt.get("current_r")
+                ctx["mgmt_be_recommended"] = mgmt.get("be_recommended", False)
+                ctx["mgmt_partial_at_1r5"] = mgmt.get("partial_at_1r5", False)
+                ctx["mgmt_trail_active"]   = mgmt.get("trail_active", False)
+                ctx["mgmt_force_flat"]     = mgmt.get("force_flat", False)
+        except Exception:
+            pass
+
+        # ── Status / reason logic (ordered by severity) ───────────────────
+        #
+        # Precedence (highest to lowest):
+        #  1. Time restriction BLOCKED
+        #  2. Daily count unavailable → BLOCKED_DAILY_COUNT_UNAVAILABLE (fail-closed)
+        #  3. Daily cap reached → DAILY_CAP_REACHED
+        #  4. Mid-range location → BLOCKED_MID_RANGE
+        #  5. No recognised setup family → WAITING_FOR_SETUP
+        #  6. Family known but confirmation incomplete → AWAITING_CONFIRMATION
+        #  7. Valid family + confirmed but structural stop invalid → BLOCKED_INVALID_STOP
+        #  8. POOR location (near level, not optimal) → WATCHING_LEVEL
+        #  9. EXCELLENT/GOOD location → CONFIRMED_SETUP
+        # 10. Family present but developing → SETUP_DEVELOPING
+        #
+        _fam_known = fam and fam in _IT_KNOWN_FAMILIES
+        if not tok:
+            ctx["status"] = "BLOCKED"
+            ctx["reason"] = treason or "Time restriction active."
+        elif daily_count == -1:
+            ctx["status"] = "BLOCKED_DAILY_COUNT_UNAVAILABLE"
+            ctx["reason"] = ("Daily trade count unavailable (DB error). "
+                             "Cannot verify cap — blocked.")
+        elif daily_count >= daily_cap:
+            ctx["status"] = "DAILY_CAP_REACHED"
+            ctx["reason"] = (f"Daily trade cap reached "
+                             f"({daily_count}/{daily_cap} INTRADAY TREND trades today).")
+        elif ctx["location_quality"] == "MID_RANGE":
+            ctx["status"] = "BLOCKED_MID_RANGE"
+            ctx["reason"] = (loc.get("reason")
+                             or "Mid-range — no structural anchor for entry.")
+        elif not _fam_known:
+            ctx["status"] = "WAITING_FOR_SETUP"
+            ctx["reason"] = (fam_r
+                             or "No recognised setup family yet — collecting context.")
+        elif not confirmed:
+            ctx["status"] = "AWAITING_CONFIRMATION"
+            ctx["reason"] = (miss[0] if miss else
+                             fam_r or "Awaiting setup confirmation steps.")
+        elif not stop_valid:
+            ctx["status"] = "BLOCKED_INVALID_STOP"
+            ctx["reason"] = ("Structural stop unavailable or invalid. "
+                             "Cannot size position safely — blocked.")
+        elif ctx["location_quality"] == "POOR":
+            ctx["status"] = "WATCHING_LEVEL"
+            ctx["reason"] = loc.get("reason") or "Approaching a level — monitoring."
+        elif ctx["location_quality"] in ("EXCELLENT", "GOOD"):
+            ctx["status"] = "CONFIRMED_SETUP"
+            ctx["reason"] = (fam_r or
+                             f"{fam.replace('_', ' ').title()} — all confirmation steps met.")
+        else:
+            ctx["status"] = "SETUP_DEVELOPING"
+            ctx["reason"] = fam_r or f"{fam.replace('_', ' ').title()} developing."
+
+    except Exception as exc:
+        ctx["reason"] = f"Context error: {exc}"
+    return ctx
+
+
+def _it_entry_veto_reasons(it_ctx, trade_plan, direction, instrument=None):
+    """Fail-CLOSED INTRADAY_TREND entry filters (MONEY-PATH, DEMOTE-ONLY).
+
+    Returns list of (code, human_reason).  Empty = PASS.
+
+    Gates (all accumulate; execution blocked if any non-empty):
+      1. MNQ-only — any non-MNQ instrument is blocked immediately.
+      2. Time restriction — entry after LAST_NEW_ENTRY_TIME or FORCE_FLAT_TIME.
+      3. Location quality — MID_RANGE setups have no structural anchor.
+      3a. Recognised setup family required — must be one of the three known
+          families (LIQUIDITY_SWEEP_REVERSAL / BREAKOUT_RETEST / TREND_PULLBACK).
+          None or unrecognised family → WAITING_FOR_SETUP, never executable.
+      4. Confirmation sequence — all steps for the detected family must be complete.
+      5. Structural stop validity — stop must be finite, positive, on the correct
+          side of price.  Invalid or unavailable stop → BLOCKED_INVALID_STOP.
+          Never default to 1 contract; a bad stop is a hard block.
+      6. Daily trade cap — fail-CLOSED when count is unavailable (count == -1).
+          If the DB is temporarily down, the gate cannot verify the cap and must
+          block rather than assume all clear.
+
+    Never raises — any exception returns a veto so a broken check never lets
+    a trade through.
+    """
+    try:
+        inst = instrument_of(instrument or (it_ctx or {}).get("instrument"))
+        # 1. MNQ-only gate
+        if inst != "MNQ":
+            return [("instrument",
+                     f"INTRADAY TREND is MNQ-only — {inst} is not eligible.")]
+        if not isinstance(it_ctx, dict):
+            return [("unavailable", "INTRADAY TREND context unavailable")]
+
+        vetoes = []
+
+        # 2. Time restriction
+        if not it_ctx.get("time_ok", True):
+            vetoes.append(("time",
+                           it_ctx.get("time_reason") or "Time restriction active."))
+
+        # 3. Location quality — MID_RANGE has no structural reason to enter
+        if it_ctx.get("location_quality") == "MID_RANGE":
+            vetoes.append(("location",
+                           it_ctx.get("location_reason")
+                           or "BLOCKED_MID_RANGE: no structural anchor for this entry."))
+
+        # 3a. Recognised setup family required (fail-closed on unknown/None).
+        fam = it_ctx.get("setup_family")
+        if not fam or fam not in _IT_KNOWN_FAMILIES:
+            vetoes.append(("no_setup",
+                           f"No recognised INTRADAY_TREND setup family "
+                           f"(got: {fam!r}). Require one of "
+                           "LIQUIDITY_SWEEP_REVERSAL / BREAKOUT_RETEST / "
+                           "TREND_PULLBACK. WAITING_FOR_SETUP."))
+
+        # 4. Confirmation sequence — only applicable once a known family is detected.
+        if fam and fam in _IT_KNOWN_FAMILIES and not it_ctx.get("confirmation_complete", False):
+            miss = it_ctx.get("confirmation_missing") or []
+            reason = (miss[0] if miss
+                      else "Setup confirmation sequence not yet complete.")
+            vetoes.append(("confirmation", reason))
+
+        # 5. Structural stop validity — hard block when stop is missing or invalid.
+        #    A position must never be sized from an invalid or unknown stop distance.
+        if not it_ctx.get("structural_stop_valid", False):
+            vetoes.append(("invalid_stop",
+                           f"Structural stop unavailable or invalid "
+                           f"(pts={it_ctx.get('structural_stop_pts')!r}). "
+                           "Cannot size position safely. BLOCKED_INVALID_STOP."))
+
+        # 6. Daily trade cap — FAIL-CLOSED when count is unavailable.
+        #    count == -1 means the DB could not be reached; we cannot confirm the
+        #    cap is clear, so block rather than assume it is.
+        daily_count = it_ctx.get("daily_trade_count", -1)
+        daily_cap   = it_ctx.get("daily_trade_cap",   2)
+        if daily_count == -1:
+            vetoes.append(("daily_count_unavailable",
+                           "Daily trade count unavailable (DB error). "
+                           "Cannot verify cap — BLOCKED_DAILY_COUNT_UNAVAILABLE."))
+        elif daily_count >= daily_cap:
+            vetoes.append(("daily_cap",
+                           f"INTRADAY TREND daily cap reached "
+                           f"({daily_count}/{daily_cap} trades today). "
+                           "Max 2 entries per session."))
+
+        return vetoes
+    except Exception as exc:
+        return [("unavailable", f"INTRADAY TREND entry checks errored ({exc})")]
+
+
+# ── INTRADAY TREND Phase 2: Key Levels, Structural Stop, Confirmation ─────────
+
+def _it_compute_session_levels(instrument, et_now=None):
+    """Scan live bar history and classify bars into trading sessions.
+
+    Returns a dict of key levels: overnight_high/low, asia_high/low,
+    london_high/low, opening_range_high/low (first 30 min of NY session),
+    session_high/low, and major_15m_swing_highs/lows (3-bar pivots).
+
+    Consumed by _it_location_quality and _it_structural_stop for richer
+    level coverage beyond the daily HTF levels from swing_ctx.
+
+    FAIL-OPEN, never raises.  All missing values → None / [].
+    """
+    out = {
+        "overnight_high": None, "overnight_low": None,
+        "asia_high":      None, "asia_low":      None,
+        "london_high":    None, "london_low":    None,
+        "opening_range_high": None, "opening_range_low": None,
+        "session_high":   None, "session_low":   None,
+        "major_15m_swing_highs": [], "major_15m_swing_lows": [],
+    }
+    try:
+        from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
+        inst = instrument_of(instrument) if instrument else instrument
+        bars = list(DATABENTO_BARS_BY_INST.get(inst) or [])
+        if not bars:
+            return out
+
+        def _ts_to_et(ts):
+            t = int(ts)
+            if t > 2_000_000_000_000_000:   # nanoseconds (Databento default)
+                return datetime.fromtimestamp(t / 1_000_000_000, tz=ET_TZ)
+            elif t > 2_000_000_000_000:     # milliseconds
+                return datetime.fromtimestamp(t / 1_000, tz=ET_TZ)
+            return datetime.fromtimestamp(t, tz=ET_TZ)              # seconds
+
+        # Session boundaries in ET minutes-from-midnight
+        ASIA_START, ASIA_END   = 0,    420   # 00:00–07:00
+        LDN_START,  LDN_END    = 420,  570   # 07:00–09:30
+        NIGHT_START            = 1080         # 18:00+  (previous-day carry)
+        OR_START,   OR_END     = 570,  600   # 09:30–10:00  (opening range)
+        NY_START               = 570          # 09:30
+
+        asia_h, asia_l = [], []
+        ldn_h,  ldn_l  = [], []
+        ovn_h,  ovn_l  = [], []
+        or_h,   or_l   = [], []
+        sess_h, sess_l = [], []
+        all_h,  all_l  = [], []  # for pivot computation
+
+        today_str = (et_now or now_utc().astimezone(ET_TZ)).strftime("%Y-%m-%d")
+
+        for b in bars:
+            try:
+                bh  = float(b.get("high",  0) if isinstance(b, dict) else b.high)
+                bl  = float(b.get("low",   0) if isinstance(b, dict) else b.low)
+                bts = b.get("ts", 0) if isinstance(b, dict) else getattr(b, "ts", 0)
+                if not bh or not bl or not bts:
+                    continue
+                bar_dt   = _ts_to_et(bts)
+                if bar_dt.strftime("%Y-%m-%d") != today_str:
+                    continue
+                hm = bar_dt.hour * 60 + bar_dt.minute
+                if ASIA_START <= hm < ASIA_END:
+                    asia_h.append(bh); asia_l.append(bl)
+                    ovn_h.append(bh);  ovn_l.append(bl)
+                elif LDN_START <= hm < LDN_END:
+                    ldn_h.append(bh); ldn_l.append(bl)
+                    ovn_h.append(bh); ovn_l.append(bl)
+                elif hm >= NIGHT_START:
+                    ovn_h.append(bh); ovn_l.append(bl)
+                if OR_START <= hm < OR_END:
+                    or_h.append(bh); or_l.append(bl)
+                if hm >= NY_START:
+                    sess_h.append(bh); sess_l.append(bl)
+                all_h.append(bh); all_l.append(bl)
+            except Exception:
+                continue
+
+        if asia_h:  out["asia_high"]          = max(asia_h)
+        if asia_l:  out["asia_low"]           = min(asia_l)
+        if ldn_h:   out["london_high"]        = max(ldn_h)
+        if ldn_l:   out["london_low"]         = min(ldn_l)
+        if ovn_h:   out["overnight_high"]     = max(ovn_h)
+        if ovn_l:   out["overnight_low"]      = min(ovn_l)
+        if or_h:    out["opening_range_high"] = max(or_h)
+        if or_l:    out["opening_range_low"]  = min(or_l)
+        if sess_h:  out["session_high"]       = max(sess_h)
+        if sess_l:  out["session_low"]        = min(sess_l)
+
+        # 3-bar pivot swing highs/lows across all today's bars
+        n = len(all_h)
+        sw_h, sw_l = [], []
+        for i in range(1, n - 1):
+            if all_h[i] > all_h[i-1] and all_h[i] > all_h[i+1]:
+                sw_h.append(all_h[i])
+            if all_l[i] < all_l[i-1] and all_l[i] < all_l[i+1]:
+                sw_l.append(all_l[i])
+        out["major_15m_swing_highs"] = sorted(set(sw_h))[-5:]  # most recent 5
+        out["major_15m_swing_lows"]  = sorted(set(sw_l))[:5]   # lowest 5
+
+    except Exception:
+        pass
+    return out
+
+
+def _it_structural_stop(setup_family, confluences, direction, price, levels, atr,
+                         buf_atr_frac=0.15):
+    """Compute the INTRADAY_TREND structural invalidation stop level.
+
+    Returns (stop_level, stop_pts, stop_source).  stop_pts is the absolute
+    distance from current price (always positive).  All three are None when
+    no structural stop can be reliably derived.
+
+    Logic per setup family:
+      LIQUIDITY_SWEEP_REVERSAL: stop beyond the swept level (the pool that
+        was taken).  Long → highest available level BELOW current price;
+        Short → lowest available level ABOVE current price.
+      BREAKOUT_RETEST: stop beyond the breakout level (prior resistance/support
+        that the price must NOT reclaim).
+      TREND_PULLBACK: stop beyond the pullback extreme (where a genuine
+        continuation trade is invalidated).
+
+    Buffer = max(2.0 pts, buf_atr_frac × ATR).  PURE, FAIL-OPEN.
+    """
+    try:
+        if not setup_family or price is None:
+            return (None, None, None)
+        atr_f = float(atr) if atr else 0.0
+        buf   = max(2.0, atr_f * buf_atr_frac)
+        lv    = levels or {}
+        p     = float(price)
+        is_long = (direction == "Long")
+
+        # Collect all candidate key levels from merged levels dict
+        cands = []
+        for key in ("swing_lows", "swing_highs",
+                    "major_15m_swing_lows", "major_15m_swing_highs"):
+            cands.extend([float(v) for v in (lv.get(key) or []) if v is not None])
+        for key in ("session_low", "session_high", "opening_range_low",
+                    "opening_range_high", "asia_low", "asia_high",
+                    "overnight_low", "overnight_high",
+                    "prior_low", "prior_high"):
+            v = lv.get(key)
+            if v is not None:
+                cands.append(float(v))
+
+        below = sorted([c for c in cands if c < p], reverse=True)  # highest below
+        above = sorted([c for c in cands if c > p])                # lowest above
+
+        if setup_family == "LIQUIDITY_SWEEP_REVERSAL":
+            if is_long:
+                ref = below[0] if below else (p - atr_f)
+                sl  = ref - buf
+                src = (f"Below swept low ({ref:.2f})" if below
+                       else "1×ATR fallback (no swept low found)")
+            else:
+                ref = above[0] if above else (p + atr_f)
+                sl  = ref + buf
+                src = (f"Above swept high ({ref:.2f})" if above
+                       else "1×ATR fallback (no swept high found)")
+
+        elif setup_family == "BREAKOUT_RETEST":
+            if is_long:
+                ref = below[0] if below else (p - atr_f)
+                sl  = ref - buf
+                src = (f"Below breakout level ({ref:.2f})" if below
+                       else "1×ATR fallback (no breakout level found)")
+            else:
+                ref = above[0] if above else (p + atr_f)
+                sl  = ref + buf
+                src = (f"Above breakout level ({ref:.2f})" if above
+                       else "1×ATR fallback (no breakout level found)")
+
+        elif setup_family == "TREND_PULLBACK":
+            if is_long:
+                ref = below[0] if below else (p - 0.75 * atr_f)
+                sl  = ref - buf
+                src = (f"Below pullback low ({ref:.2f})" if below
+                       else "0.75×ATR fallback (no pullback low found)")
+            else:
+                ref = above[0] if above else (p + 0.75 * atr_f)
+                sl  = ref + buf
+                src = (f"Above pullback high ({ref:.2f})" if above
+                       else "0.75×ATR fallback (no pullback high found)")
+
+        else:
+            return (None, None, None)
+
+        stop_pts = abs(p - sl)
+        return (round(sl, 2), round(stop_pts, 2), src)
+
+    except Exception:
+        return (None, None, None)
+
+
+def _it_confirmation_complete(setup_family, confluences, direction, alignment_score=0):
+    """Check whether the INTRADAY_TREND setup family confirmation sequence is complete.
+
+    Returns (complete: bool, steps_done: list[str], missing: list[str]).
+
+    Confirmation requirements per family:
+      LIQUIDITY_SWEEP_REVERSAL:
+        Step 1 — Liquidity sweep detected   (liquidity_sweep=True)
+        Step 2 — Price rejected, structure confirmed  (structure_confirmed=True)
+        Step 3 — CHOCH entry signal confirmed (choch=True) — the Change of
+                 Character that completes the LSR reversal
+
+      BREAKOUT_RETEST:
+        Step 1 — Structure break confirmed  (bos=True or choch=True)
+        Step 2 — VWAP-confirmed acceptance  (vwap_confirmed=True)
+        Step 3 — Failed reclaim confirmed   (structure_confirmed=True — the
+                 attempted re-break of the level that fails, confirming the new
+                 support/resistance)
+
+      TREND_PULLBACK:
+        Step 1 — Established trend          (alignment_score >= 2 TFs aligned)
+        Step 2 — Pullback to VWAP / level   (vwap_confirmed=True)
+        Step 3 — Reversal signal at pullback (structure_confirmed=True AND any
+                 of: sweep, bos, choch — i.e., a micro entry signal)
+
+    PURE, FAIL-OPEN.
+    """
+    try:
+        c = confluences or {}
+        sweep     = bool(c.get("liquidity_sweep"))
+        structure = bool(c.get("structure_confirmed"))
+        vwap_c    = bool(c.get("vwap_confirmed"))
+        choch     = bool(c.get("choch"))
+        bos       = bool(c.get("bos"))
+
+        if setup_family == "LIQUIDITY_SWEEP_REVERSAL":
+            done, miss = [], []
+            if sweep:     done.append("✓ Liquidity sweep detected")
+            else:         miss.append("Liquidity sweep not yet triggered")
+            if structure: done.append("✓ Price rejected — structure confirmed")
+            else:         miss.append("Awaiting structure confirmation (price must reject swept level)")
+            if choch:     done.append("✓ CHOCH entry signal confirmed")
+            else:         miss.append("Awaiting CHOCH — Change of Character entry signal")
+            return (sweep and structure and choch, done, miss)
+
+        elif setup_family == "BREAKOUT_RETEST":
+            done, miss = [], []
+            brk = bos or choch
+            if brk:    done.append(f"✓ Structure break ({'CHOCH' if choch else 'BOS'} confirmed)")
+            else:      miss.append("Awaiting BOS/CHOCH structure break above key level")
+            if vwap_c: done.append("✓ VWAP-confirmed acceptance")
+            else:      miss.append("Awaiting VWAP confirmation of price acceptance above break")
+            if structure: done.append("✓ Failed-reclaim confirmed — structure held")
+            else:         miss.append("Awaiting failed-reclaim (structure must hold on retest)")
+            return (brk and vwap_c and structure, done, miss)
+
+        elif setup_family == "TREND_PULLBACK":
+            done, miss = [], []
+            trend_ok = (int(alignment_score) >= 2)
+            if trend_ok: done.append(f"✓ Trend established ({alignment_score}/4 TFs aligned)")
+            else:        miss.append(f"Trend not established — need ≥2 TFs aligned (have {alignment_score})")
+            if vwap_c:   done.append("✓ Pullback reached VWAP / key level")
+            else:        miss.append("Awaiting VWAP pullback or structural level touch")
+            reversal = structure and (sweep or bos or choch)
+            if reversal: done.append("✓ Reversal signal confirmed at pullback point")
+            else:        miss.append("Awaiting reversal signal (sweep/BOS/CHOCH) at pullback level")
+            return (trend_ok and vwap_c and reversal, done, miss)
+
+        return (False, [], ["Setup family not yet identified"])
+    except Exception:
+        return (False, [], ["Confirmation check unavailable"])
+
+
+def _it_risk_sizing(stop_pts, instrument="MNQ"):
+    """Advisory contract sizing from structural stop distance.
+
+    Returns (contracts, risk_dollars).  DISPLAY-ONLY — never a money path.
+    Contracts = floor(MAX_RISK_DOLLARS / (stop_pts × point_value)).
+    Bounded: minimum 1, maximum 4.
+    """
+    try:
+        max_risk = float(os.environ.get("MAX_RISK_DOLLARS", "500"))
+        pv = point_value_for(instrument or "MNQ")
+        sp = float(stop_pts)
+        if sp <= 0 or pv <= 0:
+            return (1, None)
+        contracts = max(1, min(4, int(max_risk / (sp * pv))))
+        return (contracts, round(sp * pv * contracts, 2))
+    except Exception:
+        return (1, None)
+
+
+def _it_daily_trade_count(instrument="MNQ"):
+    """Count today's INTRADAY_TREND ghost observations that actually entered.
+
+    Excludes EXPIRED_NO_ENTRY (setup never triggered) and PENDING rows.
+    Returns (count, cap) where cap = MAX_INTRADAY_TREND_TRADES_PER_DAY (default 2).
+    Returns (-1, cap) on any DB error so the gate remains fail-open.
+    """
+    cap = int(os.environ.get("MAX_INTRADAY_TREND_TRADES_PER_DAY", "2"))
+    if not GHOST_OBS_DB_READY:
+        return (-1, cap)
+    try:
+        inst     = instrument_of(instrument) if instrument else "MNQ"
+        today_et = now_utc().astimezone(ET_TZ).strftime("%Y-%m-%d")
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT COUNT(*) FROM ghost_observations
+                     WHERE trading_mode = 'INTRADAY_TREND'
+                       AND instrument   = %s
+                       AND status NOT IN ('EXPIRED_NO_ENTRY', 'PENDING')
+                       AND (opened_at AT TIME ZONE 'America/New_York')::date
+                           = %s::date
+                    """,
+                    (inst, today_et),
+                )
+                row = cur.fetchone()
+                return (int(row[0]) if row else 0, cap)
+    except Exception:
+        return (-1, cap)
+
+
+def compute_it_trade_management(active_trade, current_price, it_ctx=None, et_now=None):
+    """Advisory INTRADAY_TREND trade management recommendations.
+
+    DISPLAY-ONLY — never mutates active_trade, never sends any broker order.
+
+    Contract model (shadow advisory):
+      1 contract : trail on 5-min structure after 1R.  No partial exits.
+      2 contracts: partial exit at 1.5R (exit 1); trail runner on 5m structure.
+      3+ contracts: partial at 1.5R (exit 1) + 2R (exit 1 more); trail remainder.
+
+    Breakeven: recommend moving stop to entry at exactly 1R (not before).
+    Normal pullbacks of 10–30 pts after 1R are expected; do not exit.
+    Force-flat: if past IT_FORCE_FLAT_TIME, recommend immediate position close.
+
+    Returns a stable dict (all keys always present).
+    """
+    out = {
+        "action": "HOLD",
+        "action_reason": "Awaiting 1R for management actions.",
+        "current_r": None, "be_recommended": False,
+        "partial_at_1r5": False, "partial_at_2r": False,
+        "trail_active": False, "force_flat": False,
+        "contracts_exit": 0, "contracts_hold": 0,
+    }
+    try:
+        if not isinstance(active_trade, dict) or current_price is None:
+            return out
+
+        t = et_now if et_now is not None else now_utc().astimezone(ET_TZ)
+
+        # EOD force-flat check
+        flat_h, flat_m = _it_parse_time("IT_FORCE_FLAT_TIME", _IT_FORCE_FLAT_DEFAULT)
+        if t.hour * 60 + t.minute >= flat_h * 60 + flat_m:
+            out.update(action="FORCE_FLAT", force_flat=True,
+                       action_reason=(f"Past {flat_h:02d}:{flat_m:02d} ET — "
+                                      "INTRADAY TREND EOD: close all positions."))
+            return out
+
+        direction = active_trade.get("direction")
+        entry     = active_trade.get("entry_price") or active_trade.get("entry_zone")
+        stop      = active_trade.get("stop_loss")
+        contracts = max(1, int(active_trade.get("contracts", 1)))
+
+        if not entry or not stop or not direction:
+            return out
+
+        p, e, s   = float(current_price), float(entry), float(stop)
+        risk_pts  = abs(e - s)
+        if risk_pts <= 0:
+            return out
+
+        cur_r = ((p - e) / risk_pts if direction == "Long" else (e - p) / risk_pts)
+        out["current_r"]      = round(cur_r, 3)
+        out["contracts_hold"] = contracts
+
+        # Structure invalidation: trend strongly inverted against position
+        if isinstance(it_ctx, dict):
+            aln = it_ctx.get("trend_alignment", "")
+            wrong = ((direction == "Long"  and aln == "STRONG_BEARISH") or
+                     (direction == "Short" and aln == "STRONG_BULLISH"))
+            if wrong and cur_r < 0.5:
+                out.update(action="CLOSE_STRUCTURE",
+                            action_reason=(f"Structure invalidated — trend reversed against "
+                                           f"position ({aln}). Exit per thesis rules."))
+                return out
+
+        # Breakeven gate: recommend BE at 1R exactly (not before)
+        if direction == "Long":
+            be_needed = (cur_r >= 1.0 and s < e)
+        else:
+            be_needed = (cur_r >= 1.0 and s > e)
+        if be_needed:
+            out["be_recommended"] = True
+
+        # Partials: 2+ contracts only
+        if contracts >= 2 and cur_r >= 1.5:
+            out.update(partial_at_1r5=True, contracts_exit=1,
+                       contracts_hold=contracts - 1)
+        if contracts >= 3 and cur_r >= 2.0:
+            out.update(partial_at_2r=True, contracts_exit=2,
+                       contracts_hold=contracts - 2)
+
+        # 5-minute structural trailing: active after 1R for all contracts
+        if cur_r >= 1.0:
+            out["trail_active"] = True
+
+        # Primary action label
+        if out["partial_at_2r"]:
+            out.update(action="PARTIAL_2R",
+                        action_reason=(f"At {cur_r:.1f}R — exit 2nd contract. "
+                                       "Trail runner on 5m structure."))
+        elif out["partial_at_1r5"]:
+            out.update(action="PARTIAL_1R5",
+                        action_reason=(f"At {cur_r:.1f}R — exit 1 contract (1.5R). "
+                                       "Trail runner on 5m structure."))
+        elif out["be_recommended"] and not out["trail_active"]:
+            out.update(action="BREAKEVEN",
+                        action_reason=(f"At {cur_r:.1f}R — move stop to entry. "
+                                       "Begin 5m structural trail."))
+        elif out["trail_active"]:
+            out.update(action="TRAIL",
+                        action_reason=(f"At {cur_r:.1f}R — trailing on 5m structure. "
+                                       "Pullbacks of 10–30 pts are expected; hold."))
+        else:
+            out.update(action="HOLD",
+                        action_reason=(f"At {cur_r:.1f}R — hold. "
+                                       "Management begins at 1R. "
+                                       "Normal pullbacks (10–30 pts) are part of the trade."))
+
+    except Exception:
+        pass
+    return out
+
+
+def _it_force_close_watchdog():
+    """Close any open INTRADAY_TREND ghost_observations past the EOD force-flat time.
+
+    Called by the heartbeat eval loop.  Closes shadow/ghost positions only —
+    INTRADAY_TREND is shadow-mode in the current build; no live broker interaction.
+
+    Sets: status='CLOSED', close_reason='IT_EOD_FORCE_CLOSE', closed_at=NOW().
+    Also computes and persists IT extended analytics fields at close time.
+
+    Safety contract (Correction 4):
+      • Any failure AFTER the flat-time threshold is logged at CRITICAL level.
+      • A failure populates _IT_FORCE_CLOSE_PENDING so the state is visible in
+        diagnostics and the failure is obvious to the operator.
+      • The heartbeat calls this function on every cycle, so _IT_FORCE_CLOSE_PENDING
+        is naturally retried without extra scheduling.
+      • On a successful close the pending state is cleared.
+      • The heartbeat's outer try/except keeps the heartbeat alive regardless.
+      • A position is NEVER silently marked closed if the DB UPDATE fails.
+    """
+    global _IT_FORCE_CLOSE_PENDING
+    try:
+        flat_h, flat_m = _it_parse_time("IT_FORCE_FLAT_TIME", _IT_FORCE_FLAT_DEFAULT)
+        now_et = now_utc().astimezone(ET_TZ)
+        if now_et.hour * 60 + now_et.minute < flat_h * 60 + flat_m:
+            return  # Not yet EOD — no close attempt needed, no failure.
+        _ts = now_et.strftime("%H:%M ET")
+
+        if not GHOST_OBS_DB_READY:
+            logger.critical(
+                "IT force-close watchdog [%s]: GHOST_OBS_DB_READY=False — "
+                "cannot close open INTRADAY_TREND positions. "
+                "FORCE_CLOSE_PENDING — will retry on next heartbeat.", _ts)
+            _IT_FORCE_CLOSE_PENDING["db_not_ready"] = {
+                "error": "GHOST_OBS_DB_READY=False",
+                "timestamp": _ts,
+            }
+            return
+
+        conn = get_db_connection()
+        if conn is None:
+            logger.critical(
+                "IT force-close watchdog [%s]: DB connection unavailable — "
+                "cannot close open INTRADAY_TREND positions. "
+                "FORCE_CLOSE_PENDING — will retry on next heartbeat.", _ts)
+            _IT_FORCE_CLOSE_PENDING["db_unavailable"] = {
+                "error": "DB connection returned None",
+                "timestamp": _ts,
+            }
+            return
+
+        try:
+            with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    UPDATE ghost_observations
+                       SET status      = 'CLOSED',
+                           close_reason= 'IT_EOD_FORCE_CLOSE',
+                           closed_at   = NOW()
+                     WHERE trading_mode = 'INTRADAY_TREND'
+                       AND status       = 'OPEN'
+                       AND (opened_at AT TIME ZONE 'America/New_York')::date
+                           = (NOW() AT TIME ZONE 'America/New_York')::date
+                    RETURNING id, entry_price, direction, risk_pts,
+                              mfe_price, mae_price, mfe_r, mae_r, gross_r
+                    """,
+                )
+                closed_rows = cur.fetchall() or []
+
+            if closed_rows:
+                logger.info(
+                    "IT EOD force-close: closed %d ghost observation(s)", len(closed_rows))
+                for row in closed_rows:
+                    _it_ghost_write_extended_fields(
+                        conn,
+                        obs_id      = row["id"],
+                        entry_price = row.get("entry_price"),
+                        mfe_price   = row.get("mfe_price"),
+                        mae_price   = row.get("mae_price"),
+                        mfe_r       = row.get("mfe_r"),
+                        gross_r     = row.get("gross_r"),
+                    )
+            conn.commit()
+            # ── Success: clear any failure state from a previous cycle. ──────
+            if _IT_FORCE_CLOSE_PENDING:
+                logger.info(
+                    "IT force-close watchdog: pending failure state cleared after "
+                    "successful close at %s.", _ts)
+                _IT_FORCE_CLOSE_PENDING.clear()
+
+        except Exception as exc:
+            # The UPDATE failed — rows in ghost_observations still have
+            # status='OPEN', so the next heartbeat cycle will retry naturally.
+            # We must NOT commit; rollback to leave positions in a retryable state.
+            logger.critical(
+                "IT force-close watchdog [%s]: FAILED to close open "
+                "INTRADAY_TREND positions: %s — "
+                "FORCE_CLOSE_PENDING set, will retry on next heartbeat.", _ts, exc)
+            _IT_FORCE_CLOSE_PENDING["close_error"] = {
+                "error": str(exc),
+                "timestamp": _ts,
+            }
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+
+    except Exception as exc:
+        logger.critical(
+            "IT force-close watchdog outer error: %s — "
+            "FORCE_CLOSE_PENDING set, will retry.", exc)
+        try:
+            _IT_FORCE_CLOSE_PENDING["outer_error"] = {
+                "error": str(exc),
+                "timestamp": "unknown",
+            }
+        except Exception:
+            pass
+
+
+def _it_ghost_write_extended_fields(conn, obs_id, entry_price,
+                                     mfe_price, mae_price, mfe_r, gross_r):
+    """Compute and persist INTRADAY_TREND extended ghost observation analytics.
+
+    Called when an IT ghost observation closes (via EOD force-close or normal
+    resolution).  Writes to the IT-specific columns added to ghost_observations:
+
+      it_touched_1r           — mfe_r >= 1.0
+      it_touched_2r           — mfe_r >= 2.0
+      it_touched_3r           — mfe_r >= 3.0
+      it_max_favorable_pts    — abs(mfe_price - entry_price) in MNQ points
+      it_max_adverse_pts      — abs(mae_price - entry_price) in MNQ points
+      it_over_100pts          — it_max_favorable_pts >= 100 (rare 100-pt+ move)
+      it_mgmt_premature_exit  — mfe_r >= 1.5 AND gross_r < 0.5 × mfe_r
+                                (trade captured < half its achievable potential,
+                                suggesting management ended it too early)
+
+    Requires an already-open connection.  FAIL-OPEN, never raises.
+    """
+    try:
+        ep   = float(entry_price) if entry_price else None
+        mfe  = float(mfe_price)   if mfe_price   else None
+        mae  = float(mae_price)   if mae_price   else None
+        mfer = float(mfe_r)       if mfe_r       else 0.0
+        gr   = float(gross_r)     if gross_r     else 0.0
+
+        fav_pts = round(abs(mfe - ep), 2) if (ep is not None and mfe is not None) else None
+        adv_pts = round(abs(mae - ep), 2) if (ep is not None and mae is not None) else None
+        premature = bool(mfer >= 1.5 and gr < 0.5 * mfer)
+        over_100  = bool(fav_pts is not None and fav_pts >= 100)
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE ghost_observations SET
+                       it_touched_1r          = %s,
+                       it_touched_2r          = %s,
+                       it_touched_3r          = %s,
+                       it_max_favorable_pts   = %s,
+                       it_max_adverse_pts     = %s,
+                       it_over_100pts         = %s,
+                       it_mgmt_premature_exit = %s
+                   WHERE id = %s""",
+                (mfer >= 1.0, mfer >= 2.0, mfer >= 3.0,
+                 fav_pts, adv_pts, over_100, premature, obs_id),
+            )
+    except Exception as exc:
+        logger.debug("IT ghost extended write (id=%s): %s", obs_id, exc)
+
+
+def _it_diag_block(a):
+    """Curated display-only INTRADAY TREND diagnostics for /status and the
+    dashboard panel.  Reads from result['intraday_trend_context'] (already
+    computed at the full_analysis seam).  FAIL-OPEN: any error → inert block."""
+    try:
+        ctx = (a or {}).get("intraday_trend_context") or {}
+        if not ctx.get("enabled"):
+            return {"enabled": False}
+        return {
+            "enabled":               True,
+            "mode":                  "INTRADAY_TREND",
+            "instrument":            ctx.get("instrument"),
+            "session":               ctx.get("session"),
+            "session_short":         ctx.get("session_short"),
+            "status":                ctx.get("status"),
+            "reason":                ctx.get("reason"),
+            "location_quality":      ctx.get("location_quality"),
+            "location_level":        ctx.get("location_level"),
+            "location_dist_pts":     ctx.get("location_dist_pts"),
+            "location_reason":       ctx.get("location_reason"),
+            "trend_4h":              ctx.get("trend_4h"),
+            "trend_1h":              ctx.get("trend_1h"),
+            "trend_15m":             ctx.get("trend_15m"),
+            "trend_5m":              ctx.get("trend_5m"),
+            "trend_alignment":       ctx.get("trend_alignment"),
+            "alignment_score":       ctx.get("alignment_score"),
+            "setup_family":          ctx.get("setup_family"),
+            "setup_family_reason":   ctx.get("setup_family_reason"),
+            "time_ok":               ctx.get("time_ok"),
+            "time_state":            ctx.get("time_state"),
+            "time_reason":           ctx.get("time_reason"),
+            "projected_points":      ctx.get("projected_points"),
+            "projected_r":           ctx.get("projected_r"),
+            "bias_1h":               ctx.get("bias_1h"),
+            "bias_4h":               ctx.get("bias_4h"),
+            # Phase 2 — confirmation sequence
+            "confirmation_complete": ctx.get("confirmation_complete", False),
+            "confirmation_steps":    ctx.get("confirmation_steps", []),
+            "confirmation_missing":  ctx.get("confirmation_missing", []),
+            # Phase 2 — structural stop & sizing
+            "structural_stop_level":  ctx.get("structural_stop_level"),
+            "structural_stop_pts":    ctx.get("structural_stop_pts"),
+            "structural_stop_source": ctx.get("structural_stop_source"),
+            "structural_stop_valid":  ctx.get("structural_stop_valid", False),
+            "recommended_contracts":  ctx.get("recommended_contracts"),
+            "risk_dollars":           ctx.get("risk_dollars"),
+            # Phase 2 — daily cap
+            "daily_trade_count":      ctx.get("daily_trade_count"),
+            "daily_trade_cap":        ctx.get("daily_trade_cap"),
+            # Safety state — EOD force-close pending (watchdog failure visible here)
+            "force_close_pending":    bool(_IT_FORCE_CLOSE_PENDING),
+            "force_close_pending_detail": (
+                list(_IT_FORCE_CLOSE_PENDING.values())[:3]
+                if _IT_FORCE_CLOSE_PENDING else []),
+            # Phase 2 — session key-levels (summary: OR + overnight only for display)
+            "opening_range_high":     (ctx.get("session_levels") or {}).get("opening_range_high"),
+            "opening_range_low":      (ctx.get("session_levels") or {}).get("opening_range_low"),
+            "overnight_high":         (ctx.get("session_levels") or {}).get("overnight_high"),
+            "overnight_low":          (ctx.get("session_levels") or {}).get("overnight_low"),
+            "session_high":           (ctx.get("session_levels") or {}).get("session_high"),
+            "session_low":            (ctx.get("session_levels") or {}).get("session_low"),
+            # Phase 2 — advisory trade management
+            "mgmt_action":            ctx.get("mgmt_action"),
+            "mgmt_action_reason":     ctx.get("mgmt_action_reason"),
+            "mgmt_current_r":         ctx.get("mgmt_current_r"),
+            "mgmt_be_recommended":    ctx.get("mgmt_be_recommended"),
+            "mgmt_partial_at_1r5":    ctx.get("mgmt_partial_at_1r5"),
+            "mgmt_trail_active":      ctx.get("mgmt_trail_active"),
+            "mgmt_force_flat":        ctx.get("mgmt_force_flat"),
+        }
+    except Exception:
+        return {"enabled": False}
 
 
 def _trend_brake_enabled():
@@ -26058,7 +27408,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # surface read the SAME context (no drift). None in SCALP / flag-off → the builder
     # falls through to its byte-identical 1:1 path and the veto block never runs.
     swing_ctx = None
-    if _swing_htf_enabled(TRADING_MODE):
+    if _swing_htf_enabled(TRADING_MODE) or TRADING_MODE == "INTRADAY_TREND":
         try:
             swing_ctx = compute_swing_context(active_ticker, current_price)
         except Exception:
@@ -26233,6 +27583,40 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 "target1":    None, "target2":   None,
                 "rr":         None, "direction": strict_direction,
                 "instrument": active_ticker, "point_value": point_value_for(active_ticker),
+            }
+
+    # ── INTRADAY TREND entry MONEY-PATH vetoes ─────────────────────────────────
+    # INTRADAY_TREND-only, DEMOTE-ONLY.  Runs independently of (and after) the
+    # SWING HTF gate so SCALP / SWING stay byte-identical.  FAIL-CLOSED.
+    # Gates: (1) MNQ-only, (2) time restriction, (3) MID_RANGE location.
+    # _it_ctx is initialised here so the result attachment later can reuse it
+    # without a second compute call even when the veto path didn't fire.
+    _it_ctx = None
+    if TRADING_MODE == "INTRADAY_TREND" and is_actionable(verdict) and strict_direction:
+        try:
+            _it_ctx = compute_intraday_trend_context(
+                active_ticker, current_price, confluences=confluences,
+                swing_ctx=swing_ctx, trade_plan=trade_plan,
+                direction=strict_direction)
+            _iv = _it_entry_veto_reasons(
+                _it_ctx, trade_plan, strict_direction, active_ticker)
+        except Exception as exc:
+            _it_ctx = None
+            _iv = [("unavailable",
+                    f"INTRADAY TREND entry checks unavailable ({exc})")]
+        if _iv:
+            verdict       = "WAIT"
+            strict_label  = "WAIT"
+            strict_reason = ("INTRADAY TREND filter: "
+                             + "; ".join(m for _, m in _iv) + ".")
+            trade_plan = {
+                "trade_plan": False,
+                "reason":     strict_reason,
+                "entry_zone": None, "stop_loss": None,
+                "target1":    None, "target2":   None,
+                "rr":         None, "direction": strict_direction,
+                "instrument": active_ticker,
+                "point_value": point_value_for(active_ticker),
             }
 
     # ── Live SWING strategy library filter (MONEY-PATH, DEMOTE-ONLY) ─────────────
@@ -27424,6 +28808,24 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["swing_strategy_filter"] = (
             swing_strategy_filter if isinstance(swing_strategy_filter, dict)
             else _swing_strategy_status(active_ticker))
+
+    # ── INTRADAY TREND context (DISPLAY-ONLY) ─────────────────────────────────
+    # Attached only when TRADING_MODE == "INTRADAY_TREND".  Reuses the _it_ctx
+    # computed at the money-path veto above when available; lazily computes for
+    # WAIT / market-closed paths.  Key absent for SCALP / SWING → byte-identical.
+    if TRADING_MODE == "INTRADAY_TREND":
+        if not isinstance(_it_ctx, dict):
+            try:
+                _it_ctx = compute_intraday_trend_context(
+                    active_ticker, result.get("current_price"),
+                    confluences=result.get("confluences"),
+                    swing_ctx=(swing_ctx if isinstance(swing_ctx, dict) else None),
+                    trade_plan=result.get("trade_plan"),
+                    direction=result.get("strict_direction"))
+            except Exception:
+                _it_ctx = {"enabled": True, "mode": "INTRADAY_TREND",
+                           "status": "ERROR", "reason": "Context unavailable."}
+        result["intraday_trend_context"] = _it_ctx
 
     # ── Unified Analyst Report (DISPLAY-ONLY) ────────────────────────────────
     # SINGLE computation point, AFTER every verdict override above (open, vetoed and
@@ -42514,6 +43916,17 @@ def _run_heartbeat_evaluations():
     # re-scored into a stream of "failed" WAITs the counters then tally.
     if not market_session_status()["open"]:
         return
+
+    # ── INTRADAY TREND: EOD force-close watchdog ─────────────────────────────
+    # Runs on every heartbeat cycle during market hours.  Closes open IT ghost
+    # observations past the configured IT_FORCE_FLAT_TIME (default 15:55 ET).
+    # Fail-open: any exception is swallowed inside _it_force_close_watchdog.
+    if TRADING_MODE == "INTRADAY_TREND":
+        try:
+            _it_force_close_watchdog()
+        except Exception as _e:
+            logger.debug("IT force-close watchdog outer error: %s", _e)
+
     for inst in _HEARTBEAT_INSTRUMENTS:
         try:
             _eval_timing_begin()          # per-instrument so phase timings don't bleed
@@ -46262,6 +47675,20 @@ def _ghost_obs_watcher_cycle():
                           net_r=net_r,
                           extra={"close_reason": close_reason, "gross_r": gross_r,
                                  "ghost_id": row["id"]})
+                # ── INTRADAY TREND extended ghost analytics ──────────────────
+                # Persist IT-specific outcome fields (1R/2R/3R flags, pts,
+                # premature-exit flag) when the closed ghost is an IT trade.
+                # FAIL-OPEN — swallowed inside _it_ghost_write_extended_fields.
+                if row.get("trading_mode") == "INTRADAY_TREND":
+                    _it_ghost_write_extended_fields(
+                        conn,
+                        obs_id      = row["id"],
+                        entry_price = row.get("entry_price"),
+                        mfe_price   = mfe_price,
+                        mae_price   = mae_price,
+                        mfe_r       = mfe_r,
+                        gross_r     = gross_r,
+                    )
 
             else:
                 # Still open — persist updated MFE/MAE and bars_held
@@ -55838,6 +57265,7 @@ def _build_status_payload(_tk):
         "advisor_blocks":      _recent_advisor_blocks(),
         "scalp_diagnostics":   _scalp_diag_block(a),
         "swing_diagnostics":   _swing_diag_block(a),
+        "intraday_trend_diagnostics": _it_diag_block(a),
         "swing_strategy_filter": a.get("swing_strategy_filter"),
         "decision_support":    a.get("decision_support"),
         "strategy_engine":     a.get("strategy_engine"),
@@ -64418,26 +65846,75 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
   <div class="se-reason" id="sd-notes"></div>
 </div>
 
-<!-- SWING thesis diagnostics (P7 / req 6 — DISPLAY-ONLY; hidden unless SWING + SWING_HTF_ENABLED) -->
+<!-- SWING / INTRADAY TREND diagnostics (DISPLAY-ONLY; hidden unless SWING or INTRADAY_TREND mode active) -->
 <div class="mod" id="mod-swingdiag" data-cat="detail" style="display:none">
-  <div class="mod-h">🌊 SWING Diagnostics <span id="swd-status" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-detail">DETAIL</span></div>
-  <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
-    <div class="gstat"><div class="l">Mode</div><div class="v" id="swd-mode">—</div></div>
-    <div class="gstat"><div class="l">1H Bias</div><div class="v" id="swd-b1h">—</div></div>
-    <div class="gstat"><div class="l">4H Bias</div><div class="v" id="swd-b4h">—</div></div>
-    <div class="gstat"><div class="l">Daily Level</div><div class="v" id="swd-dlvl">—</div></div>
-    <div class="gstat"><div class="l">Current R</div><div class="v" id="swd-curr">—</div></div>
-    <div class="gstat"><div class="l">Planned RR</div><div class="v" id="swd-rr">—</div></div>
-    <div class="gstat"><div class="l">Next Target</div><div class="v" id="swd-tgt">—</div></div>
-    <div class="gstat"><div class="l">Invalidation</div><div class="v" id="swd-inval">—</div></div>
-    <div class="gstat"><div class="l">Last Review</div><div class="v" id="swd-review">—</div></div>
+  <div class="mod-h" id="swd-panel-title">📊 INTRADAY TREND <span id="swd-status" style="font-size:10px;letter-spacing:1px"></span><span class="mod-cat cat-detail">DETAIL</span></div>
+
+  <!-- INTRADAY_TREND content (shown when mode=INTRADAY_TREND) -->
+  <div id="swd-it-content" style="display:none">
+    <!-- Row 1: session, status, direction, trends, alignment, setup -->
+    <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+      <div class="gstat"><div class="l">Session</div><div class="v" id="it-session">—</div></div>
+      <div class="gstat"><div class="l">Status</div><div class="v" id="it-status">—</div></div>
+      <div class="gstat"><div class="l">Direction</div><div class="v" id="it-dir">—</div></div>
+      <div class="gstat"><div class="l">4H Trend</div><div class="v" id="it-t4h">—</div></div>
+      <div class="gstat"><div class="l">1H Trend</div><div class="v" id="it-t1h">—</div></div>
+      <div class="gstat"><div class="l">Alignment</div><div class="v" id="it-align">—</div></div>
+      <div class="gstat"><div class="l">15m Trend</div><div class="v" id="it-t15m">—</div></div>
+      <div class="gstat"><div class="l">5m Trend</div><div class="v" id="it-t5m">—</div></div>
+      <div class="gstat"><div class="l">Setup Family</div><div class="v" id="it-setup">—</div></div>
+    </div>
+    <!-- Row 2: location, projected move -->
+    <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px">
+      <div class="gstat"><div class="l">Location Quality</div><div class="v" id="it-locq">—</div></div>
+      <div class="gstat"><div class="l">Key Level</div><div class="v" id="it-locl">—</div></div>
+      <div class="gstat"><div class="l">Projected Move</div><div class="v" id="it-pts">—</div></div>
+      <div class="gstat"><div class="l">Projected R</div><div class="v" id="it-r">—</div></div>
+    </div>
+    <!-- Row 3 (Phase 2): confirmation + structural stop + daily cap -->
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px">
+      <div class="gstat"><div class="l">Confirmed</div><div class="v" id="it-conf">—</div></div>
+      <div class="gstat"><div class="l">Struct Stop Pts</div><div class="v" id="it-stop-pts">—</div></div>
+      <div class="gstat"><div class="l">Rec Contracts</div><div class="v" id="it-contracts">—</div></div>
+      <div class="gstat"><div class="l">OR High</div><div class="v" id="it-orh">—</div></div>
+      <div class="gstat"><div class="l">OR Low</div><div class="v" id="it-orl">—</div></div>
+      <div class="gstat"><div class="l">Trades Today</div><div class="v" id="it-daily">—</div></div>
+    </div>
+    <!-- Confirmation steps list -->
+    <div id="it-conf-steps" style="display:none;margin-top:8px;font-size:10px;line-height:1.7;padding:6px 8px;background:rgba(255,255,255,.04);border-radius:5px;border:1px solid rgba(255,255,255,.08)"></div>
+    <!-- Structural stop source -->
+    <div id="it-stop-src" style="display:none;margin-top:5px;font-size:10px;color:#9ca3af;padding:3px 6px"></div>
+    <!-- Advisory management (active trade only) -->
+    <div id="it-mgmt-block" style="display:none;margin-top:8px;padding:6px 10px;border-radius:5px;background:rgba(139,92,246,.08);border:1px solid rgba(139,92,246,.2)">
+      <div style="font-size:10px;letter-spacing:.8px;color:#a78bfa;margin-bottom:3px">MANAGEMENT ADVISORY</div>
+      <div style="font-size:11px;color:#e5e7eb" id="it-mgmt-action"></div>
+      <div style="font-size:10px;color:#9ca3af;margin-top:2px" id="it-mgmt-reason"></div>
+    </div>
+    <div class="se-bias-h" style="margin-top:10px">Reason</div>
+    <div class="se-reason" id="it-reason"></div>
+    <div id="it-time-warn" style="display:none;font-size:10px;color:#f59e0b;margin-top:6px;padding:5px 8px;border:1px solid rgba(245,158,11,.3);border-radius:5px"></div>
   </div>
-  <div class="se-bias-h">Trade Thesis</div>
-  <div class="se-reason" id="swd-thesis"></div>
-  <div class="se-bias-h">Reason To Hold</div>
-  <div class="se-reason" id="swd-hold"></div>
-  <div class="se-bias-h">Reason To Exit</div>
-  <div class="se-reason" id="swd-exit"></div>
+
+  <!-- SWING content (shown when mode=SWING) -->
+  <div id="swd-swing-content" style="display:none">
+    <div class="sd-grid" style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px">
+      <div class="gstat"><div class="l">Mode</div><div class="v" id="swd-mode">—</div></div>
+      <div class="gstat"><div class="l">1H Bias</div><div class="v" id="swd-b1h">—</div></div>
+      <div class="gstat"><div class="l">4H Bias</div><div class="v" id="swd-b4h">—</div></div>
+      <div class="gstat"><div class="l">Daily Level</div><div class="v" id="swd-dlvl">—</div></div>
+      <div class="gstat"><div class="l">Current R</div><div class="v" id="swd-curr">—</div></div>
+      <div class="gstat"><div class="l">Planned RR</div><div class="v" id="swd-rr">—</div></div>
+      <div class="gstat"><div class="l">Next Target</div><div class="v" id="swd-tgt">—</div></div>
+      <div class="gstat"><div class="l">Invalidation</div><div class="v" id="swd-inval">—</div></div>
+      <div class="gstat"><div class="l">Last Review</div><div class="v" id="swd-review">—</div></div>
+    </div>
+    <div class="se-bias-h">Trade Thesis</div>
+    <div class="se-reason" id="swd-thesis"></div>
+    <div class="se-bias-h">Reason To Hold</div>
+    <div class="se-reason" id="swd-hold"></div>
+    <div class="se-bias-h">Reason To Exit</div>
+    <div class="se-reason" id="swd-exit"></div>
+  </div>
 </div>
 
 <!-- Live SWING Strategy library selector (money-path DEMOTE-ONLY; hidden unless SWING + SWING_STRATEGY_FILTER_ENABLED) -->
@@ -66337,11 +67814,15 @@ function renderModules(d){
     }
   }
 
-  // ── Module: SWING Diagnostics (P7 / req 6 — DISPLAY-ONLY mirror of the HTF gate + per-trade thesis) ──
-  const swd = d.swing_diagnostics || {};
+  // ── Module: SWING / INTRADAY TREND Diagnostics (DISPLAY-ONLY) ──
+  // Shared panel — shows INTRADAY_TREND content when mode is IT, SWING content otherwise.
+  const swd  = d.swing_diagnostics || {};
+  const itd  = d.intraday_trend_diagnostics || {};
+  const isIT = (d.trading_mode === 'INTRADAY_TREND') || itd.enabled;
   const swMod = document.getElementById('mod-swingdiag');
   if (swMod){
-    if (!swd.enabled){
+    const panelEnabled = isIT ? itd.enabled : swd.enabled;
+    if (!panelEnabled){
       swMod.style.display = 'none';
     } else {
       swMod.style.display = '';
@@ -66351,30 +67832,133 @@ function renderModules(d){
       };
       const _swBias = function(id, b){
         _swSet(id, b ? (b.charAt(0).toUpperCase()+b.slice(1)) : '—',
-               b==='bull'?'#22c55e':b==='bear'?'#ef4444':'');
+               b==='bull'||b==='BULLISH'?'#22c55e':b==='bear'||b==='BEARISH'?'#ef4444':'');
       };
-      _swSet('swd-mode', swd.mode || '—', '');
-      _swBias('swd-b1h', swd.bias_1h);
-      _swBias('swd-b4h', swd.bias_4h);
-      _swSet('swd-dlvl', swd.daily_level_nearby || '—', '');
-      _swSet('swd-curr', swd.current_r==null ? '—' : ((swd.current_r>0?'+':'')+swd.current_r+'R'),
-             swd.current_r>0?'#22c55e':swd.current_r<0?'#ef4444':'');
-      _swSet('swd-rr', swd.planned_rr==null ? '—' : ('1:'+swd.planned_rr), '');
-      _swSet('swd-tgt', swd.next_target==null ? '—' : swd.next_target, '');
-      _swSet('swd-inval', swd.invalidation_level==null ? '—' : swd.invalidation_level, '');
-      _swSet('swd-review', swd.last_review_decision || 'Pending', '');
-      const _swHtml = function(id, txt){
-        const e=document.getElementById(id);
-        if(e){ e.innerHTML = txt ? _modEsc(txt) : '—'; }
-      };
-      _swHtml('swd-thesis', swd.has_thesis ? swd.trade_thesis : 'No open SWING trade — live HTF bias only.');
-      _swHtml('swd-hold', swd.reason_to_hold);
-      _swHtml('swd-exit', swd.reason_to_exit);
-      const swst=document.getElementById('swd-status');
-      if (swst){
-        const st = swd.thesis_status;
-        swst.textContent = st || (swd.has_thesis ? '' : 'NO TRADE');
-        swst.style.color = st==='VALID'?'#22c55e':st==='WEAKENING'?'#f59e0b':st==='INVALID'?'#ef4444':'#6b7280';
+
+      const itContent  = document.getElementById('swd-it-content');
+      const swContent  = document.getElementById('swd-swing-content');
+      const panelTitle = document.getElementById('swd-panel-title');
+      const swst       = document.getElementById('swd-status');
+
+      if (isIT){
+        // ── INTRADAY TREND render ──────────────────────────────────────────────
+        if (itContent)  itContent.style.display  = '';
+        if (swContent)  swContent.style.display   = 'none';
+        if (panelTitle) panelTitle.childNodes[0].textContent = '\\u{1F4CA} INTRADAY TREND ';
+
+        const _loc = {EXCELLENT:'#22c55e', GOOD:'#86efac', POOR:'#f59e0b', MID_RANGE:'#ef4444'};
+        const _algn = {STRONG_BULLISH:'#22c55e', BULLISH:'#86efac', MIXED:'#9ca3af',
+                       BEARISH:'#fca5a5', STRONG_BEARISH:'#ef4444'};
+        const _trend = function(id, t){
+          _swSet(id, t||'—', t==='BULLISH'?'#22c55e':t==='BEARISH'?'#ef4444':'#9ca3af');
+        };
+        _swSet('it-session', (itd.session_short||itd.session)||'—', '');
+        const itSt = itd.status || '—';
+        const _itStCol = {CONFIRMED_SETUP:'#22c55e',SETUP_DEVELOPING:'#86efac',
+                          AWAITING_CONFIRMATION:'#a78bfa',WATCHING_LEVEL:'#f59e0b',
+                          BLOCKED:'#ef4444',BLOCKED_MID_RANGE:'#ef4444',
+                          DAILY_CAP_REACHED:'#f59e0b',BUILDING_CONTEXT:'#9ca3af'};
+        _swSet('it-status', itSt.replace(/_/g,' '), _itStCol[itSt]||'#9ca3af');
+        const dir = (d.directions||[]).find(function(x){ return x.is_favored; });
+        _swSet('it-dir', dir ? dir.direction : '—', dir&&dir.direction==='Long'?'#22c55e':dir?'#ef4444':'');
+        _trend('it-t4h', itd.trend_4h);
+        _trend('it-t1h', itd.trend_1h);
+        const aln = itd.trend_alignment||'MIXED';
+        _swSet('it-align', aln.replace(/_/g,' '), _algn[aln]||'#9ca3af');
+        _trend('it-t15m', itd.trend_15m);
+        _trend('it-t5m', itd.trend_5m);
+        const fam = itd.setup_family;
+        _swSet('it-setup', fam ? fam.replace(/_/g,' ') : 'None yet', fam?'#a78bfa':'#9ca3af');
+        const lq = itd.location_quality||'—';
+        _swSet('it-locq', lq, _loc[lq]||'');
+        _swSet('it-locl', itd.location_level||'—', '');
+        _swSet('it-pts', itd.projected_points ? (itd.projected_points+' pts') : '—', '');
+        _swSet('it-r',   itd.projected_r   ? (itd.projected_r+'R')   : '—',
+               itd.projected_r>=2.5?'#22c55e':itd.projected_r>=1.5?'#86efac':'');
+        // Phase 2 — confirmation
+        const confOk = itd.confirmation_complete;
+        _swSet('it-conf', confOk ? 'YES ✓' : 'No', confOk?'#22c55e':'#f59e0b');
+        const confSteps = document.getElementById('it-conf-steps');
+        if (confSteps){
+          const allSteps = (itd.confirmation_steps||[]).concat((itd.confirmation_missing||[]).map(function(m){ return '⏳ '+m; }));
+          if (allSteps.length){
+            confSteps.innerHTML = allSteps.map(function(s){ return _modEsc(s); }).join('<br>');
+            confSteps.style.display = '';
+          } else { confSteps.style.display = 'none'; }
+        }
+        // Phase 2 — structural stop
+        const stPts = itd.structural_stop_pts;
+        _swSet('it-stop-pts', stPts ? (stPts+' pts') : '—',
+               stPts&&stPts<15?'#22c55e':stPts&&stPts<30?'#86efac':'#9ca3af');
+        const stSrc = document.getElementById('it-stop-src');
+        if (stSrc){
+          if (itd.structural_stop_source){ stSrc.textContent = itd.structural_stop_source; stSrc.style.display = ''; }
+          else { stSrc.style.display = 'none'; }
+        }
+        // Phase 2 — sizing
+        const rc = itd.recommended_contracts;
+        _swSet('it-contracts', rc||'—', rc>=2?'#a78bfa':'#9ca3af');
+        // Phase 2 — session levels
+        _swSet('it-orh', itd.opening_range_high ? itd.opening_range_high.toFixed(2) : '—', '');
+        _swSet('it-orl', itd.opening_range_low  ? itd.opening_range_low.toFixed(2)  : '—', '');
+        // Phase 2 — daily cap
+        const dc = itd.daily_trade_count; const dcp = itd.daily_trade_cap||2;
+        _swSet('it-daily', (dc>=0) ? (dc+'/'+dcp) : '—',
+               (dc>=dcp&&dc>=0)?'#ef4444':dc>0?'#f59e0b':'#22c55e');
+        // Phase 2 — management advisory
+        const mgmtBlock = document.getElementById('it-mgmt-block');
+        const mgmtAct   = document.getElementById('it-mgmt-action');
+        const mgmtRsn   = document.getElementById('it-mgmt-reason');
+        const mgmtShow  = itd.mgmt_action && itd.mgmt_action !== 'HOLD';
+        if (mgmtBlock) mgmtBlock.style.display = mgmtShow ? '' : 'none';
+        if (mgmtAct && itd.mgmt_action){
+          const _mgmtCol = {FORCE_FLAT:'#ef4444',PARTIAL_2R:'#22c55e',PARTIAL_1R5:'#86efac',
+                            BREAKEVEN:'#a78bfa',TRAIL:'#6ee7b7',CLOSE_STRUCTURE:'#ef4444'};
+          mgmtAct.textContent = itd.mgmt_action.replace(/_/g,' ');
+          mgmtAct.style.color = _mgmtCol[itd.mgmt_action]||'#e5e7eb';
+        }
+        if (mgmtRsn) mgmtRsn.textContent = itd.mgmt_action_reason||'';
+        const itReason = document.getElementById('it-reason');
+        if (itReason) itReason.innerHTML = itd.reason ? _modEsc(itd.reason) : '—';
+        const itWarn = document.getElementById('it-time-warn');
+        if (itWarn){
+          if (itd.time_state && itd.time_state !== 'OK'){
+            itWarn.textContent = itd.time_reason || 'Time restriction active.';
+            itWarn.style.display = '';
+          } else { itWarn.style.display = 'none'; }
+        }
+        if (swst){
+          swst.textContent = itd.time_state||'';
+          swst.style.color = itd.time_ok===false?'#ef4444':'#6b7280';
+        }
+      } else {
+        // ── SWING render (unchanged) ───────────────────────────────────────────
+        if (itContent)  itContent.style.display  = 'none';
+        if (swContent)  swContent.style.display   = '';
+        if (panelTitle) panelTitle.childNodes[0].textContent = '\\uD83C\\uDF0A SWING Diagnostics ';
+
+        _swSet('swd-mode', swd.mode || '—', '');
+        _swBias('swd-b1h', swd.bias_1h);
+        _swBias('swd-b4h', swd.bias_4h);
+        _swSet('swd-dlvl', swd.daily_level_nearby || '—', '');
+        _swSet('swd-curr', swd.current_r==null ? '—' : ((swd.current_r>0?'+':'')+swd.current_r+'R'),
+               swd.current_r>0?'#22c55e':swd.current_r<0?'#ef4444':'');
+        _swSet('swd-rr', swd.planned_rr==null ? '—' : ('1:'+swd.planned_rr), '');
+        _swSet('swd-tgt', swd.next_target==null ? '—' : swd.next_target, '');
+        _swSet('swd-inval', swd.invalidation_level==null ? '—' : swd.invalidation_level, '');
+        _swSet('swd-review', swd.last_review_decision || 'Pending', '');
+        const _swHtml = function(id, txt){
+          const e=document.getElementById(id);
+          if(e){ e.innerHTML = txt ? _modEsc(txt) : '—'; }
+        };
+        _swHtml('swd-thesis', swd.has_thesis ? swd.trade_thesis : 'No open SWING trade — live HTF bias only.');
+        _swHtml('swd-hold', swd.reason_to_hold);
+        _swHtml('swd-exit', swd.reason_to_exit);
+        if (swst){
+          const st = swd.thesis_status;
+          swst.textContent = st || (swd.has_thesis ? '' : 'NO TRADE');
+          swst.style.color = st==='VALID'?'#22c55e':st==='WEAKENING'?'#f59e0b':st==='INVALID'?'#ef4444':'#6b7280';
+        }
       }
     }
   }

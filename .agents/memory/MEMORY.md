@@ -1,5 +1,9 @@
 # Memory Index
 
+- [INTRADAY_TREND strategy](intraday-trend-strategy.md) — MODES["INTRADAY_TREND"]=dict(MODES["SWING"]); MNQ-only; 3 gates; panel reuses mod-swingdiag; full_analysis wiring pattern.
+- [INTRADAY_TREND Phase 2 gaps](intraday-trend-phase2.md) — 7 ghost columns, 8 new helpers, confirmation/structural-stop/sizing/daily-cap/mgmt gaps closed; 105 tests in test_intraday_trend_phase2.py; prod schema needs Publish.
+
+
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.

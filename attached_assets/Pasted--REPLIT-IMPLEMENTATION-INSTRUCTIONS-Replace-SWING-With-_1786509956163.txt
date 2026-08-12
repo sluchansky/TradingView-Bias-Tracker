@@ -1,0 +1,980 @@
+# REPLIT IMPLEMENTATION INSTRUCTIONS — Replace SWING With INTRADAY TREND
+
+## OBJECTIVE
+
+Replace the existing **SWING strategy/mode** with a new strategy called:
+
+`INTRADAY_TREND`
+
+This is **not a new strategy subsystem**.
+
+Reuse the existing SWING:
+
+* dashboard location
+* backend plumbing
+* journal integration
+* risk engine
+* execution gateway
+* safety gates
+* data feeds
+* trade tracking
+* restart/recovery infrastructure where applicable
+
+The existing SWING strategy is no longer needed and does not need to be preserved as an active trading strategy.
+
+Historical SWING journal records must remain readable.
+
+The new INTRADAY_TREND strategy should initially be designed for **MNQ only**.
+
+Do not generalize this to MGC, MES, or MYM yet.
+
+---
+
+# 1. HARD SCOPE LIMITS
+
+Do NOT:
+
+* build a new panel
+* build a new crawler
+* build another research system
+* modify SCALP
+* modify MICRO SCALP
+* modify the 9:30 ORB algorithm
+* change Databento ingestion
+* replace the canonical risk engine
+* replace the execution gateway
+* alter prop-firm safety controls
+* alter emergency-stop logic
+* change unrelated edge-score logic
+* create a new database architecture
+* redesign the dashboard
+* add paid APIs
+* add external services
+
+This task is specifically:
+
+> Convert the existing SWING functionality into an MNQ large-move intraday trading strategy.
+
+If a database migration or major architecture change appears necessary, **STOP and report why before doing it.**
+
+---
+
+# 2. FIRST — AUDIT THE EXISTING SWING IMPLEMENTATION
+
+Before editing code, identify every place where SWING currently exists.
+
+Find:
+
+* strategy enum/constants
+* strategy selection logic
+* signal generation
+* dashboard display
+* API endpoints
+* journal fields
+* execution routing
+* configuration/settings
+* trade-management logic
+* stop/target logic
+* session restrictions
+* restart/recovery behavior
+* tests
+* historical database references
+
+Produce a short internal map of the existing implementation.
+
+Then modify it in place.
+
+Do not duplicate the SWING code into a second system.
+
+---
+
+# 3. RENAME / MIGRATION BEHAVIOR
+
+The active strategy name becomes:
+
+`INTRADAY_TREND`
+
+New signals and trades must journal as:
+
+`INTRADAY_TREND`
+
+Existing historical records with:
+
+`SWING`
+
+must remain readable and visible.
+
+If old configuration values contain `SWING`, support them only as a backwards-compatible alias where necessary.
+
+Do not rewrite historical trades.
+
+---
+
+# 4. PURPOSE OF INTRADAY TREND
+
+The strategy has one primary job:
+
+> Detect and participate in the major directional MNQ move occurring during the current trading day.
+
+This is NOT a scalp strategy.
+
+We are looking for approximately:
+
+* 100-point moves
+* 150-point moves
+* 200-point moves
+* 300+ point expansion days
+
+Not every trade needs to travel 100 points.
+
+However, the setup must have enough structural room that a large move is realistically available.
+
+The strategy should prefer:
+
+**fewer high-quality trades over frequent signals.**
+
+Default maximum:
+
+`MAX_INTRADAY_TREND_TRADES_PER_DAY = 2`
+
+---
+
+# 5. TIMEFRAME HIERARCHY
+
+Use:
+
+### 4H
+
+Macro context only.
+
+Determine:
+
+* major trend
+* major structure
+* major support/resistance
+
+Do NOT require 4H alignment to enter.
+
+### 1H
+
+Higher-timeframe intraday context.
+
+Determine:
+
+* directional pressure
+* major swing structure
+* important liquidity
+
+Do NOT make 1H alignment an absolute gate.
+
+### 15 MINUTE
+
+This should be the PRIMARY directional structure timeframe.
+
+Determine:
+
+* bullish/bearish structure
+* BOS
+* CHOCH
+* trend continuation
+* range
+* compression
+* expansion
+* major intraday swing highs/lows
+
+### 5 MINUTE
+
+Primary setup/confirmation timeframe.
+
+Use it for:
+
+* break and retest
+* liquidity sweep
+* failed reclaim
+* VWAP reaction
+* structure confirmation
+* entry setup
+
+### 1 MINUTE
+
+Execution refinement only.
+
+Do NOT allow the 1-minute chart to determine the overall trading direction.
+
+---
+
+# 6. SESSION AWARENESS
+
+The strategy must know which intraday session is active.
+
+At minimum classify:
+
+`ASIA`
+
+`LONDON`
+
+`US_PREMARKET`
+
+`NY_OPEN`
+
+`NY_SESSION`
+
+`LATE_SESSION`
+
+The strategy should display the current session.
+
+Session classification should use America/New_York time.
+
+Do not assume every session behaves the same.
+
+---
+
+# 7. IMPORTANT INTRADAY LEVELS
+
+Continuously calculate and maintain:
+
+* previous-day high
+* previous-day low
+* previous-day close
+* overnight high
+* overnight low
+* Asia high
+* Asia low
+* London high
+* London low
+* current session high
+* current session low
+* VWAP
+* 9:30 opening-range high
+* 9:30 opening-range low
+* major 15m swing highs
+* major 15m swing lows
+
+These levels should be available to the strategy as potential:
+
+* liquidity targets
+* entry areas
+* invalidation areas
+* profit targets
+
+Do not enter trades simply because one of these levels exists.
+
+---
+
+# 8. DO NOT ENTER IN THE MIDDLE OF NOWHERE
+
+One of the strongest filters for INTRADAY_TREND should be **location**.
+
+Avoid entries occurring in the middle of an established range without a structural reason.
+
+A qualified trade should normally originate from or confirm around something meaningful such as:
+
+* overnight high/low
+* Asia high/low
+* London high/low
+* previous-day high/low
+* VWAP
+* major 15m structure
+* opening range
+* liquidity sweep
+* confirmed breakout/retest
+
+Add a diagnostic such as:
+
+`LOCATION_QUALITY`
+
+Possible values:
+
+`EXCELLENT`
+
+`GOOD`
+
+`POOR`
+
+`MID_RANGE`
+
+MID_RANGE should generally prevent a new INTRADAY_TREND entry.
+
+---
+
+# 9. PRIMARY SETUPS
+
+Start with ONLY THREE setup families.
+
+Do not add 10 different strategies.
+
+## SETUP A — LIQUIDITY SWEEP REVERSAL
+
+Example short:
+
+MNQ runs above:
+
+* overnight high
+* London high
+* previous high
+
+Then:
+
+* rejects
+* returns below the level
+* creates bearish 5m structure
+* confirms failed reclaim
+
+Potential SHORT.
+
+Reverse conditions for LONG.
+
+---
+
+## SETUP B — BREAKOUT + RETEST CONTINUATION
+
+Example short:
+
+MNQ:
+
+* breaks major support
+* gets 5m acceptance below it
+* retests the broken level
+* fails to reclaim
+* bearish structure remains intact
+
+Potential SHORT continuation.
+
+Reverse for LONG.
+
+---
+
+## SETUP C — TREND PULLBACK CONTINUATION
+
+When a strong directional intraday trend already exists:
+
+Wait for price to pull back toward:
+
+* VWAP
+* broken structure
+* prior breakout
+* 5m/15m support/resistance
+
+Require evidence that the pullback is failing.
+
+Then enter back in the direction of the established trend.
+
+Do not chase an already extended move.
+
+---
+
+# 10. DIRECTIONAL CONTEXT
+
+Provide a directional context object containing:
+
+`trend_4h`
+
+`trend_1h`
+
+`trend_15m`
+
+`trend_5m`
+
+Possible values:
+
+`BULLISH`
+
+`BEARISH`
+
+`NEUTRAL`
+
+`RANGE`
+
+Also calculate:
+
+`trend_alignment`
+
+Examples:
+
+`STRONG_BULLISH`
+
+`BULLISH`
+
+`MIXED`
+
+`BEARISH`
+
+`STRONG_BEARISH`
+
+Higher-timeframe alignment should increase confidence.
+
+It should NOT automatically block an otherwise excellent intraday reversal setup.
+
+---
+
+# 11. PROJECTED MOVE / ROOM TO TARGET
+
+Before entering, determine whether enough room exists for the trade.
+
+Calculate:
+
+`projected_move_points`
+
+and
+
+`projected_R`
+
+based on structural entry, invalidation and logical liquidity/structure targets.
+
+Generally require:
+
+`projected_R >= 2.0`
+
+The system should prefer setups where approximately **100+ MNQ points of potential expansion** exist.
+
+Do NOT create an arbitrary 100-point take-profit.
+
+Targets must come from market structure.
+
+---
+
+# 12. STOP LOSS
+
+Stops must use **structural invalidation**.
+
+Examples:
+
+For SHORT:
+
+* above liquidity sweep high
+* above failed reclaim
+* above major 5m swing
+* above relevant 15m structure
+
+For LONG:
+
+opposite.
+
+Do NOT use tiny scalp stops simply because the strategy entered on a 1-minute chart.
+
+Use the existing canonical risk engine to determine contract quantity after stop distance is known.
+
+Never increase account risk merely because the stop is wider.
+
+---
+
+# 13. PROFIT MANAGEMENT
+
+Completely remove scalp-style management behavior from this strategy.
+
+Specifically:
+
+Do NOT:
+
+* immediately move stop to breakeven after a small favorable move
+* exit because MNQ pulls back 10–20 points
+* aggressively trail every candle
+
+Initial management rules:
+
+### Before +1R
+
+Do nothing unless market structure invalidates the trade.
+
+### Around +1R
+
+Do NOT automatically move to breakeven.
+
+Evaluate market structure.
+
+### Around +1.5R to +2R
+
+Allow first meaningful profit management.
+
+For multi-contract positions:
+
+Default concept:
+
+* take 25–50% off
+* maintain runner
+
+### Runner
+
+Runner should pursue:
+
+* next liquidity pool
+* session high/low
+* previous-day high/low
+* major 15m target
+* trend continuation
+
+Allow a successful trade to reach:
+
+2R
+
+3R
+
+4R+
+
+when the market provides it.
+
+---
+
+# 14. STRUCTURAL TRAILING
+
+After the move is established, trail using meaningful structure.
+
+Examples:
+
+SHORT:
+
+trail above confirmed 5m lower highs.
+
+LONG:
+
+trail below confirmed 5m higher lows.
+
+Do not trail on every 1-minute candle.
+
+---
+
+# 15. ONE-CONTRACT MANAGEMENT
+
+If only one MNQ contract is being traded, do not attempt partial exits.
+
+Instead use:
+
+* structural stop
+* structural target
+* structure-based trailing after sufficient favorable movement
+
+---
+
+# 16. END-OF-DAY RULE
+
+INTRADAY_TREND must NEVER intentionally hold overnight.
+
+All positions belonging to this strategy must be flat before the end of the U.S. trading day.
+
+Default:
+
+`FORCE_FLAT_TIME = 15:55 ET`
+
+Make configurable.
+
+Also prevent new INTRADAY_TREND entries late enough that there is insufficient time for a large move to develop.
+
+Default:
+
+`LAST_NEW_ENTRY_TIME = 14:30 ET`
+
+Make configurable.
+
+Do not alter unrelated execution safety systems.
+
+---
+
+# 17. NEWS / SAFETY
+
+Keep the existing:
+
+* news protection
+* prop rules
+* daily loss limits
+* position limits
+* arm state
+* safety lock
+* duplicate protection
+* execution mode
+* emergency stop
+
+Do not bypass any existing safety gate.
+
+The strategy may identify an opportunity during major news.
+
+That does NOT mean the execution layer should bypass existing news restrictions.
+
+---
+
+# 18. STATE MODEL
+
+Use clear states such as:
+
+`IDLE`
+
+`BUILDING_CONTEXT`
+
+`WATCHING_LEVEL`
+
+`SETUP_DEVELOPING`
+
+`CONFIRMATION_PENDING`
+
+`QUALIFIED`
+
+`RISK_PENDING`
+
+`READY`
+
+`ENTRY_REQUESTED`
+
+`POSITION_ACTIVE`
+
+`MANAGING`
+
+`COMPLETED`
+
+`INVALIDATED`
+
+`EXPIRED`
+
+`BLOCKED`
+
+Do not create another giant state architecture if the existing SWING implementation already has suitable states.
+
+Reuse what exists wherever practical.
+
+---
+
+# 19. DASHBOARD
+
+Replace the visible SWING wording with:
+
+# INTRADAY TREND
+
+Do NOT create another panel.
+
+The existing panel should show, at minimum:
+
+**Instrument**
+
+MNQ
+
+**Session**
+
+London / Premarket / NY Open / etc.
+
+**Status**
+
+Watching / Developing / Qualified / Active / Blocked
+
+**Direction**
+
+LONG / SHORT / NEUTRAL
+
+**4H Context**
+
+**1H Context**
+
+**15m Trend**
+
+**5m Structure**
+
+**Current Setup**
+
+Liquidity Sweep
+
+Break + Retest
+
+Trend Pullback
+
+etc.
+
+**Key Level**
+
+Example:
+
+29,720
+
+**Entry Zone**
+
+**Invalidation**
+
+**Stop Distance**
+
+**Projected Target**
+
+**Projected Move**
+
+Example:
+
+186 points
+
+**Projected R**
+
+Example:
+
+3.1R
+
+**Location Quality**
+
+**Reason**
+
+Plain-English explanation.
+
+Example:
+
+> SHORT developing. MNQ swept the London high at 29,720, rejected back below it and formed a 5-minute lower high. Waiting for 29,680 support to break and fail reclaim before qualification.
+
+---
+
+# 20. EXPLAINABILITY
+
+Every potential trade must record why it:
+
+* entered
+* did not enter
+* became invalid
+* was blocked
+
+Do not simply output:
+
+`WAIT`
+
+Instead output something like:
+
+`WAITING_FOR_BREAK`
+
+Reason:
+
+> Price rejected 29,720 but 29,680 structure remains intact. Short is not confirmed.
+
+Or:
+
+`BLOCKED_MID_RANGE`
+
+Reason:
+
+> Price is trading in the center of the overnight range with poor location and insufficient target asymmetry.
+
+---
+
+# 21. SHADOW / GHOST FIRST
+
+When implementation is complete:
+
+**DO NOT ENABLE LIVE EXECUTION.**
+
+Set INTRADAY_TREND to:
+
+`SHADOW`
+
+Use the existing ghost-trading infrastructure.
+
+Record every qualified opportunity including:
+
+* timestamp
+* direction
+* setup type
+* entry
+* stop
+* target
+* projected R
+* projected points
+* session
+* HTF context
+* location
+* MFE
+* MAE
+* eventual outcome
+* max favorable move
+* max adverse move
+* whether TP1 was reached
+* whether 2R was reached
+* whether 3R was reached
+* whether 100+ points occurred
+* whether management would have exited too early
+
+This is extremely important.
+
+We want to determine whether INTRADAY_TREND actually catches major MNQ moves before allowing it to trade.
+
+---
+
+# 22. DO NOT OPTIMIZE YET
+
+Do not tune dozens of parameters.
+
+Do not run an automatic optimizer.
+
+Do not add new indicators.
+
+Build the clean baseline first.
+
+We will collect evidence before changing thresholds.
+
+---
+
+# 23. TESTS
+
+Add regression tests covering at least:
+
+### Strategy Replacement
+
+* SWING historical records still load
+* new signals use INTRADAY_TREND
+* SCALP unchanged
+* ORB unchanged
+
+### Timeframes
+
+* 4H does not act as an absolute gate
+* 1H does not act as an absolute gate
+* 15m drives directional structure
+* 1m cannot independently reverse the strategy bias
+
+### Location
+
+* mid-range setup blocked
+* meaningful level setup permitted
+
+### Setup Types
+
+Test:
+
+* liquidity sweep reversal
+* breakout/retest
+* trend pullback
+
+Both LONG and SHORT where practical.
+
+### Risk
+
+* wider stop reduces contract size appropriately
+* strategy cannot bypass canonical risk engine
+
+### Trade Management
+
+* small favorable move does NOT automatically move stop to breakeven
+* normal pullback does not automatically exit trade
+* structural trailing occurs only after appropriate conditions
+
+### End of Day
+
+* no new trade after LAST_NEW_ENTRY_TIME
+* active INTRADAY_TREND trade force-flats by FORCE_FLAT_TIME
+
+### Safety
+
+Verify existing:
+
+* safety lock
+* execution arm
+* duplicate guard
+* daily loss limit
+* prop limits
+* execution mode
+
+still work.
+
+---
+
+# 24. ACCEPTANCE TEST
+
+Before calling this complete, demonstrate one synthetic SHORT example:
+
+MNQ rejects a major level.
+
+Example flow:
+
+`29,720 liquidity sweep`
+
+↓
+
+rejection
+
+↓
+
+5m bearish structure
+
+↓
+
+`29,680 break`
+
+↓
+
+failed reclaim
+
+↓
+
+SHORT qualified
+
+↓
+
+structural stop above invalidation
+
+↓
+
+risk engine sizes position
+
+↓
+
+target identifies approximately 100–250 points of potential downside
+
+↓
+
+trade remains active through normal pullbacks
+
+↓
+
+management begins only after meaningful favorable movement
+
+Then demonstrate the equivalent LONG flow.
+
+---
+
+# 25. FINAL VERIFICATION
+
+Run:
+
+* all new INTRADAY_TREND tests
+* existing trading strategy tests
+* risk tests
+* execution safety tests
+* dashboard/API tests
+* full regression suite
+
+Do not mark complete if this breaks existing SCALP or ORB behavior.
+
+---
+
+# 26. FINAL REPORT
+
+When finished, report ONLY:
+
+### A. Existing SWING Architecture Found
+
+Brief summary.
+
+### B. Files Changed
+
+Exact filenames.
+
+### C. What Was Reused
+
+List existing systems reused.
+
+### D. What Changed
+
+Exact behavioral changes.
+
+### E. What Was NOT Changed
+
+Confirm SCALP, ORB, data ingestion, risk engine and execution safety were not modified unexpectedly.
+
+### F. Test Results
+
+Pass/fail numbers.
+
+### G. Current Mode
+
+Must say:
+
+`INTRADAY_TREND = SHADOW`
+
+### H. Example Signal
+
+Show one complete example of what I will see on the dashboard.
+
+### I. Blockers
+
+List any unresolved issues.
+
+Do not begin unrelated improvements after completing this specification.
+
+**STOP after this task and report results.**
