@@ -27,9 +27,10 @@ import {
 // ── Constants ─────────────────────────────────────────────────────────────────
 
 const INSTRUMENTS = ['MGC', 'MNQ', 'MES', 'MYM'] as const;
-const LIVE_POLL_MS     = 5_000;
-const ORB_POLL_MS      = 10_000;
-const RESEARCH_POLL_MS = 30_000;   // Phase 2 ghost research — polls less aggressively
+const LIVE_POLL_MS          = 5_000;
+const ORB_POLL_MS           = 10_000;
+const RESEARCH_POLL_MS      = 30_000;   // Phase 2 ghost research — polls less aggressively
+const SYSTEM_HEALTH_POLL_MS = 60_000;   // System health — low-frequency background check
 
 const C = {
   green:   '#30d158',
@@ -165,6 +166,24 @@ async function fetchLiveReady(inst: string): Promise<{
       confirmations: confirmLabels,
     },
   };
+}
+
+// ── System health poller ──────────────────────────────────────────────────────
+
+interface SystemHealthResponse {
+  ok?: boolean;
+  ready_for_market?: boolean;
+  error_count?: number;
+  ghost_engine?: { table_ready?: boolean };
+  edge_ledger?: { table_ready?: boolean };
+}
+
+async function fetchSystemHealth(headers: Record<string, string>): Promise<SystemHealthResponse | null> {
+  try {
+    const res = await fetch('/api/research-health', { credentials: 'include', headers });
+    if (!res.ok) return null;
+    return await res.json() as SystemHealthResponse;
+  } catch { return null; }
 }
 
 // ── ORB shadow status poller ──────────────────────────────────────────────────
@@ -339,6 +358,9 @@ const AlertCard: React.FC<{
           {alert.type === 'RESEARCH_READY_FOR_REVIEW' && (
             <ResearchDetail alert={alert} color={color} />
           )}
+          {alert.type === 'SYSTEM_SAFETY' && (
+            <SystemSafetyDetail alert={alert} color={color} />
+          )}
         </div>
       )}
     </div>
@@ -397,6 +419,22 @@ const ResearchDetail: React.FC<{ alert: AlertItem; color: string }> = ({ alert, 
     <div style={{ marginTop: 6, fontSize: 9, color: C.txtMut, fontStyle: 'italic' }}>
       Phase 2 Ghost Research Engine — shadow experiment reached READY_FOR_REVIEW.<br />
       No live config was changed. Review findings before any action.
+    </div>
+  </div>
+);
+
+const SystemSafetyDetail: React.FC<{ alert: AlertItem; color: string }> = ({ alert, color }) => (
+  <div style={{ paddingTop: 8 }}>
+    <div style={{ fontSize: 11, fontWeight: 700, color, marginBottom: 4 }}>
+      {alert.label}
+    </div>
+    {alert.sublabel && (
+      <div style={{ fontSize: 10, color: C.txtSec, marginBottom: 6 }}>
+        {alert.sublabel}
+      </div>
+    )}
+    <div style={{ fontSize: 9, color: C.txtMut, fontStyle: 'italic' }}>
+      System event — no trading action required.
     </div>
   </div>
 );
@@ -691,10 +729,15 @@ export const GlobalAlertDock: React.FC = () => {
   );
 
   // In-memory dedup refs (session-only; queue persists across sessions)
-  const seenLiveRef     = useRef<Partial<Record<string, string>>>({});  // inst → last READY id
-  const seenOrbRef      = useRef<Partial<Record<string, string>>>({});  // inst → last ORB id
-  const seenResearchRef = useRef<Set<string>>(new Set());               // experiment_id → seen
-  const soundedRef      = useRef<Set<string>>(new Set());
+  const seenLiveRef         = useRef<Partial<Record<string, string>>>({});  // inst → last READY id
+  const seenOrbRef          = useRef<Partial<Record<string, string>>>({});  // inst → last ORB id
+  const seenResearchRef     = useRef<Set<string>>(new Set());               // experiment_id → seen
+  const soundedRef          = useRef<Set<string>>(new Set());
+  // Connection health tracking
+  const netOkRef            = useRef<boolean | null>(null);  // null=unknown, true=up, false=down
+  const consecutiveFailRef  = useRef<number>(0);
+  // System health dedup — keyed by warning text to avoid repeat alerts
+  const seenSysWarnRef      = useRef<Set<string>>(new Set());
 
   useEffect(() => { injectKeyframes(); }, []);
 
@@ -742,10 +785,13 @@ export const GlobalAlertDock: React.FC = () => {
 
   const pollLive = useCallback(async () => {
     if (document.hidden) return;
+    let networkOkCount = 0;  // instruments that returned any HTTP response (didn't throw)
+
     await Promise.allSettled(
       INSTRUMENTS.map(async (inst) => {
         try {
           const { isActionable, id, alert } = await fetchLiveReady(inst);
+          networkOkCount++;  // fetchLiveReady only returns (never throws) on HTTP response
           if (!isActionable) {
             // Reset dedup so next READY fires a fresh alert
             seenLiveRef.current[inst] = '';
@@ -763,9 +809,48 @@ export const GlobalAlertDock: React.FC = () => {
               isShadow:    false,
             } as AlertItem);
           }
-        } catch { /* network error — silently skip */ }
+        } catch { /* genuine network error — don't increment networkOkCount */ }
       })
     );
+
+    // ── Connection state machine ──────────────────────────────────────────────
+    const allFailed = networkOkCount === 0;
+    if (allFailed) {
+      consecutiveFailRef.current++;
+      // Wait for 2 consecutive all-fail polls (~10 s) before declaring offline
+      // to avoid false alarms from a single slow poll.
+      if (consecutiveFailRef.current >= 2 && netOkRef.current !== false) {
+        netOkRef.current = false;
+        pushAlert({
+          id:           `SYSTEM_OFFLINE|${Date.now()}`,
+          type:         'SYSTEM_SAFETY',
+          instrument:   'SYSTEM',
+          timestamp:    Date.now(),
+          acknowledged: false,
+          isShadow:     false,
+          label:        'Feed disconnected',
+          sublabel:     'Retrying automatically…',
+        });
+      }
+    } else {
+      consecutiveFailRef.current = 0;
+      if (netOkRef.current === false) {
+        // Was offline — now back up
+        netOkRef.current = true;
+        pushAlert({
+          id:           `SYSTEM_ONLINE|${Date.now()}`,
+          type:         'SYSTEM_SAFETY',
+          instrument:   'SYSTEM',
+          timestamp:    Date.now(),
+          acknowledged: false,
+          isShadow:     false,
+          label:        'System connected',
+          sublabel:     'Feed restored',
+        });
+      } else if (netOkRef.current === null) {
+        netOkRef.current = true;  // initial state — connected, no alert needed
+      }
+    }
   }, [pushAlert]);
 
   // ── ORB shadow polling ──────────────────────────────────────────────────────
@@ -876,6 +961,38 @@ export const GlobalAlertDock: React.FC = () => {
     } catch { /* silently ignore */ }
   }, [pushAlert]);
 
+  // ── System health polling ───────────────────────────────────────────────────
+
+  const pollSystemHealth = useCallback(async () => {
+    if (document.hidden) return;
+    try {
+      const data = await fetchSystemHealth(authHeaders());
+      if (!data) return;
+
+      const warnings: string[] = [];
+      if (data.ready_for_market === false) warnings.push('System not ready for market');
+      if (typeof data.error_count === 'number' && data.error_count > 0)
+        warnings.push(`${data.error_count} research engine error${data.error_count > 1 ? 's' : ''}`);
+      if (data.ghost_engine?.table_ready === false)  warnings.push('Ghost observations table unavailable');
+      if (data.edge_ledger?.table_ready === false)   warnings.push('Edge ledger table unavailable');
+
+      for (const warn of warnings) {
+        if (seenSysWarnRef.current.has(warn)) continue;
+        seenSysWarnRef.current.add(warn);
+        pushAlert({
+          id:           `SYS_HEALTH|${warn}`,
+          type:         'SYSTEM_SAFETY',
+          instrument:   'SYSTEM',
+          timestamp:    Date.now(),
+          acknowledged: false,
+          isShadow:     false,
+          label:        'System warning',
+          sublabel:     warn,
+        });
+      }
+    } catch { /* silently ignore */ }
+  }, [pushAlert]);
+
   // Start polling
   useEffect(() => {
     pollLive();
@@ -894,6 +1011,12 @@ export const GlobalAlertDock: React.FC = () => {
     const id = setInterval(pollResearch, RESEARCH_POLL_MS);
     return () => clearInterval(id);
   }, [pollResearch]);
+
+  useEffect(() => {
+    pollSystemHealth();
+    const id = setInterval(pollSystemHealth, SYSTEM_HEALTH_POLL_MS);
+    return () => clearInterval(id);
+  }, [pollSystemHealth]);
 
   // ── Alert click: switch instrument + navigate ───────────────────────────────
 

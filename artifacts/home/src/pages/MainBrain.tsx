@@ -12684,6 +12684,20 @@ export default function MainBrain() {
         sublabel: [inst, scannerKey].filter(Boolean).join('  ·  '),
         color:    T.cyan,
       };
+      // ── Push to persistent dock queue so it's visible on all pages ──
+      try {
+        const scanInst = inst || 'SYSTEM';
+        saveQueue(upsertAlert(loadQueue(), {
+          id:           `SCAN_FOUND|${scanInst}|${scannerKey}`,
+          type:         'SYSTEM_SAFETY' as const,
+          instrument:   scanInst,
+          timestamp:    Date.now(),
+          acknowledged: false,
+          isShadow:     false,
+          label:        'New setup found',
+          sublabel:     [scanInst, scannerKey].filter(Boolean).join('  ·  '),
+        }));
+      } catch {/* noop — dock push is advisory only */}
     }
     prevScannerKeyRef.current = scannerKey;
 
@@ -12692,12 +12706,38 @@ export default function MainBrain() {
       audioManager.play(SoundEvent.SYSTEM_ONLINE);
       nextToast = { key: Date.now(), icon: '✓', label: 'System connected',
                     sublabel: '', color: T.green };
+      // ── Push to persistent dock queue ──
+      try {
+        saveQueue(upsertAlert(loadQueue(), {
+          id:           `SYSTEM_ONLINE|${Date.now()}`,
+          type:         'SYSTEM_SAFETY' as const,
+          instrument:   'SYSTEM',
+          timestamp:    Date.now(),
+          acknowledged: false,
+          isShadow:     false,
+          label:        'System connected',
+          sublabel:     'Feed restored',
+        }));
+      } catch {/* noop */}
     }
     // SYSTEM_OFFLINE — fires on connected → error transition.
     if (isDisconnected && prevFetchOkRef.current) {
       audioManager.play(SoundEvent.SYSTEM_OFFLINE);
       nextToast = { key: Date.now(), icon: '⚠', label: 'Feed disconnected',
                     sublabel: 'Retrying automatically…', color: T.amber };
+      // ── Push to persistent dock queue ──
+      try {
+        saveQueue(upsertAlert(loadQueue(), {
+          id:           `SYSTEM_OFFLINE|${Date.now()}`,
+          type:         'SYSTEM_SAFETY' as const,
+          instrument:   'SYSTEM',
+          timestamp:    Date.now(),
+          acknowledged: false,
+          isShadow:     false,
+          label:        'Feed disconnected',
+          sublabel:     'Retrying automatically…',
+        }));
+      } catch {/* noop */}
     }
     if (isConnected)    prevFetchOkRef.current = true;
     if (isDisconnected) prevFetchOkRef.current = false;

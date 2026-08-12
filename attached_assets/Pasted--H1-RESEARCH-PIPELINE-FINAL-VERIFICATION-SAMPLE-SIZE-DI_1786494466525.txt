@@ -1,0 +1,620 @@
+# H1 RESEARCH PIPELINE — FINAL VERIFICATION & SAMPLE-SIZE DIAGNOSTIC
+
+## PURPOSE
+
+The experiment infrastructure repair appears successful.
+
+Experiment 3:
+
+* hypothesis_id = 1 (H1)
+* instrument = MNQ
+* real Databento data
+* result_id = 11
+* result status = COMPLETE
+* TEST sample size = 4
+* robustness = INSUFFICIENT_EVIDENCE
+
+However, the original H1 acceptance test is NOT complete because the sample size is far below the required minimum of 30.
+
+This task is **verification and diagnosis only**.
+
+Do NOT:
+
+* add features
+* create new hypotheses
+* change H1
+* change the 1.5× volume threshold
+* modify ORB strategy rules
+* modify production trading
+* enable live execution
+* register H1 for forward testing unless it legitimately passes the existing decision criteria
+* purchase/download additional historical data automatically
+* start any suggested Replit follow-up tasks
+* resume autonomous hypothesis generation
+
+Keep:
+
+`research_hypothesis_creation_enabled = False`
+
+---
+
+# 1. PRESERVE THE SUCCESSFUL RESULT
+
+Do not delete or overwrite:
+
+* Experiment 3
+* Result 11
+
+These are now part of the research audit trail.
+
+Do not manipulate Experiment 3 merely to force a passing result.
+
+---
+
+# 2. RUN THE FORMAL RESEARCH DECISION
+
+Run the repaired:
+
+`RESEARCH_DECISION_CREATE`
+
+against Experiment 3 / Result 11.
+
+Report the exact returned decision and every criterion used.
+
+Given:
+
+TEST sample_size = 4
+
+and:
+
+minimum required sample_size = 30
+
+the expected decision should be:
+
+`INCONCLUSIVE`
+
+or the canonical equivalent such as:
+
+`INCONCLUSIVE_INSUFFICIENT_SAMPLE`
+
+If the tool instead returns:
+
+`KEEP_FOR_FORWARD_TEST`
+
+treat that as a defect.
+
+Do NOT register H1 with the shadow system in that case.
+
+Fix the decision gate rather than allowing an underpowered experiment to pass.
+
+---
+
+# 3. VERIFY REAL DATA
+
+Provide direct evidence that Result 11 used real Databento market data.
+
+Report:
+
+* `is_real_data`
+* provider
+* instrument
+* dataset/schema if recorded
+* requested start date
+* requested end date
+* actual first bar timestamp
+* actual last bar timestamp
+* total bars loaded
+* unique trading dates represented
+
+Required:
+
+`is_real_data = true`
+
+If actual historical coverage differs from the requested date range, report that clearly.
+
+Do not describe partial coverage as a six-month experiment.
+
+---
+
+# 4. INVESTIGATE WHY THERE ARE ONLY 4 TEST TRADES
+
+This is the most important part of this task.
+
+A January 2 through June 30 MNQ ORB study producing only four qualifying TEST events needs to be explained before we spend money obtaining more data.
+
+Trace the event funnel.
+
+Start with every trading session represented in the actual dataset.
+
+Produce counts for:
+
+A. Unique trading dates available
+
+B. Dates with sufficient 09:30–09:40 ET bars to construct the opening range
+
+C. Valid opening ranges constructed
+
+D. Dates with a LONG breakout after range lock
+
+E. Breakouts passing normal ORB eligibility rules
+
+F. Breakouts with valid breakout-bar volume
+
+G. Breakouts with sufficient historical observations to calculate reference median volume
+
+H. Breakouts where:
+
+`breakout_volume >= 1.5 * reference_median_volume`
+
+I. Final TEST trades generated
+
+The funnel should look conceptually like:
+
+TOTAL DATA DAYS
+↓
+VALID OR DAYS
+↓
+LONG BREAKOUT DAYS
+↓
+BASELINE-QUALIFYING ORB EVENTS
+↓
+VALID VOLUME REFERENCE
+↓
+
+> =1.5× VOLUME EVENTS
+> ↓
+> TEST TRADES
+
+Print the count at every stage.
+
+---
+
+# 5. IDENTIFY THE EXACT BOTTLENECK
+
+Classify the primary cause of the four-trade result into one or more of these categories:
+
+### DATA_COVERAGE
+
+Databento did not actually provide the requested historical period.
+
+### ORB_DETECTION
+
+The experiment runner failed to identify ORB events that should exist.
+
+### SESSION_FILTER
+
+Timezone/session/date filtering eliminated valid trading days.
+
+### VOLUME_REFERENCE
+
+The reference median-volume calculation could not be produced for many events.
+
+### VOLUME_THRESHOLD
+
+The system correctly detected events, but very few exceeded 1.5× median volume.
+
+### ADDITIONAL_FILTER
+
+Another experiment filter eliminated otherwise valid events.
+
+### OTHER
+
+Explain precisely.
+
+Do not guess.
+
+Show counts proving the diagnosis.
+
+---
+
+# 6. VERIFY TIMEZONE HANDLING
+
+Explicitly verify that MNQ timestamps are being interpreted correctly.
+
+The ORB must correspond to:
+
+09:30–09:39:59 America/New_York
+
+with range lock at:
+
+09:40 America/New_York
+
+Verify DST conversion for the tested dates.
+
+Confirm the runner is NOT accidentally treating:
+
+09:30 UTC
+
+as:
+
+09:30 ET.
+
+Report the timestamps from at least three actual sessions showing:
+
+raw timestamp
+converted ET timestamp
+opening-range start
+opening-range end
+breakout-search start
+
+---
+
+# 7. VERIFY CONTROL POPULATION
+
+H1 asks:
+
+Does the >=1.5× volume condition improve MNQ long ORB performance?
+
+Therefore CONTROL must contain the comparable long ORB events without the elevated-volume requirement.
+
+Report:
+
+CONTROL sample size
+
+If CONTROL is also approximately four trades, the problem is probably upstream of the volume threshold.
+
+If CONTROL is substantially larger but TEST = 4, then the volume threshold/reference calculation becomes the likely explanation.
+
+This distinction is critical.
+
+---
+
+# 8. VERIFY CONTROL AND TEST DIFFER ONLY BY VOLUME FILTER
+
+Compare their configurations.
+
+They must have identical:
+
+* instrument
+* date range
+* session
+* opening-range duration
+* breakout definition
+* direction
+* entry
+* stop
+* target
+* maximum hold
+* transaction costs
+* slippage
+* other eligibility rules
+
+The intended difference must be:
+
+CONTROL:
+no >=1.5× volume requirement
+
+TEST:
+breakout_volume >= 1.5 × reference_median_volume
+
+Report any other differences.
+
+If other differences exist, Result 11 is not a clean H1 experiment.
+
+Do NOT silently fix them.
+
+Report them.
+
+---
+
+# 9. VERIFY VOLUME CALCULATION
+
+For each of the four qualifying TEST trades, report:
+
+* trading date
+* breakout timestamp
+* breakout volume
+* reference median volume
+* ratio
+* required ratio
+* PASS/FAIL
+
+Also inspect a reasonable sample of baseline breakouts that failed the volume condition.
+
+Report enough examples to demonstrate that the filter is operating correctly.
+
+Confirm there is no:
+
+* look-ahead
+* use of future-session volume
+* zero/NULL median
+* incorrect bar interval
+* timezone mismatch
+* comparison-unit mismatch
+
+---
+
+# 10. DATA QUALITY CHECK
+
+Run:
+
+`DATA_QUALITY_CHECK`
+
+for Experiment 3.
+
+Report:
+
+`PASS`
+`WARN`
+or
+`FAIL`
+
+and every warning/failure reason.
+
+Also report:
+
+* missing bars
+* duplicate bars
+* invalid OHLC
+* invalid volume
+* out-of-order timestamps
+* incomplete sessions
+* coverage percentage if available
+
+Do not manufacture a 100% score when these measurements are unavailable.
+
+---
+
+# 11. REPORT THE ACTUAL CONTROL RESULTS
+
+From Result 11 or its canonical result records, report:
+
+CONTROL:
+
+* sample size
+* win rate
+* expectancy
+* profit factor
+* net R
+* max drawdown
+* average winner
+* average loser
+* MAE
+* MFE
+
+Do not substitute TEST statistics for CONTROL statistics.
+
+---
+
+# 12. REPORT THE ACTUAL TEST RESULTS
+
+Report TEST:
+
+* sample size
+* win rate
+* expectancy
+* profit factor
+* net R
+* max drawdown
+* average winner
+* average loser
+* MAE
+* MFE
+
+Clearly label these results:
+
+`INSUFFICIENT SAMPLE — DESCRIPTIVE ONLY`
+
+because n=4.
+
+---
+
+# 13. CONTROL VS TEST
+
+Calculate:
+
+TEST − CONTROL
+
+for:
+
+* expectancy
+* win rate
+* profit factor
+* net R
+* max drawdown
+
+These are descriptive statistics only until adequate sample size exists.
+
+Do not characterize a positive difference as an improvement unless statistical requirements are met.
+
+---
+
+# 14. BOOTSTRAP VERIFICATION
+
+Report the actual bootstrap output.
+
+Required:
+
+CONTROL expectancy 95% CI
+
+TEST expectancy 95% CI
+
+and, if implemented:
+
+95% CI for:
+
+`TEST expectancy - CONTROL expectancy`
+
+If the difference CI includes zero:
+
+state:
+
+`NO STATISTICALLY DEMONSTRATED IMPROVEMENT`
+
+If the difference bootstrap cannot reasonably operate with n=4:
+
+report:
+
+`INSUFFICIENT_SAMPLE`
+
+Do not manufacture a confidence interval.
+
+---
+
+# 15. MONTE CARLO VERIFICATION
+
+Report actual Monte Carlo results for TEST:
+
+* simulation count
+* median max drawdown
+* 95th percentile max drawdown
+* 99th percentile max drawdown
+
+If the system refuses because n=4:
+
+that is acceptable.
+
+Report:
+
+`INSUFFICIENT_SAMPLE`
+
+Do not weaken the minimum-sample rule to generate statistics.
+
+---
+
+# 16. TRANSACTION COST VERIFICATION
+
+Confirm Experiment 3 actually applied:
+
+* commissions
+* fees
+* entry slippage
+* exit slippage
+
+Report the exact assumptions.
+
+Then verify that:
+
+gross results
+
+and
+
+cost-adjusted results
+
+are different when costs are nonzero.
+
+If the values are identical despite nonzero configured costs, investigate before accepting the experiment result.
+
+---
+
+# 17. GHOST / SHADOW STATUS
+
+Because H1 currently has only four TEST trades, it should NOT automatically enter research shadow validation unless the formal decision legitimately returns:
+
+`KEEP_FOR_FORWARD_TEST`
+
+Expected current state:
+
+H1 shadow registration = NOT REGISTERED
+
+Explain why.
+
+Do not change live execution.
+
+Do not create orders.
+
+Do not change the production ORB configuration.
+
+---
+
+# 18. VERIFY NO RESEARCH LEAKED INTO PRODUCTION
+
+Confirm:
+
+* production ORB threshold unchanged
+* live strategy configuration unchanged
+* execution mode unchanged
+* arm state unchanged
+* safety locks unchanged
+* no order generated by H1
+* no production promotion occurred
+
+Research must remain isolated.
+
+---
+
+# 19. DO NOT SOLVE LOW SAMPLE SIZE YET
+
+This task determines WHY n=4.
+
+Do NOT yet solve it by:
+
+* lowering 1.5× to 1.2×
+* changing ORB duration
+* allowing shorts
+* changing session times
+* removing filters
+* extending years of data
+* buying additional Databento data
+
+First identify the bottleneck.
+
+We will decide the cheapest scientifically valid solution after seeing the evidence.
+
+---
+
+# 20. REQUIRED FINAL REPORT
+
+Return ONE final report containing:
+
+1. Experiment ID
+2. Result ID
+3. Hypothesis ID
+4. `is_real_data`
+5. Data provider
+6. Requested date range
+7. Actual data coverage
+8. Total bars
+9. Unique trading days
+10. Valid OR days
+11. Long breakout days
+12. Baseline-qualified events
+13. Events with valid volume reference
+14. Events >=1.5× median
+15. CONTROL sample size
+16. TEST sample size
+17. CONTROL expectancy
+18. TEST expectancy
+19. Expectancy difference
+20. CONTROL profit factor
+21. TEST profit factor
+22. CONTROL max drawdown
+23. TEST max drawdown
+24. Bootstrap CI results
+25. Monte Carlo results
+26. Data-quality result
+27. Transaction-cost/slippage confirmation
+28. Formal research decision
+29. Shadow registration status
+30. Primary reason TEST sample size = 4
+31. Any discovered defects
+32. Files changed during this verification
+33. Tests run and results
+34. Git commit
+
+End with exactly one of these conclusions:
+
+### A — PIPELINE VALID, MORE DATA NEEDED
+
+Use only if the event funnel and calculations are correct and n=4 is genuinely caused by insufficient historical observations.
+
+### B — PIPELINE VALID, H1 FILTER IS RARE
+
+Use only if there are many valid baseline ORB events but the legitimate 1.5× volume condition reduces them to approximately four.
+
+### C — EXPERIMENT LOGIC DEFECT FOUND
+
+Use if data/session/ORB/volume/filter logic incorrectly eliminates events.
+
+### D — DATA COVERAGE DEFECT FOUND
+
+Use if the requested six-month period was not actually available to the runner.
+
+Then STOP.
+
+Do not start another task.
+Do not implement the solution to the sample-size problem.
+Do not resume autonomous hypothesis creation.
+Do not propose another research feature.
+
+We will choose the next action from this evidence.
