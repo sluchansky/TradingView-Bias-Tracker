@@ -64412,10 +64412,11 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
 
 <!-- Sensitivity (trading mode) -->
 <div id="mode-row">
-  <span id="mode-cap">Sensitivity</span>
+  <span id="mode-cap">Mode</span>
   <div class="mode-seg">
-    <div class="mode-btn" id="mode-scalp" onclick="setMode('SCALP')">SCALP · Sensitive</div>
-    <div class="mode-btn" id="mode-swing" onclick="setMode('SWING')">SWING · Strict</div>
+    <div class="mode-btn" id="mode-scalp"    onclick="setMode('SCALP')">SCALP · Sensitive</div>
+    <div class="mode-btn" id="mode-swing"    onclick="setMode('SWING')">SWING · Strict</div>
+    <div class="mode-btn" id="mode-intraday" onclick="setMode('INTRADAY_TREND')">INTRADAY · Session</div>
   </div>
 </div>
 
@@ -67439,9 +67440,11 @@ async function sendEod() {
 function paintMode(m) {
   const sc = document.getElementById('mode-scalp');
   const sw = document.getElementById('mode-swing');
+  const it = document.getElementById('mode-intraday');
   if (!sc || !sw) return;
   sc.classList.toggle('active', m === 'SCALP');
   sw.classList.toggle('active', m === 'SWING');
+  if (it) it.classList.toggle('active', m === 'INTRADAY_TREND');
 }
 async function loadMode() {
   try { const d = await api('/mode'); if (d.trading_mode) paintMode(d.trading_mode); } catch(e) {}
@@ -67451,7 +67454,10 @@ async function setMode(m) {
     const d = await api('/mode', { mode: m });
     if (d.trading_mode) {
       paintMode(d.trading_mode);
-      toast(m === 'SCALP' ? '⚡ SCALP — more sensitive' : '🎯 SWING — stricter');
+      const _mToast = m === 'SCALP' ? '⚡ SCALP — more sensitive'
+                    : m === 'INTRADAY_TREND' ? '📈 INTRADAY TREND — session setups (MNQ)'
+                    : '🎯 SWING — stricter';
+      toast(_mToast);
       refreshRec();
     } else toast('Error: '+(d.reason||d.status), false);
   } catch(e) { toast('Request failed', false); }
@@ -81935,7 +81941,7 @@ def index():
             "GET /alerts":     "View last 100 stored alerts",
             "GET /price":      "Price context, levels, structure, and risk zone",
             "GET /status":     "Full analysis with verdict and reasoning chain",
-            "GET|POST /mode":  "Read or switch trading mode (SCALP / SWING)",
+            "GET|POST /mode":  "Read or switch trading mode (SCALP / SWING / INTRADAY_TREND)",
             "POST /enter":     "Open an active trade (uses current trade plan or explicit params)",
             "POST /traderspost": "One-tap order execution gateway (routes per EXECUTION_MODE: manual/paper/live broker)",
             "POST /breakeven": "Move stop loss to entry price",
