@@ -1243,7 +1243,7 @@ def _swing_htf_enabled(mode=None):
     never enter any SWING-HTF path because the mode check fails first.
     """
     m = (mode or TRADING_MODE)
-    if m != "SWING":
+    if m not in ("SWING", "INTRADAY_TREND"):
         return False
     if os.environ.get("SWING_HTF_ENABLED", "").strip() == "0":
         return False
