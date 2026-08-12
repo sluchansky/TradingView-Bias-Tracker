@@ -267,12 +267,21 @@ SCALP is the high-frequency, sensitive profile designed for quick intraday captu
 | Minimum edge to fire READY | **60** | Gate opens at 60; below that is WAIT |
 | EARLY tier threshold | **50–59** | Setup visible but not yet confirmed |
 | EARLY size | **Half size** (flag-gated) | If SCALP half-size flag is on, EARLY fires at 50% contracts |
-| Max risk per trade | **$100** (default) | Env `MAX_RISK_DOLLARS_PER_TRADE` overrides |
+| Max risk per trade | **$200** (default) | Env `MAX_RISK_DOLLARS_PER_TRADE` overrides |
 | TRADE_READY_INTERVAL | **120s** (2 min) | How often the system re-evaluates and can re-post a READY card |
 | Max losses per day | **3** (default) | Safety cap — env `SAFETY_MAX_LOSSES_PER_DAY` overrides |
 | Zone requirement | Soft (demotes only) | A mitigated zone demotes to WAIT but does not hard-block |
 | HTF bias check | Optional | Not required by default; DUAL_TF_ENGINE flag adds a 2-confirm requirement |
 | Dynamic exits | Yes (flag-gated ON) | TP1, TP2, runner, delayed breakeven — see §7.4 |
+
+At a $200 max risk and MNQ's $2.00/pt value, the practical contract count is:
+- **ATR stop ≤ 100 pts** ($200/contract) → 1 contract eligible
+- **ATR stop ≤ 50 pts** ($100/contract) → 2 contracts eligible
+- **ATR stop > 100 pts** (> $200/contract) → 0 contracts (over-cap, trade blocked)
+
+This means setups with wider ATR-derived stops — common during elevated volatility — remain eligible at 1 contract rather than being silently blocked as they were under the previous $100 cap.
+
+> ⚠️ If you set `MAX_RISK_DOLLARS_PER_TRADE` above $200 via env override, verify your broker's intraday loss limits still accommodate the new sizing.
 
 ### 7.3 SCALP Gate Sequence
 
@@ -815,7 +824,7 @@ You do not need to stop the server. It runs 24/7 and will continue watching over
 | **R:R** | 1:1 (runner up to 3R) | 1:3 | 1:3 |
 | **Min edge** | 60 | 80 | 80 |
 | **EARLY tier** | 50–59 (half size) | None | None |
-| **Max risk/trade** | $100 | $500 | $500 |
+| **Max risk/trade** | $200 | $500 | $500 |
 | **Re-check cadence** | 2 min | 5 min | N/A (ghost) |
 | **Instruments** | All 4 | All 4 | MNQ only |
 | **Stop type** | ATR-based | ATR-based (2.5–3.0×) | Structural (session levels) |
@@ -924,4 +933,4 @@ When enabled, an additional pre-send check enforces prop-firm daily loss and dra
 
 ---
 
-*Last updated: August 2026. This manual covers the system as currently deployed, including INTRADAY TREND mode (ghost/shadow phase).*
+*Last updated: August 2026. This manual covers the system as currently deployed, including INTRADAY TREND mode (ghost/shadow phase). SCALP max risk per trade raised from $100 → $200 (August 2026).*
