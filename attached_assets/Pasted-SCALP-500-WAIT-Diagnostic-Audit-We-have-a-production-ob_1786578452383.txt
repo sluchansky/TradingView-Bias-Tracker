@@ -1,0 +1,397 @@
+SCALP 500-WAIT Diagnostic Audit
+
+We have a production observation from the SCALP mode:
+
+* Setups analyzed: 500
+* READY: 0
+* WAIT: 500
+* Databento attribution: 49.1%
+* TradingView: 14.8%
+* Internal: 14.3%
+* Unknown: 21.8%
+* Buying-pressure duplicate evidence: 95.4%
+* CVD + Volume co-occurrence: 100%
+* Sweep + CVD: 100%
+* Sweep + Volume: 100%
+* VWAP + CVD: 100%
+* VWAP + Volume: 100%
+* Average evidence ages:
+    * BOS: 2115.2 sec
+    * CHOCH: 403.7 sec
+    * Sweep: 407.9 sec
+    * CVD: 30.2 sec
+    * VWAP: 30.2 sec
+    * Volume: 30.1 sec
+
+Objective
+
+Determine why SCALP produced 0 READY setups out of 500 and whether this represents:
+
+1. legitimately poor market conditions,
+2. an overly restrictive SCALP gate,
+3. stale structural evidence,
+4. duplicated/correlated evidence,
+5. incorrectly populated/defaulted confirmations,
+6. a data-source problem,
+7. or a logging/analytics problem.
+
+HARD CONSTRAINTS
+
+Do not change trading behavior during the initial audit.
+
+Do not:
+
+* lower READY thresholds
+* increase/decrease edge-score weights
+* remove gates
+* change risk
+* change stops or targets
+* modify SCALP execution
+* modify SWING
+* modify INTRADAY_TREND
+* modify ORB
+* add indicators
+* create a new strategy
+* change production behavior merely to generate more trades
+
+This is a diagnostic audit first.
+
+⸻
+
+PHASE 1 — TRACE THE 500 WAIT DECISIONS
+
+Find the exact SCALP decision path from:
+
+market data → signal components → scoring → gates → verdict → READY/WAIT.
+
+Identify the functions/modules responsible for:
+
+* SCALP setup generation
+* edge score
+* BOS
+* CHOCH
+* liquidity sweep
+* VWAP confirmation
+* CVD confirmation
+* volume confirmation
+* strict gate evaluation
+* READY/WAIT verdict
+* source-attribution logging
+* gate-effectiveness logging
+* ghost observation/outcome tracking
+
+Document exact file names/functions.
+
+Then determine the failed-gate distribution for the 500 WAIT observations.
+
+Produce something equivalent to:
+
+Failed gate	WAIT count	% of WAIT
+edge_score		
+structure		
+VWAP		
+volume		
+CVD		
+sweep		
+volatility		
+zone		
+candle		
+risk		
+other		
+
+Also identify combinations such as:
+
+* structure + score
+* VWAP + structure
+* volume + structure
+* only one failed gate
+* two failed gates
+* 3+ failed gates
+
+We need to know what is actually killing the setups.
+
+⸻
+
+PHASE 2 — AUDIT THE 100% CO-OCCURRENCE
+
+Investigate why these pairs occur in 500/500 setups:
+
+* CVD + Volume
+* Sweep + CVD
+* Sweep + Volume
+* VWAP + CVD
+* VWAP + Volume
+
+Trace each value back to its original calculation.
+
+For each component determine:
+
+1. source
+2. function that calculates it
+3. timeframe
+4. timestamp
+5. freshness rule
+6. whether it is independently calculated
+7. whether it can be defaulted
+8. whether missing data becomes true/confirmed
+9. whether one component sets another component
+10. whether multiple components derive from the same underlying measurement
+
+Specifically search for patterns such as:
+
+value = data.get("x", True)
+
+or truthy fallbacks/defaults that could make confirmations appear present when data is unavailable.
+
+Also inspect any shared object/dictionary population where multiple confirmations are assigned together.
+
+Required conclusion
+
+Classify each pair as:
+
+* INDEPENDENT
+* CORRELATED BUT VALID
+* DUPLICATE EVIDENCE
+* DEFAULT/POPULATION BUG
+* UNKNOWN
+
+Do not change scoring yet.
+
+⸻
+
+PHASE 3 — SCALP EVIDENCE FRESHNESS
+
+Audit the freshness/TTL rules for:
+
+* BOS
+* CHOCH
+* Sweep
+* VWAP
+* CVD
+* Volume
+
+The analytics currently show approximately:
+
+* BOS = 35 minutes old
+* CHOCH = 6.7 minutes
+* Sweep = 6.8 minutes
+* VWAP/CVD/Volume = 30 seconds
+
+Determine whether these ages are intentional for SCALP.
+
+For each component report:
+
+Component	Source TF	Current TTL	Observed avg age	Entry confirmation or context?
+BOS			2115s	
+CHOCH			404s	
+Sweep			408s	
+CVD			30s	
+VWAP			30s	
+Volume			30s	
+
+Do not assume older evidence is wrong.
+
+We need to distinguish:
+
+context evidence from entry-trigger evidence.
+
+Flag anything where stale evidence is unintentionally being treated as current entry confirmation.
+
+⸻
+
+PHASE 4 — EXPLAIN THE 95.4% BUYING-PRESSURE DUPLICATION
+
+Trace the Source Attribution Analytics calculation producing:
+
+buying pressure — 477 — 95.4%
+
+Determine exactly which components are considered duplicates.
+
+Report whether the analytics detector is correctly identifying duplicated evidence or simply grouping legitimately correlated signals.
+
+Again: do not change scoring yet.
+
+⸻
+
+PHASE 5 — VERIFY SOURCE ATTRIBUTION
+
+Current distribution includes:
+
+unknown = 21.8%
+
+Determine exactly what produces unknown.
+
+Break unknown down by component if possible:
+
+Component	Databento	TradingView	Internal	Unknown
+
+Determine whether unknown represents:
+
+* legitimate internally derived evidence,
+* missing attribution metadata,
+* missing market data,
+* legacy TradingView signals,
+* fallback calculations,
+* or an actual bug.
+
+Do not migrate or replace anything merely because it says unknown.
+
+⸻
+
+PHASE 6 — CONNECT WAIT TO GHOST OUTCOMES
+
+This is the most important part.
+
+Determine whether the existing gate-effectiveness / ghost-observation system has enough completed observations to evaluate these SCALP WAITs.
+
+For every WAIT where outcome data exists, determine what happened after the rejected setup.
+
+At minimum classify:
+
+* +0.5R reached before stop
+* +1R reached before stop
+* +1.5R reached before stop
+* +2R reached before stop
+* stop reached first
+* neither / expired
+* insufficient data
+
+Then cross-reference winning rejected setups with their failed gates.
+
+Example:
+
+Failed gate	WAIT observations	Would hit +1R	Would hit stop first	Unknown
+structure				
+score				
+VWAP				
+
+The question we need answered is:
+
+Which SCALP gate, if any, is rejecting trades that subsequently demonstrate usable positive expectancy?
+
+Do not infer this from setup counts.
+
+Use actual ghost outcomes.
+
+⸻
+
+PHASE 7 — CHECK FOR ANALYTICS BUGS
+
+Verify that:
+
+SETUPS = 500
+
+means 500 unique scored setups rather than repeated polling snapshots of fewer underlying opportunities.
+
+Check deduplication keys.
+
+Confirm whether the same setup can appear multiple times during dashboard refreshes.
+
+Report:
+
+* raw observations
+* unique setup IDs
+* unique opportunities
+* unique instrument/direction/setup combinations
+* repeated snapshots
+
+This is important because 500 dashboard observations does not necessarily mean 500 independent trade opportunities.
+
+⸻
+
+PHASE 8 — TESTS
+
+Add diagnostic/regression tests only where necessary.
+
+At minimum verify:
+
+1. missing evidence cannot silently become confirmed
+2. source attribution survives through scoring
+3. evidence timestamps survive through scoring
+4. duplicate detector behaves correctly
+5. SCALP WAIT reason is preserved
+6. gate audit receives SCALP WAIT observations
+7. unique setup counting is correct
+8. no SCALP behavior changes as a side effect
+
+Run the existing relevant test suites.
+
+Do not modify production thresholds merely to make tests pass.
+
+⸻
+
+REQUIRED FINAL REPORT
+
+Return a concise report with:
+
+A. Root Cause
+
+Why were all 500 SCALP observations WAIT?
+
+B. Top Blocking Gates
+
+Rank the gates by how often they prevented READY.
+
+C. Evidence Duplication
+
+Explain the 100% co-occurrence.
+
+D. Evidence Freshness
+
+Explain whether BOS/CHOCH/Sweep ages are appropriate for SCALP.
+
+E. Unknown Source Attribution
+
+Explain the 21.8%.
+
+F. Observation Integrity
+
+Tell me whether these are actually 500 independent setups.
+
+G. Ghost Outcome Evidence
+
+Most important:
+
+How many rejected setups subsequently reached +1R before their stop?
+
+Break this down by failed gate.
+
+H. Recommended Changes
+
+Separate recommendations into:
+
+FIX NOW
+
+Only actual bugs/data-integrity/logging defects that can be fixed without changing strategy behavior.
+
+COLLECT MORE DATA
+
+Anything without enough statistical evidence.
+
+POSSIBLE SCALP RULE CHANGE
+
+Trading-rule changes supported by ghost outcome evidence.
+
+Do not implement this category without explicit approval.
+
+I. Cost-Control Recommendation
+
+Tell me the smallest set of changes worth making.
+
+Do not propose a broad refactor.
+
+⸻
+
+STOP CONDITION
+
+After the audit and any clearly safe instrumentation/bug fixes:
+
+STOP.
+
+Do not automatically redesign SCALP.
+
+Do not touch INTRADAY_TREND.
+
+Do not begin another phase.
+
+Show me the evidence and wait for approval before changing trading rules.
