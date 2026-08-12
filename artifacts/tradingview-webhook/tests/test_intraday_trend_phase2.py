@@ -353,7 +353,9 @@ class TestITTradeManagement(unittest.TestCase):
         }
 
     def test_empty_active_trade_returns_hold(self):
-        out = A.compute_it_trade_management({}, 21000.0)
+        # Must pass et_now during session hours — default 'now' may be post-market
+        out = A.compute_it_trade_management(
+            {}, 21000.0, et_now=datetime(2026, 8, 12, 10, 0, 0, tzinfo=A.ET_TZ))
         self.assertEqual(out["action"], "HOLD")
         self.assertIsNone(out["current_r"])
 
@@ -489,7 +491,9 @@ class TestITTradeManagement(unittest.TestCase):
     def test_schema_all_keys_present(self):
         expected_keys = {"action", "action_reason", "current_r", "be_recommended",
                          "partial_at_1r5", "partial_at_2r", "trail_active",
-                         "force_flat", "contracts_exit", "contracts_hold"}
+                         "force_flat", "contracts_exit", "contracts_hold",
+                         # Phase 3: stop advisory + structural trail
+                         "stop_move_reason", "trail_stop_suggested", "trail_stop_source"}
         out = A.compute_it_trade_management({}, None)
         self.assertEqual(expected_keys, set(out.keys()))
 
@@ -861,7 +865,9 @@ class TestITContextPhase2Schema(unittest.TestCase):
 
     def test_blocked_daily_count_unavailable_when_db_not_ready(self):
         """Safety correction 2: count=-1 (DB error) → BLOCKED_DAILY_COUNT_UNAVAILABLE status."""
-        ctx = self._ctx()
+        # Mock data freshness so BLOCKED_DATA doesn't fire before BLOCKED_DAILY_COUNT_UNAVAILABLE
+        with patch.object(A, "_it_data_freshness", return_value=(True, [])):
+            ctx = self._ctx()
         # With GHOST_OBS_DB_READY=False the daily count helper returns -1.
         # Correction 2 requires the status block to BLOCK rather than fail-open.
         self.assertEqual(ctx["status"], "BLOCKED_DAILY_COUNT_UNAVAILABLE")
@@ -915,7 +921,8 @@ class TestITContextPhase2Schema(unittest.TestCase):
                       ("CONFIRMED_SETUP", "SETUP_DEVELOPING", "BUILDING_CONTEXT",
                        "AWAITING_CONFIRMATION", "BLOCKED_MID_RANGE",
                        "BLOCKED_DAILY_COUNT_UNAVAILABLE",  # correction 2: fail-closed
-                       "BLOCKED_INVALID_STOP"))
+                       "BLOCKED_INVALID_STOP",
+                       "BLOCKED_DATA"))  # Phase 3: fires when trend_alignment absent
 
     def test_awaiting_confirmation_status_with_incomplete_lsr(self):
         """LSR sweep detected but CHOCH not yet → confirmation_complete=False
@@ -960,7 +967,8 @@ class TestITContextPhase2Schema(unittest.TestCase):
         with patch.object(A, "GHOST_OBS_DB_READY", True), \
              patch.object(A, "get_db_connection", return_value=mock_conn), \
              patch.object(A, "HTF_STATE_BY_INST", {}), \
-             patch.object(A, "ACTIVE_TRADES_BY_INST", {}):
+             patch.object(A, "ACTIVE_TRADES_BY_INST", {}), \
+             patch.object(A, "_it_data_freshness", return_value=(True, [])):
             ctx = A.compute_intraday_trend_context(
                 "MNQ", 21000.0,
                 confluences=confs,

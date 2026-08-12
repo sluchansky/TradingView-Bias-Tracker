@@ -1,0 +1,756 @@
+NEXT TASK — Complete the Native INTRADAY_TREND Trading Engine
+
+OBJECTIVE
+
+INTRADAY_TREND already exists as a separate selectable trading mode.
+
+Now make it a genuinely independent intraday trading system.
+
+It must NOT simply call SWING logic with a different mode name.
+
+The intended trade lifecycle is:
+
+Higher-timeframe bias → intraday structure → location → pullback → confirmation → entry → intraday management → mandatory session exit
+
+Do not redesign unrelated infrastructure.
+
+⸻
+
+1. NON-NEGOTIABLE SAFETY RULE
+
+Before changing code, trace the current execution path for:
+
+* SCALP
+* SWING
+* INTRADAY_TREND
+* 9:30 ORB
+
+Document exactly which functions are shared and which are mode-specific.
+
+Then implement the changes so:
+
+* SCALP behavior remains unchanged.
+* SWING behavior remains unchanged.
+* ORB behavior remains unchanged.
+* Databento ingestion remains unchanged.
+* canonical risk engine remains authoritative.
+* execution gateway remains authoritative.
+* prop rules remain authoritative.
+* safety/arm/emergency-stop gates remain authoritative.
+* journaling remains in the existing pipeline.
+
+Do NOT clone the entire trading system.
+
+Share infrastructure, but isolate strategy decisions.
+
+⸻
+
+2. CREATE A NATIVE INTRADAY TREND DECISION PATH
+
+Create or formalize a dedicated decision layer such as:
+
+analyze_intraday_trend(...)
+
+The exact function/file naming may follow the existing architecture.
+
+The important requirement is semantic isolation.
+
+When:
+
+TRADING_MODE == "INTRADAY_TREND"
+
+the strategy decision must route through the native Intraday Trend rules.
+
+It must NOT route through:
+
+analyze_swing()
+
+or any equivalent SWING decision engine.
+
+Shared utilities are fine.
+
+Shared SWING strategy policy is not.
+
+⸻
+
+3. INTRADAY TIMEFRAME STACK
+
+Use the following default hierarchy.
+
+Context
+
+1H
+
+Purpose:
+
+* broad session direction
+* major structure
+* major support/resistance
+* major liquidity areas
+
+Primary trend
+
+15m
+
+This is the main Intraday Trend timeframe.
+
+Determine:
+
+* bullish
+* bearish
+* neutral
+* transitioning
+
+using actual price structure rather than one indicator alone.
+
+Setup
+
+5m
+
+Use 5m to identify:
+
+* pullbacks
+* continuation structure
+* liquidity sweeps
+* reclaim/rejection
+* setup location
+
+Trigger
+
+1m
+
+Use 1m for precise confirmation/entry timing.
+
+The 1m chart must NOT independently determine the trade direction.
+
+⸻
+
+4. TREND CLASSIFICATION
+
+Build a native Intraday Trend classifier.
+
+Return at minimum:
+
+BULLISH
+BEARISH
+NEUTRAL
+TRANSITION
+
+Evaluate:
+
+* swing highs/lows
+* HH/HL or LH/LL structure
+* BOS
+* CHOCH
+* VWAP relationship
+* moving-average slope/alignment if already available
+* momentum
+* ATR/volatility regime
+* distance from major levels
+
+Do NOT require every indicator to agree.
+
+Structure should carry more importance than a simple MA crossover.
+
+Store diagnostic reasons explaining the classification.
+
+Example:
+
+15m BULLISH — HH/HL intact, price above VWAP, positive momentum
+
+⸻
+
+5. DIRECTION RULE
+
+Default:
+
+LONG
+
+Require bullish primary intraday trend.
+
+SHORT
+
+Require bearish primary intraday trend.
+
+NEUTRAL / TRANSITION
+
+No normal trend-continuation trade.
+
+Return:
+
+WAIT
+
+Do not force trades in unclear structure.
+
+⸻
+
+6. 1H CONTEXT
+
+1H is context, not an automatic hard gate.
+
+Classify:
+
+ALIGNED
+NEUTRAL
+OPPOSED
+
+Examples:
+
+15m bullish + 1H bullish:
+
+ALIGNED
+
+15m bullish + unclear 1H:
+
+NEUTRAL
+
+15m bullish directly into strong bearish 1H structure:
+
+OPPOSED
+
+Initially:
+
+* ALIGNED = favorable
+* NEUTRAL = allowed with reduced confidence
+* OPPOSED = block unless explicitly enabled by future configuration
+
+Do not reuse the SWING HTF gate.
+
+⸻
+
+7. LOCATION REQUIREMENT
+
+Do NOT allow the system to chase price simply because a trend exists.
+
+A valid Intraday Trend setup should occur around meaningful location such as:
+
+* VWAP
+* prior breakout/retest area
+* 5m support/resistance
+* supply/demand zone
+* FVG if already implemented reliably
+* order block if already implemented reliably
+* prior session high/low
+* overnight high/low
+* opening range boundaries
+* significant liquidity level
+
+Record the location used.
+
+Example:
+
+setup_location = VWAP_RETEST
+
+⸻
+
+8. PULLBACK REQUIREMENT
+
+Intraday Trend should primarily enter pullbacks within established trends, not extended impulse candles.
+
+For bullish trend:
+
+look for a controlled pullback toward valid location.
+
+For bearish trend:
+
+look for a controlled rally toward valid location.
+
+Reject setups where price is excessively extended from:
+
+* VWAP
+* recent structure
+* expected entry location
+
+Use ATR-normalized measurements where practical.
+
+Create a diagnostic:
+
+extension_state = NORMAL / EXTENDED / EXTREME
+
+EXTREME must block entry.
+
+⸻
+
+9. ENTRY CONFIRMATION
+
+After a valid trend + pullback + location, require confirmation.
+
+Valid confirmation may include combinations of:
+
+* liquidity sweep
+* rejection candle
+* engulfing/reclaim
+* micro BOS
+* micro CHOCH back toward primary trend
+* VWAP reclaim/rejection
+* momentum recovery
+* delta/CVD confirmation when reliable data exists
+
+Do NOT require every confirmation simultaneously.
+
+Implement a configurable confirmation threshold.
+
+Example:
+
+minimum_confirmations = 2
+
+The exact implementation should use the existing configuration system.
+
+⸻
+
+10. ENTRY STATE MACHINE
+
+Use explicit states so we can see why the bot is or is not trading.
+
+At minimum:
+
+WAITING_FOR_TREND
+
+WAITING_FOR_LOCATION
+
+WAITING_FOR_PULLBACK
+
+WAITING_FOR_CONFIRMATION
+
+QUALIFIED
+
+RISK_PENDING
+
+BLOCKED_RISK
+
+BLOCKED_PROP
+
+BLOCKED_DATA
+
+BLOCKED_EXTENSION
+
+BLOCKED_SESSION
+
+ENTRY_REQUESTED
+
+POSITION_ACTIVE
+
+MANAGING
+
+COMPLETED
+
+EXPIRED
+
+Do not hide everything behind generic WAIT.
+
+The dashboard/diagnostics should expose the current state.
+
+⸻
+
+11. STOP LOSS
+
+Stops must be based on trade invalidation.
+
+Preferred hierarchy:
+
+1. beyond pullback swing
+2. beyond structure invalidation
+3. ATR buffer where appropriate
+
+Do NOT use arbitrary fixed-dollar stops.
+
+Calculate stop distance first.
+
+Then send that distance into the existing canonical risk engine for position sizing.
+
+Never duplicate risk-sizing logic inside Intraday Trend.
+
+⸻
+
+12. PROFIT TARGETS
+
+Initial default management:
+
+TP1 = 1R
+
+Take partial profit when contract count allows.
+
+TP2 = 2R
+
+Allow the remaining position to seek the larger continuation.
+
+For a one-contract position, use the existing one-contract management policy or approximately:
+
+1.5R
+
+Do not introduce a second conflicting order-management engine.
+
+⸻
+
+13. BREAK-EVEN LOGIC
+
+Do NOT immediately move the stop to break-even simply because price briefly touches TP1.
+
+We previously observed trades reaching TP1 and then getting stopped at BE too frequently.
+
+Make break-even movement conditional.
+
+Possible confirmation:
+
+* TP1 achieved AND
+* continuation structure remains valid AND
+* price establishes beyond the relevant structure
+
+Prefer structural stop advancement where possible.
+
+Record why the stop was moved.
+
+⸻
+
+14. TRAILING
+
+After sufficient favorable movement, allow the runner to trail using structure.
+
+For LONG:
+
+trail beneath confirmed higher lows.
+
+For SHORT:
+
+trail above confirmed lower highs.
+
+Do not trail every candle.
+
+⸻
+
+15. SESSION RULES
+
+This mode is explicitly INTRADAY.
+
+No overnight positions.
+
+Default new-entry window:
+
+08:00 ET – 15:00 ET
+
+Make this configurable.
+
+After the entry cutoff:
+
+no new Intraday Trend positions.
+
+Mandatory flatten:
+
+15:55 ET
+
+Make configurable.
+
+Any remaining Intraday Trend position must be closed before the futures maintenance/session transition.
+
+SWING positions must NOT be affected.
+
+⸻
+
+16. DAILY TRADE CONTROLS
+
+Add configurable Intraday Trend limits.
+
+Suggested starting defaults:
+
+MAX_INTRADAY_TREND_TRADES_PER_INSTRUMENT = 3
+
+Do not immediately re-enter after a stop.
+
+Implement a cooldown.
+
+Suggested default:
+
+INTRADAY_TREND_COOLDOWN_MINUTES = 15
+
+Canonical daily-loss and prop rules still override everything.
+
+⸻
+
+17. DATA QUALITY
+
+Before qualifying an entry verify required market data is current.
+
+If required timeframe data is:
+
+* stale
+* missing
+* incomplete
+* malformed
+
+return:
+
+BLOCKED_DATA
+
+Never infer missing confirmation.
+
+Never convert unavailable data into PASS.
+
+⸻
+
+18. CONFIDENCE / SETUP SCORE
+
+Create an Intraday Trend setup score independent from SWING scoring.
+
+Suggested components:
+
+* 15m trend quality
+* 1H alignment
+* location quality
+* pullback quality
+* confirmation quality
+* VWAP relationship
+* momentum
+* volatility suitability
+* extension penalty
+* nearby opposing structure penalty
+
+Use a normalized:
+
+0–100
+
+score.
+
+Do NOT blindly copy the SWING threshold.
+
+Initially keep this in observation/ghost mode and collect the score distribution before deciding the final live threshold.
+
+⸻
+
+19. GHOST OBSERVATIONS
+
+Every potential Intraday Trend setup should feed the existing observation/research infrastructure.
+
+Record at minimum:
+
+* timestamp
+* instrument
+* mode
+* direction
+* 1H context
+* 15m trend
+* 5m setup state
+* 1m confirmation
+* setup location
+* VWAP state
+* ATR
+* volatility state
+* extension state
+* confirmations detected
+* setup score
+* entry candidate
+* stop candidate
+* TP1
+* TP2
+* final verdict
+* block reason
+* strategy version
+
+Also record subsequent:
+
+* MFE
+* MAE
+* whether TP1 would have hit
+* whether TP2 would have hit
+* whether stop would have hit
+* time to outcome
+
+Use the existing ghost observation infrastructure rather than building another research database.
+
+⸻
+
+20. DASHBOARD
+
+The Intraday Trend panel/status should clearly show:
+
+MODE: INTRADAY TREND
+
+For each instrument show:
+
+* 1H Context
+* 15m Trend
+* 5m Setup
+* 1m Trigger
+* VWAP
+* Location
+* Extension
+* Confirmations
+* Setup Score
+* State
+* Verdict
+* Block Reason
+
+I should be able to look at the dashboard and understand in seconds:
+
+what the bot sees, what it is waiting for, and why it would/wouldn’t enter.
+
+⸻
+
+21. START SAFE
+
+After implementation:
+
+DO NOT automatically enable live execution.
+
+Leave Intraday Trend in:
+
+GHOST / SHADOW / OBSERVATION
+
+using whichever existing terminology is canonical in this codebase.
+
+We want live market observations before allowing capital execution.
+
+⸻
+
+22. TESTS
+
+Add dedicated tests proving:
+
+Isolation
+
+* INTRADAY_TREND does not invoke SWING strategy policy.
+* SWING behavior remains unchanged.
+* SCALP behavior remains unchanged.
+* ORB behavior remains unchanged.
+
+Direction
+
+* bullish 15m structure permits LONG evaluation
+* bearish permits SHORT evaluation
+* neutral returns WAIT
+
+Pullback
+
+* trend + no pullback does not chase
+* valid pullback progresses toward qualification
+* extreme extension blocks
+
+Confirmation
+
+* insufficient confirmation waits
+* required confirmation count qualifies
+
+Risk
+
+* canonical risk engine is called
+* safety lock blocks
+* arm gate blocks when applicable
+* prop violation blocks
+* daily-loss limit blocks
+
+Session
+
+* entry inside session can qualify
+* new entry after cutoff blocks
+* Intraday Trend position is flattened at mandatory flatten time
+* SWING position is NOT flattened by Intraday Trend session logic
+
+Data
+
+* stale data blocks
+* missing required timeframe blocks
+
+Run the complete existing test suite afterward.
+
+No regression is acceptable.
+
+⸻
+
+23. LIVE SMOKE TEST
+
+After unit/integration tests pass, run production-safe smoke tests for:
+
+SCALP
+
+SWING
+
+INTRADAY_TREND
+
+ORB
+
+Confirm routing independently.
+
+Specifically log something equivalent to:
+
+MODE=INTRADAY_TREND strategy=intraday_trend
+
+and verify that the SWING strategy analyzer was not invoked.
+
+⸻
+
+24. FINAL REPORT
+
+Do not simply respond “done.”
+
+Return:
+
+IMPLEMENTATION REPORT
+
+Routing
+
+Show the exact function path for INTRADAY_TREND.
+
+Independence
+
+Show evidence it does not use SWING strategy policy.
+
+Rules
+
+List the implemented native Intraday Trend rules.
+
+Session protection
+
+Show entry cutoff and forced-flat behavior.
+
+Risk
+
+Show that canonical risk sizing/execution protections remain intact.
+
+Ghost collection
+
+Show exactly what Intraday Trend observations are being stored.
+
+Tests
+
+Report:
+
+X/X passed
+
+and list any failures.
+
+Smoke tests
+
+Report each mode separately.
+
+Deployment
+
+State whether a republish/restart is required.
+
+Current execution status
+
+Explicitly state:
+
+INTRADAY_TREND LIVE EXECUTION: OFF
+
+unless I separately authorize promotion.
+
+⸻
+
+DO NOT DO
+
+Do not:
+
+* rewrite Databento ingestion
+* modify SCALP thresholds
+* modify SWING thresholds
+* replace the canonical risk engine
+* bypass TradersPost/execution gateway
+* weaken prop protections
+* weaken safety gates
+* turn live execution on
+* redesign ORB
+* add unrelated strategies
+* tune parameters to make historical results look better
+
+The goal of this task is one clean, native, observable Intraday Trend engine.
+
+Build it, test it, collect live ghost data, and stop there.

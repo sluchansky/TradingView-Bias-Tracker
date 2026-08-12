@@ -6727,6 +6727,313 @@ def _it_directional_context(htf_state, price, vwap, confluences=None):
     return ctx
 
 
+# ── INTRADAY TREND Native Analysis Functions (spec §§3–10) ──────────────────
+# These are the dedicated IT strategy functions.  None of them invoke SWING
+# strategy policy (analyze_swing, _swing_entry_veto_reasons, _swing_htf_*).
+# Shared data helpers (VWAP, ATR, session levels, bar data) are fine to use.
+
+def _it_classify_trend_native(inst):
+    """Classify 15m trend from actual Databento-sourced bar data.
+
+    Uses MTF_STATE_BY_INST[inst]["bars_15m"] (up to 50 closed 15m bars) to
+    determine the primary intraday trend via HH/HL or LH/LL structure.
+
+    Returns: (trend: BULLISH | BEARISH | NEUTRAL | TRANSITION, reason: str)
+    FAIL-OPEN — returns ("NEUTRAL", reason) on any error or missing data.
+    """
+    try:
+        import trend_alignment as _ta   # noqa: PLC0415
+        state    = _ta.MTF_STATE_BY_INST.get(inst or "", {}) if inst else {}
+        mtf_trend = state.get("trend_15m", "UNAVAILABLE")
+        bars     = list(state.get("bars_15m") or [])
+
+        if mtf_trend in ("UNAVAILABLE", "STALE") or not bars:
+            return "NEUTRAL", "No 15m bar data available"
+        if len(bars) < 4:
+            return "NEUTRAL", f"Insufficient 15m bars ({len(bars)} < 4)"
+
+        # Compare first half vs second half of recent bars for HH/HL / LH/LL
+        recent = bars[-min(8, len(bars)):]
+        highs  = [float(b.get("high", b.get("close", 0))) for b in recent]
+        lows   = [float(b.get("low",  b.get("close", 0))) for b in recent]
+        mid    = max(1, len(recent) // 2)
+        early_high = max(highs[:mid]);  late_high = max(highs[mid:])
+        early_low  = min(lows[:mid]);   late_low  = min(lows[mid:])
+
+        making_hh = late_high > early_high   # higher highs
+        making_hl = late_low  > early_low    # higher lows
+        making_lh = late_high < early_high   # lower highs
+        making_ll = late_low  < early_low    # lower lows
+
+        if mtf_trend == "BULLISH":
+            if making_lh and not making_hl:
+                return "TRANSITION", "Bullish trend weakening — lower highs forming"
+            return "BULLISH", "HH/HL structure intact — 15m bullish"
+        if mtf_trend == "BEARISH":
+            if making_hl and not making_lh:
+                return "TRANSITION", "Bearish trend weakening — higher lows forming"
+            return "BEARISH", "LH/LL structure intact — 15m bearish"
+        if mtf_trend == "NEUTRAL":
+            if making_hh and making_hl:
+                return "BULLISH",  "15m structure turning bullish (HH+HL)"
+            if making_lh and making_ll:
+                return "BEARISH",  "15m structure turning bearish (LH+LL)"
+            return "NEUTRAL", "15m structure indeterminate"
+        return "NEUTRAL", f"Unrecognised MTF state: {mtf_trend}"
+    except Exception as exc:
+        return "NEUTRAL", f"15m trend classification error: {exc}"
+
+
+def _it_compute_1h_context(trend_15m_native, trend_1h):
+    """Classify 1H vs 15m alignment as ALIGNED / NEUTRAL / OPPOSED.
+
+    ALIGNED — 1H and 15m point the same direction (favorable).
+    NEUTRAL — 1H is unclear / missing, or 15m is NEUTRAL / TRANSITION.
+    OPPOSED — 1H directly opposes the 15m trend (blocked by default per spec §6).
+
+    Per spec §6: OPPOSED blocks unless IT_ALLOW_OPPOSED_1H=1 is set.
+    """
+    if trend_15m_native in ("NEUTRAL", "TRANSITION", "UNKNOWN", None):
+        return "NEUTRAL"
+    t1 = (trend_1h or "").upper()
+    if t1 in ("BULL", "BULLISH"):   t1 = "BULLISH"
+    elif t1 in ("BEAR", "BEARISH"): t1 = "BEARISH"
+    else:                           t1 = "NEUTRAL"
+    if t1 == "NEUTRAL":
+        return "NEUTRAL"
+    return "ALIGNED" if trend_15m_native == t1 else "OPPOSED"
+
+
+def _it_extension_state(price, vwap, atr):
+    """Measure how far price is from VWAP in ATR units (spec §8).
+
+    Returns: (state: NORMAL|EXTENDED|EXTREME|UNKNOWN, dist_atr: float|None, reason: str)
+
+    NORMAL   ≤ 1.0 × ATR from VWAP
+    EXTENDED  1.0–2.0 × ATR from VWAP (prefer pullback)
+    EXTREME  > 2.0 × ATR from VWAP  (BLOCKS entry per spec)
+    """
+    try:
+        if price is None or vwap is None or atr is None:
+            return "UNKNOWN", None, "Missing price/VWAP/ATR — cannot measure extension"
+        p, v, a = float(price), float(vwap), float(atr)
+        if a <= 0:
+            return "UNKNOWN", None, "ATR ≤ 0 — cannot measure extension"
+        dist_atr = abs(p - v) / a
+        d = round(dist_atr, 2)
+        if dist_atr <= 1.0:
+            return "NORMAL",   d, f"Price {d}× ATR from VWAP — normal pullback range"
+        if dist_atr <= 2.0:
+            return "EXTENDED", d, f"Price {d}× ATR from VWAP — extended; wait for pullback"
+        return     "EXTREME",  d, f"Price {d}× ATR from VWAP — extreme extension; entry blocked"
+    except Exception as exc:
+        return "UNKNOWN", None, f"Extension check error: {exc}"
+
+
+def _it_setup_score(ctx):
+    """Compute a native INTRADAY_TREND setup quality score (0–100, spec §18).
+
+    Independent of SWING scoring.  Components:
+      15m trend quality   (0–20) — BULLISH/BEARISH=20, TRANSITION=8, NEUTRAL=0
+      1H alignment        (0–15) — ALIGNED=15, NEUTRAL=7, OPPOSED=0
+      Location quality    (0–20) — EXCELLENT/KEY_LEVEL=20, GOOD/NEAR_LEVEL=13,
+                                   POOR=5, MID_RANGE/missing=0
+      Extension state     (0–15) — NORMAL=15, EXTENDED=7, EXTREME/UNKNOWN=0
+      Confirmation        (0–15) — complete=15; partial 3pts/step (max 10)
+      VWAP correct side   (0–10) — positive alignment_score for Long, negative for Short
+      Multi-TF bonus      (0– 5) — |alignment_score| ≥ 3
+
+    Fails-open (returns 0 on any error).
+    """
+    try:
+        score = 0
+        # 15m trend quality
+        t15 = ctx.get("trend_15m_native", "NEUTRAL")
+        if t15 in ("BULLISH", "BEARISH"): score += 20
+        elif t15 == "TRANSITION":         score += 8
+
+        # 1H alignment
+        c1h = ctx.get("context_1h", "NEUTRAL")
+        if c1h == "ALIGNED":   score += 15
+        elif c1h == "NEUTRAL": score += 7
+
+        # Location quality
+        lq = ctx.get("location_quality")
+        score += {"EXCELLENT": 20, "KEY_LEVEL": 20, "GOOD": 13,
+                  "NEAR_LEVEL": 13, "POOR": 5, "MID_RANGE": 0}.get(lq, 0)
+
+        # Extension state
+        ext = ctx.get("extension_state", "UNKNOWN")
+        if ext == "NORMAL":   score += 15
+        elif ext == "EXTENDED": score += 7
+
+        # Confirmation completeness
+        if ctx.get("confirmation_complete"):
+            score += 15
+        else:
+            score += min(len(ctx.get("confirmation_steps", [])) * 3, 10)
+
+        # VWAP correct side (use alignment_score as proxy)
+        al = ctx.get("alignment_score", 0)
+        t_align = ctx.get("trend_alignment", "MIXED")
+        if isinstance(al, (int, float)):
+            if "BULLISH" in str(t_align).upper() and al > 0:  score += 10
+            elif "BEARISH" in str(t_align).upper() and al < 0: score += 10
+
+        # Multi-TF bonus
+        if isinstance(al, (int, float)) and abs(al) >= 3:
+            score += 5
+
+        return max(0, min(100, score))
+    except Exception:
+        return 0
+
+
+def _it_entry_state(ctx):
+    """Map IT context to the formal 14-state entry state machine (spec §10).
+
+    States:
+      WAITING_FOR_TREND        — no clear 15m trend or 1H OPPOSED
+      WAITING_FOR_LOCATION     — trend set, no valid location
+      WAITING_FOR_PULLBACK     — location good, price too extended (EXTENDED)
+      WAITING_FOR_CONFIRMATION — pullback OK, confirmation missing
+      QUALIFIED                — all pre-risk checks pass
+      RISK_PENDING             — qualified but structural stop not yet validated
+      BLOCKED_RISK             — structural stop invalid / risk check failed
+      BLOCKED_DATA             — data stale, missing, or DB unavailable
+      BLOCKED_EXTENSION        — price at extreme extension from VWAP
+      BLOCKED_SESSION          — outside entry window or daily cap reached
+      ENTRY_REQUESTED          — (set by execution layer; not returned here)
+      POSITION_ACTIVE          — active open trade detected
+      MANAGING                 — active trade under management advisory
+      COMPLETED / EXPIRED      — (set on close / expiry; not returned here)
+    """
+    try:
+        # POSITION_ACTIVE / MANAGING
+        mgmt_action = ctx.get("mgmt_action")
+        if mgmt_action is not None:
+            if ctx.get("mgmt_force_flat") or mgmt_action == "FORCE_FLAT":
+                return "MANAGING"
+            return "POSITION_ACTIVE"
+
+        status = ctx.get("status", "BUILDING_CONTEXT")
+        ext    = ctx.get("extension_state", "UNKNOWN")
+        t15    = ctx.get("trend_15m_native", "NEUTRAL")
+        c1h    = ctx.get("context_1h", "NEUTRAL")
+
+        # Session / time blocks
+        if not ctx.get("time_ok", True) or status == "BLOCKED":
+            return "BLOCKED_SESSION"
+        if status == "DAILY_CAP_REACHED":
+            return "BLOCKED_SESSION"
+
+        # Data unavailable
+        if status == "BLOCKED_DAILY_COUNT_UNAVAILABLE":
+            return "BLOCKED_DATA"
+
+        # Extreme extension
+        if ext == "EXTREME" or status == "BLOCKED_EXTENSION":
+            return "BLOCKED_EXTENSION"
+
+        # Risk block (stop invalid)
+        if status == "BLOCKED_INVALID_STOP":
+            return "BLOCKED_RISK"
+
+        # Trend check — no 15m trend or 1H opposed
+        if t15 in ("NEUTRAL", "UNKNOWN", "TRANSITION") or c1h == "OPPOSED":
+            return "WAITING_FOR_TREND"
+
+        # Location check
+        lq = ctx.get("location_quality")
+        if status in ("BLOCKED_MID_RANGE", "WAITING_FOR_SETUP") or lq == "MID_RANGE":
+            return "WAITING_FOR_LOCATION"
+
+        # Pullback / extension check
+        if ext == "EXTENDED":
+            return "WAITING_FOR_PULLBACK"
+
+        # Confirmation check
+        if status == "AWAITING_CONFIRMATION" or not ctx.get("confirmation_complete", False):
+            return "WAITING_FOR_CONFIRMATION"
+
+        # Stop not yet computed
+        if not ctx.get("structural_stop_valid", False):
+            return "RISK_PENDING"
+
+        # All checks pass
+        if status in ("CONFIRMED_SETUP", "SETUP_DEVELOPING", "WATCHING_LEVEL"):
+            return "QUALIFIED"
+
+        return "WAITING_FOR_TREND"
+    except Exception:
+        return "WAITING_FOR_TREND"
+
+
+def analyze_intraday_trend(instrument, price, confluences=None, swing_ctx=None,
+                            trade_plan=None, direction=None, et_now=None):
+    """Native INTRADAY_TREND strategy analysis — the authoritative named decision layer.
+
+    This is the dedicated IT entry point.  It does NOT invoke any SWING
+    strategy policy:
+      ✗  analyze_swing()              — never called
+      ✗  _swing_entry_veto_reasons()  — never called
+      ✗  _swing_htf_enabled()         — never called
+      ✓  Shared data helpers (VWAP, ATR, bar data, session levels) — safe.
+
+    Called by compute_intraday_trend_context() to obtain the native IT analysis.
+    Returns a partial dict that the caller merges into the full context before
+    computing setup_score and entry_state (which need location/confirmation/stop).
+    Never raises — all errors produce safe defaults.
+    """
+    result = {
+        "trend_15m_native":        "NEUTRAL",
+        "trend_15m_native_reason": "Not computed",
+        "context_1h":              "NEUTRAL",
+        "extension_state":         "UNKNOWN",
+        "extension_dist_atr":      None,
+        "extension_reason":        None,
+        # setup_score and entry_state are computed AFTER merge (need full ctx)
+    }
+    try:
+        inst = instrument_of(instrument) if instrument else instrument
+
+        # 1. Native 15m trend classification from actual bar data (spec §4)
+        t15, t15_reason = _it_classify_trend_native(inst)
+        result["trend_15m_native"]        = t15
+        result["trend_15m_native_reason"] = t15_reason
+
+        # 2. 1H context: ALIGNED / NEUTRAL / OPPOSED (spec §6)
+        htf_state  = (HTF_STATE_BY_INST.get(inst) or {}) if inst else {}
+        def _b(raw):
+            r = (raw or "").lower()
+            if r in ("bull", "bullish"):  return "BULLISH"
+            if r in ("bear", "bearish"):  return "BEARISH"
+            return "NEUTRAL"
+        trend_1h_raw       = _b((htf_state.get("1H") or {}).get("bias"))
+        result["context_1h"] = _it_compute_1h_context(t15, trend_1h_raw)
+
+        # 3. Extension state: NORMAL / EXTENDED / EXTREME (spec §8)
+        vwap, atr = None, None
+        sc = swing_ctx if isinstance(swing_ctx, dict) else {}
+        if isinstance(trade_plan, dict):
+            vwap = trade_plan.get("vwap")
+            atr  = trade_plan.get("atr_pts")
+        if atr is None:
+            atr = sc.get("atr_1h") or sc.get("atr_4h")
+        # Spec §10: fallback to live VWAP feed; never fabricate — if live feed is
+        # also None the extension check will correctly return UNKNOWN.
+        if vwap is None and inst:
+            vwap = VWAP_BY_TICKER.get(inst)
+        ext_state, ext_dist, ext_reason = _it_extension_state(price, vwap, atr)
+        result["extension_state"]    = ext_state
+        result["extension_dist_atr"] = ext_dist
+        result["extension_reason"]   = ext_reason
+
+    except Exception as exc:
+        result["trend_15m_native_reason"] = f"analyze_intraday_trend error: {exc}"
+    return result
+
+
 def _it_setup_family(confluences, direction, price=None, levels=None, vwap=None):
     """Identify which INTRADAY_TREND setup family is developing.
 
@@ -6781,8 +7088,13 @@ def _it_setup_family(confluences, direction, price=None, levels=None, vwap=None)
 
 
 # Configurable INTRADAY_TREND time boundaries (env-overridable)
-_IT_LAST_ENTRY_DEFAULT = "15:15"   # no new entries at/after this ET time
+_IT_LAST_ENTRY_DEFAULT  = "15:00"  # no new entries at/after this ET time (spec §8)
 _IT_FORCE_FLAT_DEFAULT  = "15:55"  # positions must be flat by this ET time
+_IT_ENTRY_START_DEFAULT = "08:00"  # earliest permitted IT entry (spec §8: CME open)
+
+# Per-instrument inter-trade cooldown tracking (spec §9: 15-min default between entries).
+_IT_COOLDOWN_BY_INST: dict = {}
+_IT_COOLDOWN_LOCK = threading.Lock()
 
 # Recognised INTRADAY_TREND setup families.  Any family not in this set is
 # treated as UNKNOWN → WAITING_FOR_SETUP, never executable.
@@ -6812,21 +7124,21 @@ def _it_time_restriction(et_now=None):
 
     Returns (ok: bool, state: str, reason: str|None).
       ok=True    entry is permitted
-      ok=False   entry blocked (state = ENTRY_BLOCKED or FORCE_FLAT)
+      ok=False   entry blocked (state = BLOCKED_SESSION, ENTRY_BLOCKED, or FORCE_FLAT)
 
-    Env config:
-      INTRADAY_NEW_ENTRY_CUTOFF_ET  (default 15:15 ET)  ← preferred name
-      IT_LAST_NEW_ENTRY_TIME        (legacy alias, same default)
-      IT_FORCE_FLAT_TIME            (default 15:55 ET)
+    Env config (spec §8):
+      IT_ENTRY_START_ET             (default 08:00 ET)  — earliest permitted new entry
+      INTRADAY_NEW_ENTRY_CUTOFF_ET  (default 15:00 ET)  — preferred cutoff name
+      IT_LAST_NEW_ENTRY_TIME        (legacy alias for cutoff, same default)
+      IT_FORCE_FLAT_TIME            (default 15:55 ET)  — mandatory flatten time
     """
     try:
-        # Support new preferred env var; fall back to legacy alias, then default.
+        start_h, start_m = _it_parse_time("IT_ENTRY_START_ET", _IT_ENTRY_START_DEFAULT)
         _cutoff_raw = (os.environ.get("INTRADAY_NEW_ENTRY_CUTOFF_ET", "").strip()
                        or os.environ.get("IT_LAST_NEW_ENTRY_TIME", "").strip()
                        or _IT_LAST_ENTRY_DEFAULT)
-        last_h, last_m = _it_parse_time("IT_LAST_NEW_ENTRY_TIME",
-                                        _cutoff_raw)
-        flat_h, flat_m = _it_parse_time("IT_FORCE_FLAT_TIME",     _IT_FORCE_FLAT_DEFAULT)
+        last_h, last_m = _it_parse_time("IT_LAST_NEW_ENTRY_TIME", _cutoff_raw)
+        flat_h, flat_m = _it_parse_time("IT_FORCE_FLAT_TIME", _IT_FORCE_FLAT_DEFAULT)
         t  = et_now if et_now is not None else now_utc().astimezone(ET_TZ)
         hm = t.hour * 60 + t.minute
         if hm >= flat_h * 60 + flat_m:
@@ -6837,6 +7149,10 @@ def _it_time_restriction(et_now=None):
             return (False, "ENTRY_BLOCKED",
                     f"Past {last_h:02d}:{last_m:02d} ET — insufficient time for a "
                     "large intraday move. No new entries.")
+        if hm < start_h * 60 + start_m:
+            return (False, "BLOCKED_SESSION",
+                    f"Before {start_h:02d}:{start_m:02d} ET — INTRADAY TREND entries "
+                    "open at market open. No entries before this time.")
         return (True, "OK", None)
     except Exception:
         return (True, "OK", None)   # FAIL-OPEN — never block on parse error
@@ -6857,6 +7173,303 @@ def _it_projected_move(entry, target, risk, direction):
         return (round(pts, 1), round(pts / r, 2))
     except (TypeError, ValueError):
         return (None, None)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# INTRADAY_TREND Phase 3 — native engines (spec §§3–10)
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _it_data_freshness(inst):
+    """Check whether IT-required timeframe data is fresh enough for safe analysis.
+
+    Returns: (is_ok: bool, stale_tfs: list[str])
+
+    Per spec §10: stale or absent 15m data → BLOCKED_DATA (hard block).
+    Absent 1H HTF bias is flagged advisory-only (Pine signals are async).
+    FAIL-OPEN — any exception returns (True, []) so a check bug never
+    silently blocks every trade.
+    """
+    try:
+        stale = []
+        try:
+            import trend_alignment as _ta  # noqa: PLC0415
+            state    = (_ta.MTF_STATE_BY_INST.get(inst or "") or {}) if inst else {}
+            trend_15m = state.get("trend_15m", "UNAVAILABLE")
+            bars_15m  = list(state.get("bars_15m") or [])
+            if trend_15m in ("UNAVAILABLE", "STALE") or len(bars_15m) < 4:
+                stale.append("15m")
+        except Exception:
+            pass  # trend_alignment module miss is non-fatal
+
+        # 1H: advisory — absent bias is noted but does not hard-block
+        htf_state = (HTF_STATE_BY_INST.get(inst or "") or {}) if inst else {}
+        if not (htf_state.get("bias_1h") or htf_state.get("1H")):
+            stale.append("1H_advisory")
+
+        is_ok = "15m" not in stale   # only 15m absence is a hard block
+        return is_ok, stale
+    except Exception:
+        return True, []   # FAIL-OPEN
+
+
+def _it_5m_location_engine(inst, direction, price, session_levels, vwap, atr):
+    """Identify the nearest valid pullback location for an INTRADAY_TREND entry.
+
+    Uses the already-computed session_levels (from _it_compute_session_levels)
+    plus live VWAP and ATR.  Does NOT manufacture data — if a level is absent it
+    is simply skipped.
+
+    Returns a dict with keys:
+      setup_location       — human-readable label, e.g. "VWAP (18 145.50)"
+      setup_location_value — numeric price of that level, or None
+      setup_location_type  — "VWAP" | "OPEN_RANGE" | "SESSION_LEVEL" |
+                              "OVERNIGHT" | "SWING" | "NONE"
+      pullback_state       — AT_LOCATION | PULLING_BACK | EXTENDED |
+                              WAITING_FOR_PULLBACK | UNKNOWN
+
+    FAIL-OPEN — any exception returns an inert dict.
+    """
+    _inert = {"setup_location": None, "setup_location_value": None,
+              "setup_location_type": "NONE", "pullback_state": "UNKNOWN"}
+    try:
+        if price is None or atr is None or atr <= 0:
+            return _inert
+        p  = float(price)
+        a  = float(atr)
+        sl = session_levels or {}
+
+        def _add(label, val, typ, lst):
+            if val is None:
+                return
+            try:
+                lst.append((label, float(val), typ))
+            except (TypeError, ValueError):
+                pass
+
+        candidates = []
+        _add("VWAP",          vwap,                           "VWAP",          candidates)
+        _add("OR high",       sl.get("opening_range_high"),   "OPEN_RANGE",    candidates)
+        _add("OR low",        sl.get("opening_range_low"),    "OPEN_RANGE",    candidates)
+        _add("Session high",  sl.get("session_high"),         "SESSION_LEVEL", candidates)
+        _add("Session low",   sl.get("session_low"),          "SESSION_LEVEL", candidates)
+        _add("Overnight high",sl.get("overnight_high"),       "OVERNIGHT",     candidates)
+        _add("Overnight low", sl.get("overnight_low"),        "OVERNIGHT",     candidates)
+        _add("London high",   sl.get("london_high"),          "SESSION_LEVEL", candidates)
+        _add("London low",    sl.get("london_low"),           "SESSION_LEVEL", candidates)
+        for v in (sl.get("major_15m_swing_lows")  or []):
+            _add("15m swing low",  v, "SWING", candidates)
+        for v in (sl.get("major_15m_swing_highs") or []):
+            _add("15m swing high", v, "SWING", candidates)
+
+        if not candidates:
+            return {**_inert, "pullback_state": "WAITING_FOR_PULLBACK"}
+
+        # Filter to the relevant side relative to current price
+        if direction == "Long":
+            relevant = [(lb, v, tp) for lb, v, tp in candidates if v < p]
+        elif direction == "Short":
+            relevant = [(lb, v, tp) for lb, v, tp in candidates if v > p]
+        else:
+            relevant = candidates
+
+        if not relevant:
+            return {**_inert, "pullback_state": "WAITING_FOR_PULLBACK"}
+
+        # Nearest level = closest to current price on the correct side
+        if direction == "Long":
+            nearest = max(relevant, key=lambda x: x[1])   # highest level below price
+        elif direction == "Short":
+            nearest = min(relevant, key=lambda x: x[1])   # lowest level above price
+        else:
+            nearest = min(relevant, key=lambda x: abs(x[1] - p))
+
+        label, lv, ltype = nearest
+        dist_atr = abs(p - lv) / a
+
+        if dist_atr <= 0.25:
+            pullback_state = "AT_LOCATION"
+        elif dist_atr <= 1.0:
+            pullback_state = "PULLING_BACK"
+        else:
+            pullback_state = "EXTENDED"
+
+        return {
+            "setup_location":       f"{label} ({lv:.2f})",
+            "setup_location_value": round(lv, 2),
+            "setup_location_type":  ltype,
+            "pullback_state":       pullback_state,
+        }
+    except Exception:
+        return _inert
+
+
+def _it_check_alert_history(inst, direction, alert_types, max_age_minutes=10):
+    """Scan ALERT_HISTORY for a recent signal matching the given type tokens.
+
+    Used by _it_1m_confirmation_engine to detect micro confirmation signals
+    without requiring a separate 1m bar subscription.
+    Returns True if any compatible alert was found within max_age_minutes.
+    FAIL-OPEN — always returns False on any exception.
+    """
+    try:
+        if not inst or not alert_types:
+            return False
+        cutoff   = now_utc() - timedelta(minutes=max_age_minutes)
+        is_long  = (direction == "Long")
+        for alert in reversed(ALERT_HISTORY):
+            ts = alert.get("timestamp")
+            if ts is None:
+                continue
+            try:
+                if isinstance(ts, str):
+                    ts = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                if ts.tzinfo is None:
+                    from datetime import timezone as _dtz
+                    ts = ts.replace(tzinfo=_dtz.utc)
+                if ts < cutoff:
+                    break
+            except Exception:
+                continue
+            a_inst = instrument_of(alert.get("instrument") or alert.get("ticker") or "")
+            if a_inst and a_inst != inst:
+                continue
+            a_dir = (alert.get("direction") or alert.get("signal_direction") or "").lower()
+            if a_dir:
+                if is_long  and a_dir in ("short", "bear", "bearish", "sell"):
+                    continue
+                if not is_long and a_dir in ("long", "bull", "bullish", "buy"):
+                    continue
+            a_type = (alert.get("alert_type") or alert.get("type") or "").upper()
+            if any(t in a_type for t in alert_types):
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def _it_1m_confirmation_engine(inst, direction, confluences, price, vwap):
+    """Evaluate 1m-layer confirmation signals for an INTRADAY_TREND entry.
+
+    Reads from: confluences flags (from webhook analysis), recent ALERT_HISTORY,
+    CVD_BY_TICKER, and live VWAP.  The 1m layer is confirmation-only — it never
+    independently chooses direction.
+
+    Returns a dict with keys:
+      confirmations_detected   — list[str] of named confirmations that fired
+      confirmation_count       — int: len(confirmations_detected)
+      min_confirmations        — int: required threshold (IT_MIN_CONFIRMATIONS env, default 2)
+      confirmations_met        — bool: count >= min_confirmations
+
+    FAIL-OPEN — any exception returns a safe empty dict.
+    """
+    min_req = int(os.environ.get("IT_MIN_CONFIRMATIONS", "2"))
+    out = {
+        "confirmations_detected": [],
+        "confirmation_count":     0,
+        "min_confirmations":      min_req,
+        "confirmations_met":      False,
+    }
+    try:
+        if direction not in ("Long", "Short"):
+            return out
+        c       = confluences or {}
+        is_long = (direction == "Long")
+        detected = []
+
+        # 1. Liquidity sweep — confluence flag or recent ALERT_HISTORY signal
+        if c.get("liquidity_sweep"):
+            detected.append("liquidity_sweep")
+        elif _it_check_alert_history(inst, direction,
+                                     ("LIQUIDITY_SWEEP", "SWEEP", "SWEEP_HIGH",
+                                      "SWEEP_LOW", "STOP_HUNT")):
+            detected.append("liquidity_sweep")
+
+        # 2. Micro BOS — confluence or alert history
+        if c.get("bos") or c.get("structure_confirmed"):
+            detected.append("micro_bos")
+        if c.get("choch"):
+            detected.append("micro_choch")
+        if "micro_bos" not in detected and "micro_choch" not in detected:
+            if _it_check_alert_history(inst, direction,
+                                       ("BOS20", "CHOCH20", "MICRO_BOS",
+                                        "MICRO_CHOCH", "CHOCH", "BOS")):
+                detected.append("micro_bos")
+
+        # 3. VWAP reclaim (Long) / VWAP rejection (Short) — price side vs. VWAP
+        _vwap = (vwap if vwap is not None
+                 else VWAP_BY_TICKER.get(inst))
+        if _vwap is not None and price is not None:
+            try:
+                if is_long  and float(price) > float(_vwap):
+                    detected.append("vwap_reclaim")
+                elif not is_long and float(price) < float(_vwap):
+                    detected.append("vwap_rejection")
+            except (TypeError, ValueError):
+                pass
+        elif c.get("vwap_confirmed"):
+            detected.append("vwap_confirmed")
+
+        # 4. CVD / delta alignment — Databento-sourced CVD when available
+        cvd_block = CVD_BY_TICKER.get(inst) if inst else None
+        if isinstance(cvd_block, dict):
+            cvd_dir = cvd_block.get("direction", "")
+            if is_long  and cvd_dir in ("BULLISH", "POSITIVE", "bull"):
+                detected.append("cvd_aligned")
+            elif not is_long and cvd_dir in ("BEARISH", "NEGATIVE", "bear"):
+                detected.append("cvd_aligned")
+
+        # 5. Momentum recovery — structure + VWAP together imply recovery signal
+        if c.get("structure_confirmed") and c.get("vwap_confirmed"):
+            detected.append("momentum_recovery")
+
+        # Deduplicate preserving order
+        seen   = set()
+        unique = [x for x in detected if not (x in seen or seen.add(x))]
+        count  = len(unique)
+
+        out["confirmations_detected"] = unique
+        out["confirmation_count"]     = count
+        out["confirmations_met"]      = (count >= min_req)
+        return out
+    except Exception:
+        return out
+
+
+def _it_cooldown_remaining(inst):
+    """Return seconds remaining in the IT inter-trade cooldown for this instrument.
+
+    Cooldown window: INTRADAY_TREND_COOLDOWN_MINUTES env (default 15 min).
+    Returns 0.0 when cooldown is clear or no previous entry was recorded.
+    FAIL-OPEN — returns 0.0 on any exception.
+    """
+    try:
+        cooldown_secs = float(
+            os.environ.get("INTRADAY_TREND_COOLDOWN_MINUTES",
+                           os.environ.get("IT_COOLDOWN_MINUTES", "15"))
+        ) * 60.0
+        with _IT_COOLDOWN_LOCK:
+            last = _IT_COOLDOWN_BY_INST.get(inst or "")
+        if last is None:
+            return 0.0
+        elapsed   = time.monotonic() - last
+        remaining = cooldown_secs - elapsed
+        return max(0.0, remaining)
+    except Exception:
+        return 0.0
+
+
+def _it_register_cooldown(inst):
+    """Record the current monotonic time as the last IT entry for this instrument.
+
+    Call immediately after a ghost observation is confirmed/opened so the
+    inter-trade cooldown starts from the actual entry moment.
+    FAIL-OPEN — any exception is a no-op.
+    """
+    try:
+        with _IT_COOLDOWN_LOCK:
+            _IT_COOLDOWN_BY_INST[inst or ""] = time.monotonic()
+    except Exception:
+        pass
 
 
 def compute_intraday_trend_context(instrument, price, confluences=None,
@@ -6900,13 +7513,36 @@ def compute_intraday_trend_context(instrument, price, confluences=None,
         "recommended_contracts": 0,    # 0 = stop not yet validated; display only
         "risk_dollars":          None,
         "daily_trade_count":     -1,   # -1 = unavailable (fail-closed default)
-        "daily_trade_cap":       2,
+        "daily_trade_cap":       int(os.environ.get("IT_DAILY_CAP", "3")),  # spec §9
         "mgmt_action":           None, "mgmt_action_reason": None,
         "mgmt_current_r":        None, "mgmt_be_recommended": False,
         "mgmt_partial_at_1r5":   False, "mgmt_trail_active": False,
         "mgmt_force_flat":       False,
+        "mgmt_stop_move_reason":      None,
+        "mgmt_trail_stop_suggested":  None,
+        "mgmt_trail_stop_source":     None,
+        # Phase 3 additions (spec §§3–10)
+        "setup_location":        None,
+        "setup_location_type":   None,
+        "pullback_state":        "UNKNOWN",
+        "confirmations_detected": [],
+        "confirmation_count":    0,
+        "min_confirmations":     int(os.environ.get("IT_MIN_CONFIRMATIONS", "2")),
+        "confirmations_met":     False,
+        "data_freshness_ok":     True,
+        "stale_timeframes":      [],
+        "cooldown_remaining":    0,
         "status":               "BUILDING_CONTEXT",
         "reason":               "Gathering intraday context.",
+        # Native IT analysis (spec §§3–10) — populated by analyze_intraday_trend()
+        "trend_15m_native":        "NEUTRAL",
+        "trend_15m_native_reason": "Not computed",
+        "context_1h":              "NEUTRAL",
+        "extension_state":         "UNKNOWN",
+        "extension_dist_atr":      None,
+        "extension_reason":        None,
+        "setup_score":             0,
+        "entry_state":             "WAITING_FOR_TREND",
     }
     try:
         t = et_now if et_now is not None else now_utc().astimezone(ET_TZ)
@@ -6947,9 +7583,28 @@ def compute_intraday_trend_context(instrument, price, confluences=None,
         dir_ctx = _it_directional_context(htf_state, price, vwap, confluences)
         ctx.update(dir_ctx)
 
+        # ── Native IT analysis (spec §§3–10) ──────────────────────────────
+        # analyze_intraday_trend() is the dedicated named IT decision layer.
+        # It does NOT invoke any SWING strategy policy.
+        _it_native = analyze_intraday_trend(
+            instrument=instrument, price=price,
+            confluences=confluences, swing_ctx=swing_ctx,
+            trade_plan=trade_plan, direction=direction, et_now=et_now)
+        ctx.update(_it_native)
+
         # ── Phase 2: session key-levels from live bar history ───────────────
         sess_levels = _it_compute_session_levels(inst, t)
         ctx["session_levels"] = sess_levels
+
+        # ── Phase 3: data freshness check (spec §10) ─────────────────────────
+        freshness_ok, stale_tfs = _it_data_freshness(inst)
+        ctx["data_freshness_ok"] = freshness_ok
+        ctx["stale_timeframes"]  = stale_tfs
+
+        # ── Phase 3: inter-trade cooldown check (spec §9) ─────────────────────
+        cooldown_secs = _it_cooldown_remaining(inst)
+        ctx["cooldown_remaining"] = round(cooldown_secs)
+        ctx["min_confirmations"]  = int(os.environ.get("IT_MIN_CONFIRMATIONS", "2"))
 
         # Merged levels: HTF daily levels + live session levels
         merged_levels = dict(ctx["daily_levels"])
@@ -6965,6 +7620,23 @@ def compute_intraday_trend_context(instrument, price, confluences=None,
         ctx["location_level"]    = loc.get("level_hit")
         ctx["location_dist_pts"] = loc.get("dist_pts")
         ctx["location_reason"]   = loc.get("reason")
+
+        # ── Phase 3: 5m location engine (spec §3) ─────────────────────────────
+        _5m_loc = _it_5m_location_engine(
+            inst=inst, direction=direction,
+            price=price, session_levels=sess_levels,
+            vwap=vwap, atr=atr)
+        ctx["setup_location"]      = _5m_loc.get("setup_location")
+        ctx["setup_location_type"] = _5m_loc.get("setup_location_type")
+        ctx["pullback_state"]      = _5m_loc.get("pullback_state", "UNKNOWN")
+
+        # ── Phase 3: 1m confirmation engine (spec §4) ─────────────────────────
+        _1m_conf = _it_1m_confirmation_engine(
+            inst=inst, direction=direction,
+            confluences=confluences, price=price, vwap=vwap)
+        ctx["confirmations_detected"] = _1m_conf.get("confirmations_detected", [])
+        ctx["confirmation_count"]     = _1m_conf.get("confirmation_count", 0)
+        ctx["confirmations_met"]      = _1m_conf.get("confirmations_met", False)
 
         # Setup family
         fam, fam_r = _it_setup_family(confluences, direction, price,
@@ -7046,28 +7718,59 @@ def compute_intraday_trend_context(instrument, price, confluences=None,
                 ctx["mgmt_be_recommended"] = mgmt.get("be_recommended", False)
                 ctx["mgmt_partial_at_1r5"] = mgmt.get("partial_at_1r5", False)
                 ctx["mgmt_trail_active"]   = mgmt.get("trail_active", False)
-                ctx["mgmt_force_flat"]     = mgmt.get("force_flat", False)
+                ctx["mgmt_force_flat"]          = mgmt.get("force_flat", False)
+                ctx["mgmt_stop_move_reason"]    = mgmt.get("stop_move_reason")
+                ctx["mgmt_trail_stop_suggested"]= mgmt.get("trail_stop_suggested")
+                ctx["mgmt_trail_stop_source"]   = mgmt.get("trail_stop_source")
         except Exception:
             pass
 
         # ── Status / reason logic (ordered by severity) ───────────────────
         #
         # Precedence (highest to lowest):
-        #  1. Time restriction BLOCKED
-        #  2. Daily count unavailable → BLOCKED_DAILY_COUNT_UNAVAILABLE (fail-closed)
-        #  3. Daily cap reached → DAILY_CAP_REACHED
-        #  4. Mid-range location → BLOCKED_MID_RANGE
-        #  5. No recognised setup family → WAITING_FOR_SETUP
-        #  6. Family known but confirmation incomplete → AWAITING_CONFIRMATION
-        #  7. Valid family + confirmed but structural stop invalid → BLOCKED_INVALID_STOP
-        #  8. POOR location (near level, not optimal) → WATCHING_LEVEL
-        #  9. EXCELLENT/GOOD location → CONFIRMED_SETUP
-        # 10. Family present but developing → SETUP_DEVELOPING
+        #  0. Time restriction BLOCKED (BLOCKED_SESSION / ENTRY_BLOCKED / FORCE_FLAT)
+        #  0a. Data freshness — stale/missing TF data → BLOCKED_DATA
+        #  0b. Inter-trade cooldown active → BLOCKED_COOLDOWN
+        #  1. Extreme extension → BLOCKED_EXTENSION
+        #  2. 1H context opposed → BLOCKED_OPPOSED_1H
+        #  3. Daily count unavailable → BLOCKED_DAILY_COUNT_UNAVAILABLE (fail-closed)
+        #  4. Daily cap reached → DAILY_CAP_REACHED
+        #  5. Mid-range location → BLOCKED_MID_RANGE
+        #  6. No recognised setup family → WAITING_FOR_SETUP
+        #  7. Family known but confirmation incomplete → AWAITING_CONFIRMATION
+        #  8. Valid family + confirmed but structural stop invalid → BLOCKED_INVALID_STOP
+        #  9. POOR location (near level, not optimal) → WATCHING_LEVEL
+        # 10. EXCELLENT/GOOD location → CONFIRMED_SETUP
+        # 11. Family present but developing → SETUP_DEVELOPING
         #
         _fam_known = fam and fam in _IT_KNOWN_FAMILIES
         if not tok:
-            ctx["status"] = "BLOCKED"
+            # Preserve granular time-state so callers distinguish FORCE_FLAT,
+            # ENTRY_BLOCKED (cutoff), and BLOCKED_SESSION (pre-open).
+            ctx["status"] = (tstate if tstate in
+                             ("FORCE_FLAT", "ENTRY_BLOCKED", "BLOCKED_SESSION")
+                             else "BLOCKED")
             ctx["reason"] = treason or "Time restriction active."
+        elif not freshness_ok:
+            ctx["status"] = "BLOCKED_DATA"
+            ctx["reason"] = (f"Data stale or missing: "
+                             f"{', '.join(stale_tfs or ['unknown TF'])}. "
+                             "Cannot confirm trend direction safely.")
+        elif cooldown_secs > 0:
+            mins_left = round(cooldown_secs / 60.0, 1)
+            ctx["status"] = "BLOCKED_COOLDOWN"
+            ctx["reason"] = (f"IT inter-trade cooldown active — "
+                             f"{mins_left}min remaining before next entry permitted.")
+        elif ctx["extension_state"] == "EXTREME":
+            ctx["status"] = "BLOCKED_EXTENSION"
+            ctx["reason"] = (ctx.get("extension_reason")
+                             or f"Price {ctx.get('extension_dist_atr', '?')}× ATR "
+                             "from VWAP — extreme extension; entry blocked.")
+        elif (ctx["context_1h"] == "OPPOSED"
+              and os.environ.get("IT_ALLOW_OPPOSED_1H", "0").strip() != "1"):
+            ctx["status"] = "BLOCKED_OPPOSED_1H"
+            ctx["reason"] = ("1H trend directly OPPOSES 15m setup direction. "
+                             "Entry blocked (set IT_ALLOW_OPPOSED_1H=1 to override).")
         elif daily_count == -1:
             ctx["status"] = "BLOCKED_DAILY_COUNT_UNAVAILABLE"
             ctx["reason"] = ("Daily trade count unavailable (DB error). "
@@ -7102,6 +7805,10 @@ def compute_intraday_trend_context(instrument, price, confluences=None,
         else:
             ctx["status"] = "SETUP_DEVELOPING"
             ctx["reason"] = fam_r or f"{fam.replace('_', ' ').title()} developing."
+
+        # ── Native IT: setup score and entry state (computed last — needs full ctx) ──
+        ctx["setup_score"] = _it_setup_score(ctx)
+        ctx["entry_state"] = _it_entry_state(ctx)
 
     except Exception as exc:
         ctx["reason"] = f"Context error: {exc}"
@@ -7141,6 +7848,35 @@ def _it_entry_veto_reasons(it_ctx, trade_plan, direction, instrument=None):
             return [("unavailable", "INTRADAY TREND context unavailable")]
 
         vetoes = []
+
+        # 1a. Extreme extension — price too far from VWAP for safe pullback entry (spec §8)
+        if it_ctx.get("extension_state") == "EXTREME":
+            vetoes.append(("extension",
+                           it_ctx.get("extension_reason")
+                           or "BLOCKED_EXTENSION: price at extreme extension "
+                           "from VWAP — chasing prohibited."))
+
+        # 1b. Opposed 1H context — blocked by default (spec §6)
+        if (it_ctx.get("context_1h") == "OPPOSED"
+                and os.environ.get("IT_ALLOW_OPPOSED_1H", "0").strip() != "1"):
+            vetoes.append(("opposed_1h",
+                           "1H trend OPPOSED to 15m setup direction. "
+                           "Set IT_ALLOW_OPPOSED_1H=1 to allow (not recommended)."))
+
+        # 1c. Data freshness — stale/missing TF data blocks safe analysis (spec §10)
+        if not it_ctx.get("data_freshness_ok", True):
+            stale = it_ctx.get("stale_timeframes") or ["unknown"]
+            vetoes.append(("data_freshness",
+                           f"BLOCKED_DATA: stale or missing data for "
+                           f"{', '.join(stale)}. "
+                           "Cannot confirm trend direction safely."))
+
+        # 1d. Inter-trade cooldown — minimum 15 min between IT entries (spec §9)
+        cr = it_ctx.get("cooldown_remaining", 0)
+        if cr > 0:
+            vetoes.append(("cooldown",
+                           f"BLOCKED_COOLDOWN: {round(cr / 60.0, 1)}min cooldown "
+                           "remaining before next INTRADAY TREND entry permitted."))
 
         # 2. Time restriction
         if not it_ctx.get("time_ok", True):
@@ -7190,7 +7926,8 @@ def _it_entry_veto_reasons(it_ctx, trade_plan, direction, instrument=None):
             vetoes.append(("daily_cap",
                            f"INTRADAY TREND daily cap reached "
                            f"({daily_count}/{daily_cap} trades today). "
-                           "Max 2 entries per session."))
+                           f"Max {daily_cap} entries per session "
+                           "(env IT_DAILY_CAP to adjust)."))
 
         return vetoes
     except Exception as exc:
@@ -7493,7 +8230,8 @@ def _it_daily_trade_count(instrument="MNQ"):
     Returns (count, cap) where cap = MAX_INTRADAY_TREND_TRADES_PER_DAY (default 2).
     Returns (-1, cap) on any DB error so the gate remains fail-open.
     """
-    cap = int(os.environ.get("MAX_INTRADAY_TREND_TRADES_PER_DAY", "2"))
+    cap = int(os.environ.get("IT_DAILY_CAP",
+                             os.environ.get("MAX_INTRADAY_TREND_TRADES_PER_DAY", "3")))
     if not GHOST_OBS_DB_READY:
         return (-1, cap)
     try:
@@ -7560,13 +8298,13 @@ def _it_find_tp1(direction, entry, risk, levels, tick):
             dist = v - entry
             if lo_r <= dist <= hi_r:
                 candidates.append(v)
-        raw = min(candidates) if candidates else (entry + 1.25 * risk)
+        raw = min(candidates) if candidates else (entry + 1.0 * risk)  # spec: TP1 = 1R
     else:
         for v in all_lvls:
             dist = entry - v
             if lo_r <= dist <= hi_r:
                 candidates.append(v)
-        raw = max(candidates) if candidates else (entry - 1.25 * risk)
+        raw = max(candidates) if candidates else (entry - 1.0 * risk)  # spec: TP1 = 1R
 
     if tick:
         raw = round(round(raw / tick) * tick, 10)
@@ -7986,6 +8724,10 @@ def compute_it_trade_management(active_trade, current_price, it_ctx=None, et_now
         "partial_at_1r5": False, "partial_at_2r": False,
         "trail_active": False, "force_flat": False,
         "contracts_exit": 0, "contracts_hold": 0,
+        # Spec §6: record why stop moved; spec §7: structural trailing level
+        "stop_move_reason":     None,
+        "trail_stop_suggested": None,
+        "trail_stop_source":    None,
     }
     try:
         if not isinstance(active_trade, dict) or current_price is None:
@@ -8029,13 +8771,17 @@ def compute_it_trade_management(active_trade, current_price, it_ctx=None, et_now
                                            f"position ({aln}). Exit per thesis rules."))
                 return out
 
-        # Breakeven gate: recommend BE at 1R exactly (not before)
+        # Breakeven gate: recommend BE at 1R exactly — NOT on mere TP1 touch (spec §6).
+        # Require continuation/structural confirmation before physically moving stop.
         if direction == "Long":
             be_needed = (cur_r >= 1.0 and s < e)
         else:
             be_needed = (cur_r >= 1.0 and s > e)
         if be_needed:
-            out["be_recommended"] = True
+            out["be_recommended"]  = True
+            out["stop_move_reason"] = ("BE at 1R — structural confirmation required "
+                                       "before moving stop physically. Prefer structural "
+                                       "level beneath/above newly confirmed structure.")
 
         # Partials: 2+ contracts only
         if contracts >= 2 and cur_r >= 1.5:
@@ -8048,6 +8794,30 @@ def compute_it_trade_management(active_trade, current_price, it_ctx=None, et_now
         # 5-minute structural trailing: active after 1R for all contracts
         if cur_r >= 1.0:
             out["trail_active"] = True
+
+        # Spec §7: structural trailing — trail beneath confirmed swing lows (Long) /
+        # above confirmed swing highs (Short) after 1R.  Advisory only.
+        # NOTE: must run AFTER out["trail_active"] is set above.
+        if out["trail_active"] and isinstance(it_ctx, dict):
+            slvl           = it_ctx.get("session_levels") or {}
+            min_buf        = max(2.0, risk_pts * 0.1)
+            trail_stop     = None
+            trail_src      = None
+            if direction == "Long":
+                cands = [v for v in (slvl.get("major_15m_swing_lows") or [])
+                         if isinstance(v, (int, float)) and v > s and v < p - min_buf]
+                if cands:
+                    trail_stop = max(cands)
+                    trail_src  = f"Trail beneath swing low {trail_stop:.2f}"
+            elif direction == "Short":
+                cands = [v for v in (slvl.get("major_15m_swing_highs") or [])
+                         if isinstance(v, (int, float)) and v < s and v > p + min_buf]
+                if cands:
+                    trail_stop = min(cands)
+                    trail_src  = f"Trail above swing high {trail_stop:.2f}"
+            if trail_stop is not None:
+                out["trail_stop_suggested"] = round(trail_stop, 2)
+                out["trail_stop_source"]    = trail_src
 
         # Primary action label
         if out["partial_at_2r"]:
@@ -8075,6 +8845,48 @@ def compute_it_trade_management(active_trade, current_price, it_ctx=None, et_now
     except Exception:
         pass
     return out
+
+
+def _it_notify_force_flat(closed_row, ts_str):
+    """Queue a Discord notification when an IT ghost position is force-flattened at EOD.
+
+    Per spec §13: notify + journal every force-flat.  Gated on DISCORD_LIVE_ENABLED to
+    prevent double-fire in dev.  FAIL-OPEN — any exception logged at debug level only.
+    """
+    try:
+        row       = dict(closed_row or {})
+        inst      = row.get("instrument", "MNQ")
+        direction = row.get("direction", "?")
+        mfe_r     = row.get("mfe_r")
+        gross_r   = row.get("gross_r")
+        entry_px  = row.get("entry_price") or row.get("original_entry")
+
+        emoji     = "🔴" if direction == "Short" else "🟢"
+        result_s  = (f"MFE {mfe_r:.2f}R" if mfe_r is not None
+                     else ("Gross {:.2f}R".format(gross_r) if gross_r is not None
+                           else "outcome pending"))
+        entry_s   = f" @ {entry_px:.2f}" if entry_px else ""
+
+        msg = (f"🚨 **IT SESSION FORCE-FLAT** {emoji} | {ts_str}\n"
+               f"Instrument: **{inst}** {direction}{entry_s}\n"
+               f"Reason: EOD mandatory flatten (ghost/shadow research observation)\n"
+               f"Result: {result_s}")
+
+        def _send():
+            try:
+                url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+                if not url or not DISCORD_LIVE_ENABLED:
+                    return
+                import requests as _req
+                _req.post(url, json={"content": msg}, timeout=5)
+            except Exception:
+                pass
+
+        _enqueue_slow(_send)
+        logger.info("IT force-flat Discord notification queued: %s %s at %s",
+                    inst, direction, ts_str)
+    except Exception as exc:
+        logger.debug("_it_notify_force_flat: %s", exc)
 
 
 def _it_force_close_watchdog():
@@ -8158,6 +8970,8 @@ def _it_force_close_watchdog():
                         mfe_r       = row.get("mfe_r"),
                         gross_r     = row.get("gross_r"),
                     )
+                    # Spec §13: notify operator of each force-flattened position
+                    _it_notify_force_flat(row, _ts)
             conn.commit()
             # ── Success: clear any failure state from a previous cycle. ──────
             if _IT_FORCE_CLOSE_PENDING:
@@ -8319,6 +9133,30 @@ def _it_diag_block(a):
             "mgmt_partial_at_1r5":    ctx.get("mgmt_partial_at_1r5"),
             "mgmt_trail_active":      ctx.get("mgmt_trail_active"),
             "mgmt_force_flat":        ctx.get("mgmt_force_flat"),
+            "mgmt_stop_move_reason":  ctx.get("mgmt_stop_move_reason"),
+            "mgmt_trail_stop_suggested": ctx.get("mgmt_trail_stop_suggested"),
+            "mgmt_trail_stop_source": ctx.get("mgmt_trail_stop_source"),
+            # Phase 3 — native IT analysis fields (spec §§3–10)
+            "trend_15m_native":           ctx.get("trend_15m_native"),
+            "trend_15m_native_reason":    ctx.get("trend_15m_native_reason"),
+            "context_1h":                 ctx.get("context_1h"),
+            "extension_state":            ctx.get("extension_state"),
+            "extension_dist_atr":         ctx.get("extension_dist_atr"),
+            "setup_score":                ctx.get("setup_score", 0),
+            "entry_state":                ctx.get("entry_state"),
+            # Phase 3 — 5m location engine (spec §3)
+            "setup_location":             ctx.get("setup_location"),
+            "setup_location_type":        ctx.get("setup_location_type"),
+            "pullback_state":             ctx.get("pullback_state"),
+            # Phase 3 — 1m confirmation engine (spec §4)
+            "confirmations_detected":     ctx.get("confirmations_detected", []),
+            "confirmation_count":         ctx.get("confirmation_count", 0),
+            "min_confirmations":          ctx.get("min_confirmations", 2),
+            "confirmations_met":          ctx.get("confirmations_met", False),
+            # Phase 3 — data quality & session controls (spec §§9–10)
+            "data_freshness_ok":          ctx.get("data_freshness_ok", True),
+            "stale_timeframes":           ctx.get("stale_timeframes", []),
+            "cooldown_remaining":         ctx.get("cooldown_remaining", 0),
         }
     except Exception:
         return {"enabled": False}
@@ -47911,9 +48749,12 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                             cvd_direction, vwap_side, regime, edge_score_at_signal,
                             status, cost_r, holdout_period,
                             four_h_trend_at_signal, fifteen_m_trend_at_signal,
-                            trend_alignment_at_signal)
+                            trend_alignment_at_signal,
+                            it_trend_15m_native, it_context_1h, it_extension_state,
+                            it_setup_score, it_entry_state)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
-                               %s,%s,%s,%s,'open',%s,'training',%s,%s,%s)
+                               %s,%s,%s,%s,'open',%s,'training',%s,%s,%s,
+                               %s,%s,%s,%s,%s)
                        ON CONFLICT (obs_key) DO NOTHING
                        RETURNING id""",
                     (obs_key, strategy_key, STRATEGY_VERSION, inst,
@@ -47925,7 +48766,16 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                      cost_r_est,
                      _mtf_snap.get('four_h_trend_at_signal'),
                      _mtf_snap.get('fifteen_m_trend_at_signal'),
-                     _mtf_snap.get('trend_alignment_at_signal')),
+                     _mtf_snap.get('trend_alignment_at_signal'),
+                     # IT-native columns (NULL for non-IT modes)
+                     *((lambda _itd: (
+                         _itd.get('trend_15m_native'),
+                         _itd.get('context_1h'),
+                         _itd.get('extension_state'),
+                         (int(_itd['setup_score']) if isinstance(_itd.get('setup_score'), (int, float)) else None),
+                         _itd.get('entry_state'),
+                     ))(result.get('intraday_trend_context') or {})),
+                    ),
                 )
                 row = cur.fetchone()
                 inserted = row is not None
@@ -47957,6 +48807,11 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                       obs_key=obs_key,
                       extra={"entry": entry, "stop": stop_px,
                              "edge_score": edge_score, "session": sess_name})
+            # ── IT inter-trade cooldown: start clock on IT ghost obs create ───
+            # Per spec §9: 15-min cooldown begins the moment a new IT observation
+            # is registered (shadow mode — not on execution).
+            if TRADING_MODE == "INTRADAY_TREND":
+                _it_register_cooldown(inst)
         else:
             # ON CONFLICT — already exists; undo cooldown reservation
             with _GHOST_OBS_COOLDOWN_LOCK:
@@ -66356,6 +67211,14 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
       <div class="gstat"><div class="l">15m Trend</div><div class="v" id="it-t15m">—</div></div>
       <div class="gstat"><div class="l">5m Trend</div><div class="v" id="it-t5m">—</div></div>
       <div class="gstat"><div class="l">Setup Family</div><div class="v" id="it-setup">—</div></div>
+      <div class="gstat"><div class="l">1H Context</div><div class="v" id="it-context1h">—</div></div>
+      <div class="gstat"><div class="l">Extension</div><div class="v" id="it-ext-state">—</div></div>
+      <div class="gstat"><div class="l">Setup Score</div><div class="v" id="it-score">—</div></div>
+    </div>
+    <!-- Entry State machine pill (spec §10) -->
+    <div style="display:flex;align-items:center;gap:10px;margin-top:6px;padding:5px 8px;background:rgba(255,255,255,.03);border-radius:5px;border:1px solid rgba(255,255,255,.06)">
+      <span style="font-size:10px;color:#6b7280;letter-spacing:.8px;flex-shrink:0">ENTRY STATE</span>
+      <span style="font-size:11px;font-weight:600;letter-spacing:.8px" id="it-entry-state">—</span>
     </div>
     <!-- Row 2: location, projected move -->
     <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:8px;margin-top:8px">
@@ -66372,6 +67235,15 @@ html[data-theme=retro] .brain-chat-section,html[data-theme=retro] #mod-brain .mb
       <div class="gstat"><div class="l">OR High</div><div class="v" id="it-orh">—</div></div>
       <div class="gstat"><div class="l">OR Low</div><div class="v" id="it-orl">—</div></div>
       <div class="gstat"><div class="l">Trades Today</div><div class="v" id="it-daily">—</div></div>
+    </div>
+    <!-- Row 4 (Phase 3): 5m location engine + 1m confirmation engine + session controls -->
+    <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:8px">
+      <div class="gstat"><div class="l">Pullback State</div><div class="v" id="it-pullback-state">—</div></div>
+      <div class="gstat"><div class="l">Setup Location</div><div class="v" id="it-setup-loc">—</div></div>
+      <div class="gstat"><div class="l">1m Confirms</div><div class="v" id="it-1m-conf">—</div></div>
+      <div class="gstat"><div class="l">Cooldown</div><div class="v" id="it-cooldown">—</div></div>
+      <div class="gstat"><div class="l">Data Freshness</div><div class="v" id="it-freshness">—</div></div>
+      <div class="gstat"><div class="l">15m Native</div><div class="v" id="it-t15m-native">—</div></div>
     </div>
     <!-- Confirmation steps list -->
     <div id="it-conf-steps" style="display:none;margin-top:8px;font-size:10px;line-height:1.7;padding:6px 8px;background:rgba(255,255,255,.04);border-radius:5px;border:1px solid rgba(255,255,255,.08)"></div>
@@ -68355,7 +69227,12 @@ function renderModules(d){
         const _itStCol = {CONFIRMED_SETUP:'#22c55e',SETUP_DEVELOPING:'#86efac',
                           AWAITING_CONFIRMATION:'#a78bfa',WATCHING_LEVEL:'#f59e0b',
                           BLOCKED:'#ef4444',BLOCKED_MID_RANGE:'#ef4444',
-                          DAILY_CAP_REACHED:'#f59e0b',BUILDING_CONTEXT:'#9ca3af'};
+                          BLOCKED_EXTENSION:'#ef4444',BLOCKED_OPPOSED_1H:'#ef4444',
+                          BLOCKED_INVALID_STOP:'#ef4444',BLOCKED_DAILY_COUNT_UNAVAILABLE:'#ef4444',
+                          BLOCKED_DATA:'#ef4444',BLOCKED_COOLDOWN:'#f59e0b',
+                          BLOCKED_SESSION:'#6b7280',ENTRY_BLOCKED:'#ef4444',FORCE_FLAT:'#ef4444',
+                          DAILY_CAP_REACHED:'#f59e0b',BUILDING_CONTEXT:'#9ca3af',
+                          WAITING_FOR_SETUP:'#9ca3af'};
         _swSet('it-status', itSt.replace(/_/g,' '), _itStCol[itSt]||'#9ca3af');
         const dir = (d.directions||[]).find(function(x){ return x.is_favored; });
         _swSet('it-dir', dir ? dir.direction : '—', dir&&dir.direction==='Long'?'#22c55e':dir?'#ef4444':'');
@@ -68367,6 +69244,23 @@ function renderModules(d){
         _trend('it-t5m', itd.trend_5m);
         const fam = itd.setup_family;
         _swSet('it-setup', fam ? fam.replace(/_/g,' ') : 'None yet', fam?'#a78bfa':'#9ca3af');
+        // Spec §§3–10: native IT analysis fields
+        const _c1hCol = {ALIGNED:'#22c55e',NEUTRAL:'#9ca3af',OPPOSED:'#ef4444'};
+        const c1h = itd.context_1h||'—';
+        _swSet('it-context1h', c1h, _c1hCol[c1h]||'#9ca3af');
+        const _extCol = {NORMAL:'#22c55e',EXTENDED:'#f59e0b',EXTREME:'#ef4444',UNKNOWN:'#6b7280'};
+        const ext = itd.extension_state||'—';
+        _swSet('it-ext-state', ext, _extCol[ext]||'#6b7280');
+        const sc = (typeof itd.setup_score === 'number') ? itd.setup_score : null;
+        _swSet('it-score', sc!==null?(sc+'/100'):'—',
+               sc>=70?'#22c55e':sc>=45?'#f59e0b':sc!==null?'#ef4444':'');
+        const _esCol={QUALIFIED:'#22c55e',POSITION_ACTIVE:'#a78bfa',MANAGING:'#6ee7b7',
+          WAITING_FOR_TREND:'#6b7280',WAITING_FOR_LOCATION:'#6b7280',
+          WAITING_FOR_PULLBACK:'#f59e0b',WAITING_FOR_CONFIRMATION:'#a78bfa',
+          RISK_PENDING:'#f59e0b',BLOCKED_RISK:'#ef4444',BLOCKED_DATA:'#ef4444',
+          BLOCKED_EXTENSION:'#ef4444',BLOCKED_SESSION:'#ef4444',BLOCKED_PROP:'#ef4444'};
+        const es=itd.entry_state||'WAITING_FOR_TREND';
+        _swSet('it-entry-state',es.replace(/_/g,' '),_esCol[es]||'#6b7280');
         const lq = itd.location_quality||'—';
         _swSet('it-locq', lq, _loc[lq]||'');
         _swSet('it-locl', itd.location_level||'—', '');
@@ -68399,10 +69293,31 @@ function renderModules(d){
         // Phase 2 — session levels
         _swSet('it-orh', itd.opening_range_high ? itd.opening_range_high.toFixed(2) : '—', '');
         _swSet('it-orl', itd.opening_range_low  ? itd.opening_range_low.toFixed(2)  : '—', '');
-        // Phase 2 — daily cap
-        const dc = itd.daily_trade_count; const dcp = itd.daily_trade_cap||2;
+        // Phase 2 — daily cap (server supplies cap; default 3 per spec §9)
+        const dc = itd.daily_trade_count; const dcp = itd.daily_trade_cap||3;
         _swSet('it-daily', (dc>=0) ? (dc+'/'+dcp) : '—',
                (dc>=dcp&&dc>=0)?'#ef4444':dc>0?'#f59e0b':'#22c55e');
+        // Phase 3 — 5m location engine (spec §3)
+        const _pbCol={AT_LOCATION:'#22c55e',PULLING_BACK:'#86efac',EXTENDED:'#f59e0b',
+                      WAITING_FOR_PULLBACK:'#9ca3af',UNKNOWN:'#6b7280'};
+        const pb=itd.pullback_state||'UNKNOWN';
+        _swSet('it-pullback-state',pb.replace(/_/g,' '),_pbCol[pb]||'#6b7280');
+        _swSet('it-setup-loc',itd.setup_location||'—',itd.setup_location?'#e5e7eb':'#6b7280');
+        // Phase 3 — 1m confirmation engine (spec §4)
+        const cnt=(typeof itd.confirmation_count==='number')?itd.confirmation_count:0;
+        const mn=itd.min_confirmations||2;
+        _swSet('it-1m-conf',cnt+'/'+mn+(itd.confirmations_met?' \u2713':''),
+               itd.confirmations_met?'#22c55e':cnt>0?'#f59e0b':'#9ca3af');
+        // Phase 3 — inter-trade cooldown (spec §9)
+        const crSecs=itd.cooldown_remaining||0;
+        _swSet('it-cooldown',crSecs>0?(Math.ceil(crSecs/60)+'min left'):'Clear',
+               crSecs>0?'#f59e0b':'#22c55e');
+        // Phase 3 — data freshness (spec §10)
+        const freshOk=itd.data_freshness_ok!==false;
+        _swSet('it-freshness',freshOk?'OK \u2713':('Stale: '+(itd.stale_timeframes||[]).join(',')),
+               freshOk?'#22c55e':'#ef4444');
+        // Phase 3 — 15m native trend
+        _trend('it-t15m-native',itd.trend_15m_native);
         // Phase 2 — management advisory
         const mgmtBlock = document.getElementById('it-mgmt-block');
         const mgmtAct   = document.getElementById('it-mgmt-action');

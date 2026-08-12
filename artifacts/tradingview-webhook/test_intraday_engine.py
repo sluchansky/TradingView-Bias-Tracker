@@ -878,6 +878,513 @@ class TestSWINGIsolation(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 21. _it_classify_trend_native() — native 15m bar classifier (spec §4)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNativeTrendClassifier(unittest.TestCase):
+    """_it_classify_trend_native must classify from bar data, never SWING policy."""
+
+    def _inject_mtf(self, inst, trend_15m, bars):
+        """Inject a fake MTF state for testing."""
+        import trend_alignment as _ta
+        _ta.MTF_STATE_BY_INST[inst] = {"trend_15m": trend_15m, "bars_15m": bars}
+
+    def _clear_mtf(self, inst):
+        import trend_alignment as _ta
+        _ta.MTF_STATE_BY_INST.pop(inst, None)
+
+    def _mk_bars(self, highs, lows):
+        """Build minimal bar dicts from high/low lists."""
+        return [{"high": h, "low": l, "close": (h + l) / 2}
+                for h, l in zip(highs, lows)]
+
+    def test_bullish_trend_intact_returns_bullish(self):
+        bars = self._mk_bars(
+            [100, 102, 104, 106, 108, 110, 112, 115],
+            [ 95,  97,  99, 101, 103, 105, 107, 110],
+        )
+        self._inject_mtf("MNQ", "BULLISH", bars)
+        try:
+            trend, reason = A._it_classify_trend_native("MNQ")
+            self.assertEqual(trend, "BULLISH")
+            self.assertIn("HH/HL", reason)
+        finally:
+            self._clear_mtf("MNQ")
+
+    def test_bullish_with_lower_highs_returns_transition(self):
+        # Late bars make lower highs (weakening) but not higher lows
+        bars = self._mk_bars(
+            [115, 114, 113, 112, 111, 110, 109, 108],
+            [ 90,  89,  88,  87,  86,  85,  84,  83],
+        )
+        self._inject_mtf("MNQ", "BULLISH", bars)
+        try:
+            trend, _ = A._it_classify_trend_native("MNQ")
+            self.assertEqual(trend, "TRANSITION")
+        finally:
+            self._clear_mtf("MNQ")
+
+    def test_bearish_trend_intact_returns_bearish(self):
+        bars = self._mk_bars(
+            [115, 113, 111, 109, 107, 105, 103, 100],
+            [110, 108, 106, 104, 102, 100,  98,  95],
+        )
+        self._inject_mtf("MNQ", "BEARISH", bars)
+        try:
+            trend, reason = A._it_classify_trend_native("MNQ")
+            self.assertEqual(trend, "BEARISH")
+            self.assertIn("LH/LL", reason)
+        finally:
+            self._clear_mtf("MNQ")
+
+    def test_unavailable_returns_neutral(self):
+        self._inject_mtf("MNQ", "UNAVAILABLE", [])
+        try:
+            trend, reason = A._it_classify_trend_native("MNQ")
+            self.assertEqual(trend, "NEUTRAL")
+        finally:
+            self._clear_mtf("MNQ")
+
+    def test_insufficient_bars_returns_neutral(self):
+        bars = self._mk_bars([100, 102], [99, 101])
+        self._inject_mtf("MNQ", "BULLISH", bars)
+        try:
+            trend, reason = A._it_classify_trend_native("MNQ")
+            self.assertEqual(trend, "NEUTRAL")
+            self.assertIn("Insufficient", reason)
+        finally:
+            self._clear_mtf("MNQ")
+
+    def test_missing_instrument_returns_neutral(self):
+        """None instrument must not raise — returns NEUTRAL safely."""
+        trend, _ = A._it_classify_trend_native(None)
+        self.assertEqual(trend, "NEUTRAL")
+
+    def test_neutral_mtf_with_hh_hl_returns_bullish(self):
+        bars = self._mk_bars(
+            [100, 102, 104, 108, 110, 112, 114, 118],
+            [ 98, 100, 102, 104, 106, 108, 110, 112],
+        )
+        self._inject_mtf("MNQ", "NEUTRAL", bars)
+        try:
+            trend, _ = A._it_classify_trend_native("MNQ")
+            self.assertEqual(trend, "BULLISH")
+        finally:
+            self._clear_mtf("MNQ")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 22. _it_compute_1h_context() — 1H alignment (spec §6)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestOneHContext(unittest.TestCase):
+
+    def test_aligned_bullish(self):
+        self.assertEqual(A._it_compute_1h_context("BULLISH", "BULLISH"), "ALIGNED")
+
+    def test_aligned_bearish(self):
+        self.assertEqual(A._it_compute_1h_context("BEARISH", "BEARISH"), "ALIGNED")
+
+    def test_opposed_bull_vs_bear(self):
+        self.assertEqual(A._it_compute_1h_context("BULLISH", "BEARISH"), "OPPOSED")
+
+    def test_opposed_bear_vs_bull(self):
+        self.assertEqual(A._it_compute_1h_context("BEARISH", "BULLISH"), "OPPOSED")
+
+    def test_neutral_15m_returns_neutral(self):
+        self.assertEqual(A._it_compute_1h_context("NEUTRAL",    "BULLISH"), "NEUTRAL")
+        self.assertEqual(A._it_compute_1h_context("TRANSITION", "BEARISH"), "NEUTRAL")
+
+    def test_neutral_1h_returns_neutral(self):
+        self.assertEqual(A._it_compute_1h_context("BULLISH", "NEUTRAL"),  "NEUTRAL")
+        self.assertEqual(A._it_compute_1h_context("BEARISH", None),       "NEUTRAL")
+        self.assertEqual(A._it_compute_1h_context("BEARISH", ""),         "NEUTRAL")
+
+    def test_alternate_1h_labels_normalised(self):
+        """'bull' / 'bear' variant labels must be normalised."""
+        self.assertEqual(A._it_compute_1h_context("BULLISH", "bull"), "ALIGNED")
+        self.assertEqual(A._it_compute_1h_context("BEARISH", "bear"), "ALIGNED")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 23. _it_extension_state() — extension check (spec §8)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestExtensionState(unittest.TestCase):
+    """Price within 1× ATR = NORMAL; 1–2× = EXTENDED; >2× = EXTREME."""
+
+    def test_normal_within_1atr(self):
+        state, dist, _ = A._it_extension_state(20000.0, 20030.0, 100.0)
+        self.assertEqual(state, "NORMAL")
+        self.assertAlmostEqual(dist, 0.30, places=1)
+
+    def test_extended_between_1_and_2_atr(self):
+        state, dist, _ = A._it_extension_state(20000.0, 20150.0, 100.0)
+        self.assertEqual(state, "EXTENDED")
+        self.assertAlmostEqual(dist, 1.5, places=1)
+
+    def test_extreme_beyond_2atr(self):
+        state, dist, reason = A._it_extension_state(20000.0, 20250.0, 100.0)
+        self.assertEqual(state, "EXTREME")
+        self.assertAlmostEqual(dist, 2.5, places=1)
+        self.assertIn("extreme", reason.lower())
+
+    def test_missing_vwap_returns_unknown(self):
+        state, dist, _ = A._it_extension_state(20000.0, None, 100.0)
+        self.assertEqual(state, "UNKNOWN")
+        self.assertIsNone(dist)
+
+    def test_zero_atr_returns_unknown(self):
+        state, dist, _ = A._it_extension_state(20000.0, 20000.0, 0.0)
+        self.assertEqual(state, "UNKNOWN")
+        self.assertIsNone(dist)
+
+    def test_fails_open_on_error(self):
+        """Bad inputs must not raise — returns UNKNOWN."""
+        state, dist, _ = A._it_extension_state("bad", "data", "here")
+        self.assertEqual(state, "UNKNOWN")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 24. _it_setup_score() — IT-native quality score (spec §18)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestSetupScore(unittest.TestCase):
+
+    def _ctx(self, t15="BULLISH", c1h="ALIGNED", lq="EXCELLENT",
+             ext="NORMAL", confirmed=True, al=3):
+        return {
+            "trend_15m_native":    t15,
+            "context_1h":          c1h,
+            "location_quality":    lq,
+            "extension_state":     ext,
+            "confirmation_complete": confirmed,
+            "confirmation_steps":  ["step1", "step2"],
+            "trend_alignment":     "STRONG_BULLISH",
+            "alignment_score":     al,
+        }
+
+    def test_perfect_context_scores_high(self):
+        sc = A._it_setup_score(self._ctx())
+        self.assertGreaterEqual(sc, 70)
+
+    def test_opposed_1h_reduces_score(self):
+        high = A._it_setup_score(self._ctx(c1h="ALIGNED"))
+        low  = A._it_setup_score(self._ctx(c1h="OPPOSED"))
+        self.assertGreater(high, low)
+
+    def test_extreme_extension_reduces_score(self):
+        normal  = A._it_setup_score(self._ctx(ext="NORMAL"))
+        extreme = A._it_setup_score(self._ctx(ext="EXTREME"))
+        self.assertGreater(normal, extreme)
+
+    def test_mid_range_location_reduces_score(self):
+        good = A._it_setup_score(self._ctx(lq="EXCELLENT"))
+        poor = A._it_setup_score(self._ctx(lq="MID_RANGE"))
+        self.assertGreater(good, poor)
+
+    def test_transition_trend_less_than_directional(self):
+        bull       = A._it_setup_score(self._ctx(t15="BULLISH"))
+        transition = A._it_setup_score(self._ctx(t15="TRANSITION"))
+        self.assertGreater(bull, transition)
+
+    def test_error_returns_0(self):
+        sc = A._it_setup_score(None)
+        self.assertEqual(sc, 0)
+
+    def test_score_bounded_0_to_100(self):
+        sc = A._it_setup_score(self._ctx())
+        self.assertGreaterEqual(sc, 0)
+        self.assertLessEqual(sc, 100)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 25. _it_entry_state() — formal state machine (spec §10)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestEntryStateMachine(unittest.TestCase):
+
+    def _base(self, status="CONFIRMED_SETUP", t15="BULLISH", c1h="ALIGNED",
+              ext="NORMAL", lq="KEY_LEVEL", confirmed=True, stop_valid=True,
+              time_ok=True, daily_count=0, daily_cap=2):
+        return {
+            "status":                status,
+            "trend_15m_native":      t15,
+            "context_1h":            c1h,
+            "extension_state":       ext,
+            "location_quality":      lq,
+            "confirmation_complete": confirmed,
+            "structural_stop_valid": stop_valid,
+            "time_ok":               time_ok,
+            "daily_trade_count":     daily_count,
+            "daily_trade_cap":       daily_cap,
+        }
+
+    def test_qualified_when_all_pass(self):
+        self.assertEqual(A._it_entry_state(self._base()), "QUALIFIED")
+
+    def test_blocked_session_time_restriction(self):
+        ctx = self._base(time_ok=False)
+        self.assertEqual(A._it_entry_state(ctx), "BLOCKED_SESSION")
+
+    def test_blocked_session_daily_cap(self):
+        ctx = self._base(status="DAILY_CAP_REACHED")
+        self.assertEqual(A._it_entry_state(ctx), "BLOCKED_SESSION")
+
+    def test_blocked_extension_extreme(self):
+        ctx = self._base(ext="EXTREME")
+        self.assertEqual(A._it_entry_state(ctx), "BLOCKED_EXTENSION")
+
+    def test_blocked_data_db_unavailable(self):
+        ctx = self._base(status="BLOCKED_DAILY_COUNT_UNAVAILABLE")
+        self.assertEqual(A._it_entry_state(ctx), "BLOCKED_DATA")
+
+    def test_waiting_for_trend_neutral_15m(self):
+        ctx = self._base(t15="NEUTRAL")
+        self.assertEqual(A._it_entry_state(ctx), "WAITING_FOR_TREND")
+
+    def test_waiting_for_trend_transition(self):
+        ctx = self._base(t15="TRANSITION")
+        self.assertEqual(A._it_entry_state(ctx), "WAITING_FOR_TREND")
+
+    def test_waiting_for_trend_opposed_1h(self):
+        ctx = self._base(c1h="OPPOSED")
+        self.assertEqual(A._it_entry_state(ctx), "WAITING_FOR_TREND")
+
+    def test_waiting_for_location_mid_range(self):
+        ctx = self._base(lq="MID_RANGE", status="BLOCKED_MID_RANGE")
+        self.assertEqual(A._it_entry_state(ctx), "WAITING_FOR_LOCATION")
+
+    def test_waiting_for_pullback_extended(self):
+        ctx = self._base(ext="EXTENDED")
+        self.assertEqual(A._it_entry_state(ctx), "WAITING_FOR_PULLBACK")
+
+    def test_waiting_for_confirmation_incomplete(self):
+        ctx = self._base(status="AWAITING_CONFIRMATION", confirmed=False)
+        self.assertEqual(A._it_entry_state(ctx), "WAITING_FOR_CONFIRMATION")
+
+    def test_risk_pending_no_stop(self):
+        ctx = self._base(stop_valid=False, status="CONFIRMED_SETUP")
+        self.assertEqual(A._it_entry_state(ctx), "RISK_PENDING")
+
+    def test_blocked_risk_stop_invalid_status(self):
+        ctx = self._base(stop_valid=False, status="BLOCKED_INVALID_STOP")
+        self.assertEqual(A._it_entry_state(ctx), "BLOCKED_RISK")
+
+    def test_managing_when_force_flat(self):
+        ctx = self._base()
+        ctx["mgmt_action"]    = "FORCE_FLAT"
+        ctx["mgmt_force_flat"] = True
+        self.assertEqual(A._it_entry_state(ctx), "MANAGING")
+
+    def test_position_active_when_mgmt_action_present(self):
+        ctx = self._base()
+        ctx["mgmt_action"] = "HOLD_AT_BE"
+        self.assertEqual(A._it_entry_state(ctx), "POSITION_ACTIVE")
+
+    def test_fails_open_on_error(self):
+        """Exception in state machine must not propagate — returns WAITING_FOR_TREND."""
+        self.assertEqual(A._it_entry_state(None), "WAITING_FOR_TREND")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 26. analyze_intraday_trend() — isolation + basic contract (spec §24)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestAnalyzeIntradayTrend(unittest.TestCase):
+    """analyze_intraday_trend must exist, return the required keys, and not
+    invoke any SWING strategy policy."""
+
+    def test_returns_required_keys(self):
+        result = A.analyze_intraday_trend(
+            instrument="MNQ", price=MNQ_PRICE)
+        for key in ("trend_15m_native", "trend_15m_native_reason",
+                    "context_1h", "extension_state",
+                    "extension_dist_atr", "extension_reason"):
+            self.assertIn(key, result, f"Missing key: {key}")
+
+    def test_fails_open_on_bad_instrument(self):
+        """Unknown instrument must not raise."""
+        result = A.analyze_intraday_trend(
+            instrument="BADX", price=100.0)
+        self.assertIn("trend_15m_native", result)
+        self.assertEqual(result["trend_15m_native"], "NEUTRAL")
+
+    def test_does_not_call_swing_functions(self):
+        """SWING-policy functions must not appear as actual calls in analyze_intraday_trend.
+
+        We strip docstrings and comment-only lines before scanning so that
+        documentation mentioning the forbidden names (e.g. '✗ analyze_swing()')
+        does not produce a false positive.
+        """
+        import inspect, re
+        src = inspect.getsource(A.analyze_intraday_trend)
+        # Remove triple-quoted docstrings (single and double-quote variants)
+        src_nodoc = re.sub(r'""".*?"""', '', src, flags=re.DOTALL)
+        src_nodoc = re.sub(r"'''.*?'''", '', src_nodoc, flags=re.DOTALL)
+        # Remove comment-only lines
+        src_nodoc = "\n".join(
+            ln for ln in src_nodoc.splitlines()
+            if not ln.lstrip().startswith("#")
+        )
+        forbidden = ["analyze_swing(", "_swing_entry_veto_reasons(",
+                     "_swing_htf_enabled("]
+        for fn in forbidden:
+            self.assertNotIn(fn, src_nodoc,
+                             f"analyze_intraday_trend must not call {fn}")
+
+    def test_extension_unknown_when_no_vwap(self):
+        """Without VWAP/ATR, extension state must be UNKNOWN (not a crash)."""
+        result = A.analyze_intraday_trend(
+            instrument="MNQ", price=MNQ_PRICE, trade_plan=None, swing_ctx=None)
+        self.assertEqual(result["extension_state"], "UNKNOWN")
+
+    def test_extension_computed_from_trade_plan_vwap(self):
+        """VWAP passed via trade_plan dict must be used for extension calc."""
+        result = A.analyze_intraday_trend(
+            instrument="MNQ", price=MNQ_PRICE,
+            trade_plan={"vwap": MNQ_PRICE + 300.0, "atr_pts": 100.0})
+        # 300 pts / 100 ATR = 3.0 → EXTREME
+        self.assertEqual(result["extension_state"], "EXTREME")
+
+    def test_extension_normal_within_1atr(self):
+        result = A.analyze_intraday_trend(
+            instrument="MNQ", price=MNQ_PRICE,
+            trade_plan={"vwap": MNQ_PRICE + 50.0, "atr_pts": 100.0})
+        self.assertEqual(result["extension_state"], "NORMAL")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 27. New veto gates: EXTREME extension + OPPOSED 1H (spec §§6, 8)
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNewVetoGates(unittest.TestCase):
+
+    def _ctx_with_ext(self, ext_state):
+        ctx = _it_ctx_long()
+        ctx["extension_state"] = ext_state
+        ctx["extension_reason"] = f"Price {2.5}× ATR — {ext_state}"
+        return ctx
+
+    def _ctx_with_1h(self, c1h):
+        ctx = _it_ctx_long()
+        ctx["context_1h"]   = c1h
+        ctx["extension_state"] = "NORMAL"
+        return ctx
+
+    def test_extreme_extension_adds_veto(self):
+        ctx = self._ctx_with_ext("EXTREME")
+        vetoes = A._it_entry_veto_reasons(ctx, {}, "Long", "MNQ")
+        codes = [v[0] for v in vetoes]
+        self.assertIn("extension", codes)
+
+    def test_normal_extension_no_veto(self):
+        ctx = self._ctx_with_ext("NORMAL")
+        vetoes = A._it_entry_veto_reasons(ctx, {}, "Long", "MNQ")
+        codes = [v[0] for v in vetoes]
+        self.assertNotIn("extension", codes)
+
+    def test_extended_no_extension_veto(self):
+        """EXTENDED (not EXTREME) must NOT add an extension veto."""
+        ctx = self._ctx_with_ext("EXTENDED")
+        vetoes = A._it_entry_veto_reasons(ctx, {}, "Long", "MNQ")
+        codes = [v[0] for v in vetoes]
+        self.assertNotIn("extension", codes)
+
+    def test_opposed_1h_adds_veto_by_default(self):
+        orig = os.environ.pop("IT_ALLOW_OPPOSED_1H", None)
+        try:
+            ctx = self._ctx_with_1h("OPPOSED")
+            vetoes = A._it_entry_veto_reasons(ctx, {}, "Long", "MNQ")
+            codes = [v[0] for v in vetoes]
+            self.assertIn("opposed_1h", codes)
+        finally:
+            if orig is not None:
+                os.environ["IT_ALLOW_OPPOSED_1H"] = orig
+
+    def test_opposed_1h_allowed_with_override_env(self):
+        os.environ["IT_ALLOW_OPPOSED_1H"] = "1"
+        try:
+            ctx = self._ctx_with_1h("OPPOSED")
+            vetoes = A._it_entry_veto_reasons(ctx, {}, "Long", "MNQ")
+            codes = [v[0] for v in vetoes]
+            self.assertNotIn("opposed_1h", codes)
+        finally:
+            del os.environ["IT_ALLOW_OPPOSED_1H"]
+
+    def test_aligned_1h_no_veto(self):
+        ctx = self._ctx_with_1h("ALIGNED")
+        vetoes = A._it_entry_veto_reasons(ctx, {}, "Long", "MNQ")
+        codes = [v[0] for v in vetoes]
+        self.assertNotIn("opposed_1h", codes)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 28. BLOCKED_EXTENSION / BLOCKED_OPPOSED_1H status codes
+#     These verify compute_intraday_trend_context status precedence (spec §10).
+#     We use direct helper calls to avoid the full context chain.
+# ══════════════════════════════════════════════════════════════════════════════
+
+class TestNewStatusCodes(unittest.TestCase):
+
+    def test_entry_state_blocked_extension_for_extreme(self):
+        """_it_entry_state maps EXTREME extension → BLOCKED_EXTENSION."""
+        ctx = {
+            "status": "BUILDING_CONTEXT",
+            "extension_state": "EXTREME",
+            "context_1h": "ALIGNED",
+            "trend_15m_native": "BULLISH",
+            "location_quality": "KEY_LEVEL",
+            "confirmation_complete": True,
+            "structural_stop_valid": True,
+            "time_ok": True,
+        }
+        self.assertEqual(A._it_entry_state(ctx), "BLOCKED_EXTENSION")
+
+    def test_entry_state_waiting_for_trend_for_opposed(self):
+        """_it_entry_state maps OPPOSED 1H → WAITING_FOR_TREND."""
+        ctx = {
+            "status": "CONFIRMED_SETUP",
+            "extension_state": "NORMAL",
+            "context_1h": "OPPOSED",
+            "trend_15m_native": "BULLISH",
+            "location_quality": "KEY_LEVEL",
+            "confirmation_complete": True,
+            "structural_stop_valid": True,
+            "time_ok": True,
+        }
+        self.assertEqual(A._it_entry_state(ctx), "WAITING_FOR_TREND")
+
+    def test_setup_score_zero_on_exception(self):
+        self.assertEqual(A._it_setup_score(None), 0)
+
+    def test_setup_score_falls_back_for_unknown_extension(self):
+        ctx = {
+            "trend_15m_native": "BULLISH",
+            "context_1h": "ALIGNED",
+            "location_quality": "EXCELLENT",
+            "extension_state": "UNKNOWN",
+            "confirmation_complete": True,
+            "alignment_score": 3,
+            "trend_alignment": "STRONG_BULLISH",
+        }
+        sc = A._it_setup_score(ctx)
+        # UNKNOWN extension = 0 pts for extension component; rest can still score
+        self.assertGreaterEqual(sc, 40)
+
+    def test_stable_schema_contains_native_keys(self):
+        """compute_intraday_trend_context stable schema must expose new native keys."""
+        # Just verify the default values are set (don't need full context boot)
+        # We check by inspecting the source for the new keys in the ctx init dict
+        import inspect
+        src = inspect.getsource(A.compute_intraday_trend_context)
+        for key in ("trend_15m_native", "context_1h", "extension_state",
+                    "extension_dist_atr", "setup_score", "entry_state"):
+            self.assertIn(f'"{key}"', src,
+                          f"Stable schema must declare '{key}'")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Run
 # ══════════════════════════════════════════════════════════════════════════════
 
