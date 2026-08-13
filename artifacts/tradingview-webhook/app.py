@@ -31959,7 +31959,7 @@ def _trade_ready_loop():
                 continue
             # Re-check this instrument's slot just before sending (it may have
             # changed while full_analysis ran).
-            if not active_trade_for(inst) and is_actionable(a.get("verdict")):
+            if not active_trade_for(inst) and a.get("verdict") in FULL_READY_VERDICTS:
                 entry = _build_card_entry(a, ticker=f"{inst}1!")
                 send_live_ready_card(entry, inst)
     except Exception as exc:  # never let the loop die
@@ -32192,7 +32192,7 @@ def _databento_bar_scan(inst: str, price: float) -> None:
             if DISCORD_LIVE_ENABLED and _bars_confirmed >= READY_SUSTAIN_BARS:
                 last = LAST_LIVE_CARD_AT.get(inst)
                 if not (last and (datetime.now(timezone.utc) - last).total_seconds() < trade_ready_interval()):
-                    if not active_trade_for(inst) and is_actionable(a.get("verdict")):
+                    if not active_trade_for(inst) and a.get("verdict") in FULL_READY_VERDICTS:
                         entry = _build_card_entry(a, ticker=f"{inst}1!")
                         dispatched = send_live_ready_card(entry, inst, notify=True)
                         if dispatched:
@@ -45215,7 +45215,7 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     # error handling is isolated so a live-card failure can't suppress the journal
     # embed offloaded below.
     if (journal_entry and not active_trade_for(resolved_inst)
-            and is_actionable(a.get("verdict"))):
+            and a.get("verdict") in FULL_READY_VERDICTS):
         try:
             _dispatched = send_live_ready_card(journal_entry,
                                  record.get("ticker") or record.get("instrument")
