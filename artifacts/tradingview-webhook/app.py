@@ -28978,9 +28978,15 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # before build_strict_trade_plan is called — ensures the dedicated IT plan
     # builder receives real structural data rather than falling through to SWING.
     # SCALP and SWING are completely unaffected (_it_ctx stays None for them).
+    #
+    # ROUTING CHANGE: For INTRADAY_TREND the pre-compute is no longer gated by the
+    # legacy SWING strict label.  The SWING strict result (edge≥85 / zone / vwap /
+    # structure) is shadowed for diagnostics only; it no longer controls whether the
+    # IT context is computed or whether a trade can execute.  The IT-native pipeline
+    # (setup family → confirmation → build_intraday_trade_plan → veto layer) is the
+    # sole authority.  SCALP / SWING are completely unaffected.
     _it_ctx = None
-    if (TRADING_MODE == "INTRADAY_TREND" and strict_direction
-            and strict_label in ("Strong Trade", "Possible Trade")):
+    if TRADING_MODE == "INTRADAY_TREND" and strict_direction:
         try:
             _it_ctx = compute_intraday_trend_context(
                 active_ticker, current_price, confluences=confluences,
@@ -28989,7 +28995,42 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         except Exception:
             _it_ctx = None
 
-    if strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
+    # ── INTRADAY_TREND: native verdict (bypasses SWING strict prerequisite) ─────
+    # Captures the legacy SWING strict result as shadow analytics BEFORE it can
+    # influence the IT verdict.  The IT plan builder + veto layer then decide
+    # READY/WAIT independently from the legacy gate.  SCALP / SWING never enter
+    # this branch (TRADING_MODE guard) — their paths are byte-identical below.
+    _it_legacy_strict = None
+    if TRADING_MODE == "INTRADAY_TREND" and strict_direction:
+        # Shadow the inherited SWING strict result for ghost/gate-effectiveness logging.
+        # Do NOT use this to gate execution — it is diagnostic only.
+        _it_legacy_strict = {
+            "label":    strict_label,
+            "score":    strict_score,
+            "reason":   strict_reason,
+            "missing":  list(strict_missing or []),
+            "was_ready": strict_label in ("Strong Trade", "Possible Trade"),
+        }
+        # IT-native plan: build_strict_trade_plan delegates to build_intraday_trade_plan
+        # for INTRADAY_TREND mode, applying all IT-native hard gates (family /
+        # confirmation / structural stop / ATR bounds / chase / R:R / daily cap).
+        trade_plan = build_strict_trade_plan(
+            strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
+            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
+            edge_score=_authoritative_eb["score"],
+            swing_context=swing_ctx,
+            it_ctx=_it_ctx,
+        )
+        if trade_plan["trade_plan"]:
+            # IT does not have an EARLY READY band (no edge-score tier for IT).
+            verdict = "LONG READY" if strict_direction == "Long" else "SHORT READY"
+        else:
+            verdict       = "WAIT"
+            strict_label  = "WAIT"
+            strict_reason = trade_plan.get("reason") or strict_reason
+
+    elif strict_label in ("Strong Trade", "Possible Trade") and strict_direction:
+        # SCALP / SWING: unchanged (INTRADAY_TREND never reaches this branch)
         trade_plan = build_strict_trade_plan(
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
             volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
@@ -30372,6 +30413,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             except Exception:
                 _it_ctx = {"enabled": True, "mode": "INTRADAY_TREND",
                            "status": "ERROR", "reason": "Context unavailable."}
+        # Attach the legacy SWING strict shadow so ghost/gate-effectiveness analysis
+        # can compare what the old gate would have done vs the native IT decision.
+        if isinstance(_it_ctx, dict) and _it_legacy_strict is not None:
+            _it_ctx["legacy_strict_verdict"] = _it_legacy_strict
         result["intraday_trend_context"] = _it_ctx
 
     # ── Unified Analyst Report (DISPLAY-ONLY) ────────────────────────────────

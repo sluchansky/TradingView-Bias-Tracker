@@ -1,5 +1,6 @@
 # Memory Index
 
+- [INTRADAY_TREND native gate routing](intraday-trend-native-gate.md) — IT bypasses SWING strict gate; `_it_legacy_strict` shadow-only; 2 surgical edits in full_analysis.
 - [INTRADAY_TREND strategy](intraday-trend-strategy.md) — MODES["INTRADAY_TREND"]=dict(MODES["SWING"]); MNQ-only; 3 gates; panel reuses mod-swingdiag; full_analysis wiring pattern.
 - [INTRADAY_TREND Phase 2 gaps](intraday-trend-phase2.md) — 7 ghost columns, 8 new helpers, confirmation/structural-stop/sizing/daily-cap/mgmt gaps closed; 105 tests in test_intraday_trend_phase2.py; prod schema needs Publish.
 - [INTRADAY_TREND dedicated plan engine](intraday-trend-plan-engine.md) — build_intraday_trade_plan() fully separated from SWING; structural stop only, targets from real session levels ≥2R, 15:15 cutoff, chase gate; _swing_htf_enabled() SWING-only.
@@ -145,15 +146,9 @@
 - [EARLY tier, score-aware conflict & alert_diagnostics](early-tier-and-alert-diagnostics.md) — SCALP 75/75 → READY-or-WAIT (no EARLY tier); single alert_diagnostics block feeding /status+Discord+dashboard (incl. CVD/RVOL); use verdict helpers not literal strings.
 - [Per-direction dashboard toggle](per-direction-dashboard-toggle.md) — Long/Short toggle shows bull/bear via result["directions"]; favored side reuses authoritative edge; non-favored never floored; conflict zeros both.
 - [Tiered alerts & webhook-tail latency](tiered-alerts-and-webhook-tail-latency.md) — alert_level is display-only; any Discord POST in /webhook tail must go through _enqueue_slow, not inline.
-- [Eval diagnostics & alert-before-journal ordering](eval-diagnostics-and-alert-ordering.md) — webhook worker sends trade alert BEFORE journal embed; EVAL_METRICS deque needs lock for list() snapshots; /eval-metrics + /diagnostics-live are owner-only.
-- [Per-gate webhook diagnostics](gate-diagnostics.md) — owner-only /diagnostics shows per-gate PASS/FAIL + real "Blocked by" (authoritative "why WAIT"); no-VWAP candidate defaults opposite the alert (not a bug).
-- [Focus vs Mute decoupling](focus-vs-mute-decoupling.md) — dashboard focus = display-only/per-device; mute = server-side/global `/alerts/mute`; mute is in-memory (restart→all-unmuted); only NEW-SETUP alerts muted.
-- [TradersPost connectivity probe](traderspost-connectivity-probe.md) — HTTP 400 invalid-payload = password VALID, `invalid-password` = bad URL segment, HTTP 000 = transient OR trailing-whitespace; app .strip()s it; probe the STRIPPED value.
+- [Per-gate webhook diagnostics](gate-diagnostics.md) — owner-only /diagnostics shows per-gate PASS/FAIL + real "Blocked by"; no-VWAP candidate defaults opposite the alert (not a bug).
+- [Focus vs Mute decoupling](focus-vs-mute-decoupling.md) — dashboard focus = display-only/per-device; mute = server-side/global `/alerts/mute`; mute is in-memory (restart→all-unmuted).
 - [Unified Edge Score](unified-edge-score.md) — transparent score is the only user-visible Edge Score; zone-broken blocker must be instrument-scoped or it zeros the other instrument.
-- [Observability / eval-metrics heartbeat](observability-eval-metrics.md) — diagnostic heartbeat re-eval + counters; must stay full_analysis+_record_eval_metrics only; COUNTERS_LOCK never inside EVAL_METRICS_LOCK; WAIT reason is strict_reason not reason.
-- [EARLY intrabar pre-READY alert](early-pre-ready-alert.md) — display-only ⚡EARLY fires on sweep+structure before candle-close; never touches gate; fire-once dedupe; READY owns the signal.
-- [Per-instrument structure isolation](instrument-structure-isolation.md) — suspected cross-instrument BOS/CHOCH leak DISPROVEN; all 3 structure readers share a_inst!=inst filter; diagnose by replaying real webhooks + rebasing timestamps.
-- [Analyst professional game-plan](analyst-game-plan.md) — DISPLAY-ONLY nested analyst["game_plan"] NOT a top-level block; fail-open; flows to /status via wholesale analyst pass; own smoke not goldens.
-- [Potential-plan sweep+VWAP gate](potential-plan-sweep-vwap.md) — potential_plan generates on sweep+vwap_confirmed (not only structure_confirmed); display-only, goldens byte-identical.
-- [Dashboard display modules: equity & news](display-modules-equity-news.md) — equity curve (today, no backfill) + ForexFactory news are /status-fed DISPLAY-ONLY; news must NEVER feed the gate.
+- [Observability / eval-metrics heartbeat](observability-eval-metrics.md) — COUNTERS_LOCK never inside EVAL_METRICS_LOCK; WAIT reason is strict_reason not reason.
+- [Per-instrument structure isolation](instrument-structure-isolation.md) — suspected cross-instrument BOS/CHOCH leak DISPROVEN; all 3 structure readers share a_inst!=inst filter.
 - [Dashboard potential-plan preview](dashboard-potential-plan-preview.md) — forming-setup entry/stop/TP preview is display-only in directions[*].potential_plan; money path keys ONLY off actionable verdict + top-level trade_plan.
