@@ -77065,6 +77065,10 @@ function readyBanner(msg) {
   t._rt = setTimeout(function(){ t.classList.remove('show'); }, 9000);
 }
 function maybeReadyAlert(inst, v) {
+  // Respect server-side mute and per-device focus toggle — no bells for
+  // instruments the operator has silenced or hidden on this device.
+  if (MUTE_STATE && MUTE_STATE[inst]) return;
+  if (!instrEnabled(inst)) return;
   const actionable = jsIsActionable(v);
   const prev = _readyState[inst];
   _readyState[inst] = actionable;
@@ -77090,7 +77094,14 @@ function maybeReadyAlert(inst, v) {
 async function scanEdgeBells() {
   try {
     if (!soundOn) return;   // no sound wanted -> skip the scan and its network churn
-    const insts = (typeof INSTRUMENTS !== 'undefined' && INSTRUMENTS.length) ? INSTRUMENTS : ['MGC'];
+    const allInsts = (typeof INSTRUMENTS !== 'undefined' && INSTRUMENTS.length) ? INSTRUMENTS : ['MGC'];
+    // Skip instruments that are server-muted or focus-hidden on this device.
+    const insts = allInsts.filter(function(i){
+      if (MUTE_STATE && MUTE_STATE[i]) return false;   // server-side mute
+      if (!instrEnabled(i)) return false;              // focus toggle (per-device)
+      return true;
+    });
+    if (!insts.length) return;   // nothing to check
     const results = await Promise.all(insts.map(function(s){
       return api('/status?ticker='+encodeURIComponent(s))
                .then(function(d){ return { s:s, d:d }; })
