@@ -64,7 +64,7 @@ The system has three distinct operating modes. Each has its own signal threshold
 |------|-----------|-------------|-----|----------|
 | **SCALP** | High-frequency intraday, 1:1 quick captures | All 4 (MGC, MNQ, MES, MYM) | 1:1 | 60 (EARLY at 50) |
 | **SWING** | Stricter, multi-hour or overnight holds | All 4 | 1:3 | 80 |
-| **INTRADAY TREND** | Session-based large moves, MNQ only, ghost/shadow | MNQ only | 1:3 | 80 |
+| **INTRADAY TREND** | Session-based large moves, MNQ only, ghost/shadow | MNQ only | ≥2R | Native pipeline (no edge floor) |
 
 Switch the active mode from the **Mode** row in the dashboard (SCALP · Sensitive / SWING · Strict / INTRADAY · Session).
 
@@ -438,7 +438,7 @@ INTRADAY TREND is a specialized mode designed to capture large intraday directio
 | Parameter | Value | Notes |
 |-----------|-------|-------|
 | R:R target | **≥ 2.0** (minimum) | Target selected from the nearest real session level ≥ 2R away; no manufactured targets |
-| Minimum edge to fire | **80** | Same strict threshold as the main gate |
+| Edge score gate | **None** | IT does not use an edge score floor. Verdict comes entirely from the native IT pipeline (family → confirmation → stop → chase → target → cap). Edge score is still computed and displayed for reference. |
 | Instruments | **MNQ only** | Hard gate — all other symbols blocked |
 | Max risk per trade | **$500** | Env `MAX_RISK_DOLLARS_PER_TRADE` overrides |
 | Last new entry time | **15:15 ET** | No new entries at or after this time; env `INTRADAY_NEW_ENTRY_CUTOFF_ET` overrides |
@@ -506,7 +506,9 @@ If none of these three families are detected, the status shows **WAITING_FOR_SET
 
 ### 9.6 INTRADAY TREND Gate Sequence
 
-The full gate sequence is stricter than SCALP and completely separate from SWING:
+> **Architecture note (August 2026):** INTRADAY TREND now runs its own native gate pipeline as the sole READY/WAIT authority. It no longer inherits or passes through the SWING strict gate (edge ≥ 85, zone valid, VWAP confirmed, structure confirmed). The SWING strict result is still computed in the background as shadow data for analytics, but it has zero execution authority for IT. SCALP and SWING are completely unchanged.
+
+The full gate sequence is strictly IT-native and completely separate from SWING:
 
 1. **MNQ-only** — hard block immediately if instrument is not MNQ
 2. **Time restriction** — no entries at or after 15:15 ET; no entries at or after 15:55 ET (force-flat period)
@@ -756,6 +758,22 @@ If you want to stop Discord alerts for a specific instrument without disabling t
 
 Mute is **server-side** (affects all devices) but **resets on server restart**.
 
+### Phone Notifications (Discord @mentions)
+
+The system already sends a phone buzz for every fresh READY setup — no extra code needed. The mechanism is a Discord `@everyone` ping that is attached only to the first post of a new setup. The 5-minute re-posts are silent (no ping), so a standing READY setup rings your phone **once**, not on every interval.
+
+**To receive these as phone notifications:**
+1. Install Discord on your phone and join the server where your signal channel lives.
+2. Long-press the signal channel → **Notifications** → select **Only @mentions**.
+
+With "Only @mentions" set, only the `@everyone` ping on a fresh READY setup will buzz your phone. All other traffic in the channel (WATCH alerts, re-posts, journal embeds) arrives silently.
+
+**To test without waiting for a real setup:**
+- Dashboard → any instrument → click the **Test alert** button, or
+- Send `POST /api/notify-test` — this fires a real `@everyone` Discord push and returns `{ sent, reason }`.
+
+> **Note:** The test alert sends even when the instrument is muted (it's an explicit test), but muted status is reported in the response.
+
 ### Opening Bell
 At 09:30 ET, the system plays an audible opening bell and shows a notification. This is for awareness only — it does not automatically arm or change anything.
 
@@ -829,7 +847,7 @@ You do not need to stop the server. It runs 24/7 and will continue watching over
 | **Instruments** | All 4 | All 4 | MNQ only |
 | **Stop type** | ATR-based | ATR-based (2.5–3.0×) | Structural (session levels) |
 | **Zone gate** | Soft (demote) | Hard (block) | Hard (block) |
-| **HTF required** | No (optional flag) | Yes | Inherits SWING |
+| **HTF required** | No (optional flag) | Yes | No (native pipeline) |
 | **Daily cap** | 3 losses | 3 losses | 2 entries |
 | **Time limit** | None | None | Last entry 14:30 ET; flat 15:55 ET |
 | **Live orders** | ✅ Yes | ✅ Yes | ❌ Ghost/shadow only |
@@ -933,4 +951,4 @@ When enabled, an additional pre-send check enforces prop-firm daily loss and dra
 
 ---
 
-*Last updated: August 2026. This manual covers the system as currently deployed, including INTRADAY TREND mode (ghost/shadow phase). SCALP max risk per trade raised from $100 → $200 (August 2026).*
+*Last updated: August 2026. Changes this revision: INTRADAY TREND now uses its own native gate pipeline — the SWING strict gate (edge ≥ 85 / zone / VWAP / structure) no longer applies to IT; IT gate sequence and parameters table updated accordingly. Phone notification setup (Discord @mentions) added to §13. SCALP max risk raised from $100 → $200.*
