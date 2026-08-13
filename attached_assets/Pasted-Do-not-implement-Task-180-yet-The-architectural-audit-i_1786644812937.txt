@@ -1,0 +1,215 @@
+Do not implement Task #180 yet.
+
+The architectural audit is useful, but the evidence phase is incomplete because the ghost/gate tables contain no production observations.
+
+We are trying to reduce missed profitable MNQ INTRADAY_TREND opportunities. Do not conclude that 13/14 gates must remain hard blocks solely from code inspection.
+
+Proceed as follows.
+
+1. Fix the missing baseline first
+
+Determine why the expected production ghost/gate schema or observations are absent.
+
+Check whether this is the pending production schema/deployment issue already identified.
+
+Do not create a second parallel collector.
+
+Use the existing intended collector/schema and make the minimum change necessary for it to record INTRADAY_TREND observations.
+
+Report whether this requires:
+
+* migration/schema application
+* republish
+* process restart
+* collector restart
+* no action
+
+2. Do not wait days for new data if historical market data already exists
+
+Look for existing stored MNQ bars, alerts, confluences, webhook history, decision logs, ghost observations, or Databento-derived data that can replay the current IT decision engine.
+
+If enough historical data exists, build a temporary offline replay/audit using existing functions.
+
+Do not build new production architecture.
+
+Replay the current INTRADAY_TREND engine over available MNQ sessions and capture every point where a valid directional thesis was rejected.
+
+For each rejection determine subsequent maximum favorable excursion relative to the proposed entry/stop:
+
+* +0.5R
+* +1R
+* +1.5R
+* +2R
+
+Also capture adverse excursion where practical.
+
+3. Audit ALL important rejection causes
+
+Do not restrict the investigation to AWAITING_CONFIRMATION.
+
+Measure at minimum:
+
+* HTF conflict
+* 15m bias failure
+* 5m structure failure
+* MID_RANGE/location
+* VWAP requirement
+* liquidity sweep requirement
+* BOS/CHOCH requirement
+* candle/reversal confirmation
+* 1m trigger
+* volatility condition
+* stale-data gate
+* stop validity
+* risk cap
+* daily/prop limits
+* family-selection failure
+* confirmation incomplete
+
+Produce:
+
+Gate	Rejections	Later +1R	Later +2R	False-negative rate	Safety or Entry Quality	Recommendation
+
+4. Separate safety gates from setup-quality gates
+
+These remain hard regardless of opportunity count:
+
+* invalid/stale market data
+* emergency stop / safety lock
+* daily loss cap
+* prop/account restrictions
+* duplicate-position protection
+* invalid stop
+* risk-dollar violation
+* execution disabled
+* materially contradictory higher-timeframe structure
+
+Everything else is eligible for evidence-based classification as:
+
+* hard setup gate
+* READY requirement
+* READY_REDUCED requirement
+* score modifier
+* WATCH condition
+
+Do not loosen anything automatically.
+
+5. Re-evaluate MID_RANGE specifically
+
+Do not automatically treat MID_RANGE as a permanent hard block.
+
+Determine whether it represents genuinely poor R:R/location or whether strong trending MNQ moves are being rejected merely because price is not near an ideal zone.
+
+If strong aligned 15m/5m continuation setups frequently reach +1R/+2R after MID_RANGE rejection, propose converting it to a location penalty or READY_REDUCED condition.
+
+Do not make that change without evidence.
+
+6. Re-evaluate confirmation timing
+
+Measure whether the bot is recognizing the correct setup but entering too late because it requires the final confirmation.
+
+This includes:
+
+AWAITING_CONFIRMATION
+
+and any sequence where:
+
+15m bias valid
+→ 5m structure valid
+→ directional trigger exists
+→ final secondary confirmation arrives only after most of the move has occurred.
+
+Measure the price movement between:
+
+* first valid thesis
+* primary trigger
+* final confirmation
+* current READY point
+
+I want to know whether the bot is missing trades because it is wrong or because it is late.
+
+7. READY_REDUCED risk must actually be reduced
+
+Do not implement:
+
+50% contracts, rounded down, minimum 1
+
+if this causes a normal 1-contract MNQ trade to remain 1 contract.
+
+READY_REDUCED must target 50% of the normal IT dollar-risk allocation through the canonical risk engine.
+
+If valid contract granularity makes 50% risk impossible, do not silently increase it back to full risk.
+
+Return an explicit result such as:
+
+REDUCED_SIZE_UNAVAILABLE
+
+or keep the opportunity in WATCH/manual-only status.
+
+Never violate the normal risk allocation merely to get a trade.
+
+8. Then implement the smallest justified change
+
+After the evidence audit, identify the top 1–3 false-negative gates.
+
+Only modify gates where the replay/observations show meaningful missed +1R/+2R opportunity without unacceptable adverse excursion.
+
+Possible outcomes may include:
+
+* AWAITING_CONFIRMATION → READY_REDUCED
+* secondary VWAP confirmation → score modifier
+* secondary 1m trigger → READY vs READY_REDUCED distinction
+* MID_RANGE → penalty instead of absolute veto
+
+These are examples, not instructions to make those changes.
+
+Let the evidence decide.
+
+9. Preserve scope
+
+Do not change:
+
+* SCALP
+* SWING
+* ORB
+* dashboard design
+* prediction engine
+* unrelated strategies
+* risk caps
+* prop safety
+* execution safety
+
+Do not add indicators.
+
+10. Deliver two checkpoints
+
+Checkpoint A — before code changes
+
+Report:
+
+1. why the production observations are empty
+2. whether historical replay is possible
+3. number of MNQ sessions/setups analyzed
+4. ranked gate rejection table
+5. which gates caused the most subsequent +1R/+2R moves
+6. whether the dominant problem is bad filtering, late confirmation, or both
+
+Then proceed directly with the smallest evidence-supported implementation.
+
+Checkpoint B — after implementation
+
+Report:
+
+1. exact gates changed
+2. old behavior → new behavior
+3. READY / READY_REDUCED / WATCH / BLOCKED counts before vs after
+4. +1R/+2R opportunities recovered
+5. additional losing opportunities admitted
+6. theoretical risk impact
+7. tests passed
+8. files changed
+9. whether schema application, republish, or restart is required
+
+The objective is not more signals.
+
+The objective is to capture more legitimate MNQ intraday movement without removing the protections that keep the bot alive.

@@ -46,7 +46,11 @@ import app as A   # noqa: E402
 class TestConfirmationComplete(unittest.TestCase):
 
     def _conf(self, family, confluences, direction="Long", score=0):
-        return A._it_confirmation_complete(family, confluences, direction, score)
+        # _it_confirmation_complete now returns (complete, partial_ok, done, miss).
+        # Strip partial_ok so existing 3-value unpack tests remain unchanged.
+        complete, _partial_ok, done, miss = A._it_confirmation_complete(
+            family, confluences, direction, score)
+        return (complete, done, miss)
 
     # --- LSR ---
     def test_lsr_all_steps_complete(self):
@@ -139,8 +143,9 @@ class TestConfirmationComplete(unittest.TestCase):
     # --- Fail-open ---
     def test_exception_failopen(self):
         # Should not raise even with bad input
-        ok, _, miss = A._it_confirmation_complete("BAD_FAMILY", None, None, "bad")
+        ok, _partial, _, miss = A._it_confirmation_complete("BAD_FAMILY", None, None, "bad")
         self.assertFalse(ok)
+        self.assertFalse(_partial)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

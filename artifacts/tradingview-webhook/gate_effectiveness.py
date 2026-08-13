@@ -115,7 +115,12 @@ def _scalar_str(val: Any) -> Optional[str]:
 
 def _extract(result: dict) -> dict:
     """Pull all audit-relevant fields from a full_analysis result dict.
-    Returns a flat dict of normalized values.  Never raises."""
+    Returns a flat dict of normalized values.  Never raises.
+
+    For INTRADAY_TREND mode the IT-native context (result["intraday_trend_context"])
+    is used for blocker extraction instead of the SWING-style gate_debug fields,
+    which reflect SWING strict-gate metrics and are misleading for IT evaluation.
+    """
     try:
         from app import is_actionable, is_early_ready, ready_direction  # noqa: PLC0415
     except Exception:
@@ -155,6 +160,75 @@ def _extract(result: dict) -> dict:
         conf       = result.get("confluences") or {}
         vol        = result.get("volatility") or {}
         gd         = result.get("gate_debug") or {}
+
+        # ── IT-native extraction ──────────────────────────────────────────────
+        # When intraday_trend_context is present, use IT-native fields for blocker
+        # extraction.  The SWING-style gate_debug/comp_* fields contain SWING strict
+        # gate metrics that are meaningless for IT mode (e.g. "zone_valid" is always
+        # False for IT because IT doesn't require zone proximity).
+        it_ctx = result.get("intraday_trend_context")
+        if isinstance(it_ctx, dict) and it_ctx.get("mode") == "INTRADAY_TREND":
+            # Blockers: first from veto list, then from context status
+            it_veto_code  = trade_plan.get("it_veto_code") or ""
+            it_ctx_status = it_ctx.get("status") or ""
+            it_reason     = (trade_plan.get("reason") or it_ctx.get("reason") or "")
+            # Build the canonical blocker list from IT context
+            it_blockers: list = []
+            if it_veto_code and it_veto_code not in ("", "None"):
+                it_blockers.append(it_veto_code)
+            # Supplement with human-readable context status when no veto code
+            elif it_ctx_status and it_ctx_status not in (
+                "CONFIRMED_SETUP", "SETUP_DEVELOPING", "BUILDING_CONTEXT"
+            ):
+                it_blockers.append(it_ctx_status)
+            # READY_REDUCED: one confirmation step still missing — record which one
+            if trade_plan.get("it_ready_reduced"):
+                miss_step = trade_plan.get("it_ready_reduced_missing")
+                if miss_step:
+                    it_blockers.append(f"PENDING: {str(miss_step)[:60]}")
+            primary_blocker = it_blockers[0] if it_blockers else None
+            # IT-native confirmation component breakdown.
+            # Derive PASS/FAIL for shared columns from IT confluences.
+            _it_conf    = conf   # raw confluences dict for component columns
+            comp_bos    = _comp(_it_conf.get("bos"))
+            comp_choch  = _comp(_it_conf.get("choch"))
+            comp_vwap   = _comp(_it_conf.get("vwap_confirmed"))
+            comp_sweep  = _comp(_it_conf.get("liquidity_sweep"))
+            comp_vol    = _comp(_it_conf.get("volume_confirmed"))
+            cvd_ok_it: Optional[bool] = None
+            if "cvd_conflict" in gd:
+                cvd_ok_it = not gd["cvd_conflict"]
+            return {
+                "verdict":          verdict,
+                "direction":        direction,
+                "edge_score":       int((result.get("edge_breakdown") or {}).get("score") or 0),
+                "grade":            "WAIT",  # IT doesn't use SWING grade tiers
+                "primary_blocker":  primary_blocker,
+                "all_blockers":     it_blockers,
+                "entry_price":      trade_plan.get("entry") if trade_plan.get("trade_plan") else None,
+                "stop_price":       (float(trade_plan["stop_loss"])
+                                     if trade_plan.get("trade_plan") and trade_plan.get("stop_loss")
+                                     else None),
+                "target1_price":    (float(trade_plan["target1"])
+                                     if trade_plan.get("trade_plan") and trade_plan.get("target1")
+                                     else None),
+                "target2_price":    (float(trade_plan["target2"])
+                                     if trade_plan.get("trade_plan") and trade_plan.get("target2")
+                                     else None),
+                "risk_points":      trade_plan.get("risk_points") if trade_plan.get("trade_plan") else None,
+                "comp_bos":   comp_bos,   "comp_choch": comp_choch,
+                "comp_vwap":  comp_vwap,  "comp_sweep": comp_sweep,
+                "comp_volume": comp_vol,  "comp_cvd":   _comp(cvd_ok_it),
+                "comp_session": _comp(it_ctx.get("time_ok")),
+                "comp_zone":    _comp(it_ctx.get("location_quality") not in (None, "MID_RANGE")),
+                "atr_pts":          vol.get("atr_pts"),
+                "vwap_value":       result.get("vwap"),
+                "cvd_direction":    _scalar_str(result.get("cvd_state") or result.get("cvd_direction")),
+                "trend_alignment":  _scalar_str(it_ctx.get("trend_alignment")),
+                "volatility_regime":vol.get("regime") or vol.get("label"),
+                "session":          _scalar_str(it_ctx.get("session")),
+            }
+        # ── /IT-native extraction ─────────────────────────────────────────────
 
         # ── Gate components: prefer gate_debug, fall back to confluences ──
         bos   = gd.get("bos_confirmed")   if gd else conf.get("bos")

@@ -1,5 +1,6 @@
 # Memory Index
 
+- [INTRADAY_TREND tiered verdict: READY_REDUCED](it-tiered-verdict.md) — AWAITING_CONFIRMATION 90% win-rate → READY_REDUCED at 50% dollar-risk; 4-tuple confirmation return; gate_effectiveness IT-native extraction; 40 tests.
 - [INTRADAY_TREND native gate routing](intraday-trend-native-gate.md) — IT bypasses SWING strict gate; `_it_legacy_strict` shadow-only; 2 surgical edits in full_analysis.
 - [INTRADAY_TREND strategy](intraday-trend-strategy.md) — MODES["INTRADAY_TREND"]=dict(MODES["SWING"]); MNQ-only; 3 gates; panel reuses mod-swingdiag; full_analysis wiring pattern.
 - [INTRADAY_TREND Phase 2 gaps](intraday-trend-phase2.md) — 7 ghost columns, 8 new helpers, confirmation/structural-stop/sizing/daily-cap/mgmt gaps closed; 105 tests in test_intraday_trend_phase2.py; prod schema needs Publish.

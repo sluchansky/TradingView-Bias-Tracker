@@ -1456,8 +1456,11 @@ def set_entry_quality_gate(value):
 # "READY") would treat them identically. To make every consumer's intent explicit
 # (and to keep full-conviction-only paths exact), ALL verdict checks go through
 # these helpers instead of string matching.
-FULL_READY_VERDICTS  = ("LONG READY", "SHORT READY")
-EARLY_READY_VERDICTS = ("LONG EARLY READY", "SHORT EARLY READY")
+FULL_READY_VERDICTS    = ("LONG READY", "SHORT READY")
+EARLY_READY_VERDICTS   = ("LONG EARLY READY", "SHORT EARLY READY")
+# READY_REDUCED: confirmation 2/3 complete (primary trigger present), 50% dollar-risk.
+# Actionable for ghost writes + manual execution; never auto-fires.
+REDUCED_READY_VERDICTS = ("LONG READY_REDUCED", "SHORT READY_REDUCED")
 
 
 def is_full_ready(verdict):
@@ -1471,15 +1474,17 @@ def is_early_ready(verdict):
 
 
 def is_actionable(verdict):
-    """A tradeable alert — full READY OR EARLY READY (the union)."""
-    return verdict in FULL_READY_VERDICTS or verdict in EARLY_READY_VERDICTS
+    """A tradeable alert — full READY, EARLY READY, or READY_REDUCED (the union)."""
+    return (verdict in FULL_READY_VERDICTS
+            or verdict in EARLY_READY_VERDICTS
+            or verdict in REDUCED_READY_VERDICTS)
 
 
 def ready_direction(verdict):
-    """Long / Short for any (full or early) READY verdict, else None."""
-    if verdict in ("LONG READY", "LONG EARLY READY"):
+    """Long / Short for any (full, early, or reduced) READY verdict, else None."""
+    if verdict in ("LONG READY", "LONG EARLY READY", "LONG READY_REDUCED"):
         return "Long"
-    if verdict in ("SHORT READY", "SHORT EARLY READY"):
+    if verdict in ("SHORT READY", "SHORT EARLY READY", "SHORT READY_REDUCED"):
         return "Short"
     return None
 
@@ -7653,9 +7658,12 @@ def compute_intraday_trend_context(instrument, price, confluences=None,
         ctx["setup_family_reason"] = fam_r
 
         # ── Phase 2: confirmation sequence ─────────────────────────────────
-        confirmed, steps, miss = _it_confirmation_complete(
+        confirmed, partial_ok, steps, miss = _it_confirmation_complete(
             fam, confluences, direction, ctx.get("alignment_score", 0))
         ctx["confirmation_complete"] = confirmed
+        # confirmation_partial: 2/3 steps done with primary trigger present →
+        # eligible for READY_REDUCED (50 % dollar-risk).  False when primary absent.
+        ctx["confirmation_partial"]  = partial_ok
         ctx["confirmation_steps"]    = steps
         ctx["confirmation_missing"]  = miss
 
@@ -7907,7 +7915,12 @@ def _it_entry_veto_reasons(it_ctx, trade_plan, direction, instrument=None):
                            "TREND_PULLBACK. WAITING_FOR_SETUP."))
 
         # 4. Confirmation sequence — only applicable once a known family is detected.
-        if fam and fam in _IT_KNOWN_FAMILIES and not it_ctx.get("confirmation_complete", False):
+        #    Skip this veto for READY_REDUCED setups: confirmation_partial=True means
+        #    2/3 steps are done (primary trigger present); the partial path in
+        #    build_intraday_trade_plan already captures this correctly.
+        if (fam and fam in _IT_KNOWN_FAMILIES
+                and not it_ctx.get("confirmation_complete", False)
+                and not it_ctx.get("confirmation_partial", False)):
             miss = it_ctx.get("confirmation_missing") or []
             reason = (miss[0] if miss
                       else "Setup confirmation sequence not yet complete.")
@@ -8142,27 +8155,32 @@ def _it_structural_stop(setup_family, confluences, direction, price, levels, atr
 def _it_confirmation_complete(setup_family, confluences, direction, alignment_score=0):
     """Check whether the INTRADAY_TREND setup family confirmation sequence is complete.
 
-    Returns (complete: bool, steps_done: list[str], missing: list[str]).
+    Returns (complete: bool, partial_ok: bool, steps_done: list[str], missing: list[str]).
+
+    `complete`   — all 3 confirmation steps are present → READY.
+    `partial_ok` — primary trigger step(s) present and exactly ONE secondary step
+                   is missing → eligible for READY_REDUCED (50 % dollar-risk).
+                   partial_ok is False whenever the primary trigger itself is absent;
+                   without the core signal there is no valid setup to enter.
 
     Confirmation requirements per family:
       LIQUIDITY_SWEEP_REVERSAL:
-        Step 1 — Liquidity sweep detected   (liquidity_sweep=True)
-        Step 2 — Price rejected, structure confirmed  (structure_confirmed=True)
-        Step 3 — CHOCH entry signal confirmed (choch=True) — the Change of
-                 Character that completes the LSR reversal
+        Step 1 (primary) — Liquidity sweep detected   (liquidity_sweep=True)
+        Step 2 (primary) — Price rejected, structure confirmed  (structure_confirmed=True)
+        Step 3 (secondary) — CHOCH entry signal confirmed (choch=True)
+        partial_ok: sweep AND structure present, choch NOT yet present
 
       BREAKOUT_RETEST:
-        Step 1 — Structure break confirmed  (bos=True or choch=True)
-        Step 2 — VWAP-confirmed acceptance  (vwap_confirmed=True)
-        Step 3 — Failed reclaim confirmed   (structure_confirmed=True — the
-                 attempted re-break of the level that fails, confirming the new
-                 support/resistance)
+        Step 1 (primary)   — Structure break confirmed  (bos=True or choch=True)
+        Step 2 (secondary) — VWAP-confirmed acceptance  (vwap_confirmed=True)
+        Step 3 (secondary) — Failed reclaim confirmed   (structure_confirmed=True)
+        partial_ok: brk present AND exactly one of {vwap_c, structure} present
 
       TREND_PULLBACK:
-        Step 1 — Established trend          (alignment_score >= 2 TFs aligned)
-        Step 2 — Pullback to VWAP / level   (vwap_confirmed=True)
-        Step 3 — Reversal signal at pullback (structure_confirmed=True AND any
-                 of: sweep, bos, choch — i.e., a micro entry signal)
+        Step 1 (primary)   — Established trend (alignment_score >= 2 TFs aligned)
+        Step 2 (secondary) — Pullback to VWAP / level   (vwap_confirmed=True)
+        Step 3 (secondary) — Reversal signal at pullback (structure AND any sweep/bos/choch)
+        partial_ok: trend_ok AND exactly one of {vwap_c, reversal} present
 
     PURE, FAIL-OPEN.
     """
@@ -8182,7 +8200,9 @@ def _it_confirmation_complete(setup_family, confluences, direction, alignment_sc
             else:         miss.append("Awaiting structure confirmation (price must reject swept level)")
             if choch:     done.append("✓ CHOCH entry signal confirmed")
             else:         miss.append("Awaiting CHOCH — Change of Character entry signal")
-            return (sweep and structure and choch, done, miss)
+            complete   = sweep and structure and choch
+            partial_ok = sweep and structure and not choch   # 2/3: both primaries, missing only CHOCH
+            return (complete, partial_ok, done, miss)
 
         elif setup_family == "BREAKOUT_RETEST":
             done, miss = [], []
@@ -8193,7 +8213,11 @@ def _it_confirmation_complete(setup_family, confluences, direction, alignment_sc
             else:      miss.append("Awaiting VWAP confirmation of price acceptance above break")
             if structure: done.append("✓ Failed-reclaim confirmed — structure held")
             else:         miss.append("Awaiting failed-reclaim (structure must hold on retest)")
-            return (brk and vwap_c and structure, done, miss)
+            complete   = brk and vwap_c and structure
+            # partial_ok: primary (brk) present AND exactly one secondary present
+            secondary_count = sum([bool(vwap_c), bool(structure)])
+            partial_ok = bool(brk) and secondary_count == 1
+            return (complete, partial_ok, done, miss)
 
         elif setup_family == "TREND_PULLBACK":
             done, miss = [], []
@@ -8205,11 +8229,15 @@ def _it_confirmation_complete(setup_family, confluences, direction, alignment_sc
             reversal = structure and (sweep or bos or choch)
             if reversal: done.append("✓ Reversal signal confirmed at pullback point")
             else:        miss.append("Awaiting reversal signal (sweep/BOS/CHOCH) at pullback level")
-            return (trend_ok and vwap_c and reversal, done, miss)
+            complete   = trend_ok and vwap_c and reversal
+            # partial_ok: primary (trend_ok) present AND exactly one secondary present
+            secondary_count = sum([bool(vwap_c), bool(reversal)])
+            partial_ok = trend_ok and secondary_count == 1
+            return (complete, partial_ok, done, miss)
 
-        return (False, [], ["Setup family not yet identified"])
+        return (False, False, [], ["Setup family not yet identified"])
     except Exception:
-        return (False, [], ["Confirmation check unavailable"])
+        return (False, False, [], ["Confirmation check unavailable"])
 
 
 def _it_risk_sizing(stop_pts, instrument="MNQ"):
@@ -8468,6 +8496,8 @@ def build_intraday_trade_plan(direction, ticker, current_price,
             "session": None, "intraday_bias": None, "confidence": None,
             "expires_at": None, "entry_reason": None,
             "invalidation_level": None, "recommended_contracts": 0,
+            # READY_REDUCED fields (always present in schema)
+            "it_ready_reduced": False, "it_ready_reduced_missing": None,
         }
 
     try:
@@ -8515,10 +8545,19 @@ def build_intraday_trade_plan(direction, ticker, current_price,
                 "IT_NO_VALID_SETUP")
 
         # ── Structure confirmation gate ──────────────────────────────────────
+        # READY_REDUCED path: when exactly one secondary step is missing but the
+        # primary trigger is present (confirmation_partial=True), fall through to
+        # build the plan at 50 % dollar-risk instead of returning WAIT.
+        _it_ready_reduced = False   # set True on the partial path below
         if not ctx.get("confirmation_complete", False):
-            miss = ctx.get("confirmation_missing") or []
-            reason = miss[0] if miss else "Setup confirmation incomplete."
-            return no_plan(f"IT_STRUCTURE_FAIL: {reason}", "IT_STRUCTURE_FAIL")
+            if ctx.get("confirmation_partial", False):
+                # 2/3 confirmation steps done; build plan at reduced size.
+                _it_ready_reduced = True
+                # (fall through — all remaining hard gates still apply)
+            else:
+                miss = ctx.get("confirmation_missing") or []
+                reason = miss[0] if miss else "Setup confirmation incomplete."
+                return no_plan(f"IT_STRUCTURE_FAIL: {reason}", "IT_STRUCTURE_FAIL")
 
         # ── Structural stop ─────────────────────────────────────────────────
         # Use the pre-validated stop from context — never default to ATR.
@@ -8639,7 +8678,30 @@ def build_intraday_trade_plan(direction, ticker, current_price,
             expires_at = None
 
         # ── Risk sizing (advisory contracts) ─────────────────────────────────
-        contracts, risk_dollars = _it_risk_sizing(risk, inst)
+        # READY_REDUCED: target 50 % of the normal dollar-risk allocation through
+        # the canonical risk engine.  Per spec §7: if granularity makes 50 % risk
+        # impossible (floor rounds to 0), return REDUCED_SIZE_UNAVAILABLE rather
+        # than silently using full-size risk.
+        if _it_ready_reduced:
+            try:
+                _rr_max_risk = float(os.environ.get("MAX_RISK_DOLLARS", "500"))
+                _rr_half     = _rr_max_risk / 2.0
+                _rr_n        = max(0, min(4, int(_rr_half / (risk * pv))))
+            except Exception:
+                _rr_n = 0
+            if _rr_n < 1:
+                return no_plan(
+                    f"REDUCED_SIZE_UNAVAILABLE: At 50 % dollar-risk "
+                    f"({_rr_half:.0f}$ max), the stop width ({risk:.1f}pts × "
+                    f"${pv}/pt = ${risk * pv:.0f}/contract) leaves 0 valid "
+                    "contracts. Cannot trade this setup at reduced size without "
+                    "violating the normal risk allocation. "
+                    "Setup is valid — monitor manually.",
+                    "REDUCED_SIZE_UNAVAILABLE")
+            contracts    = _rr_n
+            risk_dollars = round(risk * pv * contracts, 2)
+        else:
+            contracts, risk_dollars = _it_risk_sizing(risk, inst)
 
         # ── Build output dict in build_strict_trade_plan schema ──────────────
         def fmt(v):
@@ -8702,6 +8764,10 @@ def build_intraday_trade_plan(direction, ticker, current_price,
                                f"{ctx.get('setup_family_reason', '')}").rstrip(" —"),
             "invalidation_level":    fmt(sl_level),
             "recommended_contracts": contracts,
+            # READY_REDUCED fields — always present so downstream consumers don't KeyError
+            "it_ready_reduced":         _it_ready_reduced,
+            "it_ready_reduced_missing": ((ctx.get("confirmation_missing") or [None])[0]
+                                         if _it_ready_reduced else None),
         }
 
     except Exception as exc:
@@ -29023,7 +29089,13 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         )
         if trade_plan["trade_plan"]:
             # IT does not have an EARLY READY band (no edge-score tier for IT).
-            verdict = "LONG READY" if strict_direction == "Long" else "SHORT READY"
+            # READY_REDUCED: 2/3 confirmation steps; plan built at 50 % dollar-risk.
+            # Actionable for ghost writes + manual execution; never auto-fires.
+            if trade_plan.get("it_ready_reduced"):
+                verdict = ("LONG READY_REDUCED"
+                           if strict_direction == "Long" else "SHORT READY_REDUCED")
+            else:
+                verdict = "LONG READY" if strict_direction == "Long" else "SHORT READY"
         else:
             verdict       = "WAIT"
             strict_label  = "WAIT"
