@@ -1,0 +1,190 @@
+Goal: Make INTRADAY_TREND take more valid MNQ trades without weakening safety/risk controls or changing SCALP/SWING behavior.
+
+Do not add new indicators, strategies, or architecture. This is a surgical gate audit and reclassification.
+
+1. Audit the current INTRADAY_TREND decision path end-to-end.
+
+Trace every condition that can produce:
+
+* READY
+* WAIT
+* BLOCKED
+* no signal
+
+For each gate, report:
+
+* gate name
+* file/function
+* hard block vs score/modifier
+* how often it blocked MNQ recently
+* whether price subsequently reached +0.5R, +1R, +1.5R, or +2R after the rejected setup
+
+Use existing ghost observations / gate audit data first. Do not build a new collector unless absolutely required.
+
+2. Rank missed-trade causes.
+
+Produce a table like:
+
+Rank	Gate	Missed setups	Hit +1R	Hit +2R	Recommendation
+
+The objective is to identify gates rejecting otherwise profitable intraday moves.
+
+3. Change INTRADAY_TREND to a tiered verdict model.
+
+Use:
+
+READY
+
+* 15m directional bias valid
+* 5m structure/setup aligned
+* acceptable entry location
+* stop/risk valid
+* no safety/prop rule violation
+
+READY_REDUCED
+
+* strong 15m + 5m alignment
+* valid structure and risk
+* exactly one secondary confirmation is missing or weak
+* use 50% of normal risk/size
+
+WATCH
+
+* directional thesis valid
+* setup forming
+* entry trigger/location not ready yet
+
+BLOCKED
+Reserve hard blocking for:
+
+* stale/invalid market data
+* opposite higher-timeframe structural conflict
+* invalid stop
+* excessive dollar risk
+* max daily loss
+* prop/account limit
+* duplicate-position protection
+* safety lock/emergency stop
+* materially contradictory structure
+
+4. Review the following confirmations specifically:
+
+* VWAP
+* candle confirmation
+* FVG
+* order block / breaker block
+* volume confirmation
+* volatility condition
+* liquidity sweep
+* 1m confirmation
+
+Unless historical evidence proves otherwise, these should generally become:
+
+* confidence modifiers,
+* edge-score modifiers,
+* or requirements for READY vs READY_REDUCED
+
+They should not independently kill a strong 15m/5m intraday setup.
+
+5. Preserve the core process:
+
+15m bias → 5m setup → 1m/5m trigger → risk validation → verdict
+
+Do not route INTRADAY_TREND through SWING logic.
+
+Do not copy SWING gates into IT.
+
+Do not modify SCALP behavior.
+
+6. Risk behavior:
+
+Keep all existing:
+
+* max-risk-dollar limits
+* daily-loss protection
+* prop rules
+* contract sizing
+* duplicate protection
+* emergency/safety gates
+
+READY_REDUCED must use exactly 50% of the normal IT risk allocation, rounded safely to valid MNQ contract sizing.
+
+Never increase risk simply to produce more trades.
+
+7. Add rejection diagnostics.
+
+Every non-READY IT setup should expose:
+
+* it_verdict
+* it_primary_blocker
+* it_secondary_missing
+* it_edge_score
+* it_15m_bias
+* it_5m_structure
+* it_trigger_state
+* it_risk_valid
+* it_would_be_ready_reduced
+* it_counterfactual_1r
+* it_counterfactual_2r
+
+Use existing DB/schema fields where possible. Avoid unnecessary migrations.
+
+8. Tests required before deployment:
+
+Add targeted tests proving:
+
+* strong 15m + 5m + risk-valid setup can become READY
+* one missing secondary confirmation becomes READY_REDUCED
+* two materially weak components do not automatically become READY
+* true HTF conflict stays BLOCKED
+* excessive risk stays BLOCKED
+* daily-loss/prop limits stay BLOCKED
+* SCALP output is unchanged
+* SWING output is unchanged
+* INTRADAY_TREND does not call the SWING verdict path
+
+Run all existing IT tests and goldens.
+
+9. Before changing thresholds, show the baseline.
+
+I want this comparison:
+
+Metric	Before	After
+MNQ IT setups		
+READY		
+READY_REDUCED		
+WATCH		
+BLOCKED		
+Counterfactual +1R missed		
+Counterfactual +2R missed		
+Average theoretical risk/trade		
+
+Do not optimize simply for trade count.
+
+The target is:
+more captured valid moves with controlled risk and fewer false-negative WAITs.
+
+10. Stop after this change.
+
+Do not:
+
+* add another strategy
+* redesign the dashboard
+* add AI prediction
+* add more indicators
+* alter ORB
+* alter SCALP
+* alter SWING
+* refactor unrelated code
+
+At completion report only:
+
+1. root causes found
+2. gates demoted from hard-block to modifier
+3. gates still hard-blocking
+4. before/after trade opportunity counts
+5. test results
+6. exact files changed
+7. whether republish/restart is required
+
+If the evidence shows a gate is actually preventing bad trades, leave it alone. We are correcting excessive filtering, not blindly loosening the bot.
