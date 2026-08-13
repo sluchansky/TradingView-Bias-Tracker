@@ -361,6 +361,13 @@ MARKET_INPUT_SOURCE_BY_TICKER: dict = {}
 # scoring, gate, or any money path. Reset to empty on server restart.
 _SOURCE_ANALYTICS_LOCK    = threading.Lock()
 _SOURCE_ANALYTICS_RECORDS: deque = deque(maxlen=500)
+
+# ── Item 8: Structure-demotion diagnostic counters (display-only, thread-safe).
+# Incremented inside evaluate_strict_setup() when STRUCTURE_REVERSAL_DEMOTE_ENABLED
+# nulls stale structure credit for the opposing candidate.  NEVER consulted by any
+# gate, risk, or execution path — purely for the analytics report.
+_STRUCTURE_DEMOTE_COUNTS = {"long": 0, "short": 0}
+_STRUCTURE_DEMOTE_LOCK   = threading.Lock()
 # Server-side dedup for CONFIRMATION alerts — applies to both TradingView and
 # Databento sources. Mirrors DatabentoBrain.CONFIRM_COOLDOWN_MIN (15 min).
 # Same-direction confirmations are suppressed for CONFIRM_COOLDOWN_MIN minutes
@@ -9911,12 +9918,24 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 has_bos_demand = has_choch_demand = False
                 has_bull_confirm = False
                 structure_demoted = "demand"
+                # Item 8: diagnostic counter (display-only, fail-open)
+                try:
+                    with _STRUCTURE_DEMOTE_LOCK:
+                        _STRUCTURE_DEMOTE_COUNTS["long"] += 1
+                except Exception:
+                    pass
             else:
                 # Fresh DEMAND reversal → demote the STALE supply (short) structure.
                 bos_sup_ts = choch_sup_ts = lh_ts = ll_ts = None
                 has_bos_supply = has_choch_supply = False
                 has_bear_confirm = False
                 structure_demoted = "supply"
+                # Item 8: diagnostic counter (display-only, fail-open)
+                try:
+                    with _STRUCTURE_DEMOTE_LOCK:
+                        _STRUCTURE_DEMOTE_COUNTS["short"] += 1
+                except Exception:
+                    pass
     structure_long  = bool(has_bos_demand or has_choch_demand or hh_ts or hl_ts)
     structure_short = bool(has_bos_supply or has_choch_supply or lh_ts or ll_ts)
 
@@ -15794,12 +15813,16 @@ def _audit_event_duplicates(inst, alert_history_snapshot, window_seconds=120, no
     return warnings
 
 
-def _record_source_analytics(result, inst):
+def _record_source_analytics(result, inst, directions=None):
     """Append one per-setup source attribution record to the Phase 5E ring buffer.
 
     FAIL-OPEN — any exception is silently swallowed. NEVER touches scoring state,
     ALERT_HISTORY, or any money-path variable. Called from full_analysis immediately
     after source_attribution and source_audit are set on `result`.
+
+    ``directions`` is the raw ``strict["directions"]`` dict from evaluate_strict_setup,
+    passed by the caller so we can extract per-direction gate debug without
+    recomputing any trading logic (Items 1, 2, 3).
     """
     if not inst or not isinstance(result, dict):
         return
@@ -15812,7 +15835,7 @@ def _record_source_analytics(result, inst):
                      "short" if "SHORT" in verdict else "neutral")
         ready     = "READY" in verdict
 
-        lsi           = result.get("learning_score_influence") or {}
+        lsi            = result.get("learning_score_influence") or {}
         learning_armed = bool(lsi.get("armed"))
 
         dc_groups = [
@@ -15822,27 +15845,85 @@ def _record_source_analytics(result, inst):
         ]
         dup_count = len(audit.get("duplicate_events") or [])
 
-        components = [
-            {
-                "component": c.get("component"),
+        # ── Item 1: Per-direction gate debug ────────────────────────────────
+        # Extracted from the already-computed evaluate_strict_setup() return so
+        # we NEVER recompute the trading decision.  The gate_debug per direction
+        # lives in strict["directions"]["Long|Short"]["gate_debug"] and contains
+        # the exact signal booleans the live SCALP decision used.
+        dirs      = directions or {}
+        long_dir  = dirs.get("Long")  or {}
+        short_dir = dirs.get("Short") or {}
+        long_gd   = long_dir.get("gate_debug")  or {}
+        short_gd  = short_dir.get("gate_debug") or {}
+
+        failed_gates_long  = (long_gd.get("failed_conditions")
+                              or long_gd.get("blockedBy") or [])
+        failed_gates_short = (short_gd.get("failed_conditions")
+                              or short_gd.get("blockedBy") or [])
+        edge_score_long  = long_gd.get("edge_score")
+        edge_score_short = short_gd.get("edge_score")
+        ready_long       = bool(long_dir.get("ready"))
+        ready_short      = bool(short_dir.get("ready"))
+
+        # ── Item 2: Zone identity for unique-opportunity dedup ───────────────
+        # Mirrors _auto_setup_key() semantics: (inst, direction, zone_low) gives
+        # one slot per setup.  Analytics-only — broker dedup is untouched.
+        tp = result.get("trade_plan") or {}
+        entry_zone = str(tp.get("entry_zone") or "")
+        try:
+            zone_low = round(float(entry_zone.split("–")[0].replace(",", "")), 0) if entry_zone else 0.0
+        except (TypeError, ValueError):
+            zone_low = 0.0
+
+        # ── Item 3: scored= annotation per component ─────────────────────────
+        # Maps each source-attribution component to the boolean from the gate_debug
+        # of the evaluated direction.  scored=True means the signal was actually
+        # active/confirmed and contributed evidence (per gate_debug field semantics).
+        # Session has no standalone gate_debug boolean → conservatively False.
+        _COMP_SIGNAL_MAP = {
+            "BOS":    "bosState",
+            "CHOCH":  "chochState",
+            "VWAP":   "vwap_confirmed",
+            "Sweep":  "liquidity_sweep",
+            "Volume": "volume_confirmed",
+            "CVD":    "cvd_confirmed",
+        }
+        signals_gd = (long_gd  if direction == "long" else
+                      short_gd if direction == "short" else {})
+
+        components = []
+        for c in attr:
+            cname   = c.get("component") or ""
+            sig_key = _COMP_SIGNAL_MAP.get(cname)
+            scored  = bool(signals_gd.get(sig_key)) if (sig_key and signals_gd) else False
+            components.append({
+                "component": cname,
                 "points":    c.get("points"),
                 "source":    c.get("source", "unknown"),
                 "age_s":     c.get("age_seconds"),
-            }
-            for c in attr
-        ]
+                "scored":    scored,
+            })
 
         record = {
-            "ts":            now_utc().isoformat(),
-            "inst":          inst,
-            "direction":     direction,
-            "edge_score":    result.get("edge_score") or 0,
-            "ready":         ready,
-            "verdict":       verdict,
-            "learning_armed": learning_armed,
-            "components":    components,
-            "dc_groups":     dc_groups,
-            "dup_count":     dup_count,
+            "ts":              now_utc().isoformat(),
+            "inst":            inst,
+            "direction":       direction,
+            "edge_score":      result.get("edge_score") or 0,
+            "ready":           ready,
+            "verdict":         verdict,
+            "learning_armed":  learning_armed,
+            "components":      components,
+            "dc_groups":       dc_groups,
+            "dup_count":       dup_count,
+            # Item 1: per-direction gate analytics
+            "failed_gates_long":  list(failed_gates_long),
+            "failed_gates_short": list(failed_gates_short),
+            "edge_score_long":    edge_score_long,
+            "edge_score_short":   edge_score_short,
+            "ready_long":         ready_long,
+            "ready_short":        ready_short,
+            # Item 2: zone identity for unique-opportunity dedup
+            "zone_low":           zone_low,
         }
 
         with _SOURCE_ANALYTICS_LOCK:
@@ -15855,12 +15936,15 @@ def _build_analytics_report():
     """Compute and return the Phase 5E source attribution analytics report.
 
     Reads the _SOURCE_ANALYTICS_RECORDS ring buffer under lock, then computes:
-      Part 1 — Session summary (total / READY / WAIT by instrument & direction)
+      Part 1 — Session summary (evaluations / unique opportunities / READY / WAIT)
       Part 2 — Duplicate evidence statistics (by evidence group)
       Part 3 — Source distribution (% by source type, component, instrument, direction)
-      Part 4 — Component correlation (pairwise co-occurrence rates)
+      Part 4 — Component correlation (pairwise co-occurrence rates, scored=True only)
       Part 5 — Evidence age statistics (avg / min / max per component)
       Part 6 — Key findings & recommendation (answers the 3 research questions)
+      Part 7 — Gate distribution (per unique opportunity, from failed_gates_long/short)
+      Part 8 — Structure-demotion diagnostics
+      Part 9 — Ghost outcome summary (from gate_audit_log if GATE_AUDIT_DB_READY)
 
     FAIL-OPEN — returns a minimal error dict on any exception. Purely read-only.
     """
@@ -15884,13 +15968,18 @@ def _build_analytics_report():
                 "min_records_for_findings": MIN_RECORDS,
                 "message": ("No data yet — results appear after live setups "
                             "are evaluated."),
-                "summary":               {"total": 0, "ready": 0, "wait": 0,
+                "summary":               {"evaluations_recorded": 0, "total": 0,
+                                          "unique_opportunities": 0,
+                                          "ready": 0, "wait": 0,
                                           "by_instrument": {}, "by_direction": {}},
                 "source_distribution":   {},
                 "duplicate_stats":       {},
                 "component_correlation": {},
                 "evidence_age":          {},
                 "findings":              empty_findings,
+                "gate_distribution":     {},
+                "structure_demote_diagnostics": {},
+                "ghost_outcome_summary": {},
                 "most_recent_attribution": [],
                 "generated_at":          now_utc().isoformat(),
             }
@@ -15907,9 +15996,26 @@ def _build_analytics_report():
             bi["total"] += 1; bi["ready" if r["ready"] else "wait"] += 1
             bd["total"] += 1; bd["ready" if r["ready"] else "wait"] += 1
 
+        # ── Item 2: Unique-opportunity dedup ──────────────────────────────
+        # A "unique opportunity" is a distinct (inst, direction, zone_low) tuple.
+        # Multiple polling snapshots of the same forming setup collapse to one.
+        # Analytics-only — broker dedup is untouched.
+        seen_opps: set = set()
+        for r in records:
+            d = r.get("direction", "neutral")
+            if d in ("long", "short"):
+                opp_key = (r["inst"], d, r.get("zone_low", 0.0))
+                seen_opps.add(opp_key)
+        unique_opps = len(seen_opps)
+
         summary = {
-            "total": n, "ready": ready_count, "wait": wait_count,
-            "by_instrument": by_inst, "by_direction": by_dir,
+            "evaluations_recorded": n,    # Item 2: renamed metric (was "total")
+            "total":                n,    # kept for backwards compat
+            "unique_opportunities": unique_opps,
+            "ready":                ready_count,
+            "wait":                 wait_count,
+            "by_instrument":        by_inst,
+            "by_direction":         by_dir,
         }
 
         # ── Part 3: Source distribution ───────────────────────────────────
@@ -15980,9 +16086,13 @@ def _build_analytics_report():
             "total_warnings":          sum(grp_counts.values()),
         }
 
-        # ── Part 4: Component correlation ─────────────────────────────────
-        def _present(comps, name):
-            return any(c.get("component") == name and c.get("age_s") is not None
+        # ── Part 4: Component correlation (Item 3: scored=True only) ─────
+        # A pair counts only when BOTH components have scored=True in the same
+        # evaluation.  This prevents the 100% co-occurrence artifact that arose
+        # because every component was present (age_s not None) in every record.
+        def _scored(comps, name):
+            """True only when the component was actually active/confirmed."""
+            return any(c.get("component") == name and c.get("scored", False)
                        for c in comps)
 
         PAIRS = [
@@ -15993,11 +16103,12 @@ def _build_analytics_report():
         component_correlation: dict = {}
         for (a, b) in PAIRS:
             cnt = sum(1 for r in records
-                      if _present(r.get("components") or [], a)
-                      and _present(r.get("components") or [], b))
+                      if _scored(r.get("components") or [], a)
+                      and _scored(r.get("components") or [], b))
             component_correlation[f"{a}+{b}"] = {
                 "count":         cnt,
                 "pct_of_setups": round(100 * cnt / n, 1),
+                "note":          "requires scored=True for both (Item 3 fix)",
             }
 
         # ── Part 5: Evidence age ──────────────────────────────────────────
@@ -16021,24 +16132,16 @@ def _build_analytics_report():
             max_dup_pct = max((v["pct_of_setups"]
                                for v in duplicate_stats["by_group"].values()),
                               default=0.0)
-            # Q1: Is Databento already fully represented by existing score components?
             q1 = ("yes"     if db_pct > 40
                   else "partial" if db_pct > 10
                   else "no")
-
-            # Q2: Are any components repeatedly scoring the same market evidence?
             q2 = ("yes"      if max_dup_pct > 20
                   else "possible" if max_dup_pct > 10
                   else "no")
-
-            # Q3: Statistical justification for a future Databento score delta?
-            # Justified only if Databento evidence is both dominant AND systematically
-            # double-counted by the current 7-component model.
             q3_justified = (max_dup_pct > 30 and db_pct > 50)
             q3 = ("yes"     if q3_justified
                   else "not_yet" if n < 100
                   else "no")
-
             rec_text = (
                 f"Duplicate evidence in {max_dup_pct:.0f}% of setups. "
                 f"Review before adding a Databento delta."
@@ -16046,7 +16149,6 @@ def _build_analytics_report():
                 else ("Insufficient statistical justification. "
                       "Keep current scoring model unchanged.")
             )
-
             findings = {
                 "databento_fully_represented": q1,
                 "repeated_evidence_scoring":   q2,
@@ -16054,7 +16156,8 @@ def _build_analytics_report():
                 "recommendation":              rec_text,
                 "databento_pct":               db_pct,
                 "max_duplicate_group_pct":     max_dup_pct,
-                "setups_analyzed":             n,
+                "evaluations_recorded":        n,
+                "unique_opportunities":        unique_opps,
             }
         else:
             findings = {
@@ -16063,18 +16166,130 @@ def _build_analytics_report():
                                    f"setups ({n}/{MIN_RECORDS} so far)."),
             }
 
+        # ── Part 7: Gate distribution per unique opportunity (Item 7) ─────
+        # For each unique opportunity, accumulate which gates failed (using the
+        # first record for that opportunity so polling repetitions don't inflate
+        # counts).  A single opportunity can appear in multiple gate counts when
+        # multiple gates failed simultaneously.
+        _GATE_LABELS = {
+            "edge_score":           "Edge Score",
+            "location":             "Location",
+            "structure_confirmed":  "Structure",
+            "vwap_confirmed":       "VWAP",
+            "conflicting_structure":"True Conflict",
+            "volatility_block":     "Vol Brake",
+            "volume_unconfirmed":   "Volume",
+            "cvd_conflict":         "CVD",
+        }
+        gate_dist_raw: dict = {}   # gate_key → count of unique opps that failed it
+        seen_opp_for_gate: set = set()
+        opp_first_record: dict = {}  # opp_key → first record
+
+        for r in records:
+            d = r.get("direction", "neutral")
+            if d not in ("long", "short"):
+                continue
+            opp_key = (r["inst"], d, r.get("zone_low", 0.0))
+            if opp_key not in opp_first_record:
+                opp_first_record[opp_key] = r
+
+        for opp_key, r in opp_first_record.items():
+            d = opp_key[1]
+            fgates = (r.get("failed_gates_long")  if d == "long"
+                      else r.get("failed_gates_short")) or []
+            # Parse "edge_score(45<60)" → "edge_score"
+            for fg in fgates:
+                gate_raw = fg.split("(")[0].strip()
+                gate_dist_raw[gate_raw] = gate_dist_raw.get(gate_raw, 0) + 1
+
+        n_opps = len(opp_first_record) or 1
+        gate_distribution = {
+            "unique_opportunities": len(opp_first_record),
+            "note":   ("An opportunity may appear in multiple gate counts "
+                       "when multiple gates failed simultaneously."),
+            "by_gate": {
+                lbl: {
+                    "count": gate_dist_raw.get(raw_key, 0),
+                    "pct_of_unique": round(
+                        100 * gate_dist_raw.get(raw_key, 0) / n_opps, 1),
+                }
+                for raw_key, lbl in _GATE_LABELS.items()
+            },
+            "raw_counts": dict(sorted(gate_dist_raw.items(),
+                                      key=lambda kv: kv[1], reverse=True)[:15]),
+        }
+
+        # ── Part 8: Structure-demotion diagnostics (Item 8) ───────────────
+        try:
+            with _STRUCTURE_DEMOTE_LOCK:
+                _dem_long  = _STRUCTURE_DEMOTE_COUNTS["long"]
+                _dem_short = _STRUCTURE_DEMOTE_COUNTS["short"]
+        except Exception:
+            _dem_long = _dem_short = 0
+
+        structure_demote_diagnostics = {
+            "enabled":          STRUCTURE_REVERSAL_DEMOTE_ENABLED,
+            "status":           "ON" if STRUCTURE_REVERSAL_DEMOTE_ENABLED else "OFF",
+            "demotions_long":   _dem_long,
+            "demotions_short":  _dem_short,
+            "demotions_total":  _dem_long + _dem_short,
+            "note": ("Counts stale-structure nullings this session. "
+                     "Resets on server restart."),
+        }
+
+        # ── Part 9: Ghost outcome summary (Item 9) ────────────────────────
+        ghost_outcome_summary: dict = {}
+        try:
+            import gate_effectiveness as _ge_rpt  # noqa: PLC0415
+            if _ge_rpt.GATE_AUDIT_DB_READY:
+                _gs = _ge_rpt.get_summary()
+                _bd = _ge_rpt.get_blocked_outcome_breakdown()
+                _re = _ge_rpt.get_rule_effectiveness()
+                if _gs.get("available"):
+                    ghost_outcome_summary = {
+                        "available":             True,
+                        "blocked_opportunities": _gs.get("total_blocked", 0),
+                        "resolved":              _gs.get("completed_outcomes", 0),
+                        "pending":               _gs.get("pending_outcomes", 0),
+                        "expired":               _bd.get("expired", 0),
+                        "reached_plus1r":        _bd.get("reached_plus1r", 0),
+                        "hit_minus1r":           _bd.get("hit_minus1r", 0),
+                        "neither_expired":        _bd.get("neither_expired", 0),
+                        "sample_warning":        (
+                            "⚠ Sample too small — do not infer expectancy."
+                            if _gs.get("completed_outcomes", 0) < 30 else None),
+                        "per_gate":              _re[:12] if _re else [],
+                        "collector_active":      _gs.get("collector_active", False),
+                        "last_recorded_at":      _gs.get("last_recorded_at"),
+                    }
+                else:
+                    ghost_outcome_summary = {
+                        "available": False,
+                        "reason":    _gs.get("error", "db_unavailable"),
+                    }
+            else:
+                ghost_outcome_summary = {
+                    "available": False,
+                    "reason":    "GATE_AUDIT_DB_READY=False — table not yet applied",
+                }
+        except Exception as _exc:
+            ghost_outcome_summary = {"available": False, "error": str(_exc)}
+
         return {
-            "record_count":             n,
-            "min_records_for_findings": MIN_RECORDS,
-            "summary":                  summary,
-            "source_distribution":      source_distribution,
-            "duplicate_stats":          duplicate_stats,
-            "component_correlation":    component_correlation,
-            "evidence_age":             evidence_age,
-            "findings":                 findings,
-            "most_recent_attribution":  (records[-1].get("components") or [])
-                                        if records else [],
-            "generated_at":             now_utc().isoformat(),
+            "record_count":                 n,
+            "min_records_for_findings":     MIN_RECORDS,
+            "summary":                      summary,
+            "source_distribution":          source_distribution,
+            "duplicate_stats":              duplicate_stats,
+            "component_correlation":        component_correlation,
+            "evidence_age":                 evidence_age,
+            "findings":                     findings,
+            "gate_distribution":            gate_distribution,
+            "structure_demote_diagnostics": structure_demote_diagnostics,
+            "ghost_outcome_summary":        ghost_outcome_summary,
+            "most_recent_attribution":      (records[-1].get("components") or [])
+                                            if records else [],
+            "generated_at":                 now_utc().isoformat(),
         }
     except Exception:
         return {"record_count": 0, "error": "report_generation_failed",
@@ -29273,7 +29488,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "double_counting_warnings": _src_dbl,
             "duplicate_events":         _src_dupes,
         }
-        _record_source_analytics(result, active_ticker)   # Phase 5E ring-buffer
+        _record_source_analytics(result, active_ticker,     # Phase 5E ring-buffer
+                                 directions=strict.get("directions"))  # Items 1-3
     except Exception:
         result["source_attribution"] = []
         result["source_audit"]       = {}

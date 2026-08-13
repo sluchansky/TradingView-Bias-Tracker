@@ -1183,6 +1183,53 @@ def get_component_stats() -> list[dict]:
             pass
 
 
+def get_blocked_outcome_breakdown() -> dict:
+    """Outcome breakdown for BLOCKED records only: +1R / -1R / expired counts.
+
+    Used by the ghost outcome summary in _build_analytics_report (Item 9).
+    Returns empty dict on any error (FAIL-OPEN).  Read-only — never touches
+    gate, risk, or execution.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return {}
+    conn = _learning_conn()
+    if conn is None:
+        return {}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE outcome_status = 'EXPIRED')              AS expired,
+                    COUNT(*) FILTER (WHERE outcome_status = 'COMPLETED'
+                                      AND final_r > 0)                              AS reached_plus1r,
+                    COUNT(*) FILTER (WHERE outcome_status = 'COMPLETED'
+                                      AND final_r <= 0)                             AS hit_minus1r,
+                    COUNT(*) FILTER (WHERE outcome_status = 'EXPIRED'
+                                      OR (outcome_status = 'COMPLETED'
+                                          AND final_r IS NULL))                     AS neither_expired
+                FROM gate_audit_log
+                WHERE gate_verdict = 'BLOCKED'
+                  AND baseline_version = %s
+            """, (BASELINE_VERSION,))
+            row = cur.fetchone()
+            if not row:
+                return {}
+            return {
+                "expired":         int(row[0] or 0),
+                "reached_plus1r":  int(row[1] or 0),
+                "hit_minus1r":     int(row[2] or 0),
+                "neither_expired": int(row[3] or 0),
+            }
+    except Exception as exc:
+        logger.debug("gate_effectiveness get_blocked_outcome_breakdown: %s", exc)
+        return {}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def get_missed_winners(limit: int = 20) -> list[dict]:
     """Top blocked opportunities that would have been profitable (highest final_r)."""
     if not GATE_AUDIT_DB_READY:
