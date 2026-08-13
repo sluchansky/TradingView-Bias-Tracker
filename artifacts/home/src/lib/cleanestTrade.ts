@@ -17,8 +17,8 @@
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-export const SCAN_INSTRUMENTS = ['MGC', 'MNQ', 'MES', 'MYM'] as const;
-export const SCAN_MODES       = ['SCALP', 'SWING']            as const;
+export const SCAN_INSTRUMENTS = ['MGC', 'MNQ', 'MES', 'MYM']                   as const;
+export const SCAN_MODES       = ['SCALP', 'SWING', 'INTRADAY_TREND']            as const;
 
 export type ScanInstrument = typeof SCAN_INSTRUMENTS[number];
 export type ScanMode       = typeof SCAN_MODES[number];
@@ -29,6 +29,9 @@ const ACTIONABLE_VERDICTS = new Set([
   'SHORT READY',
   'LONG EARLY READY',
   'SHORT EARLY READY',
+  // IT partial confirmation — manual-only at 50 % size
+  'LONG READY_REDUCED',
+  'SHORT READY_REDUCED',
 ]);
 
 // ── Types ─────────────────────────────────────────────────────────────────────

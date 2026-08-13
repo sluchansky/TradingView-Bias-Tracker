@@ -3084,6 +3084,198 @@ const CleanestTradeModal: React.FC<{
 };
 
 // ── Cleanest Trade Button strip ────────────────────────────────────────────────
+// ── Mode Overview Panel ───────────────────────────────────────────────────────
+/** Persistent always-on strip showing the best setup in each trading mode
+ *  (SCALP / INTRADAY / SWING) for the currently selected instrument.
+ *  Display-only — no execution, no gate changes. Polls every 30 s. */
+const ModeOverviewPanel: React.FC<{ ticker: string; authHeader: string }> = ({ ticker, authHeader }) => {
+  type ModeRow = { verdict: string; edge: number; reason: string | null; ok: boolean };
+  const [rows, setRows]           = React.useState<Record<string, ModeRow>>({});
+  const [loading, setLoading]     = React.useState(false);
+  const [fetchedAt, setFetchedAt] = React.useState<number | null>(null);
+
+  const MODES_CFG = [
+    { key: 'SCALP',          label: 'Scalp'    },
+    { key: 'INTRADAY_TREND', label: 'Intraday' },
+    { key: 'SWING',          label: 'Swing'    },
+  ] as const;
+
+  const ACTIONABLE_MO = new Set([
+    'LONG READY', 'SHORT READY',
+    'LONG EARLY READY', 'SHORT EARLY READY',
+    'LONG READY_REDUCED', 'SHORT READY_REDUCED',
+  ]);
+
+  const doFetch = React.useCallback(async () => {
+    if (!ticker) return;
+    setLoading(true);
+    const results = await Promise.allSettled(
+      MODES_CFG.map(({ key }) =>
+        fetch(`/api/status?ticker=${encodeURIComponent(ticker)}&mode=${key}`, {
+          headers: { Authorization: authHeader },
+        }).then(r => (r.ok ? r.json() : null)).catch(() => null)
+      )
+    );
+    const next: Record<string, ModeRow> = {};
+    MODES_CFG.forEach(({ key }, i) => {
+      const d = results[i].status === 'fulfilled' ? (results[i] as PromiseFulfilledResult<unknown>).value : null;
+      if (!d || typeof d !== 'object') {
+        next[key] = { verdict: 'WAIT', edge: 0, reason: null, ok: false };
+        return;
+      }
+      const rec = d as Record<string, unknown>;
+      const brain = rec.brain as Record<string, unknown> | undefined;
+      const dec   = (brain?.decision as Record<string, unknown> | undefined);
+      const scr   = (brain?.score   as Record<string, unknown> | undefined);
+      const verdict = String(dec?.verdict ?? rec.verdict ?? 'WAIT');
+      const edge    = Number(scr?.value   ?? rec.edge_score ?? 0);
+      const reason  = typeof rec.strict_reason === 'string' ? rec.strict_reason : null;
+      next[key] = { verdict, edge, reason, ok: true };
+    });
+    setRows(next);
+    setLoading(false);
+    setFetchedAt(Date.now());
+  }, [ticker, authHeader]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  React.useEffect(() => {
+    doFetch();
+    const id = window.setInterval(doFetch, 30_000);
+    return () => window.clearInterval(id);
+  }, [doFetch]);
+
+  // Pick the single best row (actionable first, then highest edge)
+  const bestKey = MODES_CFG.reduce<string | null>((best, { key }) => {
+    const r = rows[key];
+    if (!r?.ok) return best;
+    if (!best)  return key;
+    const br      = rows[best];
+    const candAct = ACTIONABLE_MO.has(r.verdict)  ? 1 : 0;
+    const bestAct = ACTIONABLE_MO.has(br.verdict) ? 1 : 0;
+    if (candAct !== bestAct) return candAct > bestAct ? key : best;
+    return r.edge > br.edge ? key : best;
+  }, null);
+
+  const verdictCol = (v: string): string => {
+    if (/READY_REDUCED/.test(v)) return T.cyan;
+    if (/EARLY/.test(v))         return T.amber;
+    if (/READY/.test(v))         return T.green;
+    return T.txtMuted;
+  };
+  const verdictLabel = (v: string): string => {
+    const dir = /LONG/.test(v) ? '▲ ' : /SHORT/.test(v) ? '▼ ' : '';
+    if (/READY_REDUCED/.test(v)) return `${dir}READY ½`;
+    if (/EARLY READY/.test(v))   return `${dir}EARLY`;
+    if (/READY/.test(v))         return `${dir}READY`;
+    return 'WAIT';
+  };
+
+  const anyData = Object.keys(rows).length > 0;
+
+  return (
+    <div style={{
+      marginBottom: 12,
+      border:       `1px solid ${T.border}`,
+      borderRadius: 10,
+      overflow:     'hidden',
+      background:   `${T.bg}`,
+    }}>
+      {/* Header */}
+      <div style={{
+        padding:       '6px 12px',
+        borderBottom:  `1px solid ${T.border}`,
+        display:       'flex',
+        justifyContent:'space-between',
+        alignItems:    'center',
+        background:    `${T.border}28`,
+      }}>
+        <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.08em', color:T.txtMuted }}>
+          MODE OVERVIEW · {ticker}
+        </span>
+        <span style={{ fontSize:9, color:`${T.txtMuted}70` }}>
+          {loading ? 'scanning…' : fetchedAt ? `${Math.round((Date.now() - fetchedAt) / 1000)}s ago` : '—'}
+        </span>
+      </div>
+
+      {/* Mode rows */}
+      {MODES_CFG.map(({ key, label }, idx) => {
+        const r      = rows[key];
+        const isBest = key === bestKey && r?.ok && ACTIONABLE_MO.has(r?.verdict ?? '');
+        const isAct  = r ? ACTIONABLE_MO.has(r.verdict) : false;
+        const col    = r ? verdictCol(r.verdict) : T.txtMuted;
+        const isLast = idx === MODES_CFG.length - 1;
+        return (
+          <div key={key} style={{
+            display:     'flex',
+            alignItems:  'center',
+            gap:         10,
+            padding:     '9px 12px',
+            borderBottom: isLast ? 'none' : `1px solid ${T.border}40`,
+            background:  isBest ? `${col}0c` : 'transparent',
+            transition:  'background 0.3s',
+          }}>
+            {/* Mode label */}
+            <span style={{
+              width:          58,
+              fontSize:       9.5,
+              fontWeight:     700,
+              color:          T.txtMuted,
+              letterSpacing:  '0.07em',
+              flexShrink:     0,
+              textTransform:  'uppercase',
+            }}>{label}</span>
+
+            {/* Verdict */}
+            {!anyData && <span style={{ fontSize:10, color:T.txtMuted }}>—</span>}
+            {anyData && !r?.ok && <span style={{ fontSize:10, color:`${T.txtMuted}60` }}>unavailable</span>}
+            {r?.ok && (
+              <>
+                <span style={{
+                  fontSize:   11,
+                  fontWeight: 700,
+                  color:      col,
+                  minWidth:   76,
+                }}>{verdictLabel(r.verdict)}</span>
+
+                {r.edge > 0 && (
+                  <span style={{ fontSize:10, color:col, opacity:0.75 }}>
+                    {Math.round(r.edge)}/110
+                  </span>
+                )}
+
+                {/* Blocker reason when WAIT */}
+                {!isAct && r.reason && (
+                  <span style={{
+                    fontSize:     9.5,
+                    color:        T.txtMuted,
+                    flex:         1,
+                    overflow:     'hidden',
+                    textOverflow: 'ellipsis',
+                    whiteSpace:   'nowrap',
+                    opacity:      0.7,
+                  }}>{r.reason}</span>
+                )}
+
+                {/* Best badge */}
+                {isBest && (
+                  <span style={{
+                    marginLeft:    'auto',
+                    fontSize:      9,
+                    fontWeight:    700,
+                    color:         col,
+                    letterSpacing: '0.06em',
+                    flexShrink:    0,
+                  }}>★ BEST</span>
+                )}
+              </>
+            )}
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
+// ── Cleanest Trade Button ─────────────────────────────────────────────────────
 const CleanestTradeButton: React.FC<{
   scanResult:   CleanestScanResult | null;
   scanning:     boolean;
@@ -12942,6 +13134,12 @@ export default function MainBrain() {
               <div style={{ marginBottom:12 }}>
                 <MarketStrip p={p} />
               </div>
+
+              {/* ── Mode Overview — best setup across SCALP / Intraday / SWING ── */}
+              <ModeOverviewPanel
+                ticker={ticker}
+                authHeader={getAuthHeader()['Authorization'] ?? ''}
+              />
 
               {/* ── Databento Live Market Chart ─────────────────────────────── */}
               <LiveMarketChart

@@ -57700,7 +57700,7 @@ def main_brain_route():
     _raw_tk  = (request.args.get("ticker") or "").upper()
     tk       = _instrument_from_text(_raw_tk)
     _mode_ov = (request.args.get("mode") or "").upper()
-    _mode_ov = _mode_ov if _mode_ov in ("SCALP", "SWING") else None
+    _mode_ov = _mode_ov if _mode_ov in ("SCALP", "SWING", "INTRADAY_TREND") else None
 
     if STATUS_CACHE_TTL_SEC <= 0:
         # Cache disabled — build inline (byte-identical to pre-cache path).
@@ -59118,7 +59118,7 @@ def status():
     # evaluate both modes in parallel without changing the live TRADING_MODE.
     # The override is isolated to this request's thread via _MODE_TLS.
     _mode_ov = (request.args.get("mode") or "").upper()
-    _mode_ov = _mode_ov if _mode_ov in ("SCALP", "SWING") else None
+    _mode_ov = _mode_ov if _mode_ov in ("SCALP", "SWING", "INTRADAY_TREND") else None
     if STATUS_CACHE_TTL_SEC <= 0:
         # Cache disabled — legacy inline build, byte-identical behavior.
         _MODE_TLS.override = _mode_ov
