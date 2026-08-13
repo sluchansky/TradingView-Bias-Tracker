@@ -3461,7 +3461,7 @@ SETUP_BUILDING_INTERVAL = int(os.environ.get("SETUP_BUILDING_INTERVAL", 600))  #
 # It is PURELY ADDITIVE: it never touches evaluate_strict_setup, the READY
 # verdict/score/SWING parity, the journal, or managed trades. READY remains the
 # single confirmed signal; EARLY is an unconfirmed heads-up that precedes it.
-EARLY_ALERTS_ENABLED = os.environ.get("ENABLE_EARLY_ALERTS", "true").strip().lower() in ("1", "true", "yes", "on")
+EARLY_ALERTS_ENABLED = os.environ.get("ENABLE_EARLY_ALERTS", "false").strip().lower() in ("1", "true", "yes", "on")
 # Where EARLY posts: "main" (default, the live signal channel) | "journal" | "none".
 EARLY_ALERT_CHANNEL  = os.environ.get("EARLY_ALERT_CHANNEL", "main").strip().lower()
 # Phone ping (@mention) on EARLY — OFF by default so a speculative early signal
