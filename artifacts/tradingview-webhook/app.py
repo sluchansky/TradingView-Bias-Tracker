@@ -46878,7 +46878,9 @@ def _scalp_sim_live_ctx(result):
         l["nearest_demand"]  = result.get("nearest_demand")
         l["nearest_supply"]  = result.get("nearest_supply")
         l["inst"]            = inst
-        l["session"]         = result.get("session")
+        _sess_raw            = result.get("session") or {}
+        l["session"]         = (_sess_raw.get("window") or _sess_raw.get("status")
+                                if isinstance(_sess_raw, dict) else _sess_raw)
         l["edge_score"]      = result.get("edge_score")
         return l
     except Exception:
