@@ -1,0 +1,511 @@
+BUILD: MNQ VISUAL BRAIN V1 — 1-MINUTE STATEFUL MARKET OBSERVER
+
+GOAL
+Create a lightweight visual-market observer that captures the live MNQ TradingView chart once every 60 seconds, sends the image plus recent visual-state history to a vision-capable model, receives strict structured analysis, stores every observation, and displays the current state on the existing dashboard.
+
+IMPORTANT:
+- MNQ ONLY for V1.
+- SHADOW / OBSERVATION ONLY.
+- DO NOT place trades.
+- DO NOT modify SCALP or INTRADAY_TREND decision logic yet.
+- DO NOT add another strategy.
+- Keep implementation small and isolated.
+- Reuse existing infrastructure where practical.
+- Existing trading engine must continue functioning if Visual Brain fails.
+
+==================================================
+1. ARCHITECTURE
+==================================================
+
+Create this pipeline:
+
+LIVE MNQ CHART
+    ↓
+SCREENSHOT EVERY 60 SECONDS
+    ↓
+VISUAL BRAIN ANALYZER
+    ↓
+STRICT JSON MARKET STATE
+    ↓
+STATE COMPARISON / MEMORY
+    ↓
+DATABASE
+    ↓
+VISUAL BRAIN DASHBOARD PANEL
+
+The visual analyzer MUST receive:
+1. Current screenshot
+2. Previous Visual Brain observation
+3. Up to the previous 10 observations as compact state history
+4. Current timestamp
+5. Instrument = MNQ
+
+Do NOT analyze each screenshot independently.
+
+==================================================
+2. SCREEN CAPTURE
+==================================================
+
+Capture only the TradingView MNQ chart region if possible.
+
+Preferred:
+- Browser automation / Playwright screenshot of chart element or fixed crop.
+
+Fallback:
+- Desktop screen capture with fixed configured coordinates.
+
+Config:
+
+VISUAL_BRAIN_ENABLED=true
+VISUAL_BRAIN_SYMBOL=MNQ
+VISUAL_BRAIN_INTERVAL_SECONDS=60
+
+Do not capture faster than once per minute.
+
+Store screenshots temporarily.
+
+Optionally retain only screenshots associated with meaningful state changes to reduce storage.
+
+==================================================
+3. VISUAL ANALYSIS
+==================================================
+
+Create:
+
+visual_brain.py
+
+Main entry:
+
+analyze_visual_market(
+    screenshot,
+    previous_state,
+    recent_history,
+    instrument="MNQ"
+)
+
+The model prompt should behave like a disciplined market observer.
+
+It should analyze ONLY what can reasonably be seen from the chart.
+
+Focus on:
+
+- current market structure
+- higher highs / higher lows
+- lower highs / lower lows
+- consolidation/range
+- support/resistance interaction
+- liquidity sweeps
+- breakout
+- breakdown
+- failed breakout
+- failed breakdown
+- reclaim
+- rejection
+- retest
+- continuation
+- reversal
+- momentum expansion
+- momentum exhaustion
+- chop
+- location relative to visible zones
+- whether price is approaching or leaving important structure
+
+DO NOT ask the model to predict exact future prices.
+
+==================================================
+4. STRICT OUTPUT SCHEMA
+==================================================
+
+Require VALID JSON ONLY:
+
+{
+  "instrument": "MNQ",
+  "timestamp": "...",
+
+  "bias": "BULLISH|BEARISH|NEUTRAL",
+
+  "market_state": "TRENDING_UP|TRENDING_DOWN|RANGE|REVERSAL|BREAKOUT|BREAKDOWN|RETEST|CHOP|UNCLEAR",
+
+  "structure": {
+    "short_term": "HH_HL|LH_LL|RANGE|TRANSITION|UNCLEAR",
+    "higher_low_intact": true,
+    "lower_high_intact": false
+  },
+
+  "last_event": "LIQUIDITY_SWEEP|RECLAIM|REJECTION|BREAKOUT|BREAKDOWN|RETEST|FAILED_BREAKOUT|FAILED_BREAKDOWN|STRUCTURE_SHIFT|NONE",
+
+  "support": {
+    "visible": true,
+    "description": "...",
+    "approx_price": null
+  },
+
+  "resistance": {
+    "visible": true,
+    "description": "...",
+    "approx_price": null
+  },
+
+  "long_condition": "...",
+  "short_condition": "...",
+
+  "action": "LONG_WATCH|SHORT_WATCH|WAIT|NO_TRADE",
+
+  "confidence": 0,
+
+  "state_changed": true,
+
+  "state_change_reason": "...",
+
+  "summary": "Maximum 2 concise sentences."
+}
+
+confidence = integer 0-100.
+
+Approximate prices may be null if unreadable.
+Never hallucinate a price.
+
+==================================================
+5. STATEFUL MEMORY
+==================================================
+
+This is critical.
+
+The observer must compare the current frame to previous frames.
+
+Example sequence from today's MNQ market:
+
+LIQUIDITY_SWEEP
+→ BULLISH_RECLAIM
+→ REVERSAL_CONFIRMED
+→ RESISTANCE_TEST
+→ RESISTANCE_REJECTION
+→ SECOND_FAILED_PUSH
+→ SUPPORT_TEST
+→ SUPPORT_BREAKDOWN
+→ BEARISH_CONTINUATION
+
+The observer needs to recognize transitions like this.
+
+Never permanently retain an old bullish/bearish opinion merely because an earlier signal occurred.
+
+NEW PRICE ACTION OVERRIDES OLD STATE.
+
+==================================================
+6. DATABASE
+==================================================
+
+Add a table:
+
+visual_brain_observations
+
+Columns:
+
+id
+timestamp
+instrument
+bias
+market_state
+short_term_structure
+last_event
+action
+confidence
+support_description
+support_price
+resistance_description
+resistance_price
+long_condition
+short_condition
+state_changed
+state_change_reason
+summary
+screenshot_path
+raw_json
+
+Indexes:
+
+(timestamp)
+(instrument, timestamp)
+(market_state)
+(last_event)
+
+Do not pollute the existing trade or gate tables.
+
+==================================================
+7. VISUAL STATE MACHINE
+==================================================
+
+Implement lightweight state tracking.
+
+Examples:
+
+RANGE
+→ LIQUIDITY_SWEEP
+→ RECLAIM
+→ REVERSAL
+→ RETEST
+→ CONTINUATION
+
+or:
+
+BULLISH_REVERSAL
+→ RESISTANCE_TEST
+→ REJECTION
+→ FAILED_CONTINUATION
+→ SUPPORT_TEST
+→ BREAKDOWN
+→ BEARISH_CONTINUATION
+
+Transitions should come primarily from the vision result, with previous state supplied for context.
+
+Do not create hundreds of hard-coded trading rules.
+
+The vision model interprets the chart.
+Code validates and records the interpretation.
+
+==================================================
+8. DASHBOARD
+==================================================
+
+Add a compact panel:
+
+VISUAL BRAIN — MNQ
+
+Display:
+
+Bias:
+BULLISH / BEARISH / NEUTRAL
+
+State:
+e.g. BREAKDOWN
+
+Structure:
+e.g. LH / LL
+
+Last Event:
+e.g. SUPPORT BREAKDOWN
+
+Action:
+SHORT WATCH
+
+Confidence:
+82%
+
+Support:
+...
+
+Resistance:
+...
+
+Long Condition:
+...
+
+Short Condition:
+...
+
+Current Summary:
+...
+
+Last Updated:
+10:21:00 ET
+
+Also show:
+
+STATE HISTORY
+
+Last ~10 state transitions:
+
+09:31 Liquidity Sweep
+09:34 Bullish Reclaim
+09:41 Reversal
+09:48 Resistance Rejection
+10:07 Second Rejection
+10:16 Support Test
+10:19 Breakdown
+10:20 Bearish Continuation
+
+Coloring is optional.
+Functionality first.
+
+==================================================
+9. COST CONTROL
+==================================================
+
+VERY IMPORTANT.
+
+One model call maximum per 60 seconds.
+
+MNQ only.
+
+Resize/compress screenshot before API submission.
+
+Do not send full-resolution desktop screenshots.
+
+Crop to chart region.
+
+Send compact previous-state history rather than previous screenshots.
+
+Do NOT resend 10 screenshots every minute.
+
+Current screenshot + textual history only.
+
+If market appears unchanged, still observe at the configured interval but minimize prompt/token size.
+
+Log:
+
+model calls
+tokens if available
+estimated API cost
+
+Create daily summary:
+
+visual_brain_calls_today
+visual_brain_cost_today
+
+==================================================
+10. FAILURE SAFETY
+==================================================
+
+If:
+
+- screenshot fails
+- model API fails
+- JSON invalid
+- timeout
+- rate limit
+
+Then:
+
+Visual Brain returns:
+
+status = ERROR
+
+Existing SCALP / INTRADAY / SWING systems continue normally.
+
+Visual Brain must NEVER stop the main trading engine.
+
+==================================================
+11. NO EXECUTION YET
+==================================================
+
+Visual Brain MUST NOT:
+
+- place orders
+- cancel orders
+- alter stops
+- alter targets
+- veto trades
+- force trades
+- modify SCALP score
+- modify INTRADAY score
+
+V1 is observational.
+
+Later we will compare:
+
+VISUAL BRAIN
+vs
+SCALP ENGINE
+vs
+actual subsequent price behavior.
+
+==================================================
+12. EVALUATION / GHOST OUTCOMES
+==================================================
+
+For each observation, evaluate future price movement after:
+
+1 minute
+3 minutes
+5 minutes
+10 minutes
+15 minutes
+
+Record whether the visual interpretation was directionally useful.
+
+Example:
+
+Visual Brain:
+SHORT_WATCH
+confidence 81
+
+Then record:
+
++1m favorable excursion
++3m favorable excursion
++5m favorable excursion
++10m favorable excursion
+maximum favorable excursion
+maximum adverse excursion
+
+Do NOT call these real trades.
+
+This is observational effectiveness data.
+
+==================================================
+13. STARTUP
+==================================================
+
+Visual Brain worker starts automatically with the app when:
+
+VISUAL_BRAIN_ENABLED=true
+
+No manual daily start.
+
+At boot log:
+
+[VISUAL_BRAIN] enabled
+[VISUAL_BRAIN] MNQ observer interval=60s
+
+==================================================
+14. TESTS
+==================================================
+
+Add tests for:
+
+- valid JSON parsing
+- malformed model response
+- screenshot failure
+- state persistence
+- state transitions
+- database insert
+- history retrieval
+- model timeout
+- disabled mode
+- main trading engine continues during Visual Brain failure
+
+Run all existing trading goldens/smokes afterward.
+
+SCALP behavior must remain unchanged.
+
+INTRADAY_TREND behavior must remain unchanged.
+
+SWING behavior must remain unchanged.
+
+ORB behavior must remain unchanged.
+
+==================================================
+15. DELIVERABLE REPORT
+==================================================
+
+When complete report ONLY:
+
+1. Files created
+2. Files modified
+3. DB migration applied
+4. Screenshot source/crop method
+5. Vision model being used
+6. Exact interval
+7. Example observation JSON
+8. Dashboard route/panel location
+9. Visual Brain worker status
+10. Cost controls implemented
+11. Test results
+12. Existing trading-system regression results
+13. Whether republish/restart is required
+
+DO NOT expand the scope.
+
+DO NOT redesign the trading engine.
+
+GET MNQ VISUAL BRAIN V1 RUNNING FIRST.
