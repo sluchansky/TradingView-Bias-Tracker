@@ -786,7 +786,17 @@ class GhostResearchEngine:
                     d["_fvg_family"] = True
                 self._open_results[d["result_id"]] = d
                 restored += 1
-        self._log.info("GhostResearchEngine: restored %d active experiments", restored)
+                # Restore _active_opp so post-restart POSITION_ACTIVE / BLOCKED /
+                # BREAKOUT_MISSED transitions can still resolve their opportunity.
+                # opportunity_id format is "GRE|INST|DATE|TS|DIR" — lexicographic
+                # order picks the newest when multiple rows share an instrument.
+                _ri = d.get("instrument")
+                _ro = d.get("opportunity_id")
+                if _ri and _ro and _ro > self._active_opp.get(_ri, ""):
+                    self._active_opp[_ri] = _ro
+        self._log.info(
+            "GhostResearchEngine: restored %d active experiments, _active_opp=%s",
+            restored, list(self._active_opp.keys()))
 
         # Restore FVG revisit dedup state from today's DB records
         try:

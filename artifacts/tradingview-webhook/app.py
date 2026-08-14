@@ -28916,6 +28916,11 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # Which instrument this analysis is for: an explicit override (dashboard tab)
     # wins; otherwise fall back to the most-recently-alerted instrument.
     active_ticker = instrument_of(ticker_override) if ticker_override else _active_ticker()
+    # Effective trading mode: honour a per-request TLS mode override (set by the
+    # /status?mode=… and /main-brain?mode=… routes for display-only multi-mode
+    # analysis) so that IT shadow analysis runs — and its gate decisions are
+    # recorded — whenever the caller requests mode=INTRADAY_TREND.
+    _eff_mode = getattr(_MODE_TLS, 'override', None) or TRADING_MODE
 
     score_window = cfg("SCORE_WINDOW_MIN")
     if score_window:
@@ -29052,7 +29057,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # (setup family → confirmation → build_intraday_trade_plan → veto layer) is the
     # sole authority.  SCALP / SWING are completely unaffected.
     _it_ctx = None
-    if TRADING_MODE == "INTRADAY_TREND" and strict_direction:
+    if _eff_mode == "INTRADAY_TREND" and strict_direction:
         try:
             _it_ctx = compute_intraday_trend_context(
                 active_ticker, current_price, confluences=confluences,
@@ -29067,7 +29072,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # READY/WAIT independently from the legacy gate.  SCALP / SWING never enter
     # this branch (TRADING_MODE guard) — their paths are byte-identical below.
     _it_legacy_strict = None
-    if TRADING_MODE == "INTRADAY_TREND" and strict_direction:
+    if _eff_mode == "INTRADAY_TREND" and strict_direction:
         # Shadow the inherited SWING strict result for ghost/gate-effectiveness logging.
         # Do NOT use this to gate execution — it is diagnostic only.
         _it_legacy_strict = {
@@ -29082,7 +29087,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         # confirmation / structural stop / ATR bounds / chase / R:R / daily cap).
         trade_plan = build_strict_trade_plan(
             strict_direction, active_ticker, current_price, nearest_supply, nearest_demand,
-            volatility=volatility, mode=TRADING_MODE, vwap=vwap_value,
+            volatility=volatility, mode=_eff_mode, vwap=vwap_value,
             edge_score=_authoritative_eb["score"],
             swing_context=swing_ctx,
             it_ctx=_it_ctx,
@@ -29240,7 +29245,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # risk of drift between two separate compute calls.  When the pre-compute
     # failed (_it_ctx is None) a safety fallback recomputes with the plan result.
     _iv = []
-    if TRADING_MODE == "INTRADAY_TREND" and is_actionable(verdict) and strict_direction:
+    if _eff_mode == "INTRADAY_TREND" and is_actionable(verdict) and strict_direction:
         try:
             if _it_ctx is None:
                 # Safety fallback: pre-compute failed — recompute now with plan.
@@ -30473,7 +30478,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # Attached only when TRADING_MODE == "INTRADAY_TREND".  Reuses the _it_ctx
     # computed at the money-path veto above when available; lazily computes for
     # WAIT / market-closed paths.  Key absent for SCALP / SWING → byte-identical.
-    if TRADING_MODE == "INTRADAY_TREND":
+    if _eff_mode == "INTRADAY_TREND":
         if not isinstance(_it_ctx, dict):
             try:
                 _it_ctx = compute_intraday_trend_context(
@@ -30906,7 +30911,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     if GATE_AUDIT_DB_READY:
         try:
             import gate_effectiveness as _ge_fa  # noqa: PLC0415
-            _ge_fa.record_gate_decision(result, active_ticker, TRADING_MODE)
+            _ge_fa.record_gate_decision(result, active_ticker, _eff_mode)
         except Exception as _ge_fa_exc:
             logger.debug("GateEffectiveness full_analysis (%s): %s", active_ticker, _ge_fa_exc)
 
@@ -50671,13 +50676,20 @@ def _scalp_sim_stats():
             pass
     agg = {}
     for strategy_key, status, result_label, r_mult, fidelity, closed_at in rows:
-        a = agg.setdefault(strategy_key, {"open": 0, "closed": 0, "wins": 0,
-                                          "losses": 0, "r_list": [], "fidelity": None,
+        a = agg.setdefault(strategy_key, {"open": 0, "closed": 0, "expired": 0,
+                                          "wins": 0, "losses": 0,
+                                          "r_list": [], "fidelity": None,
                                           "last_at": None})
         if fidelity and not a["fidelity"]:
             a["fidelity"] = fidelity
         if status in ("open", "resolving"):
             a["open"] += 1
+            continue
+        # Expired trades (max-hold timeout — no stop/target hit) are tracked
+        # separately and excluded from every expectancy metric so they cannot
+        # distort win_rate, avg_r, net_r, or the promotion threshold.
+        if result_label == "expired":
+            a["expired"] += 1
             continue
         a["closed"] += 1
         if r_mult is not None:
@@ -50705,6 +50717,7 @@ def _scalp_sim_stats():
                 mdd = min(mdd, cum - peak)
             dd = round(mdd, 2)
         out[key] = {"live_trades": a["closed"], "live_open": a["open"],
+                    "live_expired": a["expired"],
                     "live_win_rate": win_rate, "live_avg_r": avg_r,
                     "live_net_r": net_r, "live_max_dd_r": dd,
                     "live_last_at": a["last_at"], "live_fidelity": a["fidelity"]}
