@@ -1,0 +1,144 @@
+ublish the current build first so the new gate_audit_log.strategy, setup_id, new routes, IT hypothetical geometry, and dashboard panel are running in production.
+Fix opportunity deduplication before collecting much more data.
+Do not dedupe by only day + instrument + direction + mode + primary_blocker.
+Preferred identity:
+mode + strategy + instrument + direction + setup_id
+If setup_id is missing, create a fallback opportunity bucket using:
+mode + strategy + instrument + direction + primary_blocker + 10-minute time window
+Repeated /status polls inside the same opportunity must collapse to one opportunity.
+Genuine later setups on the same day must remain separate.
+
+Add geometry_source to gate-effectiveness records.
+Values:
+
+LIVE_PLAN
+IT_NATIVE
+ATR_FALLBACK
+SCALP_NATIVE
+NONE
+
+Existing IT ATR × 1.5 / 2R geometry may remain as a fallback, but it must never be indistinguishable from actual IT-native trade geometry.
+
+Improve blocked IT geometry.
+When enough IT structure exists, use the same stop/target construction that the live INTRADAY_TREND planner would have used.
+Only use ATR_FALLBACK when native geometry genuinely cannot be constructed.
+Do not alter live IT entry rules, stops, targets, gates, or execution behavior.
+Make SCALP a first-class research lane too.
+Every SCALP gate observation must store:
+mode=SCALP
+strategy
+setup_id
+instrument
+direction
+timestamp
+primary blocker
+all blockers
+component states
+edge score
+entry/stop/target geometry where possible
+geometry source
+eventual ghost/counterfactual outcome
+
+Preserve the originating scalp strategy through resolution.
+We need to be able to answer:
+
+VWAP_PULLBACK → ZONE blocked → +1R
+LIQUIDITY_SWEEP → CONFIRMATION blocked → -1R
+
+Do not aggregate away the strategy before the watcher resolves the trade.
+
+Add strategy-level analytics underneath each mode.
+Required reporting hierarchy:
+
+MODE → STRATEGY → GATE → OUTCOME
+
+For each strategy report:
+
+raw evaluations
+unique opportunities
+READY/pass count
+blocked count
+pass rate
+resolved counterfactual count
+would-win
+would-lose
+win rate
+net R
+average R
+profit factor
+geometry rate
+expired count
+top primary blocker
+
+Keep SCALP and INTRADAY_TREND statistically separate.
+Do not combine their:
+
+gate pass rates
+expectancy
+strategy performance
+geometry
+thresholds
+
+The combined dashboard may summarize them side by side only.
+
+Add production-health checks to the Gate Effectiveness panel.
+Show for SCALP and IT:
+
+last observation timestamp
+last resolved outcome timestamp
+observations last 24h
+unique opportunities last 24h
+pending outcomes
+resolved outcomes
+NO_GEOMETRY
+ATR_FALLBACK
+collector status: ACTIVE / SILENT
+
+Mark collector SILENT if market data is arriving but no research observations have been recorded for an abnormal period.
+
+Verify the scalp live-sim DB fix after publish.
+Production logs must no longer contain:
+can't adapt type 'dict'
+
+Confirm new scalp_strategy_sim_trades rows are actually inserting and session contains the expected session-window string.
+
+Verify the full production funnels.
+
+SCALP:
+market data → strategy candidate → gate evaluation → unique opportunity → geometry → pending → resolved
+
+INTRADAY_TREND:
+market data → IT candidate → gate evaluation → unique opportunity → native/fallback geometry → pending → resolved
+
+Do not change any trading thresholds yet.
+No changes to:
+
+zone radius
+VWAP requirements
+structure requirements
+confirmation thresholds
+edge threshold
+volatility rules
+session rules
+risk
+execution
+
+This task is instrumentation and research accuracy only.
+
+After implementation, run all four goldens and existing research/ghost smokes.
+Required:
+PARITY OK
+SCALP GOLDEN OK
+DUAL-SIM SMOKE OK
+BREAKOUT MODE SMOKE OK
+Return one final production report with:
+deployment status
+whether the dict DB error disappeared
+SCALP observations / unique opportunities / resolved
+IT observations / unique opportunities / resolved
+geometry-source breakdown
+top 5 SCALP blockers by strategy
+top 5 IT blockers
+any collector silence or unresolved pipeline issue
+
+Do not optimize the rules in this task. The goal is to make the data trustworthy enough that the next change is based on actual rejected-trade expectancy.

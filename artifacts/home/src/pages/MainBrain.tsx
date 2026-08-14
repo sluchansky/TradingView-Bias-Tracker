@@ -3270,6 +3270,13 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
     would_win: number; would_lose: number; expectancy_r: number | null;
     evidence_status: string;
   };
+  type HealthInfo = {
+    last_observation_ts: string | null; last_resolved_ts: string | null;
+    observations_24h: number; unique_opps_24h: number;
+    pending_outcomes: number; resolved_outcomes: number;
+    no_geometry_count: number; atr_fallback_count: number;
+    collector_status: 'ACTIVE' | 'SILENT' | 'NO_DATA';
+  };
   type ModeRpt = {
     available: boolean; mode: string;
     total_blocked: number; total_allowed: number;
@@ -3279,31 +3286,50 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
     gate_categories: GateCat[];
     component_pass_rates: Record<string, number>;
     evidence_status: string;
+    health?: HealthInfo;
   };
+  type StrategyRow = {
+    strategy: string; raw_evaluations: number; unique_opportunities: number;
+    ready_count: number; blocked_count: number; pass_rate: number;
+    resolved_count: number; would_win: number; would_lose: number;
+    win_rate: number | null; net_r: number | null; avg_r: number | null;
+    profit_factor: number | null; geometry_rate: number;
+    atr_fallback_count: number; top_primary_blocker: string | null;
+    evidence_status: string; no_geometry_count: number;
+  };
+  type StrategyRpt = { available: boolean; mode: string; strategies: Record<string, StrategyRow>; strategy_count: number };
 
-  const [tab, setTab]         = React.useState<'SCALP' | 'INTRADAY_TREND'>('INTRADAY_TREND');
-  const [rpts, setRpts]       = React.useState<Record<string, ModeRpt | null>>({});
-  const [loading, setLoading] = React.useState(false);
-  const [age, setAge]         = React.useState<number | null>(null);
-  const [open, setOpen]       = React.useState(false);
+  const [tab, setTab]             = React.useState<'SCALP' | 'INTRADAY_TREND'>('INTRADAY_TREND');
+  const [rpts, setRpts]           = React.useState<Record<string, ModeRpt | null>>({});
+  const [stratRpts, setStratRpts] = React.useState<Record<string, StrategyRpt | null>>({});
+  const [loading, setLoading]     = React.useState(false);
+  const [age, setAge]             = React.useState<number | null>(null);
+  const [open, setOpen]           = React.useState(false);
+  const [stratOpen, setStratOpen] = React.useState(false);
 
   const load = React.useCallback(async () => {
     if (!open) return;
     setLoading(true);
     try {
-      const [sr, ir] = await Promise.allSettled([
-        fetch('/api/gate-effectiveness/mode-report?mode=SCALP',
-          { headers: { Authorization: authHeader } })
-          .then(r => r.ok ? r.json() : null).catch(() => null),
-        fetch('/api/gate-effectiveness/mode-report?mode=INTRADAY_TREND',
-          { headers: { Authorization: authHeader } })
-          .then(r => r.ok ? r.json() : null).catch(() => null),
+      const fetchJson = (url: string) =>
+        fetch(url, { headers: { Authorization: authHeader } })
+          .then(r => r.ok ? r.json() : null).catch(() => null);
+      const [sr, ir, ssr, sir] = await Promise.allSettled([
+        fetchJson('/api/gate-effectiveness/mode-report?mode=SCALP'),
+        fetchJson('/api/gate-effectiveness/mode-report?mode=INTRADAY_TREND'),
+        fetchJson('/api/gate-effectiveness/strategy-report?mode=SCALP'),
+        fetchJson('/api/gate-effectiveness/strategy-report?mode=INTRADAY_TREND'),
       ]);
-      const extract = (res: PromiseSettledResult<unknown>) =>
+      const extractRpt = (res: PromiseSettledResult<unknown>) =>
         res.status === 'fulfilled' && res.value && typeof res.value === 'object'
           ? (res.value as Record<string, unknown>)['report'] as ModeRpt | null
           : null;
-      setRpts({ SCALP: extract(sr), INTRADAY_TREND: extract(ir) });
+      const extractStrat = (res: PromiseSettledResult<unknown>) =>
+        res.status === 'fulfilled' && res.value && typeof res.value === 'object'
+          ? (res.value as Record<string, unknown>)['report'] as StrategyRpt | null
+          : null;
+      setRpts({ SCALP: extractRpt(sr), INTRADAY_TREND: extractRpt(ir) });
+      setStratRpts({ SCALP: extractStrat(ssr), INTRADAY_TREND: extractStrat(sir) });
       setAge(Date.now());
     } finally {
       setLoading(false);
@@ -3312,19 +3338,37 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
 
   React.useEffect(() => {
     load();
-    const id = window.setInterval(load, 5 * 60_000);  // refresh every 5 min
+    const id = window.setInterval(load, 5 * 60_000);
     return () => window.clearInterval(id);
   }, [load]);
 
-  const rpt  = (rpts[tab] ?? null) as ModeRpt | null;
-  const cats = rpt?.gate_categories ?? [];
+  const rpt      = (rpts[tab] ?? null) as ModeRpt | null;
+  const stratRpt = (stratRpts[tab] ?? null) as StrategyRpt | null;
+  const cats  = rpt?.gate_categories ?? [];
   const comps = rpt?.component_pass_rates ?? {};
+  const hlth  = rpt?.health ?? null;
   const COMPS = ['BOS','CHOCH','VWAP','Sweep','Volume','CVD','Session','Zone'] as const;
 
   const catCol  = (pct: number) => pct >= 50 ? T.red : pct >= 20 ? T.amber : T.txtMuted;
   const rCol    = (v: number | null) => v == null ? T.txtMuted : v > 0 ? T.red : T.green;
   const fmtR    = (v: number | null) => v == null ? '—' : `${v > 0 ? '+' : ''}${v}R`;
   const compCol = (p: number) => p >= 70 ? T.green : p >= 40 ? T.amber : T.red;
+
+  // Relative time helper
+  const relTime = (iso: string | null): string => {
+    if (!iso) return '—';
+    const diff = (Date.now() - new Date(iso).getTime()) / 60_000;
+    if (diff < 2) return 'just now';
+    if (diff < 60) return `${Math.round(diff)}m ago`;
+    return `${Math.round(diff / 60)}h ago`;
+  };
+
+  const statusColor = (s?: string) =>
+    s === 'ACTIVE' ? T.green : s === 'SILENT' ? T.amber : T.txtMuted;
+
+  const stratRows = stratRpt?.available
+    ? Object.values(stratRpt.strategies).sort((a, b) => b.raw_evaluations - a.raw_evaluations)
+    : [];
 
   return (
     <div style={{ marginBottom: 12, border: `1px solid ${T.border}`, borderRadius: 10, overflow: 'hidden', background: T.bg }}>
@@ -3378,6 +3422,42 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
               {loading ? 'Loading…' : 'No data available for this mode.'}
             </div>
           ) : (<>
+
+            {/* ── Collector health strip ──────────────────────────────────── */}
+            {hlth && (
+              <div style={{
+                display: 'flex', flexWrap: 'wrap', gap: 10, alignItems: 'center',
+                marginBottom: 10, padding: '5px 8px',
+                background: `${T.border}12`, borderRadius: 6,
+                borderLeft: `3px solid ${statusColor(hlth.collector_status)}`,
+              }}>
+                <div style={{ display: 'flex', gap: 4, alignItems: 'center' }}>
+                  <span style={{
+                    fontSize: 8.5, fontWeight: 700,
+                    color: statusColor(hlth.collector_status),
+                    letterSpacing: '0.06em',
+                  }}>
+                    {hlth.collector_status}
+                  </span>
+                </div>
+                {[
+                  { l: 'Last obs',     v: relTime(hlth.last_observation_ts) },
+                  { l: 'Last resolved', v: relTime(hlth.last_resolved_ts) },
+                  { l: 'Obs/24h',      v: String(hlth.observations_24h) },
+                  { l: 'Opps/24h',     v: String(hlth.unique_opps_24h) },
+                  { l: 'Pending',      v: String(hlth.pending_outcomes) },
+                  { l: 'Resolved',     v: String(hlth.resolved_outcomes) },
+                  { l: 'No-geom',      v: String(hlth.no_geometry_count) },
+                  { l: 'ATR-fb',       v: String(hlth.atr_fallback_count) },
+                ].map(({ l, v }) => (
+                  <div key={l} style={{ display: 'flex', flexDirection: 'column' }}>
+                    <span style={{ fontSize: 7.5, color: `${T.txtMuted}80` }}>{l}</span>
+                    <span style={{ fontSize: 9.5, fontWeight: 600, color: T.txt }}>{v}</span>
+                  </div>
+                ))}
+              </div>
+            )}
+
             {/* Summary chips */}
             <div style={{
               display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 10,
@@ -3451,7 +3531,7 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
             <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.07em', marginBottom: 4 }}>
               COMPONENT PASS RATES
             </div>
-            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5, marginBottom: 12 }}>
               {COMPS.filter(k => comps[k] != null).map(k => {
                 const pct = comps[k] ?? 0;
                 return (
@@ -3465,6 +3545,81 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
                 );
               })}
             </div>
+
+            {/* ── Strategy breakdown (collapsible) ───────────────────────── */}
+            <div
+              role="button"
+              onClick={() => setStratOpen(o => !o)}
+              style={{
+                display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+                cursor: 'pointer', marginBottom: stratOpen ? 6 : 0,
+              }}
+            >
+              <span style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.07em' }}>
+                STRATEGIES {stratRows.length > 0 ? `(${stratRows.length})` : ''}
+              </span>
+              <span style={{ fontSize: 9, color: T.txtMuted }}>{stratOpen ? '▾' : '▸'}</span>
+            </div>
+            {stratOpen && (
+              stratRows.length === 0 ? (
+                <div style={{ fontSize: 10, color: T.txtMuted, padding: '8px 0' }}>
+                  No strategy data yet.
+                </div>
+              ) : (
+                <div style={{ overflowX: 'auto' }}>
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 9.5 }}>
+                    <thead>
+                      <tr style={{ borderBottom: `1px solid ${T.border}40` }}>
+                        {['Strategy','Evals','Opps','Pass%','Win%','Net R','Avg R','PF','Geom%','ATR-fb','Top Blocker'].map(h => (
+                          <th key={h} style={{
+                            padding: '2px 5px', fontSize: 8, color: T.txtMuted, fontWeight: 600,
+                            textAlign: h === 'Strategy' || h === 'Top Blocker' ? 'left' : 'right',
+                            whiteSpace: 'nowrap',
+                          }}>{h}</th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {stratRows.map(s => (
+                        <tr key={s.strategy} style={{ borderBottom: `1px solid ${T.border}15` }}>
+                          <td style={{ padding: '4px 5px', color: T.txt, fontWeight: 600, whiteSpace: 'nowrap', maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                            {s.strategy}
+                          </td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right', color: T.txtMuted }}>{s.raw_evaluations}</td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right', color: T.txtMuted }}>{s.unique_opportunities}</td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right', color: s.pass_rate > 20 ? T.amber : T.txtMuted }}>
+                            {s.pass_rate}%
+                          </td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right',
+                            color: s.win_rate == null ? T.txtMuted : s.win_rate >= 50 ? T.green : T.red }}>
+                            {s.win_rate != null ? `${s.win_rate}%` : '—'}
+                          </td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right', fontWeight: s.net_r != null ? 700 : 400,
+                            color: rCol(s.net_r) }}>{fmtR(s.net_r)}</td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right', color: rCol(s.avg_r) }}>{fmtR(s.avg_r)}</td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right',
+                            color: s.profit_factor == null ? T.txtMuted : s.profit_factor >= 1.5 ? T.green : s.profit_factor >= 1 ? T.amber : T.red }}>
+                            {s.profit_factor != null ? s.profit_factor.toFixed(2) : '—'}
+                          </td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right',
+                            color: s.geometry_rate > 50 ? T.green : T.txtMuted }}>
+                            {s.geometry_rate}%
+                          </td>
+                          <td style={{ padding: '4px 5px', textAlign: 'right',
+                            color: s.atr_fallback_count > 0 ? T.amber : T.txtMuted }}>
+                            {s.atr_fallback_count || '—'}
+                          </td>
+                          <td style={{ padding: '4px 5px', color: T.txtMuted, fontSize: 8.5,
+                            maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                            {s.top_primary_blocker ?? '—'}
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )
+            )}
           </>)}
         </div>
       )}

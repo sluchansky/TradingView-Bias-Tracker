@@ -434,6 +434,8 @@ export const BOT1_ROUTES = [
   "/gate-effectiveness/mode-report",
   "/gate-effectiveness/mode-comparison",
   "/gate-effectiveness/opportunities",
+  // Phase 8C MODE→STRATEGY→GATE→OUTCOME funnel analytics.
+  "/gate-effectiveness/strategy-report",
   // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).
   // Returns 4H/15M trend states from Databento 1m bar resampling.
   "/market/trend-alignment",

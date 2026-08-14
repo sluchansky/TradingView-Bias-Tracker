@@ -48079,6 +48079,14 @@ def _maybe_observe_scalp_live_sim(result, source="webhook"):
     atr     = l.get("atr") or 0.0
     session = l.get("session")
     regime  = l.get("regime")
+    # ── Defensive scalar coercion — psycopg2 cannot adapt dict to TEXT ───────
+    # detect_market_regime() may return the raw sub-dict; extract the label string.
+    if isinstance(regime, dict):
+        regime = (regime.get("label") or regime.get("regime")
+                  or str(regime)[:64])
+    if isinstance(session, dict):
+        session = (session.get("window") or session.get("label")
+                   or session.get("status") or str(session)[:64])
     edge    = result.get("edge_score")
     now_mono = time.monotonic()
     et_day   = now_utc().astimezone(ET_TZ).strftime("%Y%m%d")
@@ -82133,6 +82141,19 @@ def route_gate_saved_losses():
         import gate_effectiveness as _ge  # noqa: PLC0415
         limit = min(100, max(1, int(request.args.get("limit", 20))))
         return jsonify({"ok": True, "records": _ge.get_saved_losses(limit=limit)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/strategy-report", methods=["GET"])
+def route_gate_strategy_report():
+    """Per-strategy funnel analytics — Phase 8C MODE → STRATEGY → GATE → OUTCOME.
+    Query param: mode=SCALP | INTRADAY_TREND  (default INTRADAY_TREND)
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        mode = (request.args.get("mode") or "INTRADAY_TREND").strip().upper()
+        return jsonify({"ok": True, "report": _ge.get_strategy_report(mode)})
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 

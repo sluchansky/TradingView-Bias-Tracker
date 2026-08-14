@@ -249,21 +249,29 @@ def _extract(result: dict) -> dict:
             cvd_ok_it: Optional[bool] = None
             if "cvd_conflict" in gd:
                 cvd_ok_it = not gd["cvd_conflict"]
-            # ── Geometry: real plan or ATR-based hypothetical fallback ─────────────
-            # When the IT engine blocks before building a plan (no real geometry),
-            # compute a hypothetical entry/stop/target from current_price + ATR so
-            # the counterfactual watcher can track what would have happened.
-            # ATR×1.5 = IT structural stop philosophy; 2R target = standard IT RR.
-            # Stored in the same geometry columns as real plans — gate_verdict=BLOCKED
-            # distinguishes these from ALLOWED records.
+            # ── Geometry: real IT plan, then ATR-based hypothetical fallback ────────
             _has_plan    = bool(trade_plan.get("trade_plan"))
             _entry_px    = float(trade_plan["entry"])     if _has_plan and trade_plan.get("entry")    else None
             _stop_px     = (float(trade_plan["stop_loss"]) if _has_plan and trade_plan.get("stop_loss") else None)
             _target1_px  = (float(trade_plan["target1"])   if _has_plan and trade_plan.get("target1")   else None)
             _target2_px  = (float(trade_plan["target2"])   if _has_plan and trade_plan.get("target2")   else None)
             _risk_pts_it = trade_plan.get("risk_points")   if _has_plan else None
-            _it_strategy = "INTRADAY_TREND" if _has_plan else "IT_HYPOTHETICAL"
 
+            # geometry_source:
+            # IT_NATIVE  — the IT structural planner built a real plan.
+            # LIVE_PLAN  — trade was ALLOWED (plan activated for entry).
+            # ATR_FALLBACK — synthetic ATR×1.5 bracket used when no plan was built.
+            # NONE       — no geometry at all.
+            if gate_verdict in ("ALLOWED", "EARLY_ALLOWED"):
+                _it_geom_src = "LIVE_PLAN" if _has_plan else "NONE"
+            elif _has_plan:
+                _it_geom_src = "IT_NATIVE"
+            else:
+                _it_geom_src = "NONE"
+
+            # When no real plan was built, try ATR-based hypothetical geometry so
+            # the counterfactual watcher can track what price action would have done.
+            # ATR×1.5 stop / 2R target matches the IT structural stop philosophy.
             if _entry_px is None and direction in ("Long", "Short"):
                 _cur_px  = result.get("current_price")
                 _atr_val = vol.get("atr_pts")
@@ -274,6 +282,7 @@ def _extract(result: dict) -> dict:
                     _stop_px    = round(_e - _sdist, 2) if direction == "Long" else round(_e + _sdist, 2)
                     _target1_px = round(_e + _sdist * 2.0, 2) if direction == "Long" else round(_e - _sdist * 2.0, 2)
                     _risk_pts_it = round(_sdist, 4)
+                    _it_geom_src = "ATR_FALLBACK"
 
             return {
                 "verdict":          verdict,
@@ -298,7 +307,8 @@ def _extract(result: dict) -> dict:
                 "trend_alignment":  _scalar_str(it_ctx.get("trend_alignment")),
                 "volatility_regime":vol.get("regime") or vol.get("label"),
                 "session":          _scalar_str(it_ctx.get("session")),
-                "strategy":         _it_strategy,
+                "strategy":         it_ctx.get("setup_type") or "INTRADAY_TREND",
+                "geometry_source":  _it_geom_src,
             }
         # ── /IT-native extraction ─────────────────────────────────────────────
 
@@ -335,6 +345,29 @@ def _extract(result: dict) -> dict:
                 risk_pts = abs(float(entry) - float(stop_px))
         except Exception:
             pass
+
+        # ── Geometry source + SCALP ATR fallback ─────────────────────────────
+        # LIVE_PLAN:    real plan activated (ALLOWED record — trade entered).
+        # SCALP_NATIVE: plan data available for a BLOCKED evaluation.
+        # ATR_FALLBACK: synthetic bracket when BLOCKED with no plan data.
+        # NONE:         no geometry available.
+        if gate_verdict in ("ALLOWED", "EARLY_ALLOWED"):
+            _geom_src = "LIVE_PLAN" if entry is not None else "NONE"
+        elif entry is not None and stop_px is not None:
+            _geom_src = "SCALP_NATIVE"
+        else:
+            _atr_s = vol.get("atr_pts")
+            _cpx_s = result.get("current_price")
+            if _atr_s and _cpx_s and float(_atr_s) > 0 and direction in ("Long", "Short"):
+                _e_s    = float(_cpx_s)
+                _sd_s   = float(_atr_s) * 1.0   # SCALP: 1×ATR stop, 1:1 RR target
+                entry   = _e_s
+                stop_px = round(_e_s - _sd_s, 2) if direction == "Long" else round(_e_s + _sd_s, 2)
+                t1      = round(_e_s + _sd_s, 2) if direction == "Long" else round(_e_s - _sd_s, 2)
+                risk_pts = round(_sd_s, 4)
+                _geom_src = "ATR_FALLBACK"
+            else:
+                _geom_src = "NONE"
 
         # ── Score & grade ──
         score = int(eb.get("score") or 0)
@@ -375,6 +408,8 @@ def _extract(result: dict) -> dict:
             "trend_alignment":  _scalar_str(result.get("trend_alignment")),
             "volatility_regime":vol.get("regime") or vol.get("label"),
             "session":          _scalar_str(result.get("session_state") or result.get("session")),
+            "strategy":         _extract_strategy(result, mode),
+            "geometry_source":  _geom_src,
         }
     except Exception as exc:
         logger.debug("gate_effectiveness _extract: %s", exc)
@@ -389,6 +424,7 @@ def _extract(result: dict) -> dict:
             "comp_session": "UNAVAILABLE", "comp_zone": "UNAVAILABLE",
             "atr_pts": None, "vwap_value": None, "cvd_direction": None,
             "trend_alignment": None, "volatility_regime": None, "session": None,
+            "strategy": None, "geometry_source": "NONE",
         }
 
 
@@ -456,23 +492,26 @@ def _record(result: dict, instrument: str, mode: str) -> None:
     now   = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
 
-    # ── Opportunity grouping key (daily per instrument/direction/mode) ──────
-    # Groups every poll of the same directional setup into one "opportunity"
-    # for the mode-report deduplication queries.
-    setup_id = f"{inst}|{direction}|{mode}|{now.strftime('%Y%m%d')}"
-
     # ── Strategy / setup label ───────────────────────────────────────────────
     strategy = info.get("strategy") or _extract_strategy(result, mode)
 
+    # ── Opportunity grouping key (daily per mode+strategy+instrument+direction) ──
+    # Includes strategy so VWAP_PULLBACK and LIQUIDITY_SWEEP on the same instrument
+    # are tracked as SEPARATE opportunities in analytics queries.
+    setup_id = f"{mode}|{strategy}|{inst}|{direction}|{now.strftime('%Y%m%d')}"
+
     # ── Dedup key ──
-    # ALLOWED: 10-minute bucket per instrument/direction/mode (each READY counts)
-    # BLOCKED: 1-hour bucket per instrument/direction/mode (avoid re-recording same block)
+    # Identity = mode + strategy + instrument + direction + 10-minute bucket.
+    # • ALLOWED: each 10-minute READY window records its own row.
+    # • BLOCKED: polls within the same 10-minute window collapse to one row;
+    #   a genuine later setup on the same day gets a new row (different bucket).
+    # Including strategy prevents different sub-strategies from collapsing into
+    # a single row when they block in the same window.
+    _ten_min = now.strftime("%Y%m%d%H") + f"{now.minute // 10:02d}"
     if gate_verdict in ("ALLOWED", "EARLY_ALLOWED"):
-        ts_bucket = now.strftime("%Y%m%d%H") + f"{now.minute // _ALLOWED_DEDUP_MIN:02d}"
-        audit_id  = f"{inst}|{direction}|{mode}|ALLOWED|{ts_bucket}"
+        audit_id = f"{mode}|{strategy}|{inst}|{direction}|ALLOWED|{_ten_min}"
     else:
-        hour_bucket = now.strftime("%Y%m%d%H")
-        audit_id    = f"{inst}|{direction}|{mode}|BLOCKED|{hour_bucket}"
+        audit_id = f"{mode}|{strategy}|{inst}|{direction}|BLOCKED|{_ten_min}"
 
     # ── Determine initial outcome_status ──
     has_geometry = (
@@ -504,7 +543,8 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     atr_pts, vwap_value, cvd_direction, trend_alignment,
                     volatility_regime, session,
                     outcome_status,
-                    strategy, setup_id
+                    strategy, setup_id,
+                    geometry_source
                 ) VALUES (
                     %s,%s,%s,%s,
                     %s,%s,%s,%s,
@@ -516,7 +556,8 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     %s,%s,%s,%s,
                     %s,%s,
                     %s,
-                    %s,%s
+                    %s,%s,
+                    %s
                 )
                 ON CONFLICT (audit_id) DO UPDATE SET
                     last_seen_at     = EXCLUDED.last_seen_at,
@@ -538,7 +579,18 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     session          = EXCLUDED.session,
                     strategy         = COALESCE(EXCLUDED.strategy,  gate_audit_log.strategy),
                     setup_id         = COALESCE(EXCLUDED.setup_id,  gate_audit_log.setup_id),
-                    -- Promote NO_GEOMETRY → PENDING when hypothetical geometry arrives
+                    -- Promote geometry_source to highest-fidelity value seen for this slot.
+                    -- Ordering: LIVE_PLAN / IT_NATIVE / SCALP_NATIVE > ATR_FALLBACK > NONE.
+                    geometry_source  = CASE
+                        WHEN EXCLUDED.geometry_source IN ('LIVE_PLAN','IT_NATIVE','SCALP_NATIVE')
+                        THEN EXCLUDED.geometry_source
+                        WHEN gate_audit_log.geometry_source IN ('LIVE_PLAN','IT_NATIVE','SCALP_NATIVE')
+                        THEN gate_audit_log.geometry_source
+                        WHEN EXCLUDED.geometry_source = 'ATR_FALLBACK'
+                        THEN EXCLUDED.geometry_source
+                        ELSE COALESCE(EXCLUDED.geometry_source, gate_audit_log.geometry_source)
+                    END,
+                    -- Promote NO_GEOMETRY → PENDING when geometry arrives
                     outcome_status   = CASE
                         WHEN gate_audit_log.outcome_status = 'NO_GEOMETRY'
                          AND EXCLUDED.entry_price IS NOT NULL
@@ -562,6 +614,7 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                 info["volatility_regime"], info["session"],
                 initial_status,
                 strategy, setup_id,
+                info.get("geometry_source", "NONE"),
             ))
         conn.commit()
         logger.info(
@@ -1665,6 +1718,28 @@ def get_mode_report(mode: str) -> dict:
             cr         = cur.fetchone()
             comp_total = max(int(cr[8] or 0), 1)
 
+            # ── Collector health + 24-hour window metrics ────────────────────
+            cur.execute("""
+                SELECT
+                    MAX(recorded_at)                                                           AS last_obs_ts,
+                    MAX(outcome_resolved_at)                                                   AS last_resolved_ts,
+                    COUNT(*) FILTER (WHERE recorded_at >= NOW() - INTERVAL '24 hours')         AS obs_24h,
+                    COUNT(DISTINCT COALESCE(setup_id,
+                          instrument || '|' || direction || '|'
+                          || TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'YYYYMMDD')))
+                      FILTER (WHERE recorded_at >= NOW() - INTERVAL '24 hours')                AS opps_24h,
+                    COUNT(*) FILTER (WHERE geometry_source = 'ATR_FALLBACK')                   AS atr_fallback
+                FROM gate_audit_log
+                WHERE mode = %s AND baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
+            """, (mode, BASELINE_VERSION))
+            hr        = cur.fetchone()
+            _last_obs = hr[0]
+            _last_res = hr[1]
+            obs_24h   = int(hr[2] or 0)
+            opps_24h  = int(hr[3] or 0)
+            atr_fb    = int(hr[4] or 0)
+
         # ── Aggregate into gate categories ───────────────────────────────────
         categories: dict = {}
         for r in blocker_rows:
@@ -1749,6 +1824,22 @@ def get_mode_report(mode: str) -> dict:
                 "Zone":    round(100.0 * int(cr[7] or 0) / comp_total, 1),
             },
             "evidence_status": _evidence_status(completed),
+            "health": {
+                "last_observation_ts":  _last_obs.isoformat() if _last_obs else None,
+                "last_resolved_ts":     _last_res.isoformat() if _last_res else None,
+                "observations_24h":     obs_24h,
+                "unique_opps_24h":      opps_24h,
+                "pending_outcomes":     pending,
+                "resolved_outcomes":    completed,
+                "no_geometry_count":    no_geom,
+                "atr_fallback_count":   atr_fb,
+                "collector_status": (
+                    "ACTIVE"  if _last_obs and
+                                 (datetime.now(timezone.utc) - _last_obs).total_seconds() < 3600
+                    else "NO_DATA" if _last_obs is None
+                    else "SILENT"
+                ),
+            },
         }
     except Exception as exc:
         logger.debug("gate_effectiveness get_mode_report(%s): %s", mode, exc)
@@ -1781,6 +1872,130 @@ def get_mode_comparison() -> dict:
             ) if scalp.get("available") and it.get("available") else None,
         },
     }
+
+
+def get_strategy_report(mode: str) -> dict:
+    """Per-strategy funnel analytics within a mode: MODE→STRATEGY→GATE→OUTCOME.
+
+    Returns a dict keyed by strategy label with full pipeline stats so the
+    operator can compare e.g. VWAP_PULLBACK vs LIQUIDITY_SWEEP win rates.
+    FAIL-OPEN — display-only, never touches gate or execution.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return {"available": False}
+    conn = _learning_conn()
+    if conn is None:
+        return {"available": False, "error": "db_unavailable"}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COALESCE(strategy, mode)                                                    AS strat,
+                    COUNT(*)                                                                    AS raw_evals,
+                    COUNT(DISTINCT COALESCE(setup_id,
+                          mode || '|' || COALESCE(strategy, mode) || '|' ||
+                          instrument || '|' || direction || '|'
+                          || TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'YYYYMMDD')))             AS unique_opps,
+                    COUNT(*) FILTER (WHERE gate_verdict IN ('ALLOWED','EARLY_ALLOWED'))        AS ready_count,
+                    COUNT(*) FILTER (WHERE gate_verdict = 'BLOCKED')                           AS blocked_count,
+                    COUNT(*) FILTER (WHERE outcome_status = 'COMPLETED')                       AS resolved_count,
+                    COUNT(*) FILTER (WHERE outcome_status = 'COMPLETED' AND final_r > 0)       AS would_win,
+                    COUNT(*) FILTER (WHERE outcome_status = 'COMPLETED' AND final_r <= 0)      AS would_lose,
+                    COUNT(*) FILTER (WHERE outcome_status = 'NO_GEOMETRY')                     AS no_geometry,
+                    ROUND(SUM(final_r)
+                          FILTER (WHERE outcome_status = 'COMPLETED')::numeric, 3)             AS net_r,
+                    ROUND(AVG(final_r)
+                          FILTER (WHERE outcome_status = 'COMPLETED')::numeric, 3)             AS avg_r,
+                    ROUND(SUM(final_r)
+                          FILTER (WHERE outcome_status = 'COMPLETED' AND final_r > 0)::numeric, 3) AS gross_win,
+                    ABS(ROUND(SUM(final_r)
+                          FILTER (WHERE outcome_status = 'COMPLETED' AND final_r < 0)::numeric, 3)) AS gross_loss,
+                    COUNT(*) FILTER (WHERE entry_price IS NOT NULL)                            AS with_geometry,
+                    COUNT(*) FILTER (WHERE geometry_source = 'ATR_FALLBACK')                   AS atr_fallback
+                FROM gate_audit_log
+                WHERE mode = %s AND baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
+                GROUP BY COALESCE(strategy, mode)
+                ORDER BY raw_evals DESC
+            """, (mode, BASELINE_VERSION))
+            rows = cur.fetchall()
+
+            # Top primary blocker per strategy (separate query for efficiency)
+            cur.execute("""
+                SELECT
+                    COALESCE(strategy, mode) AS strat,
+                    COALESCE(primary_blocker, 'Unknown') AS blocker,
+                    COUNT(*) AS n
+                FROM gate_audit_log
+                WHERE mode = %s AND gate_verdict = 'BLOCKED'
+                  AND baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
+                GROUP BY 1, 2
+                ORDER BY 1, 3 DESC
+            """, (mode, BASELINE_VERSION))
+            top_blocker: dict = {}
+            for br in cur.fetchall():
+                if br[0] not in top_blocker:
+                    top_blocker[br[0]] = br[1]
+
+        result: dict = {}
+        for r in rows:
+            strat        = r[0]
+            raw_evals    = int(r[1] or 0)
+            unique_opps  = int(r[2] or 0)
+            ready        = int(r[3] or 0)
+            blocked      = int(r[4] or 0)
+            resolved     = int(r[5] or 0)
+            win          = int(r[6] or 0)
+            lose         = int(r[7] or 0)
+            no_geom      = int(r[8] or 0)
+            net_r        = _safe_float(r[9])
+            avg_r        = _safe_float(r[10])
+            gross_win    = _safe_float(r[11]) or 0.0
+            gross_loss   = _safe_float(r[12]) or 0.0
+            with_geom    = int(r[13] or 0)
+            atr_fb       = int(r[14] or 0)
+
+            pass_rate  = round(100.0 * ready  / raw_evals, 1) if raw_evals > 0 else 0.0
+            win_rate   = round(100.0 * win / (win + lose), 1) if (win + lose) > 0 else None
+            geom_rate  = round(100.0 * with_geom / raw_evals, 1) if raw_evals > 0 else 0.0
+            pf         = round(gross_win / gross_loss, 2) if gross_loss > 0 else None
+
+            result[strat] = {
+                "strategy":             strat,
+                "raw_evaluations":      raw_evals,
+                "unique_opportunities": unique_opps,
+                "ready_count":          ready,
+                "blocked_count":        blocked,
+                "pass_rate":            pass_rate,
+                "resolved_count":       resolved,
+                "would_win":            win,
+                "would_lose":           lose,
+                "no_geometry_count":    no_geom,
+                "win_rate":             win_rate,
+                "net_r":                net_r,
+                "avg_r":                avg_r,
+                "profit_factor":        pf,
+                "geometry_rate":        geom_rate,
+                "atr_fallback_count":   atr_fb,
+                "top_primary_blocker":  top_blocker.get(strat),
+                "evidence_status":      _evidence_status(win + lose),
+            }
+
+        return {
+            "available":      True,
+            "mode":           mode,
+            "strategies":     result,
+            "strategy_count": len(result),
+        }
+    except Exception as exc:
+        logger.debug("gate_effectiveness get_strategy_report(%s): %s", mode, exc)
+        return {"available": False, "error": str(exc)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def get_opportunities(
