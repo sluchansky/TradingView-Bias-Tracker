@@ -38,9 +38,9 @@ const T = {
   amber:     '#f59e0b',
   red:       '#ef4444',
   purple:    '#a855f7',
-  txtPri:    '#e2e8f0',
-  txtSec:    'rgba(226,232,240,0.60)',
-  txtMuted:  'rgba(226,232,240,0.32)',
+  txtPri:    '#f8fafc',
+  txtSec:    'rgba(248,250,252,0.82)',
+  txtMuted:  'rgba(248,250,252,0.55)',
   mono:      "'JetBrains Mono','Menlo',monospace",
 } as const;
 
