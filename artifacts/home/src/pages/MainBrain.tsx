@@ -3205,69 +3205,52 @@ const ModeOverviewPanel: React.FC<{ ticker: string; authHeader: string }> = ({ t
         const isLast = idx === MODES_CFG.length - 1;
         return (
           <div key={key} style={{
-            display:     'flex',
-            alignItems:  'center',
-            gap:         10,
-            padding:     '9px 12px',
-            borderBottom: isLast ? 'none' : `1px solid ${T.border}40`,
-            background:  isBest ? `${col}0c` : 'transparent',
-            transition:  'background 0.3s',
+            display:             'grid',
+            gridTemplateColumns: '60px 82px 54px 1fr',
+            alignItems:          'center',
+            columnGap:           8,
+            padding:             '8px 12px',
+            borderBottom:        isLast ? 'none' : `1px solid ${T.border}40`,
+            background:          isBest ? `${col}0c` : 'transparent',
+            transition:          'background 0.3s',
           }}>
-            {/* Mode label */}
+            {/* Col 1 — Mode label */}
             <span style={{
-              width:          58,
-              fontSize:       9.5,
-              fontWeight:     700,
-              color:          T.txtMuted,
-              letterSpacing:  '0.07em',
-              flexShrink:     0,
-              textTransform:  'uppercase',
+              fontSize:      9.5,
+              fontWeight:    700,
+              color:         T.txtMuted,
+              letterSpacing: '0.07em',
+              textTransform: 'uppercase',
             }}>{label}</span>
 
-            {/* Verdict */}
-            {!anyData && <span style={{ fontSize:10, color:T.txtMuted }}>—</span>}
-            {anyData && !r?.ok && <span style={{ fontSize:10, color:`${T.txtMuted}60` }}>unavailable</span>}
-            {r?.ok && (
-              <>
-                <span style={{
-                  fontSize:   11,
-                  fontWeight: 700,
-                  color:      col,
-                  minWidth:   76,
-                }}>{verdictLabel(r.verdict)}</span>
+            {/* Col 2 — Verdict */}
+            <span style={{
+              fontSize:   11,
+              fontWeight: 700,
+              color:      r?.ok ? col : `${T.txtMuted}60`,
+            }}>
+              {!anyData ? '—' : !r?.ok ? 'N/A' : verdictLabel(r.verdict)}
+            </span>
 
-                {r.edge > 0 && (
-                  <span style={{ fontSize:10, color:col, opacity:0.75 }}>
-                    {Math.round(r.edge)}/110
-                  </span>
-                )}
+            {/* Col 3 — Edge score */}
+            <span style={{ fontSize:10, color: r?.ok ? col : T.txtMuted, opacity:0.75 }}>
+              {r?.ok && r.edge > 0 ? `${Math.round(r.edge)}/110` : '—'}
+            </span>
 
-                {/* Blocker reason when WAIT */}
-                {!isAct && r.reason && (
-                  <span style={{
-                    fontSize:     9.5,
-                    color:        T.txtMuted,
-                    flex:         1,
-                    overflow:     'hidden',
-                    textOverflow: 'ellipsis',
-                    whiteSpace:   'nowrap',
-                    opacity:      0.7,
-                  }}>{r.reason}</span>
-                )}
-
-                {/* Best badge */}
-                {isBest && (
-                  <span style={{
-                    marginLeft:    'auto',
-                    fontSize:      9,
-                    fontWeight:    700,
-                    color:         col,
-                    letterSpacing: '0.06em',
-                    flexShrink:    0,
-                  }}>★ BEST</span>
-                )}
-              </>
-            )}
+            {/* Col 4 — Reason or Best badge */}
+            <span style={{
+              fontSize:     9.5,
+              color:        isBest ? col : T.txtMuted,
+              overflow:     'hidden',
+              textOverflow: 'ellipsis',
+              whiteSpace:   'nowrap',
+              opacity:      isBest ? 1 : 0.65,
+              fontWeight:   isBest ? 700 : 400,
+            }}>
+              {isBest
+                ? '★ BEST'
+                : (!isAct && r?.reason ? r.reason : '')}
+            </span>
           </div>
         );
       })}
