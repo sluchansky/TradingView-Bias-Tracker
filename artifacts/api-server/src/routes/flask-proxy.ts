@@ -436,6 +436,13 @@ export const BOT1_ROUTES = [
   "/gate-effectiveness/opportunities",
   // Phase 8C MODE→STRATEGY→GATE→OUTCOME funnel analytics.
   "/gate-effectiveness/strategy-report",
+  // Visual Brain V1 — MNQ 1-minute stateful market observer (SHADOW/DISPLAY-ONLY;
+  // owner-only; NOT in dashboard-auth OPEN_PATHS). Captures MNQ chart screenshots,
+  // sends to vision LLM, persists structured market-state observations. NEVER
+  // touches gate, scoring, sizing, learning, arm state, or execution.
+  "/visual-brain/status",
+  "/visual-brain/history",
+  "/visual-brain/cost",
   // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).
   // Returns 4H/15M trend states from Databento 1m bar resampling.
   "/market/trend-alignment",

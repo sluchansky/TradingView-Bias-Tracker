@@ -48297,6 +48297,7 @@ EL_DB_READY              = False   # set by _check_edge_ledger_db_ready() — Ph
 GRE_DB_READY             = False   # set by _check_gre_db_ready() — Phase 2 Ghost Research Engine
 DC_DB_READY              = False   # set by _check_dc_db_ready() — Phase 3 Canonical Decision Contract (shadow)
 GATE_AUDIT_DB_READY      = False   # set by _check_gate_audit_db_ready() — Phase 8C Gate Effectiveness Audit
+VB_DB_READY              = False   # set by _check_vb_db_ready() — Visual Brain V1 MNQ observer, SHADOW/DISPLAY-ONLY
 GHOST_OBS_WATCH_LOCK     = threading.Lock()   # single-flight watcher cycle
 GHOST_OBS_COOLDOWN_SECS  = max(60, int(os.environ.get("GHOST_OBS_COOLDOWN_SECS", "300")))
 _GHOST_OBS_COOLDOWN      = {}                  # (inst, direction, strategy_short) → monotonic ts
@@ -48527,6 +48528,27 @@ def _check_gate_audit_db_ready() -> None:
         GATE_AUDIT_DB_READY = _ge_probe.GATE_AUDIT_DB_READY
     except Exception as exc:
         logger.warning("GateEffectiveness: boot probe failed: %s", exc)
+
+
+def _check_vb_db_ready() -> None:
+    """Probe visual_brain_observations and set VB_DB_READY.
+    FAIL-OPEN: missing table disables persistence only — observer continues in-memory.
+    Never touches gate, scoring, sizing, learning, arm state, or execution.
+    Table: visual_brain_observations (created via DB tool; no DDL here).
+    Visual Brain V1 — SHADOW/OBSERVATION ONLY.
+
+    Injects _learning_conn from this __main__ module so visual_brain.py never
+    needs to `import app` (which would load a SECOND copy with empty globals).
+    """
+    global VB_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    try:
+        import visual_brain as _vb_probe  # noqa: PLC0415
+        _vb_probe.check_vb_db_ready(db_conn_fn=_learning_conn)
+        VB_DB_READY = _vb_probe.VB_DB_READY
+    except Exception as exc:
+        logger.warning("VisualBrain: boot probe failed: %s", exc)
 
 
 # ── Phase 8B: Research Events Ring Buffer (DISPLAY-ONLY) ─────────────────────
@@ -82198,6 +82220,61 @@ def route_gate_opportunities():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/visual-brain/status", methods=["GET"])
+def route_visual_brain_status():
+    """Last Visual Brain observation for MNQ (DISPLAY/SHADOW-ONLY).
+    Returns the most recent observation JSON from cache or DB.
+    Auth + CSRF enforced at Express /api edge.
+    Never touches gate, scoring, sizing, arm state, or execution."""
+    try:
+        import visual_brain as _vb  # noqa: PLC0415
+        inst = request.args.get("instrument", "MNQ").upper()
+        obs  = _vb.get_last_observation(inst)
+        return jsonify({
+            "ok":          True,
+            "enabled":     _vb.VISUAL_BRAIN_ENABLED,
+            "db_ready":    _vb.VB_DB_READY,
+            "instrument":  inst,
+            "observation": obs,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/visual-brain/history", methods=["GET"])
+def route_visual_brain_history():
+    """Recent Visual Brain observation history (DISPLAY/SHADOW-ONLY).
+    Returns last N observations, newest first.
+    Auth + CSRF enforced at Express /api edge.
+    Never touches gate, scoring, sizing, arm state, or execution."""
+    try:
+        import visual_brain as _vb  # noqa: PLC0415
+        inst  = request.args.get("instrument", "MNQ").upper()
+        limit = min(int(request.args.get("limit", "20")), 100)
+        hist  = _vb.get_history(inst, limit)
+        return jsonify({
+            "ok":         True,
+            "instrument": inst,
+            "count":      len(hist),
+            "history":    hist,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/visual-brain/cost", methods=["GET"])
+def route_visual_brain_cost():
+    """Visual Brain daily cost counters (DISPLAY-ONLY).
+    Returns today's model call count + estimated cost in USD.
+    Auth + CSRF enforced at Express /api edge.
+    Never touches gate, scoring, sizing, arm state, or execution."""
+    try:
+        import visual_brain as _vb  # noqa: PLC0415
+        return jsonify({"ok": True, **_vb.get_cost_summary()})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/volatility-intelligence", methods=["GET"])
 def volatility_intelligence_endpoint():
     """Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY).
@@ -84839,6 +84916,7 @@ if __name__ == "__main__":
         _check_gre_db_ready()                      # probe ghost_opportunities/experiments/results (no DDL; created via DB tool/publish diff) — PHASE 2 GHOST RESEARCH ENGINE, RESEARCH/DISPLAY-ONLY
         _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
         _check_gate_audit_db_ready()               # probe gate_audit_log (no DDL; apply db_gate_effectiveness_schema.sql) — PHASE 8C Gate Effectiveness Audit, DISPLAY/MEASUREMENT-ONLY
+        _check_vb_db_ready()                       # probe visual_brain_observations (no DDL; created via DB tool) — VISUAL BRAIN V1, SHADOW/OBSERVATION-ONLY, never touches gate/execution
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
         _check_academy_db_ready()                  # probe academy_* tables (no DDL; created via DB tool/publish diff) — TRADING ACADEMY (learning-only)
         _check_hysteresis_thesis_db_ready()        # probe hysteresis_thesis (no DDL; created via DB tool/publish diff) — THESIS PHASE 2 persistence
@@ -85078,6 +85156,30 @@ if __name__ == "__main__":
         threading.Timer(trade_ready_interval(), _trade_ready_loop).start()  # re-post READY card (mode-aware cadence)
         threading.Timer(30, _right_brain_loop).start()  # Right Brain periodic fallback (30s delay so Databento warms up)
         threading.Timer(ANALYST_REPORT_INTERVAL, _analyst_report_loop).start()  # open-position unified-thesis updates → journal channel (DISPLAY/NOTIFY only)
+    # ── Visual Brain V1 — MNQ 1-minute stateful market observer ─────────────
+    # SHADOW / OBSERVATION ONLY.  Never places trades, never modifies gate,
+    # scoring, sizing, learning, arm state, or execution.  All errors caught
+    # internally; trading engine continues on any Visual Brain failure.
+    # Activated only when VISUAL_BRAIN_ENABLED=true (default OFF → byte-identical).
+    #
+    # Dependencies are injected from this __main__ module so visual_brain.py
+    # never needs `import app`, which would create a duplicate module with empty
+    # globals, breaking DB connections and price stores.
+    try:
+        import visual_brain as _vb_boot  # noqa: PLC0415
+        _vb_boot.VB_DB_READY = VB_DB_READY   # share the probed flag
+        # Import databento_brain as a module (not the dict directly) so the
+        # lambda captures a stable module reference, not an unbound name.
+        # DATABENTO_BARS_BY_INST is never in app.py's global scope — only
+        # imported locally inside functions.
+        import databento_brain as _dbb_for_vb  # noqa: PLC0415
+        _vb_boot.start(
+            db_conn_fn=_learning_conn,
+            price_store=AUTO_PRICE_BY_TICKER,
+            bars_fn=lambda inst: list(_dbb_for_vb.DATABENTO_BARS_BY_INST.get(inst, [])),
+        )
+    except Exception as _vb_boot_exc:
+        logger.warning("[VISUAL_BRAIN] boot error (non-critical, fail-open): %s", _vb_boot_exc)
     if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:
         # Stale-fallback scanner: refreshes LB thesis during low-tick periods
         # (e.g. MGC overnight).  First cycle delayed by one full period so the

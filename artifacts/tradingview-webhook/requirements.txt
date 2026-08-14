@@ -2,3 +2,7 @@ flask>=3.0.0
 requests>=2.31.0
 psycopg2-binary>=2.9.0
 databento>=0.47.0
+openai>=1.0.0
+playwright>=1.40.0
+Pillow>=10.0.0
+matplotlib>=3.7.0

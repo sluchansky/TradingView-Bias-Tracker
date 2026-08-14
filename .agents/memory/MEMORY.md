@@ -8,6 +8,7 @@
 - [INTRADAY_TREND native engine](intraday-trend-native-engine.md) — 6 native IT helpers + analyze_intraday_trend(); BLOCKED_EXTENSION/OPPOSED_1H status codes; 5 ghost_obs columns; 109 tests; ghost/shadow only.
 
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
+- [Visual Brain V1](visual-brain-engine.md) — inject db_conn_fn/price_store/bars_fn at start(); never `import app` from sub-modules; single-flight _schedule_next in finally only; screenshots ephemeral (no temp files).
 
 - [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
 - [Databento MGC overnight silence + partial-flush fix](databento-mgc-overnight-silence.md) — MGC has 0 Databento records overnight (genuine COMEX silence); partial-flush daemon closes stale low-volume bars within 70s; thread-safety via _partial_lock.
