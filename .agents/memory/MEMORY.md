@@ -79,7 +79,7 @@
 - [GRE Phase 4 — FVG_REVISIT Research Family](gre-phase4-fvg-revisit.md) — FVG_REVISIT as Research Family #2; strategy_family/strategy SEPARATE fields; deterministic rfid/revisit_id; 10 variants; 86 tests; prod DB apply still needed.
 - [DC Phase 3 Closure](dc-phase3-closure.md) — 6 execution hooks wired; GRE DC enrichment; 13 ghost_opportunities DC columns; 6 new legal transitions (scalp path); get_record() + observe_order_accepted/rejected added; 45 tests.
 - [Profitability Engine Phase 1](profitability-engine-phase1.md) — ghost_observations table; ghost fires BEFORE _maybe_auto_execute; 69 tests; conservative stop-first resolution; net_r = gross_r − cost_r.
-- [Gate Effectiveness Audit Phase 8C](gate-effectiveness-audit.md) — MEASURE-ONLY; gate_audit_log records ALLOWED+BLOCKED; counterfactual watcher; 34 tests; prod table not yet applied (task #164).
+- [Gate Effectiveness Audit Phase 8C](gate-effectiveness-audit.md) — unified pipeline: strategy+setup_id columns; IT hypothetical geometry (ATR×1.5/2R); get_mode_report/comparison/opportunities; GateEffectivenessPanel in MainBrain.
 - [Edge Ledger Phase 8A](edge-ledger-phase8a.md) — frozen-signal accounting; 5 integration points; EL_DB_READY flag; 55 tests; display-only, learning engine unchanged.
 - [Ops Readiness Phase 8B](ops-readiness-phase8b.md) — _re_event ring-buffer; 7 hooks; /research-health + /research-events; Research Engine Health panel; 35 tests; JS-in-Python backslash trap.
 - [FVG Engine Step A](fvg-engine-step-a.md) — all-day FVG/IFVG scanner (shadow/display-only); 3 engine bugs documented; IFVG direction semantics; fixture ATR ratio trap; `@_owner_required` undefined before line 75400.

@@ -1,73 +1,52 @@
 ---
-name: Gate Effectiveness Audit (Phase 8C)
-description: Measurement-only system recording every gate decision (ALLOWED+BLOCKED) with counterfactual outcome tracking. NEVER changes gate, execution, or risk.
+name: Gate Effectiveness Audit Phase 8C (unified pipeline)
+description: DB schema, analytics functions, Flask routes, and React panel for per-mode gate breakdown (SCALP + INTRADAY_TREND).
 ---
 
-# Gate Effectiveness Audit — Phase 8C
+## DB schema additions (applied dev + schema doc updated)
+- `gate_audit_log` now has `strategy TEXT` and `setup_id TEXT` columns
+- `setup_id = INST|DIR|MODE|YYYYMMDD` — groups repeated hourly polls of the same directional opportunity
+- `strategy` — "SCALP" | "INTRADAY_TREND" | "ORB" | "IT_HYPOTHETICAL" etc.
+- Indexes: `idx_gal_mode (mode)`, `idx_gal_setup (setup_id)`
+- Back-fill ran (293 rows updated)
 
-## Core principle
-MEASURE FIRST, CHANGE SECOND. This system ONLY observes. It never modifies gate logic, Edge Score, sizing, arm state, or execution.
+## IT hypothetical geometry
+- When IT is BLOCKED before a real plan is built (the common NO_GEOMETRY case), gate_effectiveness.py now computes hypothetical entry/stop/target using `current_price + ATR×1.5 (stop) + 2R (target)`
+- Strategy label set to `"IT_HYPOTHETICAL"` to distinguish from real plans
+- ON CONFLICT promotes `outcome_status = NO_GEOMETRY → PENDING` when geometry arrives on update
+- This feeds the existing counterfactual watcher — no new watcher needed
 
-## Key files
-- `gate_effectiveness.py` — full module: `record_gate_decision()`, `_extract()`, `_scalar_str()`, `_record()`, `validate_wiring()`, analytics functions, `check_gate_audit_db_ready()`
-- `gate_baseline_2026_08_11.json` — immutable config snapshot (thresholds, flags, weights, R:R at time of deployment)
-- `db_gate_effectiveness_schema.sql` — DDL for `gate_audit_log` table; applied to dev; still needs prod apply (Publish)
-- `tests/test_gate_effectiveness.py` — 34 tests, all pass
-- `tests/test_gate_effectiveness_wiring.py` — 25 wiring regression tests, all pass
+## gate_effectiveness.py new functions
+- `_blocker_category(blocker, mode)` — maps any blocker string to 7 audit categories (Zone/location, Structure, Trend alignment, Time/session, Confirmation, Volatility, Other)
+- `_extract_strategy(result, mode)` — extracts ORB / BREAKOUT / IT setup_type / mode name
+- `get_mode_report(mode)` — per-mode gate breakdown: totals, geometry rate, expectancy, gate categories table, component pass rates
+- `get_mode_comparison()` — side-by-side SCALP vs IT (calls get_mode_report for each)
+- `get_opportunities(mode, days, instrument)` — deduplicated view (one row per day×inst×dir×mode×blocker)
 
-## Integration points in app.py
-1. `GATE_AUDIT_DB_READY = False` flag near other DB flags
-2. `_check_gate_audit_db_ready()` function (boot probe, same pattern as GRE/EdgeLedger)
-3. Called at startup after `_check_edge_ledger_db_ready()`
-4. full_analysis hook: just before `return result`, after DC observer block
-5. Watcher start: `threading.Timer(30, _ge_start.schedule_watcher).start()` at startup, gated on `GATE_AUDIT_DB_READY`
-6. Flask routes: `/gate-effectiveness`, `/gate-effectiveness/validate-wiring` (POST), `/gate-effectiveness/missed-winners`, `/gate-effectiveness/saved-losses`
-7. Proxy whitelist: `artifacts/api-server/src/routes/flask-proxy.ts` — 4 routes added
+## Flask routes added (after /gate-effectiveness/saved-losses)
+- `GET /gate-effectiveness/mode-report?mode=SCALP|INTRADAY_TREND`
+- `GET /gate-effectiveness/mode-comparison`
+- `GET /gate-effectiveness/opportunities?mode=&days=7&instrument=`
+- All whitelisted in `artifacts/api-server/src/routes/flask-proxy.ts`
 
-## gate_audit_log table
-- `audit_id` (PRIMARY KEY): deterministic dedup key — 1-hour bucket for BLOCKED, 10-minute bucket for ALLOWED
-- Records both verdicts with full gate component states (PASS/FAIL/UNAVAILABLE), all blockers, primary blocker, geometry, market context
-- `outcome_status`: PENDING → COMPLETED/EXPIRED/NO_GEOMETRY (watcher resolves BLOCKED; ALLOWED linked to strategy_trades)
-- `tp1_hit` without `tp2_hit` → closes at 1.0R (TP1 achieved, runner still open but observation closed conservatively)
+## React component
+- `GateEffectivenessPanel` added to `artifacts/home/src/pages/MainBrain.tsx`
+- Placed after `<ModeOverviewPanel>` in the JSX (before the live chart)
+- Collapsible, loads on open, auto-refreshes every 5 min
+- Tabs: SCALP / INTRADAY TREND
+- Shows: summary chips (observations, geometry rate, evidence, blocked expectancy, gate value)
+- Gate breakdown table: Gate | Blocks | % | Unique | Geom | W-Win | W-Lose | Exp.R
+- Component pass rates: 8 chips (BOS, CHOCH, VWAP, Sweep, Volume, CVD, Session, Zone)
 
-## Critical bugs fixed (wiring session)
+## Why
+- 134 prod IT records were all BLOCKED, all NO_GEOMETRY — hypothetical geometry unlocks counterfactual tracking
+- setup_id deduplication prevents poll noise from inflating block counts in the mode report
+- Mode-separated analytics answer "which gate is wrong?" per mode independently — prerequisite before any gate threshold change
 
-### Bug 1: direction always "Unknown" → all BLOCKED records dropped
-- Root cause: `strict_direction` is None on WAIT, verdict is bare "WAIT" (no direction prefix)
-- Fix: `_extract()` now parses direction from `strict_reason` as primary fallback (e.g. "Short WAIT — ..." → "Short")
-- Secondary fallback: `directions` dict keys if exactly one side present
-- Guard: `direction in (None, "Unknown") and gate_verdict == "BLOCKED"` → skip correctly when truly no candidate
+## Key constraint
+- All functions FAIL-OPEN and DISPLAY-ONLY — no gate, execution, or risk path touched
+- App.py INSERT-only rule respected: schema changes via DB tool only
 
-### Bug 2: `session_state` returned as dict → psycopg2 `can't adapt type 'dict'`
-- Root cause: `result.get("session_state")` returns `{'preferred': False, 'bonus': 0, 'window': '...'}` dict, not a string
-- Other fields at risk: `trend_alignment`, `cvd_direction` may also be dicts in some states
-- Fix: added `_scalar_str(val)` helper that collapses dicts to their most readable string field (window/label/status/name/regime), applied to `session`, `trend_alignment`, `cvd_direction` in `_extract()`
-- **Why:** full_analysis result fields evolve over time and several embed structured objects rather than scalars; any new field added to `_extract()` that comes from `result.get()` must go through `_scalar_str()` or a similar guard
-
-## GATE_AUDIT_TRACE logging
-- Fires at INFO level on every successful INSERT: `GATE_AUDIT_TRACE instrument=X direction=Y mode=Z decision=BLOCKED|ALLOWED recorder_called=true audit_id=... edge=... blocker=...`
-- Early returns log at DEBUG level (not visible in prod logs unless debug logging enabled)
-- `_LAST_RECORDED_AT` global updated after every successful INSERT; surfaced in `get_summary()` as `last_recorded_at`
-
-## Synthetic validation
-- `validate_wiring(clean_up=True)` → inserts 1 BLOCKED + 1 ALLOWED synthetic record, reads them back, deletes them
-- Returns `{"verdict": "PASS|FAIL", "verified_blocked": bool, "verified_allowed": bool, ...}`
-- Accessible via POST `/gate-effectiveness/validate-wiring` (owner-only)
-- Dashboard has "🔌 Validate Wiring" button in the Gate Effectiveness panel header
-
-## Evidence levels
-ANECDOTAL (<10) → EARLY (≥10) → MODERATE (≥30) → STRONGER_EVIDENCE (≥100) per rule/bucket
-System returns NOT_ENOUGH_DATA until MODERATE is reached. No recommendation is valid below MODERATE.
-
-## Boot log confirmation (working state)
-```
-GateEffectiveness: gate_audit_log ready (baseline=GATE_BASELINE_2026_08_11)
-GateEffectiveness: counterfactual watcher scheduled (30s delay)
-...
-GATE_AUDIT_TRACE instrument=MNQ direction=Long mode=SCALP decision=BLOCKED recorder_called=true ...
-```
-
-## Prod status
-- Dev DB: table + 6 indexes created; recorder confirmed working (5+ live rows accumulating)
-- Prod DB: NOT YET APPLIED (needs Publish → schema-diff OR direct DB tool)
-- Without prod apply: GATE_AUDIT_DB_READY stays False on live bot; no data accumulates
+## Prod apply
+- Need to Publish once so the 3 new Flask routes and schema columns are live in prod
+- After publish, IT BLOCKED records will start accumulating hypothetical geometry → watcher resolves → zone_valid counterfactual expectancy becomes available

@@ -39,6 +39,57 @@ _WATCHER_LOCK        = threading.Lock()
 _LAST_RECORDED_AT: Optional[datetime] = None   # updated after every successful INSERT
 
 
+# ── IT gate-category mapping ───────────────────────────────────────────────────
+# Maps known IT primary_blocker codes to human-readable audit categories.
+# Unknown blockers are classified heuristically by _blocker_category().
+_IT_GATE_CATEGORY: dict = {
+    "zone_valid":          "Zone / location",
+    "vwap_confirmed":      "Zone / location",
+    "location_quality":    "Zone / location",
+    "FORCE_FLAT":          "Time / session",
+    "MARKET_CLOSED":       "Time / session",
+    "SESSION_CLOSED":      "Time / session",
+    "time_ok":             "Time / session",
+    "structure_confirmed": "Structure",
+    "BLOCKED_DATA":        "Data absent",
+    "OPPOSED_1H":          "Trend alignment",
+    "BLOCKED_EXTENSION":   "Trend alignment",
+    "NO_TREND_ALIGNMENT":  "Trend alignment",
+    "trend_alignment":     "Trend alignment",
+}
+
+
+def _blocker_category(blocker: str, mode: str = "SCALP") -> str:
+    """Map a primary_blocker label to an audit gate category."""
+    if not blocker:
+        return "Other"
+    cat = _IT_GATE_CATEGORY.get(blocker)
+    if cat:
+        return cat
+    b = blocker.lower()
+    if "edge_score" in b:                              return "Confirmation"
+    if "volume" in b or "cvd" in b:                    return "Confirmation"
+    if "vwap" in b or "zone" in b or "loc" in b:       return "Zone / location"
+    if "atr" in b or "volatil" in b:                   return "Volatility"
+    if "struct" in b or "bos" in b or "choch" in b:    return "Structure"
+    if "time" in b or "session" in b or "flat" in b:   return "Time / session"
+    if "trend" in b or "align" in b or "oppos" in b:   return "Trend alignment"
+    return "Other"
+
+
+def _extract_strategy(result: dict, mode: str) -> str:
+    """Classify the strategy / setup type from the analysis result."""
+    verdict = str(result.get("verdict") or "")
+    if "ORB" in verdict.upper():
+        return "ORB"
+    if "BREAKOUT" in verdict.upper():
+        return "BREAKOUT"
+    if mode == "INTRADAY_TREND":
+        it_ctx = result.get("intraday_trend_context") or {}
+        return (it_ctx.get("setup_type") or "INTRADAY_TREND")
+    return mode
+
+
 # ── DB helper ─────────────────────────────────────────────────────────────────
 
 def _learning_conn():
@@ -198,6 +249,32 @@ def _extract(result: dict) -> dict:
             cvd_ok_it: Optional[bool] = None
             if "cvd_conflict" in gd:
                 cvd_ok_it = not gd["cvd_conflict"]
+            # ── Geometry: real plan or ATR-based hypothetical fallback ─────────────
+            # When the IT engine blocks before building a plan (no real geometry),
+            # compute a hypothetical entry/stop/target from current_price + ATR so
+            # the counterfactual watcher can track what would have happened.
+            # ATR×1.5 = IT structural stop philosophy; 2R target = standard IT RR.
+            # Stored in the same geometry columns as real plans — gate_verdict=BLOCKED
+            # distinguishes these from ALLOWED records.
+            _has_plan    = bool(trade_plan.get("trade_plan"))
+            _entry_px    = float(trade_plan["entry"])     if _has_plan and trade_plan.get("entry")    else None
+            _stop_px     = (float(trade_plan["stop_loss"]) if _has_plan and trade_plan.get("stop_loss") else None)
+            _target1_px  = (float(trade_plan["target1"])   if _has_plan and trade_plan.get("target1")   else None)
+            _target2_px  = (float(trade_plan["target2"])   if _has_plan and trade_plan.get("target2")   else None)
+            _risk_pts_it = trade_plan.get("risk_points")   if _has_plan else None
+            _it_strategy = "INTRADAY_TREND" if _has_plan else "IT_HYPOTHETICAL"
+
+            if _entry_px is None and direction in ("Long", "Short"):
+                _cur_px  = result.get("current_price")
+                _atr_val = vol.get("atr_pts")
+                if _cur_px and _atr_val and float(_atr_val) > 0:
+                    _e      = float(_cur_px)
+                    _sdist  = float(_atr_val) * 1.5
+                    _entry_px   = _e
+                    _stop_px    = round(_e - _sdist, 2) if direction == "Long" else round(_e + _sdist, 2)
+                    _target1_px = round(_e + _sdist * 2.0, 2) if direction == "Long" else round(_e - _sdist * 2.0, 2)
+                    _risk_pts_it = round(_sdist, 4)
+
             return {
                 "verdict":          verdict,
                 "direction":        direction,
@@ -205,17 +282,11 @@ def _extract(result: dict) -> dict:
                 "grade":            "WAIT",  # IT doesn't use SWING grade tiers
                 "primary_blocker":  primary_blocker,
                 "all_blockers":     it_blockers,
-                "entry_price":      trade_plan.get("entry") if trade_plan.get("trade_plan") else None,
-                "stop_price":       (float(trade_plan["stop_loss"])
-                                     if trade_plan.get("trade_plan") and trade_plan.get("stop_loss")
-                                     else None),
-                "target1_price":    (float(trade_plan["target1"])
-                                     if trade_plan.get("trade_plan") and trade_plan.get("target1")
-                                     else None),
-                "target2_price":    (float(trade_plan["target2"])
-                                     if trade_plan.get("trade_plan") and trade_plan.get("target2")
-                                     else None),
-                "risk_points":      trade_plan.get("risk_points") if trade_plan.get("trade_plan") else None,
+                "entry_price":      _entry_px,
+                "stop_price":       _stop_px,
+                "target1_price":    _target1_px,
+                "target2_price":    _target2_px,
+                "risk_points":      _risk_pts_it,
                 "comp_bos":   comp_bos,   "comp_choch": comp_choch,
                 "comp_vwap":  comp_vwap,  "comp_sweep": comp_sweep,
                 "comp_volume": comp_vol,  "comp_cvd":   _comp(cvd_ok_it),
@@ -227,6 +298,7 @@ def _extract(result: dict) -> dict:
                 "trend_alignment":  _scalar_str(it_ctx.get("trend_alignment")),
                 "volatility_regime":vol.get("regime") or vol.get("label"),
                 "session":          _scalar_str(it_ctx.get("session")),
+                "strategy":         _it_strategy,
             }
         # ── /IT-native extraction ─────────────────────────────────────────────
 
@@ -384,6 +456,14 @@ def _record(result: dict, instrument: str, mode: str) -> None:
     now   = datetime.now(timezone.utc)
     today = now.strftime("%Y-%m-%d")
 
+    # ── Opportunity grouping key (daily per instrument/direction/mode) ──────
+    # Groups every poll of the same directional setup into one "opportunity"
+    # for the mode-report deduplication queries.
+    setup_id = f"{inst}|{direction}|{mode}|{now.strftime('%Y%m%d')}"
+
+    # ── Strategy / setup label ───────────────────────────────────────────────
+    strategy = info.get("strategy") or _extract_strategy(result, mode)
+
     # ── Dedup key ──
     # ALLOWED: 10-minute bucket per instrument/direction/mode (each READY counts)
     # BLOCKED: 1-hour bucket per instrument/direction/mode (avoid re-recording same block)
@@ -423,7 +503,8 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     comp_volume, comp_cvd, comp_session, comp_zone,
                     atr_pts, vwap_value, cvd_direction, trend_alignment,
                     volatility_regime, session,
-                    outcome_status
+                    outcome_status,
+                    strategy, setup_id
                 ) VALUES (
                     %s,%s,%s,%s,
                     %s,%s,%s,%s,
@@ -434,7 +515,8 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     %s,%s,%s,%s,
                     %s,%s,%s,%s,
                     %s,%s,
-                    %s
+                    %s,
+                    %s,%s
                 )
                 ON CONFLICT (audit_id) DO UPDATE SET
                     last_seen_at     = EXCLUDED.last_seen_at,
@@ -453,7 +535,16 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     cvd_direction    = EXCLUDED.cvd_direction,
                     trend_alignment  = EXCLUDED.trend_alignment,
                     volatility_regime= EXCLUDED.volatility_regime,
-                    session          = EXCLUDED.session
+                    session          = EXCLUDED.session,
+                    strategy         = COALESCE(EXCLUDED.strategy,  gate_audit_log.strategy),
+                    setup_id         = COALESCE(EXCLUDED.setup_id,  gate_audit_log.setup_id),
+                    -- Promote NO_GEOMETRY → PENDING when hypothetical geometry arrives
+                    outcome_status   = CASE
+                        WHEN gate_audit_log.outcome_status = 'NO_GEOMETRY'
+                         AND EXCLUDED.entry_price IS NOT NULL
+                        THEN 'PENDING'
+                        ELSE gate_audit_log.outcome_status
+                    END
             """, (
                 audit_id, BASELINE_VERSION, now, now,
                 inst, direction, mode, now,
@@ -470,6 +561,7 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                 info["cvd_direction"], info["trend_alignment"],
                 info["volatility_regime"], info["session"],
                 initial_status,
+                strategy, setup_id,
             ))
         conn.commit()
         logger.info(
@@ -1482,3 +1574,299 @@ def _evidence_status(n: int) -> str:
     if n < 100:
         return "MODERATE"
     return "STRONGER_EVIDENCE"
+
+
+# ── Mode-separated analytics ───────────────────────────────────────────────────
+
+def get_mode_report(mode: str) -> dict:
+    """Per-mode gate effectiveness breakdown with category grouping.
+
+    Returns a dict suitable for the GateEffectivenessPanel React component.
+    Gate categories are mapped via _blocker_category() so both SCALP and
+    INTRADAY_TREND are presented in the same 7-category schema.
+    FAIL-OPEN — never touches gate, execution, or risk.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return {"available": False}
+    conn = _learning_conn()
+    if conn is None:
+        return {"available": False, "error": "db_unavailable"}
+    try:
+        with conn.cursor() as cur:
+            # ── Totals + expectancy ──────────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE gate_verdict IN ('ALLOWED','EARLY_ALLOWED'))  AS allowed,
+                    COUNT(*) FILTER (WHERE gate_verdict = 'BLOCKED')                     AS blocked,
+                    COUNT(*) FILTER (WHERE outcome_status = 'PENDING')                   AS pending,
+                    COUNT(*) FILTER (WHERE outcome_status = 'COMPLETED')                 AS completed,
+                    COUNT(*) FILTER (WHERE outcome_status = 'NO_GEOMETRY')               AS no_geometry,
+                    COUNT(*) FILTER (WHERE gate_verdict = 'BLOCKED'
+                                       AND entry_price IS NOT NULL)                      AS blocked_with_geom,
+                    AVG(CASE WHEN gate_verdict IN ('ALLOWED','EARLY_ALLOWED')
+                              AND outcome_status = 'COMPLETED'
+                             THEN final_r END)                                            AS allowed_exp,
+                    AVG(CASE WHEN gate_verdict = 'BLOCKED'
+                              AND outcome_status = 'COMPLETED'
+                             THEN final_r END)                                            AS blocked_exp,
+                    MIN(recorded_at)                                                      AS start_ts
+                FROM gate_audit_log
+                WHERE mode = %s AND baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
+            """, (mode, BASELINE_VERSION))
+            row        = cur.fetchone()
+            allowed    = int(row[0] or 0)
+            blocked    = int(row[1] or 0)
+            pending    = int(row[2] or 0)
+            completed  = int(row[3] or 0)
+            no_geom    = int(row[4] or 0)
+            blk_geom   = int(row[5] or 0)
+            allowed_exp = _safe_float(row[6])
+            blocked_exp = _safe_float(row[7])
+            start_ts    = row[8].isoformat() if row[8] else None
+
+            # ── Per-primary-blocker stats ────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    COALESCE(primary_blocker, 'Unknown')                                        AS blocker,
+                    COUNT(*)                                                                     AS n_blocks,
+                    ROUND(AVG(edge_score)::numeric, 1)                                          AS avg_edge,
+                    COUNT(*) FILTER (WHERE entry_price IS NOT NULL)                             AS with_geometry,
+                    COUNT(*) FILTER (WHERE outcome_status='COMPLETED' AND final_r > 0)          AS would_win,
+                    COUNT(*) FILTER (WHERE outcome_status='COMPLETED' AND final_r <= 0)         AS would_lose,
+                    ROUND(AVG(final_r) FILTER (WHERE outcome_status='COMPLETED')::numeric, 3)   AS exp_r,
+                    COUNT(DISTINCT instrument || '|' || direction || '|'
+                          || TO_CHAR(recorded_at AT TIME ZONE 'UTC', 'YYYYMMDD'))               AS unique_opps
+                FROM gate_audit_log
+                WHERE mode = %s AND gate_verdict = 'BLOCKED'
+                  AND baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
+                GROUP BY COALESCE(primary_blocker, 'Unknown')
+                ORDER BY n_blocks DESC
+            """, (mode, BASELINE_VERSION))
+            blocker_rows = cur.fetchall()
+
+            # ── Component pass rates (all records, not just BLOCKED) ─────────
+            cur.execute("""
+                SELECT
+                    SUM(CASE WHEN comp_bos    ='PASS' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN comp_choch  ='PASS' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN comp_vwap   ='PASS' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN comp_sweep  ='PASS' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN comp_volume ='PASS' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN comp_cvd    ='PASS' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN comp_session='PASS' THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN comp_zone   ='PASS' THEN 1 ELSE 0 END),
+                    COUNT(*)
+                FROM gate_audit_log
+                WHERE mode = %s AND baseline_version = %s
+                  AND audit_id NOT LIKE 'SYNTHETIC_%%'
+            """, (mode, BASELINE_VERSION))
+            cr         = cur.fetchone()
+            comp_total = max(int(cr[8] or 0), 1)
+
+        # ── Aggregate into gate categories ───────────────────────────────────
+        categories: dict = {}
+        for r in blocker_rows:
+            blocker    = r[0]
+            n_blocks   = int(r[1] or 0)
+            avg_edge   = _safe_float(r[2])
+            with_geom  = int(r[3] or 0)
+            would_win  = int(r[4] or 0)
+            would_lose = int(r[5] or 0)
+            exp_r      = _safe_float(r[6])
+            unique     = int(r[7] or 0)
+            cat = _blocker_category(blocker, mode)
+            if cat not in categories:
+                categories[cat] = {
+                    "category": cat, "rules": [],
+                    "n_blocks": 0, "unique_opps": 0,
+                    "avg_edge_wsum": 0.0, "avg_edge_n": 0,
+                    "with_geometry": 0, "would_win": 0, "would_lose": 0,
+                    "exp_r_wsum": 0.0, "exp_r_n": 0,
+                }
+            c = categories[cat]
+            if blocker not in c["rules"]:
+                c["rules"].append(blocker)
+            c["n_blocks"]      += n_blocks
+            c["unique_opps"]   += unique
+            c["with_geometry"] += with_geom
+            c["would_win"]     += would_win
+            c["would_lose"]    += would_lose
+            if avg_edge is not None:
+                c["avg_edge_wsum"] += avg_edge * n_blocks
+                c["avg_edge_n"]    += n_blocks
+            if exp_r is not None:
+                c["exp_r_wsum"] += exp_r * n_blocks
+                c["exp_r_n"]    += n_blocks
+
+        gate_cats = []
+        for _, c in sorted(categories.items(), key=lambda x: -x[1]["n_blocks"]):
+            exp  = round(c["exp_r_wsum"] / c["exp_r_n"], 3)  if c["exp_r_n"]    > 0 else None
+            edge = round(c["avg_edge_wsum"] / c["avg_edge_n"], 1) if c["avg_edge_n"] > 0 else None
+            gate_cats.append({
+                "category":       c["category"],
+                "rules":          sorted(c["rules"]),
+                "n_blocks":       c["n_blocks"],
+                "pct_of_blocked": round(100.0 * c["n_blocks"] / blocked, 1) if blocked > 0 else 0.0,
+                "unique_opps":    c["unique_opps"],
+                "avg_edge":       edge,
+                "with_geometry":  c["with_geometry"],
+                "would_win":      c["would_win"],
+                "would_lose":     c["would_lose"],
+                "expectancy_r":   exp,
+                "evidence_status": _evidence_status(c["would_win"] + c["would_lose"]),
+            })
+
+        gate_imp = None
+        if allowed_exp is not None and blocked_exp is not None:
+            gate_imp = round(allowed_exp - blocked_exp, 3)
+
+        return {
+            "available":          True,
+            "mode":               mode,
+            "start_ts":           start_ts,
+            "total_allowed":      allowed,
+            "total_blocked":      blocked,
+            "total_observations": allowed + blocked,
+            "pending_outcomes":   pending,
+            "completed_outcomes": completed,
+            "no_geometry":        no_geom,
+            "blocked_with_geometry": blk_geom,
+            "geometry_rate":      round(100.0 * blk_geom / blocked, 1) if blocked > 0 else 0.0,
+            "allowed_expectancy": round(allowed_exp, 3) if allowed_exp is not None else None,
+            "blocked_expectancy": round(blocked_exp, 3) if blocked_exp is not None else None,
+            "gate_improvement":   gate_imp,
+            "gate_categories":    gate_cats,
+            "component_pass_rates": {
+                "BOS":     round(100.0 * int(cr[0] or 0) / comp_total, 1),
+                "CHOCH":   round(100.0 * int(cr[1] or 0) / comp_total, 1),
+                "VWAP":    round(100.0 * int(cr[2] or 0) / comp_total, 1),
+                "Sweep":   round(100.0 * int(cr[3] or 0) / comp_total, 1),
+                "Volume":  round(100.0 * int(cr[4] or 0) / comp_total, 1),
+                "CVD":     round(100.0 * int(cr[5] or 0) / comp_total, 1),
+                "Session": round(100.0 * int(cr[6] or 0) / comp_total, 1),
+                "Zone":    round(100.0 * int(cr[7] or 0) / comp_total, 1),
+            },
+            "evidence_status": _evidence_status(completed),
+        }
+    except Exception as exc:
+        logger.debug("gate_effectiveness get_mode_report(%s): %s", mode, exc)
+        return {"available": False, "error": str(exc)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_mode_comparison() -> dict:
+    """Side-by-side SCALP vs INTRADAY_TREND effectiveness summary.
+    Calls get_mode_report for each mode and combines into one dict.
+    FAIL-OPEN — display-only.
+    """
+    scalp = get_mode_report("SCALP")
+    it    = get_mode_report("INTRADAY_TREND")
+    total = (scalp.get("total_observations", 0) +
+             it.get("total_observations", 0))
+    return {
+        "available":       scalp.get("available", False) or it.get("available", False),
+        "SCALP":           scalp,
+        "INTRADAY_TREND":  it,
+        "combined": {
+            "total_observations": total,
+            "modes_with_data":    sum(1 for m in (scalp, it) if m.get("available")),
+            "geometry_rate_avg":  round(
+                (scalp.get("geometry_rate", 0.0) + it.get("geometry_rate", 0.0)) / 2.0, 1
+            ) if scalp.get("available") and it.get("available") else None,
+        },
+    }
+
+
+def get_opportunities(
+    mode: Optional[str] = None,
+    days: int = 7,
+    instrument: Optional[str] = None,
+) -> list:
+    """Deduplicated unique opportunities for the audit review panel.
+
+    Collapses repeated hourly poll records into one row per
+    (inst, dir, mode, date, primary_blocker) so the operator sees distinct
+    setups rather than polling noise.  Returns the last 500 opportunities
+    across the requested window.
+    FAIL-OPEN — display-only, read-only.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return []
+    conn = _learning_conn()
+    if conn is None:
+        return []
+    try:
+        filters  = [
+            "baseline_version = %s",
+            "recorded_at >= NOW() - make_interval(days => %s)",
+            "gate_verdict = 'BLOCKED'",
+            "audit_id NOT LIKE 'SYNTHETIC_%%'",
+        ]
+        params_: list = [BASELINE_VERSION, days]
+        if mode:
+            filters.append("mode = %s")
+            params_.append(mode)
+        if instrument:
+            filters.append("instrument = %s")
+            params_.append(instrument.upper())
+        where = " AND ".join(filters)
+
+        with conn.cursor() as cur:
+            cur.execute(f"""
+                SELECT
+                    mode, instrument, direction,
+                    DATE(recorded_at AT TIME ZONE 'UTC')                               AS trade_date,
+                    COALESCE(primary_blocker, 'Unknown')                               AS primary_blocker,
+                    COUNT(*)                                                            AS n_polls,
+                    MAX(edge_score)                                                     AS peak_edge,
+                    MIN(recorded_at)                                                    AS first_seen,
+                    MAX(recorded_at)                                                    AS last_seen,
+                    BOOL_OR(entry_price IS NOT NULL)                                    AS has_geometry,
+                    BOOL_OR(outcome_status = 'COMPLETED')                              AS is_resolved,
+                    MAX(CASE WHEN outcome_status='COMPLETED' THEN final_r END)         AS final_r,
+                    MAX(CASE WHEN outcome_status='COMPLETED' AND final_r > 0
+                             THEN 1 ELSE 0 END)                                        AS was_winner,
+                    MAX(strategy)                                                       AS strategy
+                FROM gate_audit_log
+                WHERE {where}
+                GROUP BY mode, instrument, direction,
+                         DATE(recorded_at AT TIME ZONE 'UTC'),
+                         COALESCE(primary_blocker, 'Unknown')
+                ORDER BY trade_date DESC, mode, instrument, direction
+                LIMIT 500
+            """, params_)
+            rows = cur.fetchall()
+
+        return [
+            {
+                "mode":            r[0],
+                "instrument":      r[1],
+                "direction":       r[2],
+                "date":            str(r[3]),
+                "primary_blocker": r[4],
+                "n_polls":         int(r[5] or 0),
+                "peak_edge":       int(r[6] or 0),
+                "first_seen":      r[7].isoformat() if r[7] else None,
+                "last_seen":       r[8].isoformat() if r[8] else None,
+                "has_geometry":    bool(r[9]),
+                "is_resolved":     bool(r[10]),
+                "final_r":         _safe_float(r[11]),
+                "was_winner":      bool(r[12]),
+                "strategy":        r[13],
+            }
+            for r in rows
+        ]
+    except Exception as exc:
+        logger.debug("gate_effectiveness get_opportunities: %s", exc)
+        return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass

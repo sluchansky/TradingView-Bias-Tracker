@@ -430,6 +430,10 @@ export const BOT1_ROUTES = [
   "/gate-effectiveness/validate-wiring",
   "/gate-effectiveness/missed-winners",
   "/gate-effectiveness/saved-losses",
+  // Phase 8C unified pipeline — mode-separated reports + deduplicated opportunities.
+  "/gate-effectiveness/mode-report",
+  "/gate-effectiveness/mode-comparison",
+  "/gate-effectiveness/opportunities",
   // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).
   // Returns 4H/15M trend states from Databento 1m bar resampling.
   "/market/trend-alignment",

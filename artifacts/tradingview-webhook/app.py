@@ -82137,6 +82137,46 @@ def route_gate_saved_losses():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/gate-effectiveness/mode-report", methods=["GET"])
+def route_gate_mode_report():
+    """Per-mode gate effectiveness breakdown — Phase 8C unified pipeline.
+    Returns gate category table + component pass rates for SCALP or INTRADAY_TREND.
+    Query param: mode=SCALP | INTRADAY_TREND  (default INTRADAY_TREND)
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        mode = (request.args.get("mode") or "INTRADAY_TREND").strip().upper()
+        return jsonify({"ok": True, "report": _ge.get_mode_report(mode)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/mode-comparison", methods=["GET"])
+def route_gate_mode_comparison():
+    """Side-by-side SCALP vs INTRADAY_TREND effectiveness summary — Phase 8C."""
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        return jsonify({"ok": True, "comparison": _ge.get_mode_comparison()})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/opportunities", methods=["GET"])
+def route_gate_opportunities():
+    """Deduplicated opportunity list (one row per day×inst×dir×mode×blocker) — Phase 8C.
+    Query params: mode, instrument, days (default 7).
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        mode  = (request.args.get("mode") or "").strip().upper() or None
+        inst  = (request.args.get("instrument") or "").strip().upper() or None
+        days  = min(30, max(1, int(request.args.get("days", 7))))
+        opps  = _ge.get_opportunities(mode=mode, days=days, instrument=inst)
+        return jsonify({"ok": True, "opportunities": opps, "count": len(opps)})
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/volatility-intelligence", methods=["GET"])
 def volatility_intelligence_endpoint():
     """Volatility Intelligence snapshot (DISPLAY-ONLY, OBSERVE-ONLY).

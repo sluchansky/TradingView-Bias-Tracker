@@ -54,6 +54,10 @@ CREATE TABLE IF NOT EXISTS gate_audit_log (
     volatility_regime TEXT,
     session          TEXT,
 
+    -- Opportunity grouping and strategy classification (Phase 8C unified pipeline)
+    strategy         TEXT,                      -- setup label: 'SCALP' | 'INTRADAY_TREND' | 'ORB' | 'IT_HYPOTHETICAL' | …
+    setup_id         TEXT,                      -- daily opportunity key: INST|DIR|MODE|YYYYMMDD (dedup across polls)
+
     -- Forward outcome (filled by counterfactual watcher for BLOCKED;
     --                   linked to strategy_trades for ALLOWED)
     outcome_status   TEXT        NOT NULL DEFAULT 'PENDING',  -- 'PENDING' | 'COMPLETED' | 'EXPIRED' | 'NO_GEOMETRY' | 'INSUFFICIENT_COUNTERFACTUAL_DATA'
@@ -76,3 +80,5 @@ CREATE INDEX IF NOT EXISTS idx_gal_outcome      ON gate_audit_log (outcome_statu
 CREATE INDEX IF NOT EXISTS idx_gal_recorded_at  ON gate_audit_log (recorded_at DESC);
 CREATE INDEX IF NOT EXISTS idx_gal_edge_score   ON gate_audit_log (edge_score);
 CREATE INDEX IF NOT EXISTS idx_gal_blockers     ON gate_audit_log USING gin (all_blockers);
+CREATE INDEX IF NOT EXISTS idx_gal_mode         ON gate_audit_log (mode);
+CREATE INDEX IF NOT EXISTS idx_gal_setup        ON gate_audit_log (setup_id);

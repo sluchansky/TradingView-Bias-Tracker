@@ -3258,6 +3258,220 @@ const ModeOverviewPanel: React.FC<{ ticker: string; authHeader: string }> = ({ t
   );
 };
 
+
+// ── Gate Effectiveness Audit Panel ───────────────────────────────────────────
+// Polls /api/gate-effectiveness/mode-report for SCALP and INTRADAY_TREND and
+// presents the per-gate category breakdown table + component pass rates.
+// DISPLAY-ONLY — never touches gate rules, thresholds, or execution.
+const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
+  type GateCat = {
+    category: string; n_blocks: number; pct_of_blocked: number;
+    unique_opps: number; avg_edge: number | null; with_geometry: number;
+    would_win: number; would_lose: number; expectancy_r: number | null;
+    evidence_status: string;
+  };
+  type ModeRpt = {
+    available: boolean; mode: string;
+    total_blocked: number; total_allowed: number;
+    geometry_rate: number;
+    blocked_expectancy: number | null; allowed_expectancy: number | null;
+    gate_improvement: number | null;
+    gate_categories: GateCat[];
+    component_pass_rates: Record<string, number>;
+    evidence_status: string;
+  };
+
+  const [tab, setTab]         = React.useState<'SCALP' | 'INTRADAY_TREND'>('INTRADAY_TREND');
+  const [rpts, setRpts]       = React.useState<Record<string, ModeRpt | null>>({});
+  const [loading, setLoading] = React.useState(false);
+  const [age, setAge]         = React.useState<number | null>(null);
+  const [open, setOpen]       = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    if (!open) return;
+    setLoading(true);
+    try {
+      const [sr, ir] = await Promise.allSettled([
+        fetch('/api/gate-effectiveness/mode-report?mode=SCALP',
+          { headers: { Authorization: authHeader } })
+          .then(r => r.ok ? r.json() : null).catch(() => null),
+        fetch('/api/gate-effectiveness/mode-report?mode=INTRADAY_TREND',
+          { headers: { Authorization: authHeader } })
+          .then(r => r.ok ? r.json() : null).catch(() => null),
+      ]);
+      const extract = (res: PromiseSettledResult<unknown>) =>
+        res.status === 'fulfilled' && res.value && typeof res.value === 'object'
+          ? (res.value as Record<string, unknown>)['report'] as ModeRpt | null
+          : null;
+      setRpts({ SCALP: extract(sr), INTRADAY_TREND: extract(ir) });
+      setAge(Date.now());
+    } finally {
+      setLoading(false);
+    }
+  }, [open, authHeader]);
+
+  React.useEffect(() => {
+    load();
+    const id = window.setInterval(load, 5 * 60_000);  // refresh every 5 min
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  const rpt  = (rpts[tab] ?? null) as ModeRpt | null;
+  const cats = rpt?.gate_categories ?? [];
+  const comps = rpt?.component_pass_rates ?? {};
+  const COMPS = ['BOS','CHOCH','VWAP','Sweep','Volume','CVD','Session','Zone'] as const;
+
+  const catCol  = (pct: number) => pct >= 50 ? T.red : pct >= 20 ? T.amber : T.txtMuted;
+  const rCol    = (v: number | null) => v == null ? T.txtMuted : v > 0 ? T.red : T.green;
+  const fmtR    = (v: number | null) => v == null ? '—' : `${v > 0 ? '+' : ''}${v}R`;
+  const compCol = (p: number) => p >= 70 ? T.green : p >= 40 ? T.amber : T.red;
+
+  return (
+    <div style={{ marginBottom: 12, border: `1px solid ${T.border}`, borderRadius: 10, overflow: 'hidden', background: T.bg }}>
+      {/* Header / toggle */}
+      <div
+        role="button"
+        onClick={() => setOpen(o => !o)}
+        style={{
+          padding: '6px 12px',
+          borderBottom: open ? `1px solid ${T.border}` : 'none',
+          display: 'flex', justifyContent: 'space-between', alignItems: 'center',
+          background: `${T.border}28`, cursor: 'pointer', userSelect: 'none',
+        }}
+      >
+        <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.08em', color: T.txtMuted }}>
+          GATE EFFECTIVENESS AUDIT
+        </span>
+        <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+          {!open && rpts['INTRADAY_TREND']?.total_blocked != null && (
+            <span style={{ fontSize: 9, color: T.txtMuted }}>
+              IT {rpts['INTRADAY_TREND']!.total_blocked} blocked · {rpts['INTRADAY_TREND']!.geometry_rate}% geom
+            </span>
+          )}
+          {open && age && (
+            <span style={{ fontSize: 9, color: `${T.txtMuted}70` }}>
+              {loading ? 'loading…' : `${Math.round((Date.now() - age) / 60_000)}m ago`}
+            </span>
+          )}
+          <span style={{ fontSize: 10, color: T.txtMuted }}>{open ? '▾' : '▸'}</span>
+        </div>
+      </div>
+
+      {open && (
+        <div style={{ padding: '10px 12px' }}>
+          {/* Mode tabs */}
+          <div style={{ display: 'flex', gap: 6, marginBottom: 10 }}>
+            {(['SCALP', 'INTRADAY_TREND'] as const).map(m => (
+              <button key={m} onClick={() => setTab(m)} style={{
+                fontSize: 9, fontWeight: tab === m ? 700 : 400, padding: '3px 10px',
+                borderRadius: 5, border: `1px solid ${T.border}`,
+                background: tab === m ? `${T.cyan}20` : 'transparent',
+                color: tab === m ? T.cyan : T.txtMuted, cursor: 'pointer',
+              }}>
+                {m === 'INTRADAY_TREND' ? 'INTRADAY TREND' : 'SCALP'}
+              </button>
+            ))}
+          </div>
+
+          {!rpt?.available ? (
+            <div style={{ fontSize: 10, color: T.txtMuted, textAlign: 'center', padding: '12px 0' }}>
+              {loading ? 'Loading…' : 'No data available for this mode.'}
+            </div>
+          ) : (<>
+            {/* Summary chips */}
+            <div style={{
+              display: 'flex', flexWrap: 'wrap', gap: 12, marginBottom: 10,
+              padding: '6px 8px', background: `${T.border}18`, borderRadius: 6,
+            }}>
+              {[
+                { l: 'Observations',  v: String(rpt.total_blocked + rpt.total_allowed), c: T.txtMuted },
+                { l: 'Geometry rate', v: `${rpt.geometry_rate}%`, c: rpt.geometry_rate > 30 ? T.green : T.amber },
+                { l: 'Evidence',      v: rpt.evidence_status,     c: T.txtMuted },
+                ...(rpt.blocked_expectancy != null
+                  ? [{ l: 'Blocked exp.', v: fmtR(rpt.blocked_expectancy), c: rCol(rpt.blocked_expectancy) }]
+                  : []),
+                ...(rpt.gate_improvement != null
+                  ? [{ l: 'Gate value', v: fmtR(rpt.gate_improvement), c: rpt.gate_improvement > 0 ? T.green : T.amber }]
+                  : []),
+              ].map(({ l, v, c }) => (
+                <div key={l} style={{ display: 'flex', flexDirection: 'column' }}>
+                  <span style={{ fontSize: 8, color: `${T.txtMuted}80`, marginBottom: 1 }}>{l}</span>
+                  <span style={{ fontSize: 10, fontWeight: 700, color: c }}>{v}</span>
+                </div>
+              ))}
+            </div>
+
+            {/* Gate category table */}
+            <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.07em', marginBottom: 4 }}>
+              GATE BREAKDOWN
+            </div>
+            <div style={{ overflowX: 'auto', marginBottom: 10 }}>
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+                <thead>
+                  <tr style={{ borderBottom: `1px solid ${T.border}40` }}>
+                    {['Gate','Blocks','%','Unique','Geom','W-Win','W-Lose','Exp.R'].map(h => (
+                      <th key={h} style={{
+                        padding: '2px 5px', fontSize: 8.5, color: T.txtMuted, fontWeight: 600,
+                        textAlign: h === 'Gate' ? 'left' : 'right', whiteSpace: 'nowrap',
+                      }}>{h}</th>
+                    ))}
+                  </tr>
+                </thead>
+                <tbody>
+                  {cats.map(c => (
+                    <tr key={c.category} style={{ borderBottom: `1px solid ${T.border}15` }}>
+                      <td style={{ padding: '4px 5px', color: catCol(c.pct_of_blocked), fontWeight: 600, whiteSpace: 'nowrap' }}>
+                        {c.category}
+                      </td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', color: T.txt }}>{c.n_blocks}</td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', fontWeight: 700, color: catCol(c.pct_of_blocked) }}>
+                        {c.pct_of_blocked}%
+                      </td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', color: T.txtMuted }}>{c.unique_opps}</td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', color: c.with_geometry > 0 ? T.green : T.txtMuted }}>
+                        {c.with_geometry > 0 ? c.with_geometry : '—'}
+                      </td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', color: c.would_win > 0 ? T.red : T.txtMuted }}>
+                        {c.would_win > 0 ? c.would_win : '—'}
+                      </td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', color: c.would_lose > 0 ? T.green : T.txtMuted }}>
+                        {c.would_lose > 0 ? c.would_lose : '—'}
+                      </td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', fontWeight: c.expectancy_r != null ? 700 : 400,
+                        color: rCol(c.expectancy_r) }}>
+                        {fmtR(c.expectancy_r)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            {/* Component pass rates */}
+            <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.07em', marginBottom: 4 }}>
+              COMPONENT PASS RATES
+            </div>
+            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 5 }}>
+              {COMPS.filter(k => comps[k] != null).map(k => {
+                const pct = comps[k] ?? 0;
+                return (
+                  <div key={k} style={{
+                    display: 'flex', flexDirection: 'column', alignItems: 'center',
+                    minWidth: 44, padding: '4px 6px', background: `${T.border}18`, borderRadius: 5,
+                  }}>
+                    <span style={{ fontSize: 7.5, color: T.txtMuted, marginBottom: 2 }}>{k}</span>
+                    <span style={{ fontSize: 11, fontWeight: 700, color: compCol(pct) }}>{Math.round(pct)}%</span>
+                  </div>
+                );
+              })}
+            </div>
+          </>)}
+        </div>
+      )}
+    </div>
+  );
+};
+
 // ── Cleanest Trade Button ─────────────────────────────────────────────────────
 const CleanestTradeButton: React.FC<{
   scanResult:   CleanestScanResult | null;
@@ -13121,6 +13335,11 @@ export default function MainBrain() {
               {/* ── Mode Overview — best setup across SCALP / Intraday / SWING ── */}
               <ModeOverviewPanel
                 ticker={ticker}
+                authHeader={getAuthHeader()['Authorization'] ?? ''}
+              />
+
+              {/* ── Gate Effectiveness Audit — per-mode block/outcome breakdown ── */}
+              <GateEffectivenessPanel
                 authHeader={getAuthHeader()['Authorization'] ?? ''}
               />
 
