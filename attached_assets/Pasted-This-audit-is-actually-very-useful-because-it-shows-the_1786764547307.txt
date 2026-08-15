@@ -1,0 +1,100 @@
+This audit is actually very useful because it shows the research architecture is largely built. I would not add another strategy family or redesign anything right now. The priority should be making the existing stack trustworthy and autonomous.
+
+The biggest issue is that a research engine that silently stops collecting data is worse than having fewer strategies, because you can spend days thinking you're accumulating evidence when you aren't.
+
+What I would do next
+
+P0 — make the research pipeline reliable before touching strategy logic.
+
+Verify and repair production schema
+Confirm every required research table exists.
+Confirm every ghost_observations IT column from db_mtf_schema_patch.sql exists in production.
+Add a /research-health schema section showing:
+expected columns
+missing columns
+table accessibility
+last successful write
+Do not silently swallow schema mismatches.
+Keep schema changes out-of-band if that's your deployment pattern, but create one canonical migration/check script so Publish isn't guesswork.
+Fix expired simulations contaminating evidence
+EXPIRED, invalid, aborted, incomplete, or otherwise non-trade observations must not count toward:
+trade count
+PF
+expectancy
+win rate
+promotion thresholds
+Keep them in the DB for diagnostics, just exclude them from performance statistics.
+Recalculate existing experiment statistics after the fix.
+
+Change the dangerous learning-gate failure behavior
+
+This is the one architectural choice in the audit I really dislike:
+
+DB failure → LIVE_ELIGIBLE
+
+For a trading system, research infrastructure failure should never grant permission that otherwise might have been denied.
+
+Change it to something like:
+
+DB/error/unknown → NO_RESEARCH_OPINION
+
+Then preserve the normal trading system's existing eligibility rather than explicitly labeling the setup research-approved.
+
+In other words, the research layer remains fail-open regarding blocking the existing strategy, but it must not manufacture evidence of approval.
+
+Add the watchdog
+
+Every research subsystem should expose:
+
+last scan
+last opportunity
+last DB write
+last closure
+error count
+observations today
+closed observations today
+engine enabled
+engine healthy
+
+Alert only on actual abnormal silence, not simply because there haven't been trades.
+
+Then make it autonomous
+
+After those four fixes, add one small Research Operations panel instead of more strategy UI.
+
+It should basically say:
+
+RESEARCH ENGINE
+
+HEALTHY ✓
+
+GRE: Running
+SCALP: Running
+FVG: Running
+INTRADAY_TREND: Running
+
+Observations today: 47
+Closed: 13
+Experiments validating: 6
+Promising: 2
+Ready for review: 1
+Errors last 24h: 0
+Last DB write: 23 sec ago
+
+And underneath:
+
+Needs Attention
+
+ORB_CLOSE_RETEST_V3 — READY FOR REVIEW
+
+That gets you much closer to what you've been wanting: the bot does the research while you focus on other things, and you only become involved when something genuinely deserves attention.
+
+What I would not spend money on yet
+
+Don't build the three missing scalp detectors yet. Don't tune the FVG thresholds. Don't add more variants. Don't change GRE promotion thresholds. Don't build another research engine. And don't auto-promote strategies to live trading.
+
+You already have 20 GRE experiments + 16 scalp detectors + FVG sequencing + IT ghost research. That's more than enough surface area to discover something profitable. The bottleneck now is clean evidence and operational reliability, not a lack of ideas.
+
+Once P0 is finished, let the system collect data. Then our next meaningful decision should come from the evidence: which strategies are actually making money, which gates help them, and which should be killed.
+
+That is the direction I'd lock in rather than starting another branch of the project.
