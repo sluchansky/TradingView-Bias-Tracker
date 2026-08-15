@@ -23,6 +23,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { id: 'execution',  label: 'Execution',     path: '/main-brain/execution', icon: '⊙' },
   { id: 'journal',    label: 'Journal',       path: '/main-brain/journal',   icon: '≡' },
   { id: 'coach',      label: 'Coach',         path: '/main-brain/coach',     icon: '◆' },
+  { id: 'research',   label: 'Research',      path: '/main-brain/research',  icon: '⬡' },
   { id: 'alerts',     label: 'Alerts',        path: '/main-brain/alerts',    icon: '◉' },
 ] as const;
 

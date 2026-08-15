@@ -82121,6 +82121,162 @@ def route_research_events():
     })
 
 
+# ── Research Operations panel endpoint ────────────────────────────────────────
+# Lightweight aggregated status for the Research Ops dashboard panel.
+# DISPLAY-ONLY.  Auth handled by Express proxy.  NOT in OPEN_PATHS.
+# NEVER touches gate, scoring, sizing, learning, arm state, or broker.
+
+@app.route("/research-ops", methods=["GET"])
+def route_research_ops():
+    """Research Operations status — aggregated health for the Research panel.
+
+    Returns one lightweight response consumed by the frontend Research panel:
+      • Engine flags (GRE, FVG, SCALP, IT) — enabled + running
+      • Ghost observations today / closed today / total open / last DB write
+      • Evidence-state counts from ghost_experiments
+      • Compact READY_FOR_REVIEW list (≤10 rows)
+      • Overall healthy flag + needs_attention flag
+      • Error count since last boot
+
+    Auth handled by Express proxy.  NOT in OPEN_PATHS.
+    NEVER touches gate, scoring, sizing, learning, or execution.
+    """
+    now_utc = datetime.now(timezone.utc)
+    today   = now_utc.date().isoformat()
+
+    # ── Engine flags ──────────────────────────────────────────────────────────
+    # GRE and FVG share the GhostResearchEngine; SCALP and IT are independent.
+    # IT running = TRADING_MODE is currently set to INTRADAY_TREND at runtime.
+    # Membership in the static MODES catalog is NOT sufficient — INTRADAY_TREND
+    # is always registered there but only "running" when the operator selects it.
+    it_enabled   = TRADING_MODE == "INTRADAY_TREND"
+    out: dict = {
+        "ok":          True,
+        "ts":          now_utc.isoformat(),
+        "boot_ts":     _RESEARCH_BOOT_TS,
+        "error_count": _RESEARCH_ERROR_COUNT,
+        "engines": {
+            "gre":   {"enabled": GRE_DB_READY,             "running": False, "label": "GRE (ORB)"},
+            "fvg":   {"enabled": GRE_DB_READY,             "running": False, "label": "FVG Research"},
+            "scalp": {"enabled": bool(SCALP_LIVE_SIM_ENABLED), "running": bool(SCALP_LIVE_SIM_ENABLED), "label": "SCALP Sim"},
+            "it":    {"enabled": it_enabled,                "running": it_enabled, "label": "IT Gate"},
+        },
+        "ghost": {
+            "observations_today": 0,
+            "closed_today":       0,
+            "total_open":         0,
+            "last_created_at":    None,
+        },
+        "evidence_states":       {},   # evidence_state → count
+        "ready_for_review":      [],   # compact list ≤10
+        "ready_for_review_count": 0,
+        "healthy":        False,
+        "needs_attention": False,
+    }
+
+    # ── GRE engine health (covers both ORB and FVG families) ─────────────────
+    if GRE_DB_READY and "_GHOST_RESEARCH_ENGINE" in globals():
+        try:
+            _gre = globals()["_GHOST_RESEARCH_ENGINE"]
+            gre_h = _gre.get_health()
+            out["engines"]["gre"]["running"]              = True
+            out["engines"]["gre"]["opportunities_today"]  = gre_h.get("opportunities_today", 0)
+            out["engines"]["gre"]["total_experiments"]    = gre_h.get("total_experiments", 0)
+            out["engines"]["gre"]["active_ghost_trades"]  = gre_h.get("active_ghost_trades", 0)
+            out["engines"]["gre"]["version"]              = gre_h.get("gre_version")
+            # FVG family breakdown (within same engine)
+            fam_b = gre_h.get("family_breakdown", {})
+            fvg_b = fam_b.get("FVG_REVISIT", {})
+            out["engines"]["fvg"]["running"]              = True
+            out["engines"]["fvg"]["opportunities_today"]  = int(fvg_b.get("opps_today", 0) or 0)
+            out["engines"]["fvg"]["total_opportunities"]  = int(fvg_b.get("total_opps", 0) or 0)
+        except Exception as _gre_exc:
+            out["engines"]["gre"]["error"] = str(_gre_exc)[:80]
+
+    # ── DB queries — ghost observations + evidence state counts ───────────────
+    if GRE_DB_READY and LEARNING_DB_ENABLED:
+        conn = _learning_conn()
+        if conn:
+            try:
+                with conn.cursor() as cur:
+                    # Observation summary for today.
+                    # obs_today  = created on today's UTC trading date (new setups)
+                    # closed_today = closed_at falls on today's UTC date (actual exits,
+                    #                regardless of when the observation was opened)
+                    # total_open   = closed_at IS NULL (most robust across all status values)
+                    cur.execute(
+                        """
+                        SELECT
+                            COUNT(*) FILTER (WHERE DATE(created_at AT TIME ZONE 'UTC') = %s)    AS obs_today,
+                            COUNT(*) FILTER (WHERE closed_at IS NOT NULL
+                                               AND DATE(closed_at AT TIME ZONE 'UTC') = %s)     AS closed_today,
+                            COUNT(*) FILTER (WHERE closed_at IS NULL)                            AS open_total,
+                            MAX(created_at)
+                        FROM ghost_observations
+                        """,
+                        (today, today),
+                    )
+                    r = cur.fetchone()
+                    if r:
+                        out["ghost"]["observations_today"] = int(r[0] or 0)
+                        out["ghost"]["closed_today"]       = int(r[1] or 0)
+                        out["ghost"]["total_open"]         = int(r[2] or 0)
+                        out["ghost"]["last_created_at"]    = (
+                            r[3].isoformat() if r[3] else None
+                        )
+
+                    # Evidence-state breakdown
+                    cur.execute(
+                        "SELECT evidence_state, COUNT(*) FROM ghost_experiments"
+                        " GROUP BY evidence_state"
+                    )
+                    out["evidence_states"] = {
+                        row[0]: int(row[1]) for row in cur.fetchall()
+                    }
+
+                    # Compact READY_FOR_REVIEW list (≤10 rows)
+                    cur.execute(
+                        """
+                        SELECT e.experiment_id, e.variant_name,
+                               o.instrument, o.direction, o.strategy_family,
+                               o.trading_date
+                        FROM ghost_experiments e
+                        JOIN ghost_opportunities o
+                          ON o.opportunity_id = e.opportunity_id
+                        WHERE e.evidence_state = 'READY_FOR_REVIEW'
+                        ORDER BY o.trading_date DESC NULLS LAST
+                        LIMIT 10
+                        """
+                    )
+                    cols = [d[0] for d in cur.description]
+                    rfr  = []
+                    for row in cur.fetchall():
+                        d = dict(zip(cols, row))
+                        if d.get("trading_date"):
+                            d["trading_date"] = d["trading_date"].isoformat()
+                        rfr.append(d)
+                    out["ready_for_review"]       = rfr
+                    out["ready_for_review_count"] = len(rfr)
+            except Exception as _db_exc:
+                out["db_error"] = str(_db_exc)[:120]
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    # ── Overall health flag ───────────────────────────────────────────────────
+    out["healthy"] = (
+        GRE_DB_READY
+        and GHOST_OBS_DB_READY
+        and out["engines"]["gre"]["running"]
+        and out["error_count"] == 0
+    )
+    out["needs_attention"] = out["ready_for_review_count"] > 0
+
+    return jsonify(out)
+
+
 # ── Phase 8C: Gate Effectiveness Audit routes ─────────────────────────────────
 # DISPLAY/MEASUREMENT ONLY.  Auth handled by Express proxy.  NOT in OPEN_PATHS.
 # NEVER touches gate, scoring, sizing, learning, arm state, or broker.

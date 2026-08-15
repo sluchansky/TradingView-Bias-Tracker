@@ -3612,6 +3612,294 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   );
 };
 
+// ── Research Operations Panel ─────────────────────────────────────────────────
+// DISPLAY-ONLY. Shows research engine health, observation pipeline, evidence
+// state breakdown, and READY_FOR_REVIEW queue.  Fetches /api/research-ops every
+// 30 s.  Fail-open: never touches gate, scoring, or execution.
+const ResearchOpsPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
+  type EngineInfo = {
+    enabled: boolean; running: boolean; label: string;
+    opportunities_today?: number; total_experiments?: number;
+    active_ghost_trades?: number; version?: string; error?: string;
+    total_opportunities?: number;
+  };
+  type ResearchOps = {
+    ok: boolean; ts: string; boot_ts: string; error_count: number;
+    engines: { gre: EngineInfo; fvg: EngineInfo; scalp: EngineInfo; it: EngineInfo };
+    ghost: { observations_today: number; closed_today: number; total_open: number; last_created_at: string | null };
+    evidence_states: Record<string, number>;
+    ready_for_review: Array<{ experiment_id: string; variant_name: string; instrument: string; direction: string; strategy_family: string; trading_date: string | null }>;
+    ready_for_review_count: number;
+    healthy: boolean; needs_attention: boolean; db_error?: string;
+  };
+
+  const [data, setData]     = React.useState<ResearchOps | null>(null);
+  const [loading, setLoading] = React.useState(false);
+  const [age, setAge]       = React.useState<number | null>(null);
+  const [err, setErr]       = React.useState<string | null>(null);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await fetch('/api/research-ops', {
+        credentials: 'include',
+        headers: authHeader ? { Authorization: authHeader } : {},
+      });
+      if (!r.ok) { setErr(`HTTP ${r.status}`); return; }
+      const j = await r.json() as ResearchOps;
+      setData(j);
+      setErr(null);
+      setAge(Date.now());
+    } catch (e) {
+      setErr(String(e));
+    } finally {
+      setLoading(false);
+    }
+  }, [authHeader]);
+
+  React.useEffect(() => {
+    load();
+    const id = window.setInterval(load, 30_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+  const fmtAgeMs = (ts: string | null): string => {
+    if (!ts) return '—';
+    try {
+      const secs = Math.round((Date.now() - new Date(ts).getTime()) / 1000);
+      if (secs < 60)  return `${secs}s ago`;
+      if (secs < 3600) return `${Math.round(secs / 60)}m ago`;
+      return `${Math.round(secs / 3600)}h ago`;
+    } catch { return '—'; }
+  };
+
+  const EngineChip: React.FC<{ info: EngineInfo }> = ({ info }) => {
+    const ok  = info.enabled && info.running;
+    const off = !info.enabled;
+    const col = ok ? T.green : off ? T.txtMuted : T.amber;
+    const dot = ok ? '●' : off ? '○' : '◌';
+    const lbl = ok ? 'Running' : off ? 'Off' : 'Not running';
+    return (
+      <div style={{ display:'flex', flexDirection:'column', gap:2, padding:'7px 10px',
+        background:`${col}0f`, border:`1px solid ${col}28`, borderRadius:7 }}>
+        <div style={{ display:'flex', alignItems:'center', gap:5 }}>
+          <span style={{ color:col, fontSize:9 }}>{dot}</span>
+          <span style={{ fontSize:10, fontWeight:700, color:T.txtSec, letterSpacing:'0.06em' }}>{info.label}</span>
+          <span style={{ marginLeft:'auto', fontSize:9, color:col, letterSpacing:'0.04em' }}>{lbl}</span>
+        </div>
+        {info.opportunities_today != null && (
+          <div style={{ fontSize:9, color:T.txtMuted }}>
+            Opps today: <span style={{ color:T.txtSec }}>{info.opportunities_today}</span>
+            {info.active_ghost_trades != null && (
+              <span>  ·  Active: <span style={{ color:T.cyan }}>{info.active_ghost_trades}</span></span>
+            )}
+          </div>
+        )}
+        {info.error && (
+          <div style={{ fontSize:8.5, color:T.amber, marginTop:1 }}>⚠ {info.error}</div>
+        )}
+      </div>
+    );
+  };
+
+  const EVIDENCE_LABELS: Record<string, { short: string; col: string }> = {
+    INSUFFICIENT_DATA: { short: 'Insufficient',  col: T.txtMuted },
+    OBSERVING:         { short: 'Observing',      col: '#60a5fa' },
+    VALIDATING:        { short: 'Validating',     col: T.amber },
+    PROMISING:         { short: 'Promising',      col: '#a78bfa' },
+    READY_FOR_REVIEW:  { short: 'Ready ★',        col: T.green },
+    REJECTED:          { short: 'Rejected',       col: T.red },
+    RETIRED:           { short: 'Retired',        col: T.txtMuted },
+  };
+
+  const ghost    = data?.ghost;
+  const engines  = data?.engines;
+  const ev       = data?.evidence_states ?? {};
+  const rfr      = data?.ready_for_review ?? [];
+  const healthy  = data?.healthy ?? false;
+  const hasAttn  = (data?.needs_attention) ?? false;
+
+  return (
+    <section
+      id="research-ops-panel"
+      aria-label="Research Operations"
+      style={{ background:T.panel, border:`1px solid ${T.border}`, borderRadius:10, overflow:'hidden' }}
+    >
+      {/* ── Header ─────────────────────────────────────────────────────────── */}
+      <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 14px',
+        borderBottom:`1px solid ${T.border}`, background:'rgba(255,255,255,0.015)' }}>
+        <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.1em', textTransform:'uppercase', color:T.txtSec, flex:1 }}>
+          Research Operations
+        </span>
+        {data && (
+          <span style={{ display:'flex', alignItems:'center', gap:5,
+            padding:'3px 8px', borderRadius:5,
+            background: healthy ? 'rgba(34,197,94,0.1)' : hasAttn ? 'rgba(245,158,11,0.1)' : 'rgba(100,116,139,0.1)',
+            border: `1px solid ${healthy ? 'rgba(34,197,94,0.28)' : hasAttn ? 'rgba(245,158,11,0.28)' : 'rgba(100,116,139,0.28)'}`,
+          }}>
+            <span style={{ fontSize:8, color: healthy ? T.green : hasAttn ? T.amber : T.txtMuted }}>
+              {healthy ? '●' : '◌'}
+            </span>
+            <span style={{ fontSize:9, fontWeight:700, letterSpacing:'0.06em',
+              color: healthy ? T.green : hasAttn ? T.amber : T.txtMuted }}>
+              {healthy ? 'HEALTHY' : hasAttn ? 'NEEDS ATTENTION' : 'PENDING'}
+            </span>
+          </span>
+        )}
+        {age && (
+          <span style={{ fontSize:9, color:T.txtMuted }}>{fmtAgeMs(new Date(age).toISOString())}</span>
+        )}
+        <button onClick={load} disabled={loading}
+          style={{ background:'transparent', border:'none', color:T.cyan, cursor:'pointer', fontSize:11, padding:'2px 4px', opacity: loading ? 0.4 : 1 }}
+          title="Refresh">↺</button>
+      </div>
+
+      <div style={{ padding:'12px 14px', display:'flex', flexDirection:'column', gap:14 }}>
+        {err ? (
+          <div style={{ padding:'10px 12px', background:'rgba(239,68,68,0.08)', borderRadius:7, fontSize:11, color:T.red }}>
+            ⚠ Could not load research status: {err}
+          </div>
+        ) : !data ? (
+          <div style={{ fontSize:11, color:T.txtMuted, padding:8 }}>Loading research status…</div>
+        ) : (
+          <>
+            {/* ── Engine grid ─────────────────────────────────────────────── */}
+            <div>
+              <div style={{ fontSize:9, fontWeight:700, letterSpacing:'0.1em', color:T.txtMuted, textTransform:'uppercase', marginBottom:6 }}>
+                Engine Status
+              </div>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:6 }}>
+                {engines && (
+                  <>
+                    <EngineChip info={engines.gre} />
+                    <EngineChip info={engines.fvg} />
+                    <EngineChip info={engines.scalp} />
+                    <EngineChip info={engines.it} />
+                  </>
+                )}
+              </div>
+            </div>
+
+            {/* ── Observation summary ─────────────────────────────────────── */}
+            <div>
+              <div style={{ fontSize:9, fontWeight:700, letterSpacing:'0.1em', color:T.txtMuted, textTransform:'uppercase', marginBottom:6 }}>
+                Today's Activity
+              </div>
+              <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr 1fr', gap:4 }}>
+                {[
+                  { label:'Obs today',     value: ghost?.observations_today ?? '—' },
+                  { label:'Closed today',  value: ghost?.closed_today ?? '—' },
+                  { label:'Open trades',   value: ghost?.total_open ?? '—' },
+                ].map(({ label, value }) => (
+                  <div key={label} style={{ padding:'6px 8px', background:'rgba(255,255,255,0.025)', borderRadius:6 }}>
+                    <div style={{ fontSize:9, color:T.txtMuted, marginBottom:2 }}>{label}</div>
+                    <div style={{ fontSize:14, fontWeight:700, color:T.txtSec, fontFamily:T.mono }}>{value}</div>
+                  </div>
+                ))}
+              </div>
+              <div style={{ marginTop:6, display:'grid', gridTemplateColumns:'1fr 1fr', gap:4 }}>
+                <div style={{ padding:'5px 8px', background:'rgba(255,255,255,0.025)', borderRadius:6, fontSize:10 }}>
+                  <span style={{ color:T.txtMuted }}>Last DB write: </span>
+                  <span style={{ color: data.error_count > 0 ? T.amber : T.txtSec }}>
+                    {fmtAgeMs(ghost?.last_created_at ?? null)}
+                  </span>
+                </div>
+                <div style={{ padding:'5px 8px', background: data.error_count > 0 ? 'rgba(239,68,68,0.08)' : 'rgba(255,255,255,0.025)', borderRadius:6, fontSize:10 }}>
+                  <span style={{ color:T.txtMuted }}>Errors: </span>
+                  <span style={{ color: data.error_count > 0 ? T.red : T.green, fontWeight:700 }}>
+                    {data.error_count}
+                  </span>
+                </div>
+              </div>
+            </div>
+
+            {/* ── Evidence pipeline ───────────────────────────────────────── */}
+            {Object.keys(ev).length > 0 && (
+              <div>
+                <div style={{ fontSize:9, fontWeight:700, letterSpacing:'0.1em', color:T.txtMuted, textTransform:'uppercase', marginBottom:6 }}>
+                  Evidence Pipeline
+                </div>
+                <div style={{ display:'flex', flexDirection:'column', gap:3 }}>
+                  {Object.entries(ev)
+                    .sort(([a], [b]) => {
+                      const ORDER = ['INSUFFICIENT_DATA','OBSERVING','VALIDATING','PROMISING','READY_FOR_REVIEW','REJECTED','RETIRED'];
+                      return ORDER.indexOf(a) - ORDER.indexOf(b);
+                    })
+                    .map(([state, count]) => {
+                      const meta = EVIDENCE_LABELS[state] ?? { short: state, col: T.txtMuted };
+                      const total = Object.values(ev).reduce((a, b) => a + b, 0);
+                      const pct   = total > 0 ? Math.round(count / total * 100) : 0;
+                      return (
+                        <div key={state} style={{ display:'flex', alignItems:'center', gap:6 }}>
+                          <span style={{ width:90, fontSize:9, color:meta.col, letterSpacing:'0.02em' }}>{meta.short}</span>
+                          <div style={{ flex:1, height:5, background:'rgba(255,255,255,0.06)', borderRadius:3, overflow:'hidden' }}>
+                            <div style={{ height:'100%', width:`${pct}%`, background:meta.col, opacity:0.7, borderRadius:3, transition:'width 0.4s ease' }} />
+                          </div>
+                          <span style={{ width:28, fontSize:10, fontWeight:700, color:meta.col, textAlign:'right', fontFamily:T.mono }}>{count}</span>
+                        </div>
+                      );
+                    })
+                  }
+                </div>
+              </div>
+            )}
+
+            {/* ── Needs Attention queue ───────────────────────────────────── */}
+            {rfr.length > 0 && (
+              <div>
+                <div style={{ display:'flex', alignItems:'center', gap:6, marginBottom:6, padding:'5px 10px',
+                  background:'rgba(34,197,94,0.06)', border:'1px solid rgba(34,197,94,0.2)',
+                  borderRadius:6 }}>
+                  <span style={{ fontSize:9, color:T.green }}>●</span>
+                  <span style={{ fontSize:9, fontWeight:700, letterSpacing:'0.1em', color:T.green, textTransform:'uppercase' }}>
+                    Needs Attention — {rfr.length} item{rfr.length !== 1 ? 's' : ''}
+                  </span>
+                </div>
+                <div style={{ display:'flex', flexDirection:'column', gap:4 }}>
+                  {rfr.map(ex => (
+                    <div key={ex.experiment_id}
+                      style={{ padding:'6px 10px', background:'rgba(34,197,94,0.04)',
+                        border:'1px solid rgba(34,197,94,0.15)', borderRadius:6 }}>
+                      <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', marginBottom:2 }}>
+                        <span style={{ fontSize:10, fontWeight:700, color:T.green, fontFamily:T.mono }}>
+                          {ex.variant_name}
+                        </span>
+                        <span style={{ fontSize:9, color:T.txtMuted }}>
+                          {ex.instrument} · {ex.direction}
+                        </span>
+                      </div>
+                      <div style={{ fontSize:9, color:T.txtMuted }}>
+                        {ex.strategy_family}
+                        {ex.trading_date && ` · ${ex.trading_date}`}
+                      </div>
+                      <div style={{ fontSize:8.5, color:T.green, marginTop:2, letterSpacing:'0.06em' }}>
+                        READY FOR REVIEW — requires human operator action
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
+
+            {/* ── DB error ────────────────────────────────────────────────── */}
+            {data.db_error && (
+              <div style={{ padding:'7px 10px', background:'rgba(239,68,68,0.07)', border:'1px solid rgba(239,68,68,0.2)', borderRadius:6, fontSize:9.5, color:T.red }}>
+                DB error: {data.db_error}
+              </div>
+            )}
+
+            {/* ── Boot info ───────────────────────────────────────────────── */}
+            <div style={{ fontSize:8.5, color:T.txtMuted, borderTop:`1px solid ${T.border}`, paddingTop:8 }}>
+              Boot: {fmtAgeMs(data.boot_ts)} · Events in buffer: {data ? '(see /research-events)' : '—'}
+            </div>
+          </>
+        )}
+      </div>
+    </section>
+  );
+};
+
 const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   type GateCat = {
     category: string; n_blocks: number; pct_of_blocked: number;
@@ -13707,6 +13995,10 @@ export default function MainBrain() {
         return <JournalFullPage />;
       case 'coach':
         return <CoachPanel p={p} />;
+      case 'research':
+        return (
+          <ResearchOpsPanel authHeader={getAuthHeader()['Authorization'] ?? ''} />
+        );
       case 'execution':
         return (
           <>
@@ -13815,8 +14107,8 @@ export default function MainBrain() {
         <Header p={p} fetchState={fetchState} lastOk={lastOk} ticker={ticker} setTicker={handleSetTicker} refresh={refresh} onAskAi={() => setAskOpen(true)} />
 
         <main id="main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
-          {/* Execution renders immediately — it has its own data source (ARM hook), no brain poll needed */}
-          {section === 'execution' ? renderSectionPanels() :
+          {/* Execution and Research render immediately — they have own data sources, no brain poll needed */}
+          {(section === 'execution' || section === 'research') ? renderSectionPanels() :
           isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
             <>
               {/* Stale banner */}
