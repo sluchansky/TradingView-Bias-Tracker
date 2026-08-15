@@ -60,12 +60,22 @@ def _make_obs(bias="BULLISH", state="TRENDING_UP", event="RECLAIM",
 
 
 def _import_vb():
-    """Import visual_brain with AI_INTEGRATIONS env vars stubbed."""
+    """Import visual_brain with AI_INTEGRATIONS env vars stubbed.
+    VISUAL_BRAIN_ENABLED is forced to 'false' so tests that check the default-off
+    behaviour are not affected by the dev environment having it set to true.
+    """
     os.environ.setdefault("AI_INTEGRATIONS_OPENAI_API_KEY", "test-key")
     os.environ.setdefault("AI_INTEGRATIONS_OPENAI_BASE_URL", "https://api.openai.com/v1")
     if "visual_brain" in sys.modules:
         del sys.modules["visual_brain"]
-    return importlib.import_module("visual_brain")
+    # Temporarily clear the flag so module-level VISUAL_BRAIN_ENABLED evaluates False
+    _orig = os.environ.pop("VISUAL_BRAIN_ENABLED", None)
+    try:
+        mod = importlib.import_module("visual_brain")
+    finally:
+        if _orig is not None:
+            os.environ["VISUAL_BRAIN_ENABLED"] = _orig
+    return mod
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -185,7 +195,7 @@ class TestScreenshotFailure(unittest.TestCase):
         with patch("visual_brain.capture_chart_screenshot",
                    side_effect=RuntimeError("capture failed")), \
              patch("visual_brain._schedule_next",
-                   side_effect=lambda: reschedule_called.set()):
+                   side_effect=lambda *a: reschedule_called.set()):
             self.vb._vb_tick()   # must not raise
 
         self.assertTrue(reschedule_called.is_set(), "_schedule_next should be called even on failure")
@@ -200,7 +210,7 @@ class TestStatePersistence(unittest.TestCase):
 
     def setUp(self):
         self.vb = _import_vb()
-        self.vb._LAST_OBSERVATION = None
+        self.vb._LAST_OBSERVATION_BY_INST.clear()
         self.vb.VISUAL_BRAIN_ENABLED = True
 
     def test_last_observation_updated_after_tick(self):
@@ -216,13 +226,13 @@ class TestStatePersistence(unittest.TestCase):
             self.vb._vb_tick()
 
         with self.vb._VB_LOCK:
-            cached = self.vb._LAST_OBSERVATION
+            cached = self.vb._LAST_OBSERVATION_BY_INST.get("MNQ")
         self.assertIsNotNone(cached)
         self.assertEqual(cached["bias"], "BULLISH")
 
     def test_cache_returned_by_get_last_observation(self):
         obs = _make_obs()
-        self.vb._LAST_OBSERVATION = obs
+        self.vb._LAST_OBSERVATION_BY_INST["MNQ"] = obs
         result = self.vb.get_last_observation("MNQ")
         self.assertIsNotNone(result)
         self.assertEqual(result["bias"], obs["bias"])
@@ -399,7 +409,7 @@ class TestModelTimeout(unittest.TestCase):
              patch("visual_brain.analyze_visual_market",
                    side_effect=RuntimeError("model timeout")), \
              patch("visual_brain._schedule_next",
-                   side_effect=lambda: reschedule_called.set()):
+                   side_effect=lambda *a: reschedule_called.set()):
             self.vb._vb_tick()  # must not raise
 
         self.assertTrue(reschedule_called.is_set())
@@ -419,7 +429,7 @@ class TestDisabledMode(unittest.TestCase):
     def test_start_is_noop_when_disabled(self):
         timer_started = threading.Event()
         with patch("visual_brain._schedule_next",
-                   side_effect=lambda: timer_started.set()):
+                   side_effect=lambda *a: timer_started.set()):
             self.vb.start()
         self.assertFalse(timer_started.is_set(), "No timer should start when disabled")
 
@@ -789,7 +799,7 @@ class TestSingleFlightReschedule(unittest.TestCase):
         """Run one _vb_tick with chosen stub behaviour; return # _schedule_next calls."""
         counter = {"n": 0}
 
-        def _fake_schedule():
+        def _fake_schedule(*_args):
             counter["n"] += 1
 
         screenshot = capture_returns if capture_returns is not None else b"fake-img"
@@ -822,7 +832,7 @@ class TestSingleFlightReschedule(unittest.TestCase):
         # (patch returns None but side_effect=None so no raise; fn returns None)
         n2 = 0
         counter = {"n": 0}
-        def _fake_schedule():
+        def _fake_schedule(*_args):
             counter["n"] += 1
         with patch("visual_brain._schedule_next", side_effect=_fake_schedule), \
              patch("visual_brain.capture_chart_screenshot", return_value=None), \
@@ -845,7 +855,7 @@ class TestSingleFlightReschedule(unittest.TestCase):
         """When VISUAL_BRAIN_ENABLED=False, _schedule_next must not be called at all."""
         self.vb.VISUAL_BRAIN_ENABLED = False
         counter = {"n": 0}
-        with patch("visual_brain._schedule_next", side_effect=lambda: counter.__setitem__("n", counter["n"] + 1)):
+        with patch("visual_brain._schedule_next", side_effect=lambda *a: counter.__setitem__("n", counter["n"] + 1)):
             self.vb._vb_tick()
         self.assertEqual(counter["n"], 0,
                          "_schedule_next should not be called when disabled")

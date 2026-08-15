@@ -3266,54 +3266,60 @@ const ModeOverviewPanel: React.FC<{ ticker: string; authHeader: string }> = ({ t
 // ── Visual Brain Panel ────────────────────────────────────────────────────────
 const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   type VBObs = {
-    timestamp: string;
-    instrument: string;
-    bias: string;
-    market_state: string;
-    short_term_structure: string | null;
-    last_event: string;
-    action: string;
-    confidence: number;
-    support_description: string;
-    support_price: number | null;
-    resistance_description: string;
-    resistance_price: number | null;
-    long_condition: string;
-    short_condition: string;
-    state_changed: boolean;
-    state_change_reason: string;
-    summary: string;
+    timestamp: string; instrument: string; bias: string; market_state: string;
+    short_term_structure: string | null; last_event: string; action: string;
+    confidence: number; support_description: string; support_price: number | null;
+    resistance_description: string; resistance_price: number | null;
+    long_condition: string; short_condition: string;
+    state_changed: boolean; state_change_reason: string; summary: string;
     p1m: number | null; p3m: number | null; p5m: number | null;
-    p10m: number | null; p15m: number | null;
-    mfe: number | null; mae: number | null;
+    p10m: number | null; p15m: number | null; mfe: number | null; mae: number | null;
     outcome_resolved: boolean;
   };
-  const [obs, setObs]       = React.useState<VBObs | null>(null);
+  type AllStatus = {
+    enabled: boolean; db_ready: boolean; symbols: string[];
+    instruments: Record<string, { observation: VBObs | null }>;
+    cost: { calls_today: number; cost_today_usd: number };
+  };
+
+  const [allStatus, setAllStatus] = React.useState<AllStatus | null>(null);
+  const [activeTab, setActiveTab] = React.useState<string>('');
   const [hist, setHist]     = React.useState<VBObs[]>([]);
-  const [enabled, setEnabled] = React.useState<boolean | null>(null);
-  const [dbReady, setDbReady] = React.useState<boolean>(false);
+  const [histInst, setHistInst] = React.useState<string>('');
   const [lastFetch, setLastFetch] = React.useState<number | null>(null);
   const [open, setOpen]     = React.useState(true);
   const [histOpen, setHistOpen] = React.useState(false);
 
+  // Fetch all-status + history for active tab
   const load = React.useCallback(async () => {
     if (!open) return;
     try {
       const hdr = { Authorization: authHeader };
-      const [sr, hr] = await Promise.allSettled([
-        fetch('/api/visual-brain/status', { headers: hdr }).then(r => r.ok ? r.json() : null).catch(() => null),
-        fetch('/api/visual-brain/history?limit=10', { headers: hdr }).then(r => r.ok ? r.json() : null).catch(() => null),
-      ]);
-      if (sr.status === 'fulfilled' && sr.value) {
-        const data = sr.value as Record<string, unknown>;
-        setEnabled(data.enabled as boolean);
-        setDbReady(data.db_ready as boolean);
-        setObs((data.observation as VBObs) ?? null);
+      const sr = await fetch('/api/visual-brain/all-status', { headers: hdr })
+        .then(r => r.ok ? r.json() : null).catch(() => null);
+      if (sr) {
+        setAllStatus(sr as AllStatus);
         setLastFetch(Date.now());
+        // Set initial tab to first symbol with data, or first symbol
+        setActiveTab(prev => {
+          if (prev) return prev;
+          const syms: string[] = (sr as AllStatus).symbols ?? [];
+          return syms[0] ?? '';
+        });
       }
-      if (hr.status === 'fulfilled' && hr.value) {
-        const data = hr.value as Record<string, unknown>;
-        setHist((data.history as VBObs[]) ?? []);
+    } catch { /* pass */ }
+  }, [open, authHeader]);
+
+  // Fetch history when active tab changes
+  const loadHist = React.useCallback(async (inst: string) => {
+    if (!inst || !open) return;
+    try {
+      const hdr = { Authorization: authHeader };
+      const hr = await fetch(`/api/visual-brain/history?instrument=${encodeURIComponent(inst)}&limit=10`, { headers: hdr })
+        .then(r => r.ok ? r.json() : null).catch(() => null);
+      if (hr) {
+        setHist((hr as Record<string, unknown>).history as VBObs[] ?? []);
+        setHistInst(inst);
       }
     } catch { /* pass */ }
   }, [open, authHeader]);
@@ -3323,6 +3329,16 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
     const id = window.setInterval(load, 30_000);
     return () => window.clearInterval(id);
   }, [load]);
+
+  React.useEffect(() => {
+    if (activeTab && activeTab !== histInst) loadHist(activeTab);
+  }, [activeTab, histInst, loadHist]);
+
+  // When all-status refreshes, reload history if tab changed
+  React.useEffect(() => {
+    if (activeTab) loadHist(activeTab);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [allStatus]);
 
   const biasColor = (b: string | null | undefined) => {
     const s = (b ?? '').toUpperCase();
@@ -3347,14 +3363,27 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   const fmtPct = (v: number | null | undefined) =>
     v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(3)}%`;
 
-  // State history: only show rows where state_changed=true, newest first
+  const enabled  = allStatus?.enabled ?? null;
+  const dbReady  = allStatus?.db_ready ?? false;
+  const symbols  = allStatus?.symbols ?? [];
+  const obsMap   = allStatus?.instruments ?? {};
+  const obs      = activeTab ? (obsMap[activeTab]?.observation ?? null) : null;
   const transitions = hist.filter(h => h.state_changed);
+
+  // Compact bias chip for tabs — shows bias of each instrument at a glance
+  const biasDot = (inst: string) => {
+    const o = obsMap[inst]?.observation;
+    if (!o) return null;
+    const col = biasColor(o.bias);
+    return <span style={{ width: 6, height: 6, borderRadius: '50%', background: col,
+      display: 'inline-block', marginLeft: 4, flexShrink: 0 }} />;
+  };
 
   return (
     <section id="mod-visual-brain" style={{
       background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10,
       overflow: 'hidden', marginBottom: 12,
-    }} aria-label="Visual Brain MNQ">
+    }} aria-label="Visual Brain">
       {/* Header */}
       <div style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '10px 14px',
         borderBottom: `1px solid ${T.border}`, background: 'rgba(255,255,255,0.015)',
@@ -3362,13 +3391,21 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
         onClick={() => setOpen(o => !o)}>
         <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.1em',
           textTransform: 'uppercase', color: T.txtSec, flex: 1 }}>
-          👁 Visual Brain — MNQ
+          👁 Visual Brain
+          {symbols.length > 0 && (
+            <span style={{ color: T.txtMuted, fontWeight: 400 }}> — {symbols.join(' · ')}</span>
+          )}
         </span>
         {enabled !== null && (
           <Badge label={enabled ? 'ENABLED' : 'DISABLED'}
             color={enabled ? T.green : T.txtMuted} />
         )}
         {dbReady && <Badge label="DB OK" color={T.green} />}
+        {allStatus?.cost && (
+          <span style={{ fontSize: 9, color: T.txtMuted }}>
+            {allStatus.cost.calls_today} calls · ${allStatus.cost.cost_today_usd.toFixed(4)}
+          </span>
+        )}
         {lastFetch && (
           <span style={{ fontSize: 9, color: T.txtMuted }}>{fmtAge(new Date(lastFetch).toISOString())}</span>
         )}
@@ -3382,155 +3419,191 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
               Visual Brain is disabled.<br />
               <span style={{ fontSize: 10 }}>Set <code style={{ fontFamily: T.mono, color: T.cyan }}>VISUAL_BRAIN_ENABLED=true</code> to activate.</span>
             </div>
-          ) : !obs ? (
-            <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
-              {dbReady ? 'Awaiting first observation…' : 'DB table not ready — apply migration first.'}
-            </div>
           ) : (
             <>
-              {/* ── Main state row ── */}
-              <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
-                {/* Bias */}
-                <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
-                  border: `1px solid ${biasColor(obs.bias)}33`, textAlign: 'center' }}>
-                  <div style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Bias</div>
-                  <div style={{ fontSize: 18, fontWeight: 800, color: biasColor(obs.bias) }}>{obs.bias ?? '—'}</div>
-                </div>
-                {/* State */}
-                <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
-                  border: `1px solid ${stateColor(obs.market_state)}33`, textAlign: 'center' }}>
-                  <div style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>State</div>
-                  <div style={{ fontSize: 11, fontWeight: 700, color: stateColor(obs.market_state) }}>
-                    {(obs.market_state ?? '—').replace(/_/g, ' ')}
-                  </div>
-                  {obs.short_term_structure && (
-                    <div style={{ fontSize: 9, color: T.txtSec, marginTop: 2 }}>
-                      {obs.short_term_structure.replace(/_/g, '/')}
-                    </div>
-                  )}
-                </div>
-                {/* Action + Confidence */}
-                <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
-                  border: `1px solid ${actionColor(obs.action)}33`, textAlign: 'center' }}>
-                  <div style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Action</div>
-                  <div style={{ fontSize: 13, fontWeight: 800, color: actionColor(obs.action) }}>
-                    {(obs.action ?? '—').replace(/_/g, ' ')}
-                  </div>
-                  <div style={{ fontSize: 10, color: actionColor(obs.action), marginTop: 2 }}>
-                    {obs.confidence ?? 0}% conf
-                  </div>
-                </div>
-              </div>
-
-              {/* ── Last Event ── */}
-              <KV label="Last Event" value={
-                <Pill text={(obs.last_event ?? 'NONE').replace(/_/g, ' ')}
-                  color={obs.last_event === 'NONE' ? T.txtMuted : T.cyan} />
-              } />
-
-              {/* ── Support / Resistance ── */}
-              <KV label="Support" value={
-                <span style={{ color: T.green, fontSize: 11 }}>
-                  {obs.support_description || '—'}
-                  {obs.support_price != null && ` @ ${obs.support_price.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 })}`}
-                </span>
-              } />
-              <KV label="Resistance" value={
-                <span style={{ color: T.red, fontSize: 11 }}>
-                  {obs.resistance_description || '—'}
-                  {obs.resistance_price != null && ` @ ${obs.resistance_price.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 })}`}
-                </span>
-              } />
-
-              {/* ── Conditions ── */}
-              {obs.long_condition && (
-                <KV label="Long When" value={<span style={{ color: T.green, fontSize: 10.5 }}>{obs.long_condition}</span>} />
-              )}
-              {obs.short_condition && (
-                <KV label="Short When" value={<span style={{ color: T.red, fontSize: 10.5 }}>{obs.short_condition}</span>} />
-              )}
-
-              {/* ── Summary ── */}
-              {obs.summary && (
-                <div style={{ margin: '10px 0', padding: '8px 10px', background: T.panelAlt,
-                  borderRadius: 6, borderLeft: `3px solid ${T.cyan}`, fontSize: 11, color: T.txtSec,
-                  lineHeight: 1.5 }}>
-                  {obs.summary}
-                </div>
-              )}
-
-              {/* ── State change notice ── */}
-              {obs.state_changed && obs.state_change_reason && (
-                <div style={{ marginBottom: 8, padding: '6px 10px', background: `${T.amber}12`,
-                  borderRadius: 6, border: `1px solid ${T.amber}33`, fontSize: 10.5, color: T.amber }}>
-                  ⚡ {obs.state_change_reason}
-                </div>
-              )}
-
-              {/* ── Ghost outcomes (when resolved) ── */}
-              {obs.outcome_resolved && (
-                <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 4 }}>
-                  {([['1m', obs.p1m], ['3m', obs.p3m], ['5m', obs.p5m], ['10m', obs.p10m], ['15m', obs.p15m]] as [string, number | null][]).map(([lbl, val]) => (
-                    <div key={lbl} style={{ textAlign: 'center', background: T.panelAlt, borderRadius: 5, padding: '4px 2px' }}>
-                      <div style={{ fontSize: 8, color: T.txtMuted }}>{lbl}</div>
-                      <div style={{ fontSize: 10.5, fontWeight: 700, color: val == null ? T.txtMuted : val > 0 ? T.green : T.red }}>
-                        {fmtPct(val)}
-                      </div>
-                    </div>
-                  ))}
-                </div>
-              )}
-
-              {/* ── Last Updated ── */}
-              <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <span style={{ fontSize: 9, color: T.txtMuted }}>
-                  Last Updated: {fmtTs(obs.timestamp)} ET
-                </span>
-                <span style={{ fontSize: 9, color: T.txtMuted }}>{fmtAge(obs.timestamp)}</span>
-              </div>
-
-              {/* ── State History ── */}
-              <div style={{ marginTop: 10 }}>
-                <div onClick={() => setHistOpen(h => !h)}
-                  style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer',
-                    padding: '4px 0', borderTop: `1px solid ${T.border}` }}>
-                  <span style={{ fontSize: 9.5, fontWeight: 700, color: T.txtSec,
-                    letterSpacing: '0.08em', textTransform: 'uppercase', flex: 1 }}>
-                    State History
-                  </span>
-                  <Badge label={`${transitions.length} shifts`} color={T.cyan} />
-                  <span style={{ fontSize: 10, color: T.txtMuted }}>{histOpen ? '▲' : '▼'}</span>
-                </div>
-                {histOpen && (
-                  <div style={{ marginTop: 6, maxHeight: 200, overflowY: 'auto' }}>
-                    {transitions.length === 0 ? (
-                      <div style={{ fontSize: 10, color: T.txtMuted, textAlign: 'center', padding: '8px 0' }}>
-                        No state transitions yet
-                      </div>
-                    ) : transitions.map((row, i) => (
-                      <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8,
-                        padding: '4px 6px', borderRadius: 4, marginBottom: 2,
-                        background: i === 0 ? `${T.cyan}08` : 'transparent',
-                        borderLeft: i === 0 ? `2px solid ${T.cyan}` : `2px solid transparent` }}>
-                        <span style={{ fontSize: 9.5, color: T.txtMuted, fontFamily: T.mono, flexShrink: 0 }}>
-                          {fmtTs(row.timestamp)}
-                        </span>
-                        <Pill text={(row.last_event ?? 'NONE').replace(/_/g, ' ')}
-                          color={biasColor(row.bias)} />
-                        <span style={{ fontSize: 9.5, color: stateColor(row.market_state) }}>
-                          {(row.market_state ?? '').replace(/_/g, ' ')}
-                        </span>
-                        {row.state_change_reason && (
-                          <span style={{ fontSize: 9, color: T.txtMuted, flex: 1,
-                            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                            — {row.state_change_reason}
+              {/* ── Instrument tabs ── */}
+              {symbols.length > 1 && (
+                <div style={{ display: 'flex', gap: 4, marginBottom: 12, borderBottom: `1px solid ${T.border}`, paddingBottom: 8 }}>
+                  {symbols.map(inst => {
+                    const isActive = inst === activeTab;
+                    const instObs = obsMap[inst]?.observation;
+                    const instBias = instObs?.bias ?? null;
+                    return (
+                      <button key={inst}
+                        onClick={() => setActiveTab(inst)}
+                        style={{
+                          display: 'flex', alignItems: 'center', gap: 5,
+                          padding: '4px 12px', borderRadius: 6, cursor: 'pointer', fontSize: 11,
+                          fontWeight: isActive ? 700 : 500,
+                          background: isActive ? `${T.cyan}18` : 'transparent',
+                          border: isActive ? `1px solid ${T.cyan}55` : `1px solid ${T.border}`,
+                          color: isActive ? T.cyan : T.txtSec,
+                          transition: 'all 0.15s',
+                        }}>
+                        {inst}
+                        {biasDot(inst)}
+                        {instBias && (
+                          <span style={{ fontSize: 8.5, color: biasColor(instBias), marginLeft: 2 }}>
+                            {instBias.slice(0, 4)}
                           </span>
                         )}
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
+
+              {!obs ? (
+                <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
+                  {dbReady ? `Awaiting first observation for ${activeTab || 'instrument'}…` : 'DB table not ready — apply migration first.'}
+                </div>
+              ) : (
+                <>
+                  {/* ── Main state row ── */}
+                  <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginBottom: 12 }}>
+                    {/* Bias */}
+                    <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
+                      border: `1px solid ${biasColor(obs.bias)}33`, textAlign: 'center' }}>
+                      <div style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Bias</div>
+                      <div style={{ fontSize: 18, fontWeight: 800, color: biasColor(obs.bias) }}>{obs.bias ?? '—'}</div>
+                    </div>
+                    {/* State */}
+                    <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
+                      border: `1px solid ${stateColor(obs.market_state)}33`, textAlign: 'center' }}>
+                      <div style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>State</div>
+                      <div style={{ fontSize: 11, fontWeight: 700, color: stateColor(obs.market_state) }}>
+                        {(obs.market_state ?? '—').replace(/_/g, ' ')}
                       </div>
-                    ))}
+                      {obs.short_term_structure && (
+                        <div style={{ fontSize: 9, color: T.txtSec, marginTop: 2 }}>
+                          {obs.short_term_structure.replace(/_/g, '/')}
+                        </div>
+                      )}
+                    </div>
+                    {/* Action + Confidence */}
+                    <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 12px',
+                      border: `1px solid ${actionColor(obs.action)}33`, textAlign: 'center' }}>
+                      <div style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 4 }}>Action</div>
+                      <div style={{ fontSize: 13, fontWeight: 800, color: actionColor(obs.action) }}>
+                        {(obs.action ?? '—').replace(/_/g, ' ')}
+                      </div>
+                      <div style={{ fontSize: 10, color: actionColor(obs.action), marginTop: 2 }}>
+                        {obs.confidence ?? 0}% conf
+                      </div>
+                    </div>
                   </div>
-                )}
-              </div>
+
+                  {/* ── Last Event ── */}
+                  <KV label="Last Event" value={
+                    <Pill text={(obs.last_event ?? 'NONE').replace(/_/g, ' ')}
+                      color={obs.last_event === 'NONE' ? T.txtMuted : T.cyan} />
+                  } />
+
+                  {/* ── Support / Resistance ── */}
+                  <KV label="Support" value={
+                    <span style={{ color: T.green, fontSize: 11 }}>
+                      {obs.support_description || '—'}
+                      {obs.support_price != null && ` @ ${obs.support_price.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 })}`}
+                    </span>
+                  } />
+                  <KV label="Resistance" value={
+                    <span style={{ color: T.red, fontSize: 11 }}>
+                      {obs.resistance_description || '—'}
+                      {obs.resistance_price != null && ` @ ${obs.resistance_price.toLocaleString('en-US', { minimumFractionDigits: 1, maximumFractionDigits: 2 })}`}
+                    </span>
+                  } />
+
+                  {/* ── Conditions ── */}
+                  {obs.long_condition && (
+                    <KV label="Long When" value={<span style={{ color: T.green, fontSize: 10.5 }}>{obs.long_condition}</span>} />
+                  )}
+                  {obs.short_condition && (
+                    <KV label="Short When" value={<span style={{ color: T.red, fontSize: 10.5 }}>{obs.short_condition}</span>} />
+                  )}
+
+                  {/* ── Summary ── */}
+                  {obs.summary && (
+                    <div style={{ margin: '10px 0', padding: '8px 10px', background: T.panelAlt,
+                      borderRadius: 6, borderLeft: `3px solid ${T.cyan}`, fontSize: 11, color: T.txtSec,
+                      lineHeight: 1.5 }}>
+                      {obs.summary}
+                    </div>
+                  )}
+
+                  {/* ── State change notice ── */}
+                  {obs.state_changed && obs.state_change_reason && (
+                    <div style={{ marginBottom: 8, padding: '6px 10px', background: `${T.amber}12`,
+                      borderRadius: 6, border: `1px solid ${T.amber}33`, fontSize: 10.5, color: T.amber }}>
+                      ⚡ {obs.state_change_reason}
+                    </div>
+                  )}
+
+                  {/* ── Ghost outcomes (when resolved) ── */}
+                  {obs.outcome_resolved && (
+                    <div style={{ marginTop: 8, display: 'grid', gridTemplateColumns: 'repeat(5, 1fr)', gap: 4 }}>
+                      {([['1m', obs.p1m], ['3m', obs.p3m], ['5m', obs.p5m], ['10m', obs.p10m], ['15m', obs.p15m]] as [string, number | null][]).map(([lbl, val]) => (
+                        <div key={lbl} style={{ textAlign: 'center', background: T.panelAlt, borderRadius: 5, padding: '4px 2px' }}>
+                          <div style={{ fontSize: 8, color: T.txtMuted }}>{lbl}</div>
+                          <div style={{ fontSize: 10.5, fontWeight: 700, color: val == null ? T.txtMuted : val > 0 ? T.green : T.red }}>
+                            {fmtPct(val)}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+
+                  {/* ── Last Updated ── */}
+                  <div style={{ marginTop: 8, display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                    <span style={{ fontSize: 9, color: T.txtMuted }}>
+                      {activeTab} · Last Updated: {fmtTs(obs.timestamp)} ET
+                    </span>
+                    <span style={{ fontSize: 9, color: T.txtMuted }}>{fmtAge(obs.timestamp)}</span>
+                  </div>
+
+                  {/* ── State History ── */}
+                  <div style={{ marginTop: 10 }}>
+                    <div onClick={() => setHistOpen(h => !h)}
+                      style={{ display: 'flex', alignItems: 'center', gap: 6, cursor: 'pointer',
+                        padding: '4px 0', borderTop: `1px solid ${T.border}` }}>
+                      <span style={{ fontSize: 9.5, fontWeight: 700, color: T.txtSec,
+                        letterSpacing: '0.08em', textTransform: 'uppercase', flex: 1 }}>
+                        State History — {activeTab}
+                      </span>
+                      <Badge label={`${transitions.length} shifts`} color={T.cyan} />
+                      <span style={{ fontSize: 10, color: T.txtMuted }}>{histOpen ? '▲' : '▼'}</span>
+                    </div>
+                    {histOpen && (
+                      <div style={{ marginTop: 6, maxHeight: 200, overflowY: 'auto' }}>
+                        {transitions.length === 0 ? (
+                          <div style={{ fontSize: 10, color: T.txtMuted, textAlign: 'center', padding: '8px 0' }}>
+                            No state transitions yet
+                          </div>
+                        ) : transitions.map((row, i) => (
+                          <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8,
+                            padding: '4px 6px', borderRadius: 4, marginBottom: 2,
+                            background: i === 0 ? `${T.cyan}08` : 'transparent',
+                            borderLeft: i === 0 ? `2px solid ${T.cyan}` : `2px solid transparent` }}>
+                            <span style={{ fontSize: 9.5, color: T.txtMuted, fontFamily: T.mono, flexShrink: 0 }}>
+                              {fmtTs(row.timestamp)}
+                            </span>
+                            <Pill text={(row.last_event ?? 'NONE').replace(/_/g, ' ')}
+                              color={biasColor(row.bias)} />
+                            <span style={{ fontSize: 9.5, color: stateColor(row.market_state) }}>
+                              {(row.market_state ?? '').replace(/_/g, ' ')}
+                            </span>
+                            {row.state_change_reason && (
+                              <span style={{ fontSize: 9, color: T.txtMuted, flex: 1,
+                                overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                — {row.state_change_reason}
+                              </span>
+                            )}
+                          </div>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                </>
+              )}
             </>
           )}
         </div>

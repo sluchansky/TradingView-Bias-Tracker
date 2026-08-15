@@ -443,6 +443,7 @@ export const BOT1_ROUTES = [
   "/visual-brain/status",
   "/visual-brain/history",
   "/visual-brain/cost",
+  "/visual-brain/all-status",
   // Phase 8B.1: Multi-Timeframe Trend Alignment endpoint (DISPLAY-ONLY).
   // Returns 4H/15M trend states from Databento 1m bar resampling.
   "/market/trend-alignment",

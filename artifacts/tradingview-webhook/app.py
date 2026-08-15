@@ -82299,6 +82299,32 @@ def route_visual_brain_cost():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
+@app.route("/visual-brain/all-status", methods=["GET"])
+def route_visual_brain_all_status():
+    """All active Visual Brain instrument observations in one call (DISPLAY/SHADOW-ONLY).
+    Returns a dict of instrument → last observation for every symbol in _VB_SYMBOLS.
+    Used by the multi-instrument tabbed panel in the dashboard.
+    Auth + CSRF enforced at Express /api edge.
+    Never touches gate, scoring, sizing, arm state, or execution."""
+    try:
+        import visual_brain as _vb  # noqa: PLC0415
+        instruments: dict = {}
+        for inst in _vb._VB_SYMBOLS:
+            instruments[inst] = {
+                "instrument": inst,
+                "observation": _vb.get_last_observation(inst),
+            }
+        return jsonify({
+            "ok":         True,
+            "enabled":    _vb.VISUAL_BRAIN_ENABLED,
+            "db_ready":   _vb.VB_DB_READY,
+            "symbols":    _vb._VB_SYMBOLS,
+            "cost":       _vb.get_cost_summary(),
+            "instruments": instruments,
+        })
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
 
 @app.route("/volatility-intelligence", methods=["GET"])
 def volatility_intelligence_endpoint():

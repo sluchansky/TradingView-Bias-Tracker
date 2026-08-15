@@ -1,6 +1,6 @@
-"""Visual Brain V1 — MNQ 1-Minute Stateful Market Observer.
+"""Visual Brain V1 — Multi-Instrument 1-Minute Stateful Market Observer.
 
-Captures the live MNQ TradingView chart (or a locally-generated candlestick
+Captures the live chart (or a locally-generated candlestick
 chart from Databento bars) once per 60 seconds, sends the image plus a compact
 text history to a vision-capable LLM, receives a strict JSON market state, and
 persists every observation to visual_brain_observations.
@@ -13,6 +13,7 @@ SHADOW / OBSERVATION ONLY.
 - One model call maximum per 60 seconds; screenshot compressed to ≤800px wide.
 
 Flag: VISUAL_BRAIN_ENABLED=true  (default OFF → byte-identical).
+Instruments: VISUAL_BRAIN_SYMBOL=MNQ,MGC,MES,MYM  (comma-separated; default all 4).
 """
 
 from __future__ import annotations
@@ -31,7 +32,9 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VISUAL_BRAIN_ENABLED   = os.getenv("VISUAL_BRAIN_ENABLED", "false").lower() in ("true", "1", "yes")
-VISUAL_BRAIN_SYMBOL    = os.getenv("VISUAL_BRAIN_SYMBOL", "MNQ")
+VISUAL_BRAIN_SYMBOL    = os.getenv("VISUAL_BRAIN_SYMBOL", "MNQ,MGC,MES,MYM")
+# Parsed list — used by all multi-instrument logic; VISUAL_BRAIN_SYMBOL kept for compat
+_VB_SYMBOLS: list = [s.strip().upper() for s in VISUAL_BRAIN_SYMBOL.split(",") if s.strip()]
 VISUAL_BRAIN_INTERVAL  = max(60, int(os.getenv("VISUAL_BRAIN_INTERVAL_SECONDS", "60")))
 _VB_MODEL              = "gpt-5.4"               # vision-capable; matches ASSISTANT_MODEL used throughout app.py
 _VB_MAX_TOKENS         = 1200
@@ -43,7 +46,8 @@ _CHART_BARS_LOOKBACK   = 60                       # bars sent to chart renderer
 # ── Module-level state ────────────────────────────────────────────────────────
 VB_DB_READY          = False
 _VB_LOCK             = threading.Lock()
-_LAST_OBSERVATION    : Optional[dict] = None     # most recent parsed observation
+# Per-instrument last observation cache (replaces single _LAST_OBSERVATION).
+_LAST_OBSERVATION_BY_INST: dict = {}   # instrument → most recent parsed observation dict
 
 # ── Injected dependencies (set by check_vb_db_ready() and start()) ────────────
 # These are injected at boot time by app.py so that visual_brain.py never needs
@@ -159,11 +163,26 @@ def get_cost_summary() -> dict:
 # Screenshot capture
 # ─────────────────────────────────────────────────────────────────────────────
 
-# TradingView public embed URL — MNQ futures, 1-minute chart, no login required.
-_TV_EMBED_URL = (
-    "https://www.tradingview.com/chart/?symbol=CME_MINI%3ANQ1%21&interval=1"
-    "&theme=dark&hide_side_toolbar=1&hide_top_toolbar=1&allow_symbol_change=0"
-)
+# TradingView public embed URLs per instrument — 1-minute chart, no login required.
+# Playwright fallback only; primary path uses matplotlib from Databento bars.
+_TV_EMBED_URLS: dict = {
+    "MNQ": (
+        "https://www.tradingview.com/chart/?symbol=CME_MINI%3ANQ1%21&interval=1"
+        "&theme=dark&hide_side_toolbar=1&hide_top_toolbar=1&allow_symbol_change=0"
+    ),
+    "MGC": (
+        "https://www.tradingview.com/chart/?symbol=COMEX%3AMG1%21&interval=1"
+        "&theme=dark&hide_side_toolbar=1&hide_top_toolbar=1&allow_symbol_change=0"
+    ),
+    "MES": (
+        "https://www.tradingview.com/chart/?symbol=CME_MINI%3AES1%21&interval=1"
+        "&theme=dark&hide_side_toolbar=1&hide_top_toolbar=1&allow_symbol_change=0"
+    ),
+    "MYM": (
+        "https://www.tradingview.com/chart/?symbol=CBOT_MINI%3AYM1%21&interval=1"
+        "&theme=dark&hide_side_toolbar=1&hide_top_toolbar=1&allow_symbol_change=0"
+    ),
+}
 
 def _compress_image(raw_png: bytes, max_px: int = _VB_IMAGE_MAX_PX) -> bytes:
     """Resize + JPEG-compress screenshot bytes; returns JPEG bytes."""
@@ -288,7 +307,10 @@ def capture_chart_screenshot(symbol: str = "MNQ", timeout_s: int = _VB_SCREENSHO
                 java_script_enabled=True,
             )
             page = ctx.new_page()
-            page.goto(_TV_EMBED_URL, timeout=timeout_s * 1000, wait_until="networkidle")
+            tv_url = _TV_EMBED_URLS.get(symbol, _TV_EMBED_URLS["MNQ"])
+            if symbol not in _TV_EMBED_URLS:
+                logger.debug("[VISUAL_BRAIN] %s has no TradingView URL; using MNQ fallback", symbol)
+            page.goto(tv_url, timeout=timeout_s * 1000, wait_until="networkidle")
             try:
                 page.wait_for_selector("canvas", timeout=15000)
                 page.wait_for_timeout(3000)   # let chart render
@@ -308,7 +330,20 @@ def capture_chart_screenshot(symbol: str = "MNQ", timeout_s: int = _VB_SCREENSHO
 # Visual analysis via GPT vision
 # ─────────────────────────────────────────────────────────────────────────────
 
-_SYSTEM_PROMPT = """You are a disciplined institutional futures trader analyzing a 1-minute MNQ (Micro E-mini Nasdaq) chart image.
+# Human-readable labels for each supported instrument — used in the system prompt
+# so the model knows what asset it is looking at.
+_INSTRUMENT_LABELS: dict = {
+    "MNQ": "MNQ (Micro E-mini Nasdaq)",
+    "MGC": "MGC (Micro Gold)",
+    "MES": "MES (Micro E-mini S&P 500)",
+    "MYM": "MYM (Micro E-mini Dow Jones)",
+}
+
+
+def _get_system_prompt(instrument: str) -> str:
+    """Return the analysis system prompt with the correct instrument label."""
+    label = _INSTRUMENT_LABELS.get(instrument, instrument)
+    return f"""You are a disciplined institutional futures trader analyzing a 1-minute {label} chart image.
 
 Your job: describe ONLY what you can directly observe in the chart. Never guess or predict specific future prices.
 
@@ -326,27 +361,27 @@ Analyze:
 Respond with ONLY valid JSON — no markdown fences, no commentary outside the JSON.
 
 Required schema (all fields mandatory):
-{
-  "instrument": "MNQ",
+{{
+  "instrument": "{instrument}",
   "timestamp": "<current ISO UTC>",
   "bias": "BULLISH|BEARISH|NEUTRAL",
   "market_state": "TRENDING_UP|TRENDING_DOWN|RANGE|REVERSAL|BREAKOUT|BREAKDOWN|RETEST|CHOP|UNCLEAR",
-  "structure": {
+  "structure": {{
     "short_term": "HH_HL|LH_LL|RANGE|TRANSITION|UNCLEAR",
     "higher_low_intact": true,
     "lower_high_intact": false
-  },
+  }},
   "last_event": "LIQUIDITY_SWEEP|RECLAIM|REJECTION|BREAKOUT|BREAKDOWN|RETEST|FAILED_BREAKOUT|FAILED_BREAKDOWN|STRUCTURE_SHIFT|NONE",
-  "support": {
+  "support": {{
     "visible": true,
     "description": "brief description or empty string",
     "approx_price": null
-  },
-  "resistance": {
+  }},
+  "resistance": {{
     "visible": true,
     "description": "brief description or empty string",
     "approx_price": null
-  },
+  }},
   "long_condition": "what would validate a long entry",
   "short_condition": "what would validate a short entry",
   "action": "LONG_WATCH|SHORT_WATCH|WAIT|NO_TRADE",
@@ -354,7 +389,7 @@ Required schema (all fields mandatory):
   "state_changed": true,
   "state_change_reason": "one sentence or empty string",
   "summary": "Maximum 2 concise sentences describing what you see."
-}
+}}
 
 Rules:
 - confidence: integer 0-100
@@ -484,7 +519,7 @@ def analyze_visual_market(
                 model=_VB_MODEL,
                 max_completion_tokens=_VB_MAX_TOKENS,
                 messages=[
-                    {"role": "system", "content": _SYSTEM_PROMPT},
+                    {"role": "system", "content": _get_system_prompt(instrument)},
                     {"role": "user",   "content": user_content},
                 ],
             )
@@ -613,8 +648,9 @@ def _insert_observation(obs: dict, screenshot_path: Optional[str] = None) -> Opt
 def get_last_observation(instrument: str = "MNQ") -> Optional[dict]:
     """Return the most recent observation dict from cache or DB."""
     with _VB_LOCK:
-        if _LAST_OBSERVATION and _LAST_OBSERVATION.get("instrument") == instrument:
-            return dict(_LAST_OBSERVATION)
+        cached = _LAST_OBSERVATION_BY_INST.get(instrument)
+        if cached:
+            return dict(cached)
     if not VB_DB_READY:
         return None
     conn = _get_conn()
@@ -840,29 +876,27 @@ def _backfill_ghost_outcomes() -> None:
 # Main worker loop
 # ─────────────────────────────────────────────────────────────────────────────
 
-_VB_TIMER: Optional[threading.Timer] = None
+_VB_TIMERS: dict = {}   # instrument → active threading.Timer
 
 
-def _vb_tick() -> None:
-    """One observation cycle: capture → analyze → persist → reschedule.
+def _vb_tick(instrument: str = "MNQ") -> None:
+    """One observation cycle for one instrument: capture → analyze → persist → reschedule.
 
-    Scheduling contract: `_schedule_next()` is called EXACTLY ONCE, exclusively
-    in `finally`.  Early returns from failure paths must NOT call `_schedule_next()`
-    themselves — doing so would double-schedule timers on every persistent failure,
-    rapidly creating overlapping Chromium/model work and runaway API cost.
+    Scheduling contract: `_schedule_next(instrument)` is called EXACTLY ONCE,
+    exclusively in `finally`.  Early returns from failure paths must NOT call
+    `_schedule_next()` themselves — doing so would double-schedule timers on every
+    persistent failure, rapidly creating overlapping model work and runaway API cost.
 
     The enabled guard is checked BEFORE `try/finally` so that a disabled tick
     is a true no-op: no reschedule, no timers accumulated.  `_schedule_next()`
-    itself is also a no-op when disabled, but the outer guard means it is never
-    reached at all, keeping the disabled path byte-identical to baseline.
+    itself is also a no-op when disabled, keeping the disabled path byte-identical.
     """
-    global _LAST_OBSERVATION, _VB_TIMER
+    global _VB_TIMERS
 
     if not VISUAL_BRAIN_ENABLED:
         return   # disabled → true no-op; no timer accumulated
 
     try:
-        instrument = VISUAL_BRAIN_SYMBOL
         screenshot_bytes: Optional[bytes] = None
 
         # ── Capture ──────────────────────────────────────────────────────────
@@ -885,7 +919,8 @@ def _vb_tick() -> None:
         recent_history.reverse()
 
         with _VB_LOCK:
-            prev_state = dict(_LAST_OBSERVATION) if _LAST_OBSERVATION else None
+            _cached_prev = _LAST_OBSERVATION_BY_INST.get(instrument)
+            prev_state = dict(_cached_prev) if _cached_prev else None
 
         # ── Analyze ──────────────────────────────────────────────────────────
         try:
@@ -902,7 +937,7 @@ def _vb_tick() -> None:
         # ── Persist ──────────────────────────────────────────────────────────
         obs_id = _insert_observation(obs, screenshot_path=None)
         with _VB_LOCK:
-            _LAST_OBSERVATION = dict(obs)
+            _LAST_OBSERVATION_BY_INST[instrument] = dict(obs)
         logger.info(
             "[VISUAL_BRAIN] obs id=%s bias=%s state=%s event=%s action=%s conf=%s%%",
             obs_id,
@@ -921,16 +956,26 @@ def _vb_tick() -> None:
 
     finally:
         # Single reschedule point — always reached, never duplicated.
-        _schedule_next()
+        _schedule_next(instrument)
 
 
-def _schedule_next() -> None:
-    global _VB_TIMER
+def _schedule_next(instrument: str = "MNQ", delay: Optional[float] = None) -> None:
+    """Schedule the next tick for `instrument`.
+
+    `delay` overrides the interval for the initial staggered start.
+    First-tick delays are VISUAL_BRAIN_INTERVAL + i*slot (≥60s) so all instruments
+    wait for boot to complete before any screenshot/model work begins.
+    When None (the default), uses VISUAL_BRAIN_INTERVAL so regular ticks fire at
+    the configured cadence regardless of how long each analysis took.
+    """
+    global _VB_TIMERS
     if not VISUAL_BRAIN_ENABLED:
         return
-    _VB_TIMER = threading.Timer(VISUAL_BRAIN_INTERVAL, _vb_tick)
-    _VB_TIMER.daemon = True
-    _VB_TIMER.start()
+    interval = delay if delay is not None else float(VISUAL_BRAIN_INTERVAL)
+    t = threading.Timer(interval, _vb_tick, args=(instrument,))
+    t.daemon = True
+    t.start()
+    _VB_TIMERS[instrument] = t
 
 
 def start(
@@ -960,7 +1005,18 @@ def start(
     if not VISUAL_BRAIN_ENABLED:
         logger.info("[VISUAL_BRAIN] disabled (VISUAL_BRAIN_ENABLED not set) — byte-identical mode")
         return
-    logger.info("[VISUAL_BRAIN] enabled")
-    logger.info("[VISUAL_BRAIN] %s observer interval=%ds", VISUAL_BRAIN_SYMBOL, VISUAL_BRAIN_INTERVAL)
-    # First tick after one full interval so startup completes first
-    _schedule_next()
+    logger.info("[VISUAL_BRAIN] enabled — instruments: %s  interval=%ds",
+                ", ".join(_VB_SYMBOLS), VISUAL_BRAIN_INTERVAL)
+    # Each instrument's first tick is delayed by at least one full VISUAL_BRAIN_INTERVAL
+    # (preserving the original "let boot complete first" safety margin) plus a
+    # per-instrument slot offset that spreads all first ticks across the 60-second
+    # window, preventing a concurrent model-call burst at startup.
+    #
+    # With n=4 and interval=60s → slots of 15s → delays: 60, 75, 90, 105.
+    # With n=1 (single-instrument override) → delay: 60 (matches original behaviour).
+    n = max(len(_VB_SYMBOLS), 1)
+    slot = float(VISUAL_BRAIN_INTERVAL) / n
+    for i, inst in enumerate(_VB_SYMBOLS):
+        first_delay = float(VISUAL_BRAIN_INTERVAL) + float(i) * slot
+        logger.info("[VISUAL_BRAIN] %s observer first_tick_delay=%.0fs", inst, first_delay)
+        _schedule_next(inst, delay=first_delay)
