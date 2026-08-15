@@ -16866,19 +16866,38 @@ def _record_orphan_active_trade(at, inst, outcome_str, exit_price):
 
 def _check_learning_eligibility(instrument, mode=None):
     """Return (status, rule_reason) from the in-memory LEARNING_ELIGIBILITY cache.
-    FAIL-OPEN: no data (DB off, 0 trades computed) -> ('LIVE_ELIGIBLE', None).
-    GHOST_ONLY means: demote live mode to paper (trade still fires, builds evidence).
-    DISABLED means: block this instrument entirely (repeated setup failures).
+
+    Status values:
+      LIVE_ELIGIBLE       – DB has data (n≥0) and metrics pass; explicit approval.
+      GHOST_ONLY          – demote live mode to paper (trade fires, builds evidence).
+      DISABLED            – block this instrument entirely (repeated setup failures).
+      NO_RESEARCH_OPINION – research layer has no data to form an opinion (DB off,
+                            cache not yet warm, or status key missing). Callers treat
+                            this as "no research veto, no research approval" — the
+                            existing strategy eligibility is preserved unchanged.
+                            This is NOT an approval: it must never be equated with
+                            LIVE_ELIGIBLE.
+
+    Note: n=0 (DB reachable but no closed trades yet) returns LIVE_ELIGIBLE because
+    the bootstrap decision is intentional and based on a successful DB read.
+
     mode-namespaced key ('{inst}::{mode}') tried first; bare instrument as warm-up
     fallback so the gate never silently permits before first recompute."""
     if not LEARNING_DB_ENABLED:
-        return "LIVE_ELIGIBLE", None
+        # DB layer unavailable — no opinion, not an approval.
+        return "NO_RESEARCH_OPINION", "learning_db_disabled"
     ns = _ns_learning_key(instrument, mode) if mode else instrument
     with LEARNING_ELIGIBILITY_LOCK:
         elig = LEARNING_ELIGIBILITY.get(ns) or LEARNING_ELIGIBILITY.get(instrument)
     if not elig:
-        return "LIVE_ELIGIBLE", None  # no recompute yet: fail-open
-    return elig.get("status", "LIVE_ELIGIBLE"), elig.get("rule_triggered")
+        # Cache not yet warm (recompute hasn't run) — no opinion, not an approval.
+        return "NO_RESEARCH_OPINION", "cache_not_warmed"
+    # Default to NO_RESEARCH_OPINION if the status key is missing or corrupt,
+    # so a partially-written cache entry never manufactures an approval.
+    # Use `or` rather than `.get(key, default)` so a None status (corrupt entry)
+    # also resolves to NO_RESEARCH_OPINION — .get() only uses the default when the
+    # key is absent, not when it is present but None.
+    return (elig.get("status") or "NO_RESEARCH_OPINION"), elig.get("rule_triggered")
 
 
 def _recompute_learning_eligibility(conn):
@@ -25762,7 +25781,8 @@ def _build_brain_state(result):
         try:
             _elig_status, _elig_reason = _check_learning_eligibility(inst, mode=TRADING_MODE)
         except Exception:
-            _elig_status, _elig_reason = "LIVE_ELIGIBLE", None
+            # Display fallback: exception in display path — no opinion (not an approval).
+            _elig_status, _elig_reason = "NO_RESEARCH_OPINION", "display_exception"
 
         # ── Record meaningful state changes ───────────────────────────────
         _bs_record_events(inst, result)
@@ -27699,7 +27719,7 @@ def build_coach_interface(result, instrument=None, mode=None):
         # _check_learning_eligibility() acquires LEARNING_ELIGIBILITY_LOCK read-only;
         # no writes, no counters, no timestamps, no DB, no recompute triggered.
         _elig_status, _ = _check_learning_eligibility(inst, mode=_mode)
-        rule_engine_eligibility = _elig_status  # "GHOST_ONLY" | "LIVE_ELIGIBLE"
+        rule_engine_eligibility = _elig_status  # "GHOST_ONLY" | "LIVE_ELIGIBLE" | "NO_RESEARCH_OPINION"
 
         # ── Learning diagnostics (Phase 7I.1 — canonical key + win-rate fix) ───────
         # Exposes full pipeline state including lookup_status (CANONICAL | LEGACY_COMPAT
@@ -63374,6 +63394,11 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
         _KNOWN_LRE_STATUSES = {
             "LIVE_ELIGIBLE", "GHOST_ONLY", "DISABLED",
             "INSUFFICIENT_SAMPLES", "NO_OPTIONAL_DATA",
+            # NO_RESEARCH_OPINION: research layer has no data (DB off / cache cold /
+            # corrupt entry). Treated as "no opinion" — pass through without approving
+            # or blocking. Does NOT grant LIVE_ELIGIBLE; existing strategy eligibility
+            # is preserved unchanged.
+            "NO_RESEARCH_OPINION",
         }
         if _lre_status not in _KNOWN_LRE_STATUSES:
             # Unrecognised status: treat as contradictory — block auto-execution.
