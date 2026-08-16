@@ -38,6 +38,23 @@ GATE_AUDIT_DB_READY  = False
 _WATCHER_LOCK        = threading.Lock()
 _LAST_RECORDED_AT: Optional[datetime] = None   # updated after every successful INSERT
 
+# ── Watcher diagnostic state ──────────────────────────────────────────────────
+# Written on every cycle; never gates or affects the money path.
+_GE_WATCHER_STATE: dict = {
+    "last_worker_run":       None,   # ISO-8601 UTC timestamp of last cycle start
+    "pending_count":         0,      # rows queried as PENDING in last cycle
+    "eligible_count":        0,      # rows with bars available (signal_ts in window)
+    "settled_last_run":      0,      # rows with rowcount>0 update in last cycle
+    "failed_last_run":       0,      # rows that raised exceptions in last cycle
+    "last_error":            None,   # str of most-recent exception
+    "cycles_total":          0,      # total watcher cycles since server start
+    "backfill_settled":      0,      # COMPLETED rows from last backfill run
+    "backfill_insufficient": 0,      # INSUFFICIENT_COUNTERFACTUAL_DATA rows from last backfill
+    "backfill_last_run":     None,   # ISO-8601 UTC timestamp of last backfill start
+}
+_BACKFILL_RUNNING = False
+_BACKFILL_LOCK    = threading.Lock()
+
 
 # ── IT gate-category mapping ───────────────────────────────────────────────────
 # Maps known IT primary_blocker codes to human-readable audit categories.
@@ -164,7 +181,7 @@ def _scalar_str(val: Any) -> Optional[str]:
     return str(val)[:120]
 
 
-def _extract(result: dict) -> dict:
+def _extract(result: dict, mode: str = "SCALP") -> dict:
     """Pull all audit-relevant fields from a full_analysis result dict.
     Returns a flat dict of normalized values.  Never raises.
 
@@ -205,6 +222,15 @@ def _extract(result: dict) -> dict:
             if len(dir_keys) == 1:
                 direction = dir_keys[0]
         direction = direction or "Unknown"
+
+        # Compute gate_verdict here so the geometry-source branch (and the
+        # IT-native branch) can reference it without a NameError.
+        # _record() independently classifies the verdict and uses its own copy;
+        # this copy is only for field extraction purposes inside _extract().
+        gate_verdict = (
+            "EARLY_ALLOWED" if is_early_ready(verdict) else
+            ("ALLOWED"      if is_actionable(verdict)  else "BLOCKED")
+        )
 
         trade_plan = result.get("trade_plan") or {}
         eb         = result.get("edge_breakdown") or {}
@@ -457,7 +483,7 @@ def _record(result: dict, instrument: str, mode: str) -> None:
         is_actionable  = lambda v: "READY" in str(v)
         is_early_ready = lambda v: "EARLY" in str(v)
 
-    info    = _extract(result)
+    info    = _extract(result, mode)
     verdict = info["verdict"]
     score   = info["edge_score"]
     direction = info["direction"]
@@ -704,13 +730,28 @@ def _gate_audit_watcher_cycle() -> None:
     if not GATE_AUDIT_DB_READY:
         return
 
-    # Lazy import to avoid circular-import at module load time
+    # ── Update diagnostic state ───────────────────────────────────────────────
+    _GE_WATCHER_STATE["cycles_total"] += 1
+    _GE_WATCHER_STATE["last_worker_run"] = datetime.now(timezone.utc).isoformat()
+
+    # Lazy import to avoid circular-import at module load time.
+    # CRITICAL: DATABENTO_BARS_BY_INST lives in databento_brain, NOT in
+    # app.py's global scope — getattr(app, ...) always returned {} before
+    # this fix.  Import directly from the correct module.
+    try:
+        import databento_brain as _dbb  # noqa: PLC0415
+        bars_by_inst: dict = _dbb.DATABENTO_BARS_BY_INST
+    except Exception as exc:
+        logger.warning("gate_audit_watcher_cycle: databento_brain import failed: %s", exc)
+        _GE_WATCHER_STATE["last_error"] = f"databento_brain import: {exc}"
+        return
+
     try:
         import app as _app  # noqa: PLC0415
-        bars_by_inst: dict = getattr(_app, "DATABENTO_BARS_BY_INST", {})
         learning_db_enabled: bool = getattr(_app, "LEARNING_DB_ENABLED", False)
     except Exception as exc:
-        logger.debug("gate_audit_watcher_cycle import: %s", exc)
+        logger.warning("gate_audit_watcher_cycle: app import failed: %s", exc)
+        _GE_WATCHER_STATE["last_error"] = f"app import: {exc}"
         return
 
     if not learning_db_enabled:
@@ -718,6 +759,7 @@ def _gate_audit_watcher_cycle() -> None:
 
     conn = _learning_conn()
     if conn is None:
+        _GE_WATCHER_STATE["last_error"] = "db_connection_unavailable"
         return
 
     now = datetime.now(timezone.utc)
@@ -741,49 +783,61 @@ def _gate_audit_watcher_cycle() -> None:
                 LIMIT 200
             """)
             for r in cur.fetchall():
+                # Normalize signal_time to UTC-aware at fetch time so the
+                # signal_ts < expiry_cutoff comparison never raises TypeError.
+                _sig = r[8]
+                if _sig is not None and hasattr(_sig, "tzinfo") and _sig.tzinfo is None:
+                    _sig = _sig.replace(tzinfo=timezone.utc)
                 pending_rows.append({
-                    "audit_id":   r[0], "instrument": r[1], "direction": r[2],
-                    "entry":      float(r[3]),  "stop":      float(r[4]),
-                    "target1":    float(r[5]),
-                    "target2":    float(r[6]) if r[6] is not None else None,
-                    "risk_pts":   float(r[7]) if r[7] else 1.0,
-                    "signal_time": r[8],
-                    "bars_held":  int(r[9]) if r[9] is not None else 0,
-                    "mfe_r":      float(r[10]) if r[10] is not None else 0.0,
-                    "mae_r":      float(r[11]) if r[11] is not None else 0.0,
-                    "mfe_price":  float(r[12]) if r[12] is not None else None,
-                    "mae_price":  float(r[13]) if r[13] is not None else None,
-                    "tp1_hit":    bool(r[14]) if r[14] is not None else False,
+                    "audit_id":    r[0], "instrument": r[1], "direction": r[2],
+                    "entry":       float(r[3]),  "stop":      float(r[4]),
+                    "target1":     float(r[5]),
+                    "target2":     float(r[6]) if r[6] is not None else None,
+                    "risk_pts":    float(r[7]) if r[7] else 1.0,
+                    "signal_time": _sig,
+                    "bars_held":   int(r[9]) if r[9] is not None else 0,
+                    "mfe_r":       float(r[10]) if r[10] is not None else 0.0,
+                    "mae_r":       float(r[11]) if r[11] is not None else 0.0,
+                    "mfe_price":   float(r[12]) if r[12] is not None else None,
+                    "mae_price":   float(r[13]) if r[13] is not None else None,
+                    "tp1_hit":     bool(r[14]) if r[14] is not None else False,
                     "gate_verdict": r[15],
                 })
     except Exception as exc:
-        logger.debug("gate_audit_watcher_cycle query: %s", exc)
+        logger.warning("gate_audit_watcher_cycle query: %s", exc)
+        _GE_WATCHER_STATE["last_error"] = f"query: {exc}"
         try:
             conn.close()
         except Exception:
             pass
         return
 
+    _GE_WATCHER_STATE["pending_count"] = len(pending_rows)
+    settled_this_run  = 0
+    failed_this_run   = 0
+    eligible_this_run = 0
+
     for row in pending_rows:
         try:
-            inst       = row["instrument"]
-            direction  = row["direction"]
-            entry      = row["entry"]
-            stop_px    = row["stop"]
-            target1    = row["target1"]
-            target2    = row["target2"]
-            risk_pts   = row["risk_pts"] if row["risk_pts"] > 0 else 1.0
-            signal_ts  = row["signal_time"]
-            bars_held  = row["bars_held"]
-            mfe_r      = row["mfe_r"]
-            mae_r      = row["mae_r"]
-            mfe_price  = row["mfe_price"]
-            mae_price  = row["mae_price"]
+            inst        = row["instrument"]
+            direction   = row["direction"]
+            entry       = row["entry"]
+            stop_px     = row["stop"]
+            target1     = row["target1"]
+            target2     = row["target2"]
+            risk_pts    = row["risk_pts"] if row["risk_pts"] > 0 else 1.0
+            signal_ts   = row["signal_time"]
+            bars_held   = row["bars_held"]
+            mfe_r       = row["mfe_r"]
+            mae_r       = row["mae_r"]
+            mfe_price   = row["mfe_price"]
+            mae_price   = row["mae_price"]
             tp1_already = row["tp1_hit"]
-            audit_id   = row["audit_id"]
+            audit_id    = row["audit_id"]
 
-            # Expire old records with no bar data
+            # Expire old records that the watcher can never settle
             if signal_ts and signal_ts < expiry_cutoff:
+                _rc = 0
                 with conn.cursor() as cur:
                     cur.execute("""
                         UPDATE gate_audit_log
@@ -791,20 +845,22 @@ def _gate_audit_watcher_cycle() -> None:
                                outcome_resolved_at = %s
                          WHERE audit_id = %s AND outcome_status = 'PENDING'
                     """, (now, audit_id))
+                    _rc = cur.rowcount
                 conn.commit()
+                if _rc > 0:
+                    settled_this_run += 1
                 continue
 
-            # Get bars for this instrument
+            # Get bars for this instrument — now sourced from databento_brain
             bars = bars_by_inst.get(inst) or bars_by_inst.get(inst.upper()) or []
             if not bars:
                 continue   # no bar data yet — leave PENDING
 
+            eligible_this_run += 1
+
             # Only look at bars AFTER the signal time
             if signal_ts:
-                sig_ts = signal_ts
-                if sig_ts.tzinfo is None:
-                    sig_ts = sig_ts.replace(tzinfo=timezone.utc)
-                relevant = [b for b in bars if _bar_ts(b) > sig_ts]
+                relevant = [b for b in bars if _bar_ts(b) > signal_ts]
             else:
                 relevant = list(bars)
 
@@ -859,14 +915,19 @@ def _gate_audit_watcher_cycle() -> None:
                     stop_hit = True
                     break
 
-            bars_held += new_bars
+            # bars_held is the total count of bars seen after signal_time this
+            # cycle.  We REPLACE (not accumulate) the DB value because
+            # `relevant` always re-reads ALL bars after signal_time — adding
+            # `new_bars` on top of the stored `bars_held` would inflate the
+            # count on every watcher cycle for an unresolved PENDING row.
+            bars_held = new_bars
 
             # TP1 hit but TP2 bars haven't arrived yet — record 1R close.
             # In real trading the runner continues, but for counterfactual
             # accounting we close the observation at TP1 to avoid an
             # indefinitely-PENDING record.
             if tp1_hit and final_r is None and not stop_hit:
-                final_r       = 1.0
+                final_r        = 1.0
                 outcome_status = "COMPLETED"
             elif final_r is not None:
                 outcome_status = "COMPLETED"
@@ -895,14 +956,22 @@ def _gate_audit_watcher_cycle() -> None:
                     outcome_status, outcome_status, now,
                     audit_id,
                 ))
+                _rc = cur.rowcount
             conn.commit()
+            if outcome_status != "PENDING" and _rc > 0:
+                settled_this_run += 1
 
         except Exception as exc:
-            logger.debug("gate_audit_watcher row %s: %s", row.get("audit_id"), exc)
+            logger.warning("gate_audit_watcher row %s: %s", row.get("audit_id"), exc)
+            failed_this_run += 1
             try:
                 conn.rollback()
             except Exception:
                 pass
+
+    _GE_WATCHER_STATE["settled_last_run"] = settled_this_run
+    _GE_WATCHER_STATE["failed_last_run"]  = failed_this_run
+    _GE_WATCHER_STATE["eligible_count"]   = eligible_this_run
 
     try:
         conn.close()
@@ -930,21 +999,340 @@ def _bar_ts(bar: dict) -> datetime:
 
 def schedule_watcher() -> None:
     """Self-rescheduling watcher that resolves PENDING counterfactuals.
-    Called once at server startup; re-arms itself after each cycle."""
+    Called once at server startup; re-arms itself after each cycle.
+    Uses a real non-blocking lock acquire so overlapping timers skip rather
+    than stack (the old `with lock: pass` body was a no-op guard).
+    """
     if not GATE_AUDIT_DB_READY:
         return
-    with _WATCHER_LOCK:
-        pass   # single-flight guard checked inline inside cycle if needed
-    try:
-        _gate_audit_watcher_cycle()
-    except Exception as exc:
-        logger.debug("gate_audit schedule_watcher: %s", exc)
-    finally:
+    # Non-blocking acquire: if another cycle is still running, skip this
+    # invocation and reschedule for the next interval.
+    if not _WATCHER_LOCK.acquire(blocking=False):
         try:
             import threading as _t  # noqa: PLC0415
             _t.Timer(_WATCHER_INTERVAL_SEC, schedule_watcher).start()
         except Exception:
             pass
+        return
+    try:
+        _gate_audit_watcher_cycle()
+    except Exception as exc:
+        logger.warning("gate_audit schedule_watcher: %s", exc)
+        _GE_WATCHER_STATE["last_error"] = str(exc)
+    finally:
+        _WATCHER_LOCK.release()
+        try:
+            import threading as _t  # noqa: PLC0415
+            _t.Timer(_WATCHER_INTERVAL_SEC, schedule_watcher).start()
+        except Exception:
+            pass
+
+
+def get_settlement_health() -> dict:
+    """Return watcher diagnostic state + live outcome_status counts from DB.
+    DISPLAY-ONLY. FAIL-OPEN — never touches gate or execution."""
+    health = dict(_GE_WATCHER_STATE)
+    health["watcher_interval_sec"] = _WATCHER_INTERVAL_SEC
+    health["expiry_hours"]         = _OUTCOME_EXPIRY_HOURS
+
+    db_counts: dict = {}
+    db_ok = True
+    if GATE_AUDIT_DB_READY:
+        conn = _learning_conn()
+        if conn is None:
+            # Connection unavailable despite DB being flagged ready — report as
+            # unhealthy so a live DB outage is surfaced instead of silently
+            # returning an empty-but-ok result.
+            db_counts["error"] = "connection_unavailable"
+            db_ok = False
+        else:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("""
+                        SELECT outcome_status, COUNT(*)
+                          FROM gate_audit_log
+                         GROUP BY outcome_status
+                    """)
+                    for row in cur.fetchall():
+                        db_counts[str(row[0]).lower()] = int(row[1])
+                conn.close()
+            except Exception as exc:
+                logger.warning("get_settlement_health db: %s", exc)
+                db_counts["error"] = str(exc)
+                db_ok = False
+
+    return {
+        "ok":      db_ok,
+        "watcher": health,
+        "db":      db_counts,
+    }
+
+
+def _run_backfill_thread() -> None:
+    """Background thread: settle stale EXPIRED/PENDING observations.
+
+    For each row that has geometry (entry/stop/target prices):
+      - Recent PENDING rows (signal_time within the expiry window) with no
+        buffered bars are left PENDING for the normal watcher to settle once
+        bars arrive — they must NOT be terminated here.
+      - If the observation is past the expiry window and bars are available
+        → re-run _resolve_bar_outcome() and mark COMPLETED.
+      - If the observation is past the expiry window and no bars are available
+        → mark INSUFFICIENT_COUNTERFACTUAL_DATA (distinguishable from EXPIRED).
+
+    DISPLAY/RESEARCH ONLY — never generates orders, reserves risk, or
+    touches gate, execution, arm state, or broker.
+    """
+    global _BACKFILL_RUNNING
+    _GE_WATCHER_STATE["backfill_last_run"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        import databento_brain as _dbb  # noqa: PLC0415
+        bars_by_inst: dict = _dbb.DATABENTO_BARS_BY_INST
+    except Exception as exc:
+        logger.warning("GE backfill: databento_brain import failed: %s", exc)
+        _BACKFILL_RUNNING = False
+        return
+
+    conn = _learning_conn()
+    if conn is None:
+        logger.warning("GE backfill: db connection unavailable")
+        _BACKFILL_RUNNING = False
+        return
+
+    now = datetime.now(timezone.utc)
+    expiry_cutoff = now - timedelta(hours=_OUTCOME_EXPIRY_HOURS)
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT audit_id, instrument, direction,
+                       entry_price, stop_price, target1_price, target2_price,
+                       risk_points, signal_time, bars_held,
+                       mfe_r, mae_r, mfe_price, mae_price, tp1_hit
+                  FROM gate_audit_log
+                 WHERE outcome_status IN ('EXPIRED', 'PENDING')
+                   AND entry_price  IS NOT NULL
+                   AND stop_price   IS NOT NULL
+                   AND target1_price IS NOT NULL
+                 ORDER BY signal_time DESC
+                 LIMIT 2000
+            """)
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.warning("GE backfill query: %s", exc)
+        try:
+            conn.close()
+        except Exception:
+            pass
+        _BACKFILL_RUNNING = False
+        return
+
+    settled = 0
+    insufficient = 0
+
+    for r in rows:
+        try:
+            audit_id    = r[0]
+            inst        = r[1]
+            direction   = r[2]
+            entry       = float(r[3])
+            stop_px     = float(r[4])
+            target1     = float(r[5])
+            target2     = float(r[6]) if r[6] is not None else None
+            risk_pts    = max(float(r[7]) if r[7] else 1.0, 1e-6)
+            sig         = r[8]
+            if sig is not None and hasattr(sig, "tzinfo") and sig.tzinfo is None:
+                sig = sig.replace(tzinfo=timezone.utc)
+            bars_held   = int(r[9]) if r[9] is not None else 0
+            mfe_r       = float(r[10]) if r[10] is not None else 0.0
+            mae_r       = float(r[11]) if r[11] is not None else 0.0
+            mfe_price   = float(r[12]) if r[12] is not None else None
+            mae_price   = float(r[13]) if r[13] is not None else None
+            tp1_already = bool(r[14]) if r[14] is not None else False
+
+            bars = bars_by_inst.get(inst) or bars_by_inst.get(inst.upper()) or []
+            relevant: list = []
+            if bars and sig:
+                relevant = [b for b in bars if _bar_ts(b) > sig]
+            elif bars:
+                relevant = list(bars)
+
+            if not relevant:
+                # Recent PENDING rows (still within the 6h settlement window)
+                # must stay PENDING so the normal watcher can settle them once
+                # bars arrive.  Only terminate observations that are demonstrably
+                # stale (past expiry) or have no signal timestamp.
+                if sig is not None and sig >= expiry_cutoff:
+                    continue  # within window, no bars yet — leave PENDING
+                _rc2 = 0
+                with conn.cursor() as cur2:
+                    cur2.execute("""
+                        UPDATE gate_audit_log
+                           SET outcome_status = 'INSUFFICIENT_COUNTERFACTUAL_DATA',
+                               outcome_resolved_at = %s
+                         WHERE audit_id = %s
+                           AND outcome_status IN ('EXPIRED', 'PENDING')
+                    """, (now, audit_id))
+                    _rc2 = cur2.rowcount
+                conn.commit()
+                if _rc2 > 0:
+                    insufficient += 1
+                continue
+
+            # Re-run counterfactual resolution with the available bars
+            stop_hit   = False
+            tp1_hit    = tp1_already
+            tp2_hit    = False
+            final_r    = None
+            new_bars   = 0
+
+            for bar in relevant:
+                h  = float(bar.get("high") or bar.get("h") or 0)
+                lo = float(bar.get("low")  or bar.get("l") or 0)
+                if h == 0 and lo == 0:
+                    continue
+                new_bars += 1
+                mfe_r, mae_r, mfe_price, mae_price, bar_stop, bar_tp1 = _resolve_bar_outcome(
+                    h, lo, entry, stop_px, target1, direction,
+                    mfe_r, mae_r, mfe_price, mae_price, risk_pts,
+                )
+                if bar_stop and not tp1_hit:
+                    stop_hit = True
+                    final_r  = -1.0
+                    break
+                if bar_tp1 and not tp1_hit:
+                    tp1_hit = True
+                    if target2 is None:
+                        final_r = 1.0
+                        break
+                if tp1_hit and target2 is not None:
+                    reached = h >= target2 if direction == "Long" else lo <= target2
+                    if reached:
+                        t2_r    = (target2 - entry) / risk_pts if direction == "Long" else (entry - target2) / risk_pts
+                        final_r = round((1.0 + t2_r) / 2.0, 3)
+                        tp2_hit = True
+                        break
+                if bar_stop and tp1_hit:
+                    final_r  = 0.0
+                    stop_hit = True
+                    break
+
+            bars_held += new_bars
+            if tp1_hit and final_r is None and not stop_hit:
+                final_r        = 1.0
+                outcome_status = "COMPLETED"
+            elif final_r is not None:
+                outcome_status = "COMPLETED"
+            else:
+                # Bars available but no definitive outcome yet.
+                # If the observation is still within the settlement window,
+                # leave it PENDING for the normal watcher to continue monitoring
+                # as more bars arrive — do NOT prematurely terminate it.
+                if sig is not None and sig >= expiry_cutoff:
+                    continue  # within window, no outcome yet — leave PENDING
+                outcome_status = "INSUFFICIENT_COUNTERFACTUAL_DATA"
+
+            _rc2 = 0
+            with conn.cursor() as cur2:
+                cur2.execute("""
+                    UPDATE gate_audit_log
+                       SET mfe_r    = %s, mae_r    = %s,
+                           mfe_price = %s, mae_price = %s,
+                           tp1_hit  = %s, tp2_hit   = %s, stop_hit = %s,
+                           final_r  = %s, bars_held = %s,
+                           outcome_status = %s,
+                           outcome_resolved_at = %s
+                     WHERE audit_id = %s
+                       AND outcome_status IN ('EXPIRED', 'PENDING')
+                """, (
+                    round(mfe_r, 4), round(mae_r, 4), mfe_price, mae_price,
+                    tp1_hit, tp2_hit, stop_hit,
+                    final_r, bars_held,
+                    outcome_status, now,
+                    audit_id,
+                ))
+                _rc2 = cur2.rowcount
+            conn.commit()
+            if _rc2 > 0:
+                if outcome_status == "COMPLETED":
+                    settled += 1
+                else:
+                    insufficient += 1
+
+        except Exception as exc:
+            logger.warning("GE backfill row %s: %s", r[0] if r else "?", exc)
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+
+    _GE_WATCHER_STATE["backfill_settled"]      = settled
+    _GE_WATCHER_STATE["backfill_insufficient"] = insufficient
+    logger.info(
+        "GE backfill complete: total=%d settled(COMPLETED)=%d insufficient_data=%d",
+        len(rows), settled, insufficient,
+    )
+    try:
+        conn.close()
+    except Exception:
+        pass
+    _BACKFILL_RUNNING = False
+
+
+def trigger_backfill(force: bool = False) -> dict:
+    """Trigger the safe one-time backfill in a background thread.
+    Idempotent: skips if already running unless force=True.
+    Counts eligible rows synchronously before starting the thread and
+    returns that count so callers can report progress immediately.
+    DISPLAY/RESEARCH ONLY — never touches gate, execution, or risk.
+    """
+    global _BACKFILL_RUNNING
+    with _BACKFILL_LOCK:
+        if _BACKFILL_RUNNING and not force:
+            return {"queued": False, "reason": "already_running", "eligible": 0}
+        _BACKFILL_RUNNING = True
+
+    # Count eligible rows synchronously before launching the thread so the
+    # HTTP response can include the scope of the backfill.
+    eligible = 0
+    conn = _learning_conn()
+    if conn is not None:
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT COUNT(*) FROM gate_audit_log
+                     WHERE outcome_status IN ('EXPIRED', 'PENDING')
+                       AND entry_price   IS NOT NULL
+                       AND stop_price    IS NOT NULL
+                       AND target1_price IS NOT NULL
+                """)
+                eligible = int(cur.fetchone()[0] or 0)
+            conn.close()
+        except Exception as exc:
+            logger.warning("trigger_backfill eligible count: %s", exc)
+
+    t = threading.Thread(target=_run_backfill_thread, daemon=True, name="ge_backfill")
+    t.start()
+    return {"queued": True, "eligible": eligible}
+
+
+def trigger_backfill_if_needed() -> None:
+    """Called at startup: kick off the backfill only on the very first start.
+    Checks cycles_total == 0 so that a warm restart (watcher already cycled)
+    does not re-run the backfill unnecessarily — the watcher is already
+    processing PENDING rows correctly at that point.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return
+    if _GE_WATCHER_STATE["cycles_total"] != 0:
+        logger.info(
+            "GateEffectiveness: auto-backfill skipped — watcher already cycled "
+            "(cycles_total=%d)", _GE_WATCHER_STATE["cycles_total"],
+        )
+        return
+    logger.info("GateEffectiveness: auto-backfill starting (startup hook, first cycle)")
+    trigger_backfill(force=False)
 
 
 # ── Analytics queries ─────────────────────────────────────────────────────────

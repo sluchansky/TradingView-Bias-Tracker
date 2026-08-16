@@ -51,6 +51,22 @@ def _make_app_stub():
 _APP_STUB = _make_app_stub()
 sys.modules.setdefault("app", _APP_STUB)
 
+
+def _make_dbb_stub():
+    """Return a minimal databento_brain stub for tests.
+
+    The watcher cycle imports databento_brain.DATABENTO_BARS_BY_INST directly
+    (not via the app stub), so tests that exercise bar-resolution logic must
+    set bars on this stub, not on _APP_STUB.
+    """
+    stub = types.ModuleType("databento_brain")
+    stub.DATABENTO_BARS_BY_INST = {}
+    return stub
+
+
+_DBB_STUB = _make_dbb_stub()
+sys.modules.setdefault("databento_brain", _DBB_STUB)
+
 import gate_effectiveness as ge  # noqa: E402  (must come after stub registration)
 
 
@@ -59,16 +75,23 @@ import gate_effectiveness as ge  # noqa: E402  (must come after stub registratio
 # ---------------------------------------------------------------------------
 
 def _mock_conn(rows=None, rowcount=1):
-    """Return a mock psycopg2 connection whose cursor returns `rows`."""
+    """Return a mock psycopg2 connection whose cursor returns `rows`.
+
+    Critical: use MagicMock(return_value=cur) for __enter__ so that
+    `with conn.cursor() as x:` gives x == cur.  Python's dunder machinery
+    looks up __enter__ on type(obj), not the instance, so a plain lambda
+    assignment is ignored; MagicMock(return_value=...) stores the callable
+    in a way that MagicMock's magic-method system actually uses.
+    """
     cur = MagicMock()
-    cur.__enter__ = lambda s: cur
+    cur.__enter__ = MagicMock(return_value=cur)   # `with cur as x:` → x is cur
     cur.__exit__  = MagicMock(return_value=False)
     cur.fetchone  = MagicMock(return_value=(rows[0] if rows else None))
     cur.fetchall  = MagicMock(return_value=(rows or []))
     cur.rowcount  = rowcount
     conn = MagicMock()
     conn.cursor   = MagicMock(return_value=cur)
-    conn.__enter__ = lambda s: conn
+    conn.__enter__ = MagicMock(return_value=conn)  # `with conn as x:` → x is conn
     conn.__exit__  = MagicMock(return_value=False)
     return conn, cur
 
@@ -291,8 +314,10 @@ class TestOutlineTracksTP(unittest.TestCase):
              row["mfe_r"], row["mae_r"], row["mfe_price"], row["mae_price"],
              row["tp1_hit"], row["gate_verdict"]),
         ])
-        # Single bar: high reaches target1
-        _APP_STUB.DATABENTO_BARS_BY_INST = {
+        # Single bar: high reaches target1.
+        # After the databento_brain fix, the watcher reads bars from the
+        # databento_brain module directly — set bars on _DBB_STUB, not _APP_STUB.
+        _DBB_STUB.DATABENTO_BARS_BY_INST = {
             "MNQ": [{"high": 2012.0, "low": 1998.0, "ts": datetime.now(timezone.utc)}]
         }
         with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
@@ -319,7 +344,8 @@ class TestOutcomeTracksStop(unittest.TestCase):
              2000.0, 1990.0, 2010.0, 2020.0, 10.0, sig, 0,
              0.0, 0.0, None, None, False, "BLOCKED"),
         ])
-        _APP_STUB.DATABENTO_BARS_BY_INST = {
+        # Watcher reads from databento_brain stub, not the app stub.
+        _DBB_STUB.DATABENTO_BARS_BY_INST = {
             "MNQ": [{"high": 2001.0, "low": 1988.0, "ts": datetime.now(timezone.utc)}]
         }
         with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
@@ -569,6 +595,294 @@ class TestBaselineVersion(unittest.TestCase):
             ge.record_gate_decision(_full_result("LONG READY", 70), "MNQ", "SCALP")
         params = cur.execute.call_args[0][1]
         self.assertEqual(params[1], ge.BASELINE_VERSION)
+
+
+# ---------------------------------------------------------------------------
+# Additional: backfill PENDING preservation
+# ---------------------------------------------------------------------------
+
+class TestBackfillRecentPendingPreservation(unittest.TestCase):
+    """Backfill must not terminate observations still inside the settlement window."""
+
+    def _make_recent_row(self, has_bars=False):
+        """Row whose signal_time is 2 hours ago — well inside the 6h window."""
+        sig = datetime.now(timezone.utc) - timedelta(hours=2)
+        return (
+            "BF_RECENT|Long|SCALP|BLOCKED|2026081110", "MNQ", "Long",
+            2000.0, 1990.0, 2010.0, 2020.0,    # entry/stop/t1/t2
+            10.0, sig, 0,                        # risk_pts, signal_time, bars_held
+            0.0, 0.0, None, None, False,         # mfe_r, mae_r, mfe_p, mae_p, tp1
+        )
+
+    def test_recent_pending_no_bars_is_preserved(self):
+        """Backfill must skip (not INSUFFICIENT) a recent row with no buffered bars."""
+        ge.GATE_AUDIT_DB_READY = True
+        conn, cur = _mock_conn(rows=[self._make_recent_row(has_bars=False)])
+        _DBB_STUB.DATABENTO_BARS_BY_INST = {}   # no bars in buffer
+
+        with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
+            ge._run_backfill_thread()
+
+        # No UPDATE should have been issued for this recent PENDING row
+        update_calls = [
+            c for c in cur.execute.call_args_list
+            if "UPDATE" in str(c)
+        ]
+        self.assertEqual(len(update_calls), 0,
+                         "Backfill must not UPDATE a recent PENDING row with no bars")
+
+    def test_recent_pending_bars_no_outcome_is_preserved(self):
+        """Backfill must skip a recent row with bars that haven't hit TP or stop."""
+        ge.GATE_AUDIT_DB_READY = True
+        sig = datetime.now(timezone.utc) - timedelta(hours=2)
+        row = (
+            "BF_RECENT2|Long|SCALP|BLOCKED|2026081110", "MNQ", "Long",
+            2000.0, 1990.0, 2010.0, 2020.0,
+            10.0, sig, 0,
+            0.0, 0.0, None, None, False,
+        )
+        conn, cur = _mock_conn(rows=[row])
+        # Bar that neither hits stop (1990) nor target1 (2010)
+        _DBB_STUB.DATABENTO_BARS_BY_INST = {
+            "MNQ": [{"high": 2003.0, "low": 1995.0, "ts": datetime.now(timezone.utc)}]
+        }
+
+        with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
+            ge._run_backfill_thread()
+
+        update_calls = [
+            c for c in cur.execute.call_args_list
+            if "UPDATE" in str(c)
+        ]
+        self.assertEqual(len(update_calls), 0,
+                         "Backfill must not terminate a recent in-window PENDING row "
+                         "that has bars but no definitive outcome yet")
+
+    def test_stale_pending_no_bars_becomes_insufficient(self):
+        """Backfill must mark an expired row with no bars as INSUFFICIENT_COUNTERFACTUAL_DATA."""
+        ge.GATE_AUDIT_DB_READY = True
+        sig = datetime.now(timezone.utc) - timedelta(hours=8)   # past 6h window
+        row = (
+            "BF_STALE|Long|SCALP|BLOCKED|2026081104", "MNQ", "Long",
+            2000.0, 1990.0, 2010.0, 2020.0,
+            10.0, sig, 0,
+            0.0, 0.0, None, None, False,
+        )
+        conn, cur = _mock_conn(rows=[row], rowcount=1)
+        _DBB_STUB.DATABENTO_BARS_BY_INST = {}   # no bars
+
+        with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
+            ge._run_backfill_thread()
+
+        update_calls = [
+            c for c in cur.execute.call_args_list
+            if "UPDATE" in str(c) and "INSUFFICIENT" in str(c)
+        ]
+        self.assertGreater(len(update_calls), 0,
+                           "Stale PENDING row with no bars must be marked INSUFFICIENT")
+
+
+# ---------------------------------------------------------------------------
+# Additional: trigger_backfill_if_needed startup guard
+# ---------------------------------------------------------------------------
+
+class TestBackfillStartupGuard(unittest.TestCase):
+    """trigger_backfill_if_needed must only fire before the watcher has cycled."""
+
+    def test_skips_when_cycles_total_nonzero(self):
+        """If the watcher has already run at least once, backfill must not start."""
+        ge.GATE_AUDIT_DB_READY = True
+        original = ge._GE_WATCHER_STATE["cycles_total"]
+        ge._GE_WATCHER_STATE["cycles_total"] = 1
+        try:
+            with patch.object(ge, "trigger_backfill") as mock_bf:
+                ge.trigger_backfill_if_needed()
+            mock_bf.assert_not_called()
+        finally:
+            ge._GE_WATCHER_STATE["cycles_total"] = original
+
+    def test_fires_when_cycles_total_is_zero(self):
+        """If no watcher cycle has run yet, backfill must be triggered."""
+        ge.GATE_AUDIT_DB_READY = True
+        original = ge._GE_WATCHER_STATE["cycles_total"]
+        ge._GE_WATCHER_STATE["cycles_total"] = 0
+        try:
+            with patch.object(ge, "trigger_backfill") as mock_bf:
+                ge.trigger_backfill_if_needed()
+            mock_bf.assert_called_once()
+        finally:
+            ge._GE_WATCHER_STATE["cycles_total"] = original
+
+
+# ---------------------------------------------------------------------------
+# Additional: get_settlement_health DB failure → ok: false
+# ---------------------------------------------------------------------------
+
+class TestSettlementHealthDbFailure(unittest.TestCase):
+    """get_settlement_health must return ok=False when the DB aggregate query fails."""
+
+    def test_db_failure_returns_ok_false(self):
+        """When the GROUP BY query raises, ok must be False and error key present."""
+        ge.GATE_AUDIT_DB_READY = True
+        conn = MagicMock()
+        cur = MagicMock()
+        cur.__enter__ = MagicMock(return_value=cur)
+        cur.__exit__  = MagicMock(return_value=False)
+        cur.execute   = MagicMock(side_effect=Exception("connection lost"))
+        conn.cursor   = MagicMock(return_value=cur)
+
+        with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
+            result = ge.get_settlement_health()
+
+        self.assertFalse(result["ok"],
+                         "ok must be False when the DB aggregate query raises")
+        self.assertIn("error", result["db"],
+                      "db dict must carry an 'error' key on failure")
+
+    def test_unavailable_connection_returns_ok_false(self):
+        """When _learning_conn() returns None (DB outage), ok must be False.
+
+        This is the regression test for the bug where an unavailable connection
+        silently returned ok=True with an empty db dict — a live DB outage was
+        reported as healthy.
+        """
+        ge.GATE_AUDIT_DB_READY = True
+        with patch.object(_APP_STUB, "_learning_conn", return_value=None):
+            result = ge.get_settlement_health()
+
+        self.assertFalse(result["ok"],
+                         "ok must be False when _learning_conn returns None")
+        self.assertEqual(result["db"].get("error"), "connection_unavailable",
+                         "db.error must be 'connection_unavailable' when no connection")
+
+    def test_db_success_returns_ok_true(self):
+        """When the GROUP BY query succeeds, ok must be True."""
+        ge.GATE_AUDIT_DB_READY = True
+        conn, cur = _mock_conn(rows=[("PENDING", 10), ("COMPLETED", 5)])
+
+        with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
+            result = ge.get_settlement_health()
+
+        self.assertTrue(result["ok"])
+        self.assertIn("watcher", result)
+
+
+# ---------------------------------------------------------------------------
+# Additional: watcher settled_last_run only counts rowcount > 0
+# ---------------------------------------------------------------------------
+
+class TestWatcherBarsHeldStability(unittest.TestCase):
+    """bars_held must not inflate across multiple watcher cycles for a PENDING row.
+
+    Regression: the watcher always re-reads ALL bars after signal_time.
+    Before the fix, `bars_held += new_bars` accumulated across cycles —
+    a row with 10 bars processed twice would write bars_held=20 instead of 10.
+    After the fix, bars_held = new_bars (replace, not accumulate).
+    """
+
+    def _make_pending_row(self):
+        sig = datetime.now(timezone.utc) - timedelta(minutes=15)
+        return (
+            "BH_STABLE|Long|SCALP|ALLOWED|2026081109", "MNQ", "Long",
+            2000.0, 1990.0, 2010.0, 2020.0,
+            10.0, sig, 0,              # bars_held starts at 0
+            0.0, 0.0, None, None, False, "ALLOWED",
+        )
+
+    def _run_one_cycle(self, conn):
+        """Run exactly one watcher cycle against the given mock connection."""
+        _DBB_STUB.DATABENTO_BARS_BY_INST = {
+            "MNQ": [
+                {"high": 2005.0, "low": 1998.0, "ts": datetime.now(timezone.utc)},
+                {"high": 2004.0, "low": 1997.0, "ts": datetime.now(timezone.utc) + timedelta(seconds=1)},
+            ]
+        }
+        with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
+            ge._gate_audit_watcher_cycle()
+
+    def test_bars_held_does_not_double_across_two_cycles(self):
+        """Running the watcher twice on the same row must not double bars_held.
+
+        The test simulates two watcher cycles: the first processes 2 bars and
+        writes bars_held=2; the second reads bars_held=2 from the DB, processes
+        the same 2 bars, and must still write bars_held=2 — not 4.
+        """
+        ge.GATE_AUDIT_DB_READY = True
+        row = self._make_pending_row()
+
+        # First cycle: DB row has bars_held=0
+        conn1, cur1 = _mock_conn(rows=[row], rowcount=1)
+        self._run_one_cycle(conn1)
+
+        # Extract bars_held written by first cycle
+        update_calls1 = [
+            c for c in cur1.execute.call_args_list if "UPDATE" in str(c)
+        ]
+        self.assertTrue(update_calls1, "First cycle must issue an UPDATE")
+        params1 = update_calls1[-1][0][1]   # positional args tuple
+        # bars_held is the 9th param in the UPDATE (index 8, 0-based)
+        # Look for it by scanning for the integer at the bars_held position
+        bars_held_after_cycle1 = None
+        for p in params1:
+            if isinstance(p, int) and 1 <= p <= 100:
+                bars_held_after_cycle1 = p
+                break
+        self.assertIsNotNone(bars_held_after_cycle1, "Must find bars_held in UPDATE params")
+        self.assertEqual(bars_held_after_cycle1, 2,
+                         "First cycle: bars_held must equal the 2 bars processed")
+
+        # Second cycle: simulate DB returning bars_held=2 (as written by first cycle)
+        row2 = list(row)
+        row2[9] = 2          # bars_held already 2 in DB
+        conn2, cur2 = _mock_conn(rows=[tuple(row2)], rowcount=1)
+        self._run_one_cycle(conn2)
+
+        update_calls2 = [
+            c for c in cur2.execute.call_args_list if "UPDATE" in str(c)
+        ]
+        self.assertTrue(update_calls2, "Second cycle must issue an UPDATE")
+        params2 = update_calls2[-1][0][1]
+        bars_held_after_cycle2 = None
+        for p in params2:
+            if isinstance(p, int) and 1 <= p <= 100:
+                bars_held_after_cycle2 = p
+                break
+        self.assertIsNotNone(bars_held_after_cycle2,
+                             "Must find bars_held in second cycle UPDATE params")
+        self.assertEqual(bars_held_after_cycle2, 2,
+                         "Second cycle must write bars_held=2 (same 2 bars), not 4 "
+                         "(regression: += instead of = doubled the count)")
+
+
+class TestWatcherRowcountGuard(unittest.TestCase):
+    """settled_last_run must not increment when another process won a concurrent UPDATE."""
+
+    def test_no_increment_when_rowcount_zero(self):
+        """When UPDATE.rowcount == 0, settled_last_run must not increase."""
+        ge.GATE_AUDIT_DB_READY = True
+        sig = datetime.now(timezone.utc) - timedelta(minutes=5)
+        row = (
+            "ROWCOUNT_TEST|Long|SCALP|BLOCKED|2026081109", "MNQ", "Long",
+            2000.0, 1990.0, 2010.0, 2020.0,
+            10.0, sig, 0,
+            0.0, 0.0, None, None, False, "BLOCKED",
+        )
+        # rowcount=0 simulates a lost race (another process updated the row first)
+        conn, cur = _mock_conn(rows=[row], rowcount=0)
+        _DBB_STUB.DATABENTO_BARS_BY_INST = {
+            "MNQ": [{"high": 2012.0, "low": 1996.0, "ts": datetime.now(timezone.utc)}]
+        }
+
+        before = ge._GE_WATCHER_STATE["settled_last_run"]
+        with patch.object(_APP_STUB, "_learning_conn", return_value=conn):
+            ge._gate_audit_watcher_cycle()
+
+        # settled_last_run must not go above its previous value
+        self.assertLessEqual(
+            ge._GE_WATCHER_STATE["settled_last_run"], before,
+            "settled_last_run must not increment when UPDATE rowcount is 0 "
+            "(concurrent process already updated the row)",
+        )
 
 
 if __name__ == "__main__":

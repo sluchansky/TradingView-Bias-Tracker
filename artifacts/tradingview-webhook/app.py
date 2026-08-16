@@ -82401,6 +82401,38 @@ def route_gate_opportunities():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/gate-effectiveness/settlement-health", methods=["GET"])
+def route_gate_settlement_health():
+    """Watcher diagnostic state + live outcome_status breakdown — Phase 8C.
+    Returns _GE_WATCHER_STATE (cycles, settled, errors) + per-status DB counts.
+    DISPLAY-ONLY.  Auth enforced at Express /api edge.  FAIL-OPEN.
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        return jsonify(_ge.get_settlement_health())
+    except Exception as exc:
+        logger.warning("route_gate_settlement_health: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/backfill", methods=["POST"])
+def route_gate_backfill():
+    """Trigger one-time safe backfill for stale EXPIRED/PENDING observations.
+    Owner-only (Express dashboard auth).  DISPLAY/RESEARCH ONLY — never
+    generates orders, reserves risk, or touches gate, arm state, or execution.
+    Idempotent: subsequent calls while running return queued=false.
+    Query param: force=true to re-trigger even if already running.
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        force  = request.args.get("force", "false").lower() == "true"
+        result = _ge.trigger_backfill(force=force)
+        return jsonify({"ok": True, **result})
+    except Exception as exc:
+        logger.warning("route_gate_backfill: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/visual-brain/status", methods=["GET"])
 def route_visual_brain_status():
     """Last Visual Brain observation for MNQ (DISPLAY/SHADOW-ONLY).
@@ -85173,6 +85205,11 @@ if __name__ == "__main__":
             import gate_effectiveness as _ge_start  # noqa: PLC0415
             threading.Timer(30, _ge_start.schedule_watcher).start()
             logger.info("GateEffectiveness: counterfactual watcher scheduled (30s delay)")
+            # One-time backfill: settle stale EXPIRED/PENDING rows that accumulated
+            # while the bar-source bug was active.  Runs in a daemon thread; safe
+            # to call on every restart (idempotent via outcome_status guard).
+            threading.Timer(20, _ge_start.trigger_backfill_if_needed).start()
+            logger.info("GateEffectiveness: auto-backfill scheduled (20s delay, before watcher)")
         except Exception as _ge_start_exc:
             logger.warning("GateEffectiveness: watcher start failed: %s", _ge_start_exc)
     # ── Databento Brain — real-time market data feed ──────────────────────────

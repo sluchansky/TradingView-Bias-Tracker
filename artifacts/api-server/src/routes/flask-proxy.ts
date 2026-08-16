@@ -438,6 +438,11 @@ export const BOT1_ROUTES = [
   "/gate-effectiveness/mode-report",
   "/gate-effectiveness/mode-comparison",
   "/gate-effectiveness/opportunities",
+  // Phase 8C settlement-health: watcher diagnostic state + outcome_status counts.
+  // Backfill: one-time POST to settle stale EXPIRED/PENDING observations.
+  // Both DISPLAY/RESEARCH ONLY — never touches gate, execution, or risk.
+  "/gate-effectiveness/settlement-health",
+  "/gate-effectiveness/backfill",
   // Phase 8C MODE→STRATEGY→GATE→OUTCOME funnel analytics.
   "/gate-effectiveness/strategy-report",
   // Visual Brain V1 — MNQ 1-minute stateful market observer (SHADOW/DISPLAY-ONLY;
