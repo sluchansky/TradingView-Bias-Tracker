@@ -3414,7 +3414,11 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
 
       {open && (
         <div style={{ padding: '12px 14px' }}>
-          {!enabled ? (
+          {enabled === null ? (
+            <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
+              Loading…
+            </div>
+          ) : enabled === false ? (
             <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
               Visual Brain is disabled.<br />
               <span style={{ fontSize: 10 }}>Set <code style={{ fontFamily: T.mono, color: T.cyan }}>VISUAL_BRAIN_ENABLED=true</code> to activate.</span>
