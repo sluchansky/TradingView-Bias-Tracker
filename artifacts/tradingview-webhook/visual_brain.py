@@ -57,9 +57,11 @@ _LAST_OBSERVATION_BY_INST: dict = {}   # instrument → most recent parsed obser
 #
 # _db_conn_fn  : callable() → psycopg2 connection | None
 # _price_store : dict reference {instrument: {"value": float}} (AUTO_PRICE_BY_TICKER)
+# _vwap_store  : dict reference {instrument: {"value": float, ...}} (VWAP_BY_TICKER)
 # _bars_fn     : callable(instrument: str) → list[dict]  (live Databento bars)
 _db_conn_fn  : Optional[Callable] = None
 _price_store : Optional[dict]     = None
+_vwap_store  : Optional[dict]     = None
 _bars_fn     : Optional[Callable] = None
 
 # ── Cost tracking (resets at midnight ET) ────────────────────────────────────
@@ -229,15 +231,37 @@ def _generate_chart_from_bars(bars: list, instrument: str) -> bytes:
             boxstyle="square,pad=0", linewidth=0, facecolor=col, zorder=2
         ))
 
-    # ── VWAP line ──
-    cum_pv = 0.0; cum_v = 0.0; vwap_vals = []
-    for b in recent:
+    # ── VWAP line — cumulative from session open (all bars), not just the window ──
+    # Computing from only the last 60 bars resets the running average and produces
+    # a value that diverges significantly from the true session VWAP, especially
+    # late in the trading day.  We accumulate from bar 0 (all bars) and only
+    # *display* the portion that falls within the visible window.
+    cum_pv = 0.0; cum_v = 0.0; all_vwap = []
+    for b in bars:
         tp = (b.get("high", 0) + b.get("low", 0) + b.get("close", 0)) / 3.0
         v  = b.get("volume", 1) or 1
         cum_pv += tp * v; cum_v += v
-        vwap_vals.append(cum_pv / cum_v if cum_v else tp)
+        all_vwap.append(cum_pv / cum_v if cum_v else tp)
+    vwap_vals = all_vwap[-len(recent):]      # trim to visible bars
     ax1.plot(times, vwap_vals, color="#38bdf8", linewidth=1.2, linestyle="--",
              label="VWAP", zorder=3)
+
+    # ── Live VWAP overlay — authoritative value from VWAP_BY_TICKER ──────────
+    # Shown as a solid horizontal annotation so the model can read the exact
+    # level and cross-check it against the cumulative line above.
+    if _vwap_store is not None:
+        live_vwap_rec = _vwap_store.get(instrument) or {}
+        live_vwap_val = live_vwap_rec.get("value")
+        if live_vwap_val is not None:
+            try:
+                lv = float(live_vwap_val)
+                ax1.axhline(lv, color="#7dd3fc", linewidth=0.9, linestyle="-",
+                            alpha=0.55, zorder=2)
+                ax1.text(len(recent) - 1, lv,
+                         f" Live VWAP {lv:,.1f}",
+                         color="#7dd3fc", fontsize=6.5, va="bottom", zorder=4)
+            except (TypeError, ValueError):
+                pass
 
     # ── Current price label ──
     last_close = recent[-1].get("close", 0) if recent else 0
@@ -1025,6 +1049,7 @@ def _schedule_next(instrument: str = "MNQ", delay: Optional[float] = None) -> No
 def start(
     db_conn_fn: Optional[Callable] = None,
     price_store: Optional[dict] = None,
+    vwap_store: Optional[dict] = None,
     bars_fn: Optional[Callable] = None,
 ) -> None:
     """Start the Visual Brain worker.  Call once at boot if VISUAL_BRAIN_ENABLED.
@@ -1035,14 +1060,19 @@ def start(
                      is used.  Never stored as a module-level `import app`.
         price_store: dict reference to AUTO_PRICE_BY_TICKER from app.py's
                      __main__ globals (not a copy — same object so prices update).
+        vwap_store:  dict reference to VWAP_BY_TICKER from app.py's __main__
+                     globals — used to overlay the authoritative session VWAP on
+                     the chart so the model reads the correct level.
         bars_fn:     callable(instrument: str) → list[dict] wrapping
                      DATABENTO_BARS_BY_INST.get() from app.py's __main__ globals.
     """
-    global _db_conn_fn, _price_store, _bars_fn
+    global _db_conn_fn, _price_store, _vwap_store, _bars_fn
     if db_conn_fn is not None:
         _db_conn_fn = db_conn_fn
     if price_store is not None:
         _price_store = price_store
+    if vwap_store is not None:
+        _vwap_store = vwap_store
     if bars_fn is not None:
         _bars_fn = bars_fn
 

@@ -85420,6 +85420,7 @@ if __name__ == "__main__":
         _vb_boot.start(
             db_conn_fn=_learning_conn,
             price_store=AUTO_PRICE_BY_TICKER,
+            vwap_store=VWAP_BY_TICKER,
             bars_fn=lambda inst: list(_dbb_for_vb.DATABENTO_BARS_BY_INST.get(inst, [])),
         )
     except Exception as _vb_boot_exc:
