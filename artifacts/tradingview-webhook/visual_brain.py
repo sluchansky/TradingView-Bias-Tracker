@@ -286,6 +286,8 @@ def capture_chart_screenshot(symbol: str = "MNQ", timeout_s: int = _VB_SCREENSHO
         bars = _bars_fn(symbol)
         if not bars:
             raise ValueError("no live bars available yet")
+        if len(bars) < 5:
+            raise ValueError(f"only {len(bars)} bar(s) available — need ≥5 for meaningful analysis")
         return _generate_chart_from_bars(bars, symbol)
     except Exception as exc:
         errors.append(f"matplotlib: {exc}")
@@ -645,12 +647,53 @@ def _insert_observation(obs: dict, screenshot_path: Optional[str] = None) -> Opt
 # History + status reads
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _flatten_obs(obs: dict) -> dict:
+    """Flatten the nested model response to match the DB history row shape.
+
+    The model returns nested structure/support/resistance objects; the DB
+    stores flat columns (short_term_structure, support_description, etc.).
+    This ensures get_last_observation() and get_history() return the same
+    shape so the dashboard panel renders correctly from both sources.
+
+    Safe to call on an already-flat dict — setdefault guards prevent
+    overwriting values that are already present.
+    """
+    if not obs:
+        return obs
+    flat = dict(obs)
+    struct = obs.get("structure") or {}
+    sup    = obs.get("support")   or {}
+    res    = obs.get("resistance") or {}
+
+    # Remove nested objects and promote their keys to top level
+    flat.pop("structure",  None)
+    flat.pop("support",    None)
+    flat.pop("resistance", None)
+
+    flat.setdefault("short_term_structure",   struct.get("short_term"))
+    flat.setdefault("support_description",    sup.get("description", ""))
+    flat.setdefault("support_price",          sup.get("approx_price"))
+    flat.setdefault("resistance_description", res.get("description", ""))
+    flat.setdefault("resistance_price",       res.get("approx_price"))
+
+    # DB-only fields absent in the raw model response — default to None/False
+    for key in ("id", "screenshot_path", "p1m", "p3m", "p5m",
+                "p10m", "p15m", "mfe", "mae"):
+        flat.setdefault(key, None)
+    flat.setdefault("outcome_resolved", False)
+    return flat
+
+
 def get_last_observation(instrument: str = "MNQ") -> Optional[dict]:
-    """Return the most recent observation dict from cache or DB."""
+    """Return the most recent observation dict from cache or DB, flattened.
+
+    Always returns the same key shape as get_history() so callers do not need
+    to handle two different structures.
+    """
     with _VB_LOCK:
         cached = _LAST_OBSERVATION_BY_INST.get(instrument)
         if cached:
-            return dict(cached)
+            return _flatten_obs(dict(cached))
     if not VB_DB_READY:
         return None
     conn = _get_conn()
@@ -665,7 +708,8 @@ def get_last_observation(instrument: str = "MNQ") -> Optional[dict]:
             """, (instrument,))
             row = cur.fetchone()
             if row and row[0]:
-                return row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                raw = row[0] if isinstance(row[0], dict) else json.loads(row[0])
+                return _flatten_obs(raw)
         return None
     except Exception:
         return None
