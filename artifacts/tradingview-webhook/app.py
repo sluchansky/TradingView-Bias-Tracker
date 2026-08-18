@@ -31295,6 +31295,47 @@ def _build_trade_card_embed(entry, footer_text):
     except Exception as exc:
         logger.error("Trade-debate card block error: %s", exc)
 
+    # ── Additive: ⚡ Order Flow field (display-only; buy/sell pressure at signal time).
+    # Shows score, state, CVD slope, delta ratio, and reversal confirmation when
+    # ORDER_FLOW_V1_ENABLED is on and bars have V1 buy/sell fields. Built defensively
+    # — field is simply absent when flag is off or bars are pre-V1 (byte-identical). ──
+    try:
+        _of = entry.get("order_flow") or {}
+        if _of.get("available"):
+            _of_score      = _of.get("order_flow_score")
+            _of_state      = (_of.get("order_flow_state") or "NEUTRAL").replace("_", " ")
+            _of_rev        = _of.get("order_flow_reversal_confirmed")
+            _of_cvd_slope  = _of.get("cvd_slope")
+            _of_delta_ratio = _of.get("delta_ratio")
+            _of_absorption = _of.get("absorption_side")
+            _of_abs_str    = _of.get("absorption_strength")
+            _state_emoji   = {
+                "STRONG BULLISH": "🟢🟢", "BULLISH": "🟢",
+                "NEUTRAL": "⚪",
+                "BEARISH": "🔴", "STRONG BEARISH": "🔴🔴",
+            }.get(_of_state, "⚪")
+            _score_str = f"{_of_score}/100" if _of_score is not None else "—"
+            _slope_str = f"{_of_cvd_slope:+.0f}" if isinstance(_of_cvd_slope, (int, float)) else "—"
+            _delta_str = (f"{_of_delta_ratio:+.1%}"
+                          if isinstance(_of_delta_ratio, (int, float)) else "—")
+            _rev_str   = ("✅ Confirmed" if _of_rev is True
+                          else ("❌ No" if _of_rev is False else "—"))
+            _of_lines  = [
+                f"{_state_emoji} **{_of_state}**  ·  Score: **{_score_str}**",
+                f"CVD Slope: **{_slope_str}**  ·  Delta Ratio: **{_delta_str}**",
+            ]
+            if _of_absorption:
+                _abs_label = f"{_of_abs_str} {_of_absorption}" if _of_abs_str else _of_absorption
+                _of_lines.append(f"Absorption: **{_abs_label.replace('_', ' ')}**")
+            _of_lines.append(f"Reversal Confirmed: {_rev_str}")
+            embed["fields"].append({
+                "name":   "⚡ Order Flow",
+                "value":  "\n".join(_of_lines)[:1024],
+                "inline": False,
+            })
+    except Exception as exc:
+        logger.error("Order-flow card block error: %s", exc)
+
     # ── Additive: 🧭 Market Intelligence field (display-only; market state + Long/
     # Short Directional Confidence + trend memory + HTF alignment). Mirrors the
     # dashboard panel on the live card. Built defensively so a missing/disabled
@@ -36463,6 +36504,10 @@ def _build_card_entry(a, ticker=None, record=None):
     # ("one read, many consumers"). Absent in SCALP / flag-off → entry byte-identical.
     if _swing_htf_enabled():
         entry["_swing_context"] = a.get("swing_context")
+    # Order Flow V1 (flag-on only): carry the order-flow snapshot onto the card
+    # entry so the live alert and journal can display OF state. Absent when flag is
+    # off or engine unavailable → entry byte-identical (defensive .get always safe).
+    entry["order_flow"] = a.get("order_flow")
     # V1 Journal Interface version field — additive, no behavior change.
     entry["_version"] = "v1"
     return entry
