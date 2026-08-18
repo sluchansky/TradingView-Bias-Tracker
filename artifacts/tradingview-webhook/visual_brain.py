@@ -200,9 +200,16 @@ def _compress_image(raw_png: bytes, max_px: int = _VB_IMAGE_MAX_PX) -> bytes:
 
 
 def _generate_chart_from_bars(bars: list, instrument: str) -> bytes:
-    """Fallback: render a matplotlib OHLCV candlestick chart from Databento bars.
-    Returns JPEG bytes.  Used when Playwright screenshot fails.
+    """Render a matplotlib OHLCV candlestick chart from Databento bars.
+    Returns JPEG bytes.
+
+    Memory safety: fig is ALWAYS closed in finally, even if an exception fires
+    mid-render.  Without try/finally a failed render leaks the figure object,
+    causing slow OOM over hours (4 instruments × every 60s = ~240 figs/hour).
+    plt.close("all") at the top also reclaims any figures that leaked before
+    this fix was applied.
     """
+    import gc  # noqa: PLC0415
     import matplotlib  # noqa: PLC0415
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt  # noqa: PLC0415
@@ -211,80 +218,96 @@ def _generate_chart_from_bars(bars: list, instrument: str) -> bytes:
     if not bars:
         raise ValueError("no bars for chart generation")
 
+    # Safety: purge any orphaned figures from previous failed renders.
+    plt.close("all")
+
     recent = bars[-_CHART_BARS_LOOKBACK:]
     times  = list(range(len(recent)))
 
+    # Reject flat/dead charts before touching the model — overnight sessions for
+    # MGC/MES/MYM produce bars with identical OHLC values; sending those wastes
+    # an API call and always returns UNCLEAR/0%.
+    closes = [b.get("close", 0) for b in recent if b.get("close")]
+    if closes and max(closes) - min(closes) < 0.01:
+        raise ValueError(f"chart is flat (range {max(closes)-min(closes):.4f}) — skipping dead-market bars")
+
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 6), gridspec_kw={"height_ratios": [3, 1]})
-    fig.patch.set_facecolor("#050c1a")
-    for ax in (ax1, ax2):
-        ax.set_facecolor("#0b1628")
-        ax.tick_params(colors="white")
-        ax.spines[:].set_color("#1e3a5f")
+    try:
+        fig.patch.set_facecolor("#050c1a")
+        for ax in (ax1, ax2):
+            ax.set_facecolor("#0b1628")
+            ax.tick_params(colors="white")
+            ax.spines[:].set_color("#1e3a5f")
 
-    # ── Candlesticks ──
-    for i, b in enumerate(recent):
-        o, h, lo, c = b.get("open", 0), b.get("high", 0), b.get("low", 0), b.get("close", 0)
-        col = "#22c55e" if c >= o else "#ef4444"
-        ax1.plot([i, i], [lo, h], color=col, linewidth=0.8, zorder=1)
-        ax1.add_patch(mpatches.FancyBboxPatch(
-            (i - 0.3, min(o, c)), 0.6, abs(c - o) or 0.5,
-            boxstyle="square,pad=0", linewidth=0, facecolor=col, zorder=2
-        ))
+        # ── Candlesticks ──
+        for i, b in enumerate(recent):
+            o, h, lo, c = b.get("open", 0), b.get("high", 0), b.get("low", 0), b.get("close", 0)
+            col = "#22c55e" if c >= o else "#ef4444"
+            ax1.plot([i, i], [lo, h], color=col, linewidth=0.8, zorder=1)
+            ax1.add_patch(mpatches.FancyBboxPatch(
+                (i - 0.3, min(o, c)), 0.6, abs(c - o) or 0.5,
+                boxstyle="square,pad=0", linewidth=0, facecolor=col, zorder=2
+            ))
 
-    # ── VWAP line — cumulative from session open (all bars), not just the window ──
-    # Computing from only the last 60 bars resets the running average and produces
-    # a value that diverges significantly from the true session VWAP, especially
-    # late in the trading day.  We accumulate from bar 0 (all bars) and only
-    # *display* the portion that falls within the visible window.
-    cum_pv = 0.0; cum_v = 0.0; all_vwap = []
-    for b in bars:
-        tp = (b.get("high", 0) + b.get("low", 0) + b.get("close", 0)) / 3.0
-        v  = b.get("volume", 1) or 1
-        cum_pv += tp * v; cum_v += v
-        all_vwap.append(cum_pv / cum_v if cum_v else tp)
-    vwap_vals = all_vwap[-len(recent):]      # trim to visible bars
-    ax1.plot(times, vwap_vals, color="#38bdf8", linewidth=1.2, linestyle="--",
-             label="VWAP", zorder=3)
+        # ── VWAP line — cumulative from session open (all bars), not just the window ──
+        # Computing from only the last 60 bars resets the running average and produces
+        # a value that diverges significantly from the true session VWAP, especially
+        # late in the trading day.  We accumulate from bar 0 (all bars) and only
+        # *display* the portion that falls within the visible window.
+        cum_pv = 0.0; cum_v = 0.0; all_vwap = []
+        for b in bars:
+            tp = (b.get("high", 0) + b.get("low", 0) + b.get("close", 0)) / 3.0
+            v  = b.get("volume", 1) or 1
+            cum_pv += tp * v; cum_v += v
+            all_vwap.append(cum_pv / cum_v if cum_v else tp)
+        vwap_vals = all_vwap[-len(recent):]      # trim to visible bars
+        ax1.plot(times, vwap_vals, color="#38bdf8", linewidth=1.2, linestyle="--",
+                 label="VWAP", zorder=3)
 
-    # ── Live VWAP overlay — authoritative value from VWAP_BY_TICKER ──────────
-    # Shown as a solid horizontal annotation so the model can read the exact
-    # level and cross-check it against the cumulative line above.
-    if _vwap_store is not None:
-        live_vwap_rec = _vwap_store.get(instrument) or {}
-        live_vwap_val = live_vwap_rec.get("value")
-        if live_vwap_val is not None:
-            try:
-                lv = float(live_vwap_val)
-                ax1.axhline(lv, color="#7dd3fc", linewidth=0.9, linestyle="-",
-                            alpha=0.55, zorder=2)
-                ax1.text(len(recent) - 1, lv,
-                         f" Live VWAP {lv:,.1f}",
-                         color="#7dd3fc", fontsize=6.5, va="bottom", zorder=4)
-            except (TypeError, ValueError):
-                pass
+        # ── Live VWAP overlay — authoritative value from VWAP_BY_TICKER ──────────
+        # Shown as a solid horizontal annotation so the model can read the exact
+        # level and cross-check it against the cumulative line above.
+        if _vwap_store is not None:
+            live_vwap_rec = _vwap_store.get(instrument) or {}
+            live_vwap_val = live_vwap_rec.get("value")
+            if live_vwap_val is not None:
+                try:
+                    lv = float(live_vwap_val)
+                    ax1.axhline(lv, color="#7dd3fc", linewidth=0.9, linestyle="-",
+                                alpha=0.55, zorder=2)
+                    ax1.text(len(recent) - 1, lv,
+                             f" Live VWAP {lv:,.1f}",
+                             color="#7dd3fc", fontsize=6.5, va="bottom", zorder=4)
+                except (TypeError, ValueError):
+                    pass
 
-    # ── Current price label ──
-    last_close = recent[-1].get("close", 0) if recent else 0
-    ax1.axhline(last_close, color="#f59e0b", linewidth=0.8, linestyle=":")
-    ax1.text(len(recent) - 1, last_close, f" {last_close:,.1f}",
-             color="#f59e0b", fontsize=7, va="center")
+        # ── Current price label ──
+        last_close = recent[-1].get("close", 0) if recent else 0
+        ax1.axhline(last_close, color="#f59e0b", linewidth=0.8, linestyle=":")
+        ax1.text(len(recent) - 1, last_close, f" {last_close:,.1f}",
+                 color="#f59e0b", fontsize=7, va="center")
 
-    ax1.set_title(f"{instrument} — 1m  ({len(recent)} bars)", color="white", fontsize=10)
-    ax1.legend(fontsize=7, facecolor="#0b1628", labelcolor="white")
+        ax1.set_title(f"{instrument} — 1m  ({len(recent)} bars)", color="white", fontsize=10)
+        ax1.legend(fontsize=7, facecolor="#0b1628", labelcolor="white")
 
-    # ── Volume bars ──
-    for i, b in enumerate(recent):
-        o, c = b.get("open", 0), b.get("close", 0)
-        ax2.bar(i, b.get("volume", 0), color="#22c55e" if c >= o else "#ef4444",
-                width=0.8, alpha=0.7)
-    ax2.set_ylabel("Vol", color="#94a3b8", fontsize=7)
+        # ── Volume bars ──
+        for i, b in enumerate(recent):
+            o, c = b.get("open", 0), b.get("close", 0)
+            ax2.bar(i, b.get("volume", 0), color="#22c55e" if c >= o else "#ef4444",
+                    width=0.8, alpha=0.7)
+        ax2.set_ylabel("Vol", color="#94a3b8", fontsize=7)
 
-    plt.tight_layout(pad=0.4)
-    buf = io.BytesIO()
-    plt.savefig(buf, format="jpeg", dpi=90, bbox_inches="tight",
-                facecolor="#050c1a")
-    plt.close(fig)
-    return buf.getvalue()
+        plt.tight_layout(pad=0.4)
+        buf = io.BytesIO()
+        plt.savefig(buf, format="jpeg", dpi=90, bbox_inches="tight",
+                    facecolor="#050c1a")
+        result = buf.getvalue()
+    finally:
+        # Always close — prevents figure leak regardless of how we exit.
+        plt.close(fig)
+        gc.collect()
+
+    return result
 
 
 def capture_chart_screenshot(symbol: str = "MNQ", timeout_s: int = _VB_SCREENSHOT_TIMEOUT) -> bytes:
@@ -806,7 +829,23 @@ def _backfill_ghost_outcomes() -> None:
 
     Uses injected _bars_fn and _price_store — never imports app or databento_brain
     directly (see module docstring for why).
+
+    Concurrency guard: _BACKFILL_RUNNING prevents a new thread from piling up
+    while a previous one is still running DB queries.  Without this, 4 instruments
+    × every 60s can accumulate hundreds of simultaneous DB connections under load.
     """
+    global _BACKFILL_RUNNING
+    if _BACKFILL_RUNNING:
+        return   # previous run still in progress — skip
+    _BACKFILL_RUNNING = True
+    try:
+        _backfill_ghost_outcomes_inner()
+    finally:
+        _BACKFILL_RUNNING = False
+
+
+def _backfill_ghost_outcomes_inner() -> None:
+    """Inner implementation — called only when the concurrency guard is held."""
     if not VB_DB_READY:
         return
     if _bars_fn is None:
@@ -945,6 +984,7 @@ def _backfill_ghost_outcomes() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _VB_TIMERS: dict = {}   # instrument → active threading.Timer
+_BACKFILL_RUNNING = False   # guards against concurrent backfill threads
 
 
 def _vb_tick(instrument: str = "MNQ") -> None:
