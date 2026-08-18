@@ -78,7 +78,7 @@ i_show_pivots = input.bool (false, "Show pivot dots",      group=grp_display)
 // ===========================================================================
 
 // Session-anchored VWAP (same anchor as the live bot's Databento VWAP)
-[vwap_val, _, _] = ta.vwap(hlc3)
+vwap_val = ta.vwap(hlc3)
 
 // ATR
 atr = ta.atr(i_atr_len)
@@ -104,8 +104,10 @@ ph = ta.pivothigh(high, i_pivot_len, i_pivot_len)
 pl = ta.pivotlow (low,  i_pivot_len, i_pivot_len)
 
 // Track the last two confirmed pivot highs and lows
-var float ph1 = na,  var float ph2 = na
-var float pl1 = na,  var float pl2 = na
+var float ph1 = na
+var float ph2 = na
+var float pl1 = na
+var float pl2 = na
 
 if not na(ph)
     ph2 := ph1
