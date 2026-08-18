@@ -11,7 +11,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 echo "[prod-build] installing Python deps via uv sync"
-UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-.pythonlibs}" uv sync --frozen
+UV_PROJECT_ENVIRONMENT="${UV_PROJECT_ENVIRONMENT:-.pythonlibs}" uv sync --frozen --no-compile-bytecode
 
 echo "[prod-build] building Express api-server"
 pnpm --filter @workspace/api-server run build
