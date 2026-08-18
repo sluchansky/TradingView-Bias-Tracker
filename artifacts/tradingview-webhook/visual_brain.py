@@ -249,13 +249,29 @@ def _generate_chart_from_bars(bars: list, instrument: str) -> bytes:
                 boxstyle="square,pad=0", linewidth=0, facecolor=col, zorder=2
             ))
 
-        # ── VWAP line — cumulative from session open (all bars), not just the window ──
-        # Computing from only the last 60 bars resets the running average and produces
-        # a value that diverges significantly from the true session VWAP, especially
-        # late in the trading day.  We accumulate from bar 0 (all bars) and only
-        # *display* the portion that falls within the visible window.
+        # ── VWAP line — anchored to the current CME session open, not bar[0] ──
+        # The hist-seed loads 3+ days of bars for MTF Trend.  Computing VWAP from
+        # bar[0] produces a multi-day average that sits far from today's price;
+        # the model sees the VWAP floating 100-200 pts from the candles and calls
+        # the chart UNCLEAR on every cycle.
+        #
+        # Fix: filter to bars on or after the current session open before
+        # accumulating.  CME equity micros (MNQ/MES/MYM) open at 23:00 UTC
+        # (18:00 ET); COMEX gold (MGC) opens at 22:00 UTC (17:00 ET).
+        session_open_hour_utc = 22 if instrument == "MGC" else 23
+        _now_utc = datetime.now(timezone.utc)
+        _candidate = _now_utc.replace(
+            hour=session_open_hour_utc, minute=0, second=0, microsecond=0
+        )
+        if _candidate > _now_utc:          # open hasn't happened yet today → use yesterday's
+            _candidate -= timedelta(days=1)
+        _session_open_unix = _candidate.timestamp()
+        _session_bars = [b for b in bars if b.get("ts", 0) >= _session_open_unix]
+        # Fall back to all bars only if session has just opened and few bars exist
+        _vwap_source = _session_bars if len(_session_bars) >= 10 else bars
+
         cum_pv = 0.0; cum_v = 0.0; all_vwap = []
-        for b in bars:
+        for b in _vwap_source:
             tp = (b.get("high", 0) + b.get("low", 0) + b.get("close", 0)) / 3.0
             v  = b.get("volume", 1) or 1
             cum_pv += tp * v; cum_v += v
