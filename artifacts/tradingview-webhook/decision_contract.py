@@ -233,6 +233,16 @@ def _build_legal_transitions() -> frozenset:
         # transition history.  Reason code (VWAP_CONFLICT / NO_STRUCTURE / etc.)
         # is real and preserved — do not substitute UNKNOWN.
         (DS.OBSERVING,        DS.WAIT),
+        # ── OBSERVING → EARLY and WAIT → EARLY: confirmed legitimate paths ──
+        # On restart the DC boots in OBSERVING; the first full_analysis may score
+        # EARLY (60–69) before enough signals have arrived to reach READY. Similarly
+        # WAIT can transition to EARLY when partial conditions improve (e.g. CVD
+        # flips or VWAP confirmed but structure still pending). The canonical happy
+        # path is OBSERVING → SETUP_FORMING → EARLY, but in practice SETUP_FORMING
+        # is transient and often skipped in a single evaluation tick, so the direct
+        # hop is a confirmed production behaviour, not an error.
+        (DS.OBSERVING,        DS.EARLY),
+        (DS.WAIT,             DS.EARLY),
         (DS.ORDER_REJECTED,   DS.EXECUTABLE),
         (DS.ORDER_REJECTED,   DS.CANCELLED),
         (DS.CANCELLED,        DS.OBSERVING),
