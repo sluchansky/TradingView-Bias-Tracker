@@ -451,7 +451,7 @@ class DatabentoBrain:
             # ── Bar builder ──
             bar_minute = int(ts_s // 60) * 60
             self._check_session_reset(inst, bar_minute)
-            self._tick_bar(inst, bar_minute, price, size)
+            self._tick_bar(inst, bar_minute, price, size, side=side)
 
             # ── Live tick broadcast (SSE chart feed) ──
             # Fire AFTER _tick_bar so DATABENTO_PARTIAL_BY_INST already reflects
@@ -490,20 +490,29 @@ class DatabentoBrain:
 
     # ── Bar builder ───────────────────────────────────────────────────────────
 
-    def _tick_bar(self, inst: str, bar_minute: int, price: float, size: int) -> None:
+    def _tick_bar(
+        self, inst: str, bar_minute: int, price: float, size: int,
+        side: "str | None" = None,
+    ) -> None:
         # Hold the lock only for the read-modify of _partial so the periodic
         # flush thread cannot read a stale pointer or double-close the same bar.
+        #
+        # Order Flow V1: buy_volume / sell_volume are accumulated per bar from
+        # the Databento trade side field (A = buy aggressor, B = sell aggressor).
+        # Side N (unknown) adds to total volume only (same as before).
         with self._partial_lock:
             p = self._partial[inst]
             if p is None or p["ts"] != bar_minute:
                 to_close = p           # capture old partial (may be None)
                 self._partial[inst] = {
-                    "ts":     bar_minute,
-                    "open":   price,
-                    "high":   price,
-                    "low":    price,
-                    "close":  price,
-                    "volume": size,
+                    "ts":          bar_minute,
+                    "open":        price,
+                    "high":        price,
+                    "low":         price,
+                    "close":       price,
+                    "volume":      size,
+                    "buy_volume":  size if side == "A" else 0,
+                    "sell_volume": size if side == "B" else 0,
                 }
             else:
                 to_close = None        # same minute — just update in place
@@ -511,6 +520,10 @@ class DatabentoBrain:
                 if price < p["low"]:  p["low"]  = price
                 p["close"]   = price
                 p["volume"] += size
+                if side == "A":
+                    p["buy_volume"]  = p.get("buy_volume",  0) + size
+                elif side == "B":
+                    p["sell_volume"] = p.get("sell_volume", 0) + size
             # Publish a display snapshot so Flask routes can read the partial
             # bar without acquiring this lock.  dict() creates a frozen copy
             # while we're still inside the lock — consistent and lock-free for readers.
@@ -651,13 +664,20 @@ class DatabentoBrain:
                 self._vs[inst] = {"ts": now_iso, "source": "databento"}
 
         # ── Public bar store (dashboard live chart) ───────────────────────────
+        # Order Flow V1: include per-bar buy/sell volume and the session CVD
+        # snapshot at the moment this bar closed.  Older bars that were recorded
+        # before this code was deployed will lack these keys — order_flow_engine
+        # detects the absence and returns available=False, reason=bars_pre_v1.
         pub: dict[str, Any] = {
-            "ts":     bar["ts"],
-            "open":   bar["open"],
-            "high":   bar["high"],
-            "low":    bar["low"],
-            "close":  bar["close"],
-            "volume": bar["volume"],
+            "ts":           bar["ts"],
+            "open":         bar["open"],
+            "high":         bar["high"],
+            "low":          bar["low"],
+            "close":        bar["close"],
+            "volume":       bar["volume"],
+            "buy_volume":   bar.get("buy_volume",  0),
+            "sell_volume":  bar.get("sell_volume", 0),
+            "cvd_snapshot": self._cvd_acc[inst],   # session cumulative at bar close
         }
         if vwap is not None: pub["vwap"] = vwap
         if atr  is not None: pub["atr"]  = atr

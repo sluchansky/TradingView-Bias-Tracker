@@ -30935,6 +30935,26 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         except Exception as _ge_fa_exc:
             logger.debug("GateEffectiveness full_analysis (%s): %s", active_ticker, _ge_fa_exc)
 
+    # ── Order Flow V1 — SHADOW / DISPLAY / RESEARCH ONLY ─────────────────────
+    # MUST come after ALL gate/verdict computation — it is observation-only and
+    # must never influence any earlier decision in this function.
+    # Flag-gated (ORDER_FLOW_V1_ENABLED env, default OFF). Fail-open.
+    # No existing READY can become WAIT because of this block.
+    # DATABENTO_BARS_BY_INST lives in databento_brain — lazy-import like the
+    # existing bar-reader pattern (cf. line ~7981 in this file).
+    try:
+        import order_flow_engine as _ofe  # noqa: PLC0415
+        if _ofe.ORDER_FLOW_V1_ENABLED:
+            from databento_brain import DATABENTO_BARS_BY_INST as _dbi_of  # noqa: PLC0415
+            _of_result = _ofe.compute_order_flow(
+                active_ticker,
+                _dbi_of.get(active_ticker) or [],
+                CVD_BY_TICKER.get(active_ticker),
+            )
+            result["order_flow"] = _of_result
+    except Exception as _of_exc:
+        logger.debug("order_flow_engine full_analysis (%s): %s", active_ticker, _of_exc)
+
     return result
 
 
@@ -49147,6 +49167,10 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
             with _GHOST_OBS_COOLDOWN_LOCK:
                 _GHOST_OBS_COOLDOWN.pop(ckey, None)
             return
+        # Order Flow V1 snapshot — frozen at signal time (all fields nullable).
+        # NULL when ORDER_FLOW_V1_ENABLED=0 or bars predate V1 deployment.
+        _of_snap = result.get("order_flow") or {}
+
         inserted = False
         try:
             with conn.cursor() as cur:
@@ -49161,10 +49185,16 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                             four_h_trend_at_signal, fifteen_m_trend_at_signal,
                             trend_alignment_at_signal,
                             it_trend_15m_native, it_context_1h, it_extension_state,
-                            it_setup_score, it_entry_state)
+                            it_setup_score, it_entry_state,
+                            of_cvd, of_cvd_slope, of_bar_delta, of_delta_ratio,
+                            of_delta_acceleration, of_ask_volume, of_bid_volume,
+                            of_book_imbalance, of_absorption_side, of_absorption_strength,
+                            of_cvd_divergence, of_order_flow_score, of_order_flow_state,
+                            of_reversal_confirmed)
                        VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                                %s,%s,%s,%s,'open',%s,'training',%s,%s,%s,
-                               %s,%s,%s,%s,%s)
+                               %s,%s,%s,%s,%s,
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
                        ON CONFLICT (obs_key) DO NOTHING
                        RETURNING id""",
                     (obs_key, strategy_key, STRATEGY_VERSION, inst,
@@ -49185,6 +49215,23 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                          (int(_itd['setup_score']) if isinstance(_itd.get('setup_score'), (int, float)) else None),
                          _itd.get('entry_state'),
                      ))(result.get('intraday_trend_context') or {})),
+                     # Order Flow V1 columns (all nullable; NULL when flag OFF or bars_pre_v1)
+                     *((lambda _of: (
+                         _of.get('cvd'),
+                         _of.get('cvd_slope'),
+                         _of.get('bar_delta'),
+                         _of.get('delta_ratio'),
+                         _of.get('delta_acceleration'),
+                         _of.get('ask_volume'),
+                         _of.get('bid_volume'),
+                         None,                           # book_imbalance always NULL (no order book)
+                         _of.get('absorption_side'),
+                         _of.get('absorption_strength'),
+                         _of.get('cvd_divergence'),
+                         _of.get('order_flow_score'),
+                         _of.get('order_flow_state'),
+                         bool(_of['order_flow_reversal_confirmed']) if _of.get('available') and _of.get('order_flow_reversal_confirmed') is not None else None,
+                     ))(_of_snap)),
                     ),
                 )
                 row = cur.fetchone()
@@ -68114,6 +68161,18 @@ function doResetSafetyLock() {}
   </div>
 </div>
 
+<!-- ════ Order Flow V1 (bar-level delta analysis — shadow/research/display-only) ════ -->
+<!-- Computes per-bar buy/sell volume imbalance and session CVD slope from live
+     Databento tick data.  Flag-gated: ORDER_FLOW_V1_ENABLED env (default OFF).
+     Bars captured before V1 deployment lack buy/sell fields and show a stub.
+     DISPLAY-ONLY: never modifies gate, scoring, sizing, arm state, or execution. -->
+<div class="mod" id="mod-order-flow" data-cat="detail">
+  <div class="mod-h">⚡ Order Flow<span style="font-size:10px;color:#6b7280;margin-left:4px">V1 · BAR DELTA</span><span class="mod-cat cat-detail">DETAIL</span></div>
+  <div id="of-body">
+    <div style="color:var(--muted);font-size:12px;padding:4px 0">Set ORDER_FLOW_V1_ENABLED=1 to enable live metrics.</div>
+  </div>
+</div>
+
 <!-- ════ Source Attribution Analytics (Phase 5E — research/display-only) ════ -->
 <!-- Diagnostics panel: which market-data sources contributed to each scored
      setup. Hidden behind Advanced panels toggle. Never modifies scoring or
@@ -75746,6 +75805,7 @@ var _liveNavSections = {
     'mod-data-feed',      // Data Feed / alert timing (moved from overview Phase 3B)
     'mod-chartprev',      // Live Chart Preview
     'mod-cvd',            // Volume Delta (CVD) & RVOL
+    'mod-order-flow',     // Order Flow V1 (bar delta / absorption / reversal)
     'mod-mi',             // Market Intelligence (structure / supply-demand)
     'mod-fastentry',      // Fast Entry Trigger
     'mod-xmarket',        // Index Alignment
@@ -79774,6 +79834,57 @@ function renderBLPanels(d){
     evEl.innerHTML=events.join('');
   }
 
+  // ── Order Flow V1 panel (display-only, flag-gated) ──────────────────────
+  (function(){
+    var of = d && d.order_flow;
+    var ofEl = document.getElementById('of-body');
+    if(!ofEl) return;
+    if(!of || of.available===false){
+      var reason = of && of.reason;
+      var msg = reason==='flag_off'
+        ? 'Set ORDER_FLOW_V1_ENABLED=1 to enable live metrics.'
+        : reason==='bars_pre_v1'
+        ? 'Waiting for V1 bars — metrics populate on next bar close.'
+        : reason==='no_bars'
+        ? 'No Databento bars received yet.'
+        : 'Order flow data not available.';
+      ofEl.innerHTML='<div style="color:var(--muted);font-size:12px;padding:4px 0">'+msg+'</div>';
+      return;
+    }
+    function fmt(v,digits){ return v==null?'&#8212;':Number(v).toFixed(digits||0); }
+    function arrow(v){ return v==null?'&#8212;':v>0?'&#9650;':v<0?'&#9660;':'&#8212;'; }
+    var state = of.order_flow_state||'NEUTRAL';
+    var score = of.order_flow_score;
+    var stateColor = state==='STRONG_BULLISH'?'#22c55e':state==='BULLISH'?'#6ee7b7':
+                     state==='STRONG_BEARISH'?'#ef4444':state==='BEARISH'?'#fca5a5':'#9ca3af';
+    var divTxt = of.cvd_divergence||'&#8212;';
+    var divCol = of.cvd_divergence==='BULLISH'?'#6ee7b7':of.cvd_divergence==='BEARISH'?'#fca5a5':'#9ca3af';
+    var absText = of.absorption_side
+      ? (of.absorption_side==='SELLERS_ABSORBED'?'SELLERS':
+         of.absorption_side==='BUYERS_ABSORBED'?'BUYERS':'&#8212;')
+        +(of.absorption_strength?' ('+of.absorption_strength+')':'')
+      : '&#8212;';
+    var revText = of.order_flow_reversal_confirmed===true
+      ? '<span style="color:#f59e0b">&#9889; DETECTED</span>'
+      : of.order_flow_reversal_confirmed===false ? '&#8212;' : '&#8212;';
+    var rows=[
+      ['State', '<span style="color:'+stateColor+';font-weight:600">'+state+'</span>'],
+      ['Score', score!=null?score+'/100':'&#8212;'],
+      ['Delta',   (of.bar_delta!=null?(of.bar_delta>0?'+':'')+of.bar_delta:'&#8212;')],
+      ['Ratio',   fmt(of.delta_ratio,3)],
+      ['Accel.',  arrow(of.delta_acceleration)],
+      ['CVD Slope', arrow(of.cvd_slope)+(of.cvd_slope!=null?' ('+fmt(of.cvd_slope,0)+')':'')],
+      ['Divergence','<span style="color:'+divCol+'">'+divTxt+'</span>'],
+      ['Absorption', absText],
+      ['Reversal Seq.', revText],
+      ['Ask Vol (buys)', of.ask_volume!=null?of.ask_volume.toLocaleString():'&#8212;'],
+      ['Bid Vol (sells)', of.bid_volume!=null?of.bid_volume.toLocaleString():'&#8212;'],
+    ];
+    ofEl.innerHTML='<div class="cvd-stats">'+rows.map(function(r){
+      return '<div class="gstat"><div class="l">'+r[0]+'</div><div class="v">'+r[1]+'</div></div>';
+    }).join('')+'</div>';
+  })();
+
   // ── Header nav bar: sync ticker tabs + time + session badge ──
   var tpTabEls=document.querySelectorAll('#tp-tabs .tp-tab');
   if(tpTabEls.length&&inst){tpTabEls.forEach(function(t){t.classList.toggle('active',t.dataset.tk===inst);});}
@@ -82450,6 +82561,35 @@ def route_gate_backfill():
     except Exception as exc:
         logger.warning("route_gate_backfill: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/order-flow/status", methods=["GET"])
+def route_order_flow_status():
+    """Current order-flow analysis for all active instruments.
+
+    DISPLAY/RESEARCH ONLY — reads the per-bar order flow state computed in
+    full_analysis() by order_flow_engine.compute_order_flow().
+    Never modifies gate, scoring, sizing, arm state, or execution.
+    Returns a flag_off stub when ORDER_FLOW_V1_ENABLED is not set.
+    """
+    try:
+        import order_flow_engine as _ofe  # noqa: PLC0415
+        if not _ofe.ORDER_FLOW_V1_ENABLED:
+            return jsonify({
+                "enabled":     False,
+                "reason":      "flag_off",
+                "instruments": {},
+            })
+        from databento_brain import DATABENTO_BARS_BY_INST as _dbi_route  # noqa: PLC0415
+        out = {}
+        for _inst in list(INSTRUMENT_SPECS):
+            _bars = _dbi_route.get(_inst) or []
+            _cvd  = CVD_BY_TICKER.get(_inst)
+            out[_inst] = _ofe.compute_order_flow(_inst, _bars, _cvd)
+        return jsonify({"enabled": True, "instruments": out})
+    except Exception as exc:
+        logger.warning("route_order_flow_status: %s", exc)
+        return jsonify({"enabled": False, "error": str(exc)}), 500
 
 
 @app.route("/gate-effectiveness/scalp-feedback-health", methods=["GET"])

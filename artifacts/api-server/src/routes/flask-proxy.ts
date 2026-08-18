@@ -453,6 +453,9 @@ export const BOT1_ROUTES = [
   // Neither endpoint touches gate, scoring, sizing, learning, or execution.
   "/gate-effectiveness/scalp-feedback-health",
   "/gate-effectiveness/shadow-cohorts",
+  // Order Flow V1: per-instrument bar delta / absorption / reversal metrics.
+  // Shadow/research/display-only — never modifies gate, execution, or scoring.
+  "/order-flow/status",
   // Visual Brain V1 — MNQ 1-minute stateful market observer (SHADOW/DISPLAY-ONLY;
   // owner-only; NOT in dashboard-auth OPEN_PATHS). Captures MNQ chart screenshots,
   // sends to vision LLM, persists structured market-state observations. NEVER
