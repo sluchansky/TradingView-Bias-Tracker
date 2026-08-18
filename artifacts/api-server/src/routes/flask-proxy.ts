@@ -445,6 +445,14 @@ export const BOT1_ROUTES = [
   "/gate-effectiveness/backfill",
   // Phase 8C MODE→STRATEGY→GATE→OUTCOME funnel analytics.
   "/gate-effectiveness/strategy-report",
+  // Phase 10 SCALP Feedback Loop research endpoints (DISPLAY/RESEARCH ONLY;
+  // owner-only; NOT in dashboard-auth OPEN_PATHS).
+  // scalp-feedback-health: pipeline health snapshot (vwap coverage, strategy
+  // identity coverage, ghost_observations webhook count, outcome breakdown).
+  // shadow-cohorts: per-cohort win-rate analytics for BLOCKED SCALP records.
+  // Neither endpoint touches gate, scoring, sizing, learning, or execution.
+  "/gate-effectiveness/scalp-feedback-health",
+  "/gate-effectiveness/shadow-cohorts",
   // Visual Brain V1 — MNQ 1-minute stateful market observer (SHADOW/DISPLAY-ONLY;
   // owner-only; NOT in dashboard-auth OPEN_PATHS). Captures MNQ chart screenshots,
   // sends to vision LLM, persists structured market-state observations. NEVER

@@ -1,0 +1,129 @@
+Add Order Flow V1 to the existing trading bot.
+
+Objective
+
+Use existing Databento data to calculate order-flow confirmation for MNQ.
+
+Do NOT create a new strategy.
+Do NOT change existing entry rules, gates, risk rules, or execution logic.
+Do NOT make order flow a hard blocker.
+Do NOT add new paid APIs or services.
+
+Order flow is initially SHADOW / research + scoring only.
+
+1. Calculate These Metrics
+
+Using existing Databento trade/bar/order-book data where available:
+
+* Bar Delta = aggressive buy volume − aggressive sell volume
+* Delta Ratio
+* Delta Acceleration
+* CVD
+* CVD Slope
+* CVD Divergence
+* Buy/Sell Absorption
+* Book Imbalance, only if reliable bid/ask depth is already available
+
+Do not fabricate unavailable metrics.
+
+2. Create Order Flow State
+
+Return:
+
+order_flow_score: 0-100
+order_flow_state:
+STRONG_BULLISH
+BULLISH
+NEUTRAL
+BEARISH
+STRONG_BEARISH
+
+Score evidence such as:
+
+* CVD direction/alignment
+* Delta direction
+* Delta acceleration
+* Absorption
+* CVD/price divergence
+* Book imbalance when available
+
+Keep the scoring logic centralized and configurable.
+
+3. Detect High-Value Reversal Sequence
+
+Specifically identify:
+
+LIQUIDITY SWEEP
+→ ABSORPTION
+→ DELTA REVERSAL
+→ STRUCTURE CONFIRMATION
+
+Expose it as:
+
+order_flow_reversal_confirmed = true/false
+
+Do not require this condition for READY.
+
+4. Ghost Logging
+
+Attach order-flow data to every applicable ghost/trade observation:
+
+cvd
+cvd_slope
+bar_delta
+delta_ratio
+delta_acceleration
+bid_volume
+ask_volume
+book_imbalance
+absorption_side
+absorption_strength
+cvd_divergence
+order_flow_score
+order_flow_state
+order_flow_reversal_confirmed
+
+Use nullable fields where data is unavailable.
+
+5. Dashboard
+
+Add a compact ORDER FLOW section showing:
+
+ORDER FLOW: BULLISH
+Score: 67/100
+CVD          ↑
+Delta        +1,842
+Acceleration ↑
+Absorption   SELLERS
+Divergence   BULLISH
+
+It must clearly distinguish unavailable data from neutral order flow.
+
+6. Research
+
+Make the stored fields queryable so we can later compare:
+
+* win rate
+* profit factor
+* expectancy
+* MAE/MFE
+* TP1/TP2 rate
+
+against order-flow score/state and individual signals.
+
+Safety
+
+This first version is observation-only.
+
+No existing READY can become WAIT because of Order Flow V1.
+
+Before modifying code:
+
+1. Find the existing Databento ingestion path.
+2. Identify which required order-flow inputs already exist.
+3. Identify which metrics cannot be calculated reliably from current data.
+4. Reuse existing infrastructure instead of creating duplicate collectors.
+5. Show me the proposed files/functions/schema changes.
+6. Then implement the smallest viable patch.
+7. Run existing tests and add focused Order Flow V1 tests.
+8. Confirm existing trade verdicts are unchanged with Order Flow V1 enabled.

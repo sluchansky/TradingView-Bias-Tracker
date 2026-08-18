@@ -95,7 +95,13 @@ def _blocker_category(blocker: str, mode: str = "SCALP") -> str:
 
 
 def _extract_strategy(result: dict, mode: str) -> str:
-    """Classify the strategy / setup type from the analysis result."""
+    """Classify the strategy / setup type from the analysis result.
+
+    For SCALP/SWING, uses strategy_engine.active_key to distinguish
+    LIQUIDITY_SWEEP_REVERSAL from VWAP_PULLBACK_CONTINUATION from
+    OPENING_DRIVE etc., rather than returning the bare mode name.
+    Falls back to mode if no strategy engine selection is available.
+    """
     verdict = str(result.get("verdict") or "")
     if "ORB" in verdict.upper():
         return "ORB"
@@ -104,7 +110,131 @@ def _extract_strategy(result: dict, mode: str) -> str:
     if mode == "INTRADAY_TREND":
         it_ctx = result.get("intraday_trend_context") or {}
         return (it_ctx.get("setup_type") or "INTRADAY_TREND")
+    # Phase 5: use strategy_engine.active_key for precise sub-strategy identity.
+    # active_key holds canonical names (LIQUIDITY_SWEEP_REVERSAL, VWAP_PULLBACK_CONTINUATION,
+    # OPENING_DRIVE, etc.) which are far more informative than the bare mode name.
+    se = result.get("strategy_engine") or {}
+    active_key = se.get("active_key")
+    if active_key and str(active_key) not in ("", "None"):
+        return str(active_key)
     return mode
+
+
+def _et_session_bucket(dt_utc: datetime) -> str:
+    """Return a canonical ET trading session bucket label.
+
+    All reports and cohort selectors call this single function to prevent
+    dashboard disagreements.  Uses UTC-4 (EDT) as a stable approximation
+    of ET; during EST the bucket labels remain correct even though times
+    shift by one hour — acceptably close for session-level analytics.
+
+    Buckets (Phase 9):
+        Overnight       — before 08:00 ET
+        08:00-09:30     — pre-market
+        09:30-10:30     — open
+        10:30-12:00     — late morning
+        12:00-14:00     — midday
+        14:00-15:45     — afternoon
+        15:45-16:00     — closing (pay special attention — historically protective)
+        16:00-17:00     — after-hours
+        Evening         — 17:00+
+    """
+    try:
+        et = dt_utc.astimezone(timezone(timedelta(hours=-4)))  # approximate EDT
+        h = et.hour + et.minute / 60.0
+        if h < 8.0:
+            return "Overnight"
+        if h < 9.5:
+            return "08:00-09:30"
+        if h < 10.5:
+            return "09:30-10:30"
+        if h < 12.0:
+            return "10:30-12:00"
+        if h < 14.0:
+            return "12:00-14:00"
+        if h < 15.75:
+            return "14:00-15:45"
+        if h < 16.0:
+            return "15:45-16:00"
+        if h < 17.0:
+            return "16:00-17:00"
+        return "Evening"
+    except Exception:
+        return "Unknown"
+
+
+def _classify_shadow_cohort(info: dict, gate_verdict: str, mode: str,
+                             direction: str, score: int, now: datetime) -> Optional[str]:
+    """Assign a shadow research cohort label to a BLOCKED SCALP evaluation.
+
+    Returns None if the record does not fit any tracked cohort.
+    Precedence when multiple conditions could match: A → B → C.
+
+    Cohort A — EDGE35_OTHER_GATES_PASS:
+        Edge is the primary blocker; structure, volume, CVD, and entry
+        quality all pass; score ≥ 30 (meaningful near-miss, not noise).
+    Cohort B — VOLUME_ONLY_BLOCK_1030_1200:
+        Volume is the blocking condition; evaluation falls in the
+        10:30–12:00 ET window; all other key gates pass.
+    Cohort C — SHORT_CVD_ONLY_BLOCK:
+        Short direction; CVD is the blocking condition; all other key
+        gates pass.  Tracks whether high-quality Shorts are being
+        suppressed by the CVD hard filter.
+
+    Never raises — returns None on any exception.
+    """
+    try:
+        if gate_verdict != "BLOCKED" or mode != "SCALP":
+            return None
+
+        blocker_raw   = info.get("primary_blocker") or ""
+        blocker       = blocker_raw.lower()
+        all_b         = info.get("all_blockers") or []
+        all_b_str     = " ".join(str(b).lower() for b in all_b)
+
+        # Gate component results from _extract output
+        cv_pass   = info.get("comp_cvd",    "UNAVAILABLE") in ("PASS", "UNAVAILABLE")
+        vol_pass  = info.get("comp_volume", "UNAVAILABLE") == "PASS"
+        bos_pass  = info.get("comp_bos",    "UNAVAILABLE") == "PASS"
+        choch_pass= info.get("comp_choch",  "UNAVAILABLE") == "PASS"
+        struct_ok = bos_pass or choch_pass
+        vwap_pass = info.get("comp_vwap",   "UNAVAILABLE") in ("PASS", "UNAVAILABLE")
+        loc_ok    = not ("entry quality" in blocker or "location" in blocker
+                         or "entry quality" in all_b_str or "location" in all_b_str)
+        cvd_fail  = (info.get("comp_cvd", "UNAVAILABLE") == "FAIL"
+                     or "cvd" in blocker or "cvd" in all_b_str)
+
+        # Cohort A — edge is the sole meaningful blocker
+        edge_blocked = (
+            "edge" in blocker
+            or "edge" in all_b_str
+            or (not blocker and score < 50 and score >= 30)
+        )
+        if (edge_blocked and struct_ok and vol_pass and cv_pass
+                and vwap_pass and loc_ok and score >= 30
+                and not cvd_fail):
+            return "EDGE35_OTHER_GATES_PASS"
+
+        # Cohort B — volume gate blocks during late-morning window
+        try:
+            et = now.astimezone(timezone(timedelta(hours=-4)))
+            et_h = et.hour + et.minute / 60.0
+        except Exception:
+            et_h = -1.0
+        in_vol_window = 10.5 <= et_h < 12.0
+        vol_blocked = "volume" in blocker or "volume" in all_b_str
+        if (in_vol_window and vol_blocked and not edge_blocked
+                and struct_ok and cv_pass and vwap_pass and loc_ok):
+            return "VOLUME_ONLY_BLOCK_1030_1200"
+
+        # Cohort C — CVD blocks a Short setup, everything else qualifies
+        if (direction == "Short" and cvd_fail and not edge_blocked
+                and struct_ok and vol_pass and vwap_pass and loc_ok):
+            return "SHORT_CVD_ONLY_BLOCK"
+
+        return None
+    except Exception:
+        return None
 
 
 # ── DB helper ─────────────────────────────────────────────────────────────────
@@ -328,7 +458,7 @@ def _extract(result: dict, mode: str = "SCALP") -> dict:
                 "comp_session": _comp(it_ctx.get("time_ok")),
                 "comp_zone":    _comp(it_ctx.get("location_quality") not in (None, "MID_RANGE")),
                 "atr_pts":          vol.get("atr_pts"),
-                "vwap_value":       result.get("vwap"),
+                "vwap_value":       result.get("vwap_value") or result.get("vwap"),
                 "cvd_direction":    _scalar_str(result.get("cvd_state") or result.get("cvd_direction")),
                 "trend_alignment":  _scalar_str(it_ctx.get("trend_alignment")),
                 "volatility_regime":vol.get("regime") or vol.get("label"),
@@ -372,18 +502,50 @@ def _extract(result: dict, mode: str = "SCALP") -> dict:
         except Exception:
             pass
 
-        # ── Geometry source + SCALP ATR fallback ─────────────────────────────
-        # LIVE_PLAN:    real plan activated (ALLOWED record — trade entered).
-        # SCALP_NATIVE: plan data available for a BLOCKED evaluation.
-        # ATR_FALLBACK: synthetic bracket when BLOCKED with no plan data.
-        # NONE:         no geometry available.
+        # ── Geometry source + ATR fallback ───────────────────────────────────
+        # LIVE_PLAN:         real plan activated (ALLOWED — trade entered).
+        # LIVE_PLAN_ATR_FILL: ALLOWED but trade_plan missing entry/stop; ATR
+        #                     bracket synthesised so the watcher WHERE clause
+        #                     (entry_price/stop_price/target1_price IS NOT NULL)
+        #                     can resolve the PENDING row.  Previously these rows
+        #                     remained stuck as PENDING forever (Phase 2 fix).
+        # SCALP_NATIVE:      plan data available for a BLOCKED evaluation.
+        # ATR_FALLBACK:      synthetic bracket when BLOCKED with no plan data.
+        # NONE:              no geometry available even with ATR fallback.
+        _atr_s = vol.get("atr_pts")
+        _cpx_s = result.get("current_price")
+
         if gate_verdict in ("ALLOWED", "EARLY_ALLOWED"):
-            _geom_src = "LIVE_PLAN" if entry is not None else "NONE"
+            if entry is not None and stop_px is not None and t1 is not None:
+                _geom_src = "LIVE_PLAN"
+            else:
+                # Phase 2 fix: synthesise ATR bracket for ALLOWED records that
+                # lack full trade_plan geometry so the outcome watcher can
+                # eventually resolve them.  Preserves any real values that are
+                # present (e.g. entry might exist but stop is missing).
+                if _atr_s and _cpx_s and float(_atr_s) > 0 and direction in ("Long", "Short"):
+                    _e_s  = float(entry) if entry is not None else float(_cpx_s)
+                    _sd_s = float(_atr_s) * 1.0
+                    if entry is None:
+                        entry = _e_s
+                    if stop_px is None:
+                        stop_px = (
+                            round(_e_s - _sd_s, 2) if direction == "Long"
+                            else round(_e_s + _sd_s, 2)
+                        )
+                    if t1 is None:
+                        t1 = (
+                            round(_e_s + _sd_s, 2) if direction == "Long"
+                            else round(_e_s - _sd_s, 2)
+                        )
+                    if risk_pts is None:
+                        risk_pts = round(_sd_s, 4)
+                    _geom_src = "LIVE_PLAN_ATR_FILL"
+                else:
+                    _geom_src = "NONE"
         elif entry is not None and stop_px is not None:
             _geom_src = "SCALP_NATIVE"
         else:
-            _atr_s = vol.get("atr_pts")
-            _cpx_s = result.get("current_price")
             if _atr_s and _cpx_s and float(_atr_s) > 0 and direction in ("Long", "Short"):
                 _e_s    = float(_cpx_s)
                 _sd_s   = float(_atr_s) * 1.0   # SCALP: 1×ATR stop, 1:1 RR target
@@ -427,11 +589,19 @@ def _extract(result: dict, mode: str = "SCALP") -> dict:
             "comp_session":     _comp(conf.get("preferred_session") or conf.get("session")),
             "comp_zone":        _comp(conf.get("zone_mitigated") or conf.get("zone_valid")),
             "atr_pts":          vol.get("atr_pts"),
-            "vwap_value":       result.get("vwap"),
+            # Phase 4 fix: result["vwap_value"] is the scalar VWAP price from
+            # full_analysis.  result["vwap"] (the old key) is a different object
+            # in some call paths; prefer vwap_value, fall back to vwap.
+            "vwap_value":       result.get("vwap_value") or result.get("vwap"),
             # session_state / trend_alignment may be dicts in the live result;
             # _scalar_str collapses them to a readable string psycopg2 can INSERT.
             "cvd_direction":    _scalar_str(result.get("cvd_state") or result.get("cvd_direction")),
-            "trend_alignment":  _scalar_str(result.get("trend_alignment")),
+            # Phase 4 fix: trend_alignment lives inside swing_context when SWING HTF
+            # is enabled; fall back to top-level result key for compatibility.
+            "trend_alignment":  _scalar_str(
+                result.get("trend_alignment")
+                or (result.get("swing_context") or {}).get("trend_alignment")
+            ),
             "volatility_regime":vol.get("regime") or vol.get("label"),
             "session":          _scalar_str(result.get("session_state") or result.get("session")),
             "strategy":         _extract_strategy(result, mode),
@@ -521,6 +691,15 @@ def _record(result: dict, instrument: str, mode: str) -> None:
     # ── Strategy / setup label ───────────────────────────────────────────────
     strategy = info.get("strategy") or _extract_strategy(result, mode)
 
+    # ── Session bucket (Phase 9 — canonical time-of-day classification) ──────
+    _session_bkt = _et_session_bucket(now)
+
+    # ── Shadow research cohort (Phase 7) ─────────────────────────────────────
+    # Classify BLOCKED SCALP records into one of three research cohorts so we
+    # can measure what would have happened if a specific gate had not blocked.
+    # NEVER promotes a BLOCKED record to READY; purely observational.
+    _cohort = _classify_shadow_cohort(info, gate_verdict, mode, direction, score, now)
+
     # ── Opportunity grouping key (daily per mode+strategy+instrument+direction) ──
     # Includes strategy so VWAP_PULLBACK and LIQUIDITY_SWEEP on the same instrument
     # are tracked as SEPARATE opportunities in analytics queries.
@@ -570,7 +749,8 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     volatility_regime, session,
                     outcome_status,
                     strategy, setup_id,
-                    geometry_source
+                    geometry_source,
+                    shadow_cohort, session_bucket
                 ) VALUES (
                     %s,%s,%s,%s,
                     %s,%s,%s,%s,
@@ -583,7 +763,8 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     %s,%s,
                     %s,
                     %s,%s,
-                    %s
+                    %s,
+                    %s,%s
                 )
                 ON CONFLICT (audit_id) DO UPDATE SET
                     last_seen_at     = EXCLUDED.last_seen_at,
@@ -606,16 +787,21 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                     strategy         = COALESCE(EXCLUDED.strategy,  gate_audit_log.strategy),
                     setup_id         = COALESCE(EXCLUDED.setup_id,  gate_audit_log.setup_id),
                     -- Promote geometry_source to highest-fidelity value seen for this slot.
-                    -- Ordering: LIVE_PLAN / IT_NATIVE / SCALP_NATIVE > ATR_FALLBACK > NONE.
+                    -- Ordering: LIVE_PLAN / LIVE_PLAN_ATR_FILL / IT_NATIVE / SCALP_NATIVE
+                    --           > ATR_FALLBACK > NONE.
                     geometry_source  = CASE
-                        WHEN EXCLUDED.geometry_source IN ('LIVE_PLAN','IT_NATIVE','SCALP_NATIVE')
+                        WHEN EXCLUDED.geometry_source IN ('LIVE_PLAN','LIVE_PLAN_ATR_FILL','IT_NATIVE','SCALP_NATIVE')
                         THEN EXCLUDED.geometry_source
-                        WHEN gate_audit_log.geometry_source IN ('LIVE_PLAN','IT_NATIVE','SCALP_NATIVE')
+                        WHEN gate_audit_log.geometry_source IN ('LIVE_PLAN','LIVE_PLAN_ATR_FILL','IT_NATIVE','SCALP_NATIVE')
                         THEN gate_audit_log.geometry_source
                         WHEN EXCLUDED.geometry_source = 'ATR_FALLBACK'
                         THEN EXCLUDED.geometry_source
                         ELSE COALESCE(EXCLUDED.geometry_source, gate_audit_log.geometry_source)
                     END,
+                    -- shadow_cohort: preserve the first cohort classification seen
+                    shadow_cohort    = COALESCE(gate_audit_log.shadow_cohort, EXCLUDED.shadow_cohort),
+                    -- session_bucket: always update with latest (clock-stable within a slot)
+                    session_bucket   = COALESCE(EXCLUDED.session_bucket, gate_audit_log.session_bucket),
                     -- Promote NO_GEOMETRY → PENDING when geometry arrives
                     outcome_status   = CASE
                         WHEN gate_audit_log.outcome_status = 'NO_GEOMETRY'
@@ -641,6 +827,7 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                 initial_status,
                 strategy, setup_id,
                 info.get("geometry_source", "NONE"),
+                _cohort, _session_bkt,
             ))
         conn.commit()
         logger.info(
@@ -2468,6 +2655,168 @@ def get_opportunities(
     except Exception as exc:
         logger.debug("gate_effectiveness get_opportunities: %s", exc)
         return []
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+# ── Phase 10: SCALP Feedback Loop research API ───────────────────────────────
+
+def get_scalp_feedback_health() -> dict:
+    """Diagnostic snapshot of the SCALP feedback pipeline health.
+
+    Returns per-mode/per-instrument counts broken down by outcome_status
+    and geometry_source, plus watcher state and fix-coverage summary.
+    FAIL-OPEN — display-only, read-only.  Never touches gate or execution.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return {"ok": False, "reason": "GATE_AUDIT_DB_READY=False"}
+    conn = _learning_conn()
+    if conn is None:
+        return {"ok": False, "reason": "no_db_connection"}
+    try:
+        with conn.cursor() as cur:
+            # ── Outcome-status breakdown ──────────────────────────────────────
+            cur.execute("""
+                SELECT
+                    mode,
+                    gate_verdict,
+                    geometry_source,
+                    outcome_status,
+                    COUNT(*) AS n
+                FROM gate_audit_log
+                WHERE baseline_version = %s
+                  AND recorded_at >= NOW() - INTERVAL '14 days'
+                GROUP BY mode, gate_verdict, geometry_source, outcome_status
+                ORDER BY mode, gate_verdict, geometry_source, outcome_status
+            """, (BASELINE_VERSION,))
+            breakdown = [
+                {
+                    "mode": r[0], "gate_verdict": r[1],
+                    "geometry_source": r[2], "outcome_status": r[3], "n": int(r[4]),
+                }
+                for r in cur.fetchall()
+            ]
+
+            # ── vwap_value coverage (Phase 4 fix metric) ─────────────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE vwap_value IS NOT NULL) AS with_vwap,
+                    COUNT(*)                                         AS total
+                FROM gate_audit_log
+                WHERE baseline_version = %s
+                  AND recorded_at >= NOW() - INTERVAL '7 days'
+            """, (BASELINE_VERSION,))
+            vr = cur.fetchone()
+            vwap_coverage = {
+                "with_vwap": int(vr[0]) if vr else 0,
+                "total":     int(vr[1]) if vr else 0,
+            }
+
+            # ── Strategy identity coverage (Phase 5 fix metric) ──────────────
+            cur.execute("""
+                SELECT
+                    COUNT(*) FILTER (WHERE strategy IS NOT NULL
+                                       AND strategy NOT IN ('SCALP','SWING','INTRADAY_TREND'))
+                                                            AS with_substrategy,
+                    COUNT(*)                                AS total
+                FROM gate_audit_log
+                WHERE baseline_version = %s
+                  AND recorded_at >= NOW() - INTERVAL '7 days'
+            """, (BASELINE_VERSION,))
+            sr = cur.fetchone()
+            strategy_coverage = {
+                "with_substrategy": int(sr[0]) if sr else 0,
+                "total":            int(sr[1]) if sr else 0,
+            }
+
+            # ── Ghost observations from webhook (Phase 1 fix metric) ──────────
+            # ghost_observations uses signal_time, not ts.
+            cur.execute("""
+                SELECT COUNT(*)
+                FROM ghost_observations
+                WHERE source = 'webhook'
+                  AND signal_time >= NOW() - INTERVAL '7 days'
+            """)
+            ghost_r = cur.fetchone()
+            ghost_webhook_count = int(ghost_r[0]) if ghost_r else 0
+
+        return {
+            "ok":                  True,
+            "watcher_state":       _GE_WATCHER_STATE,
+            "outcome_breakdown":   breakdown,
+            "vwap_coverage":       vwap_coverage,
+            "strategy_coverage":   strategy_coverage,
+            "ghost_webhook_7d":    ghost_webhook_count,
+            "baseline_version":    BASELINE_VERSION,
+        }
+    except Exception as exc:
+        logger.debug("get_scalp_feedback_health: %s", exc)
+        return {"ok": False, "reason": str(exc)}
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def get_shadow_cohort_stats(days: int = 14) -> dict:
+    """Shadow cohort analytics for Phase 7 BLOCKED SCALP research.
+
+    Returns per-cohort win-rate, outcome counts, and peak-edge distribution.
+    Cohorts are BLOCKED records only; ALLOWED records never appear.
+    FAIL-OPEN — display-only, read-only.  Never touches gate or execution.
+    """
+    if not GATE_AUDIT_DB_READY:
+        return {"ok": False, "reason": "GATE_AUDIT_DB_READY=False"}
+    conn = _learning_conn()
+    if conn is None:
+        return {"ok": False, "reason": "no_db_connection"}
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT
+                    COALESCE(shadow_cohort, 'UNCLASSIFIED') AS cohort,
+                    session_bucket,
+                    direction,
+                    COUNT(*)                                  AS n_total,
+                    COUNT(*) FILTER (WHERE outcome_status='COMPLETED')
+                                                              AS n_resolved,
+                    COUNT(*) FILTER (WHERE outcome_status='COMPLETED' AND final_r > 0)
+                                                              AS n_winners,
+                    ROUND(AVG(edge_score)::numeric, 1)        AS avg_edge,
+                    ROUND(MAX(edge_score)::numeric, 1)        AS peak_edge,
+                    ROUND(AVG(final_r)::numeric, 3)           AS avg_r
+                FROM gate_audit_log
+                WHERE baseline_version = %s
+                  AND recorded_at >= NOW() - make_interval(days => %s)
+                  AND gate_verdict IN ('BLOCKED', 'EARLY_BLOCKED')
+                GROUP BY cohort, session_bucket, direction
+                ORDER BY n_total DESC
+            """, (BASELINE_VERSION, days))
+            rows = cur.fetchall()
+
+        cohorts = [
+            {
+                "cohort":       r[0],
+                "session":      r[1],
+                "direction":    r[2],
+                "n_total":      int(r[3]),
+                "n_resolved":   int(r[4]),
+                "n_winners":    int(r[5]),
+                "win_rate":     round(int(r[5]) / int(r[4]), 3) if int(r[4]) > 0 else None,
+                "avg_edge":     _safe_float(r[6]),
+                "peak_edge":    _safe_float(r[7]),
+                "avg_r":        _safe_float(r[8]),
+            }
+            for r in rows
+        ]
+        return {"ok": True, "days": days, "cohorts": cohorts, "baseline_version": BASELINE_VERSION}
+    except Exception as exc:
+        logger.debug("get_shadow_cohort_stats: %s", exc)
+        return {"ok": False, "reason": str(exc)}
     finally:
         try:
             conn.close()

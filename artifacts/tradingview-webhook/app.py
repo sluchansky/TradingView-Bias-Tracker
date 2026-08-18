@@ -45092,6 +45092,25 @@ def _process_webhook_alert(record, parsed_price, resolved_inst, normalized,
     alert_sent_at = None
     tiered_sent   = False
 
+    # ── Phase 1: Ghost observation for READY webhook verdicts ─────────────────
+    # _ghost_observe_setup is normally called only from the Databento bar-close
+    # scan path (app.py ~line 32235). Webhook READY verdicts were never reaching
+    # it, so ghost_observations had 0 rows from webhook-sourced setups.
+    # Adding the call here ensures every READY webhook evaluation is recorded
+    # so its outcome can be measured by the profitability watcher.
+    # FAIL-OPEN: never delays the decision or touches any execution path.
+    try:
+        if is_actionable(a.get("verdict")):
+            _goe = _ghost_observe_setup(a, resolved_inst, source="webhook")
+            logger.debug(
+                "ghost_observe_setup webhook (%s): verdict=%s goe=%s",
+                resolved_inst, a.get("verdict"), _goe,
+            )
+    except Exception as _goe_exc:
+        logger.warning(
+            "ghost_observe_setup webhook error (%s): %s", resolved_inst, _goe_exc
+        )
+
     # ── Unconfirmed zone mitigation → consumed-zone notice, skip the trade
     # engine. A CONFIRMED bullish mitigation reaction sets zone_mitigated_near
     # False (handled as a LONG above) and falls through to the READY-card path.
@@ -82430,6 +82449,44 @@ def route_gate_backfill():
         return jsonify({"ok": True, **result})
     except Exception as exc:
         logger.warning("route_gate_backfill: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/scalp-feedback-health", methods=["GET"])
+def route_scalp_feedback_health():
+    """SCALP Feedback Loop pipeline health snapshot (Phase 10).
+
+    Returns per-mode/instrument outcome_status breakdown, vwap_value coverage
+    (Phase 4 fix metric), sub-strategy identity coverage (Phase 5 fix metric),
+    and ghost_observations webhook count (Phase 1 fix metric).
+    DISPLAY/RESEARCH ONLY.  Auth enforced at Express /api edge.  FAIL-OPEN.
+    Never touches gate, scoring, sizing, arm state, or execution.
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        days = max(1, min(90, int(request.args.get("days", 14))))
+        return jsonify(_ge.get_scalp_feedback_health())
+    except Exception as exc:
+        logger.warning("route_scalp_feedback_health: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/gate-effectiveness/shadow-cohorts", methods=["GET"])
+def route_gate_shadow_cohorts():
+    """Phase 7 shadow cohort analytics for BLOCKED SCALP records.
+
+    Returns per-cohort win-rate, outcome counts, and peak-edge distribution.
+    Cohorts: EDGE35_OTHER_GATES_PASS / VOLUME_ONLY_BLOCK_1030_1200 /
+    SHORT_CVD_ONLY_BLOCK.  Query param: days (default 14, max 90).
+    DISPLAY/RESEARCH ONLY.  Auth enforced at Express /api edge.  FAIL-OPEN.
+    Never touches gate, scoring, sizing, arm state, or execution.
+    """
+    try:
+        import gate_effectiveness as _ge  # noqa: PLC0415
+        days = max(1, min(90, int(request.args.get("days", 14))))
+        return jsonify(_ge.get_shadow_cohort_stats(days=days))
+    except Exception as exc:
+        logger.warning("route_gate_shadow_cohorts: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
