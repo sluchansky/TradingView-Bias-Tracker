@@ -1,32 +1,32 @@
-// ═══════════════════════════════════════════════════════════════════════════
-// MNQ Scalp Bot Approximation  — Pine Script v5 Strategy
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// MNQ Scalp Bot Approximation  - Pine Script v5 Strategy
+// ===========================================================================
 //
 // Replicates the live bot's SCALP gate logic for MNQ (Micro Nasdaq):
-//   • Session-anchored VWAP gate
-//   • Pivot-based market structure  (BOS / CHOCH / HH-HL / LH-LL)
-//   • Liquidity-sweep detection
-//   • CVD proxy  (cumulative bar-close delta vs its own baseline)
-//   • RVOL ≥ 1.5 volume gate
-//   • Session bonus (+10 during preferred CME hours)
-//   • Edge score 0-110 — signal fires at ≥ 60 (EARLY) or ≥ 70 (READY)
-//   • ATR-based stop (2.5× ATR, floor = 12 pts) — configurable R:R target
-//   • Daily entry cap (default 3)
+//   - Session-anchored VWAP gate
+//   - Pivot-based market structure  (BOS / CHOCH / HH-HL / LH-LL)
+//   - Liquidity-sweep detection
+//   - CVD proxy  (cumulative bar-close delta vs its own baseline)
+//   - RVOL >= 1.5 volume gate
+//   - Session bonus (+10 during preferred CME hours)
+//   - Edge score 0-110  signal fires at >= 60 (EARLY) or >= 70 (READY)
+//   - ATR-based stop (2.5x ATR, floor = 12 pts) - configurable R:R target
+//   - Daily entry cap (default 3)
 //
 // HOW TO USE
-//   1. Open TradingView → New indicator → Pine Script editor
+//   1. Open TradingView -> New indicator -> Pine Script editor
 //   2. Paste this entire script and click "Add to chart"
 //   3. Set the chart to  MNQ1! (or MNQZ2024, etc.)  on a 1-minute timeframe
 //   4. Tune inputs via the Settings gear (edge threshold, ATR mult, R:R, etc.)
 //
 // APPROXIMATIONS vs. the live bot
-//   • CVD: uses bar direction × volume (no tick-level data)
-//   • Zone gate: MNQ does not require a zone — omitted here (matches bot)
-//   • VWAP source: TradingView session VWAP (same anchor as bot's Databento VWAP)
-//   • Structure alerts (CHOCH/BOS) come from pivot math, not webhook alerts
-//   • Learning-engine score adjustments (±15) are not replicated
+//   - CVD: uses bar direction x volume (no tick-level data)
+//   - Zone gate: MNQ does not require a zone - omitted here (matches bot)
+//   - VWAP source: TradingView session VWAP (same anchor as bot's Databento VWAP)
+//   - Structure alerts (CHOCH/BOS) come from pivot math, not webhook alerts
+//   - Learning-engine score adjustments (+/-15) are not replicated
 //
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 //@version=5
 strategy(
     title             = "MNQ Scalp Bot Approximation",
@@ -37,13 +37,13 @@ strategy(
     default_qty_type  = strategy.fixed,
     default_qty_value = 1,
     commission_type   = strategy.commission.cash_per_contract,
-    commission_value  = 0.50,   // ~$0.50/side typical retail
-    slippage          = 2       // 2 ticks slippage
+    commission_value  = 0.50,
+    slippage          = 2
 )
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // INPUTS
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 grp_signal  = "Signal"
 grp_risk    = "Risk / Sizing"
 grp_display = "Display"
@@ -60,7 +60,7 @@ i_cvd_len     = input.int  (20,    "CVD baseline length",
 i_atr_len     = input.int  (14,    "ATR length",           group=grp_risk)
 i_atr_mult    = input.float(2.5,   "ATR stop multiplier",
                              minval=0.5, step=0.5,         group=grp_risk)
-i_stop_floor  = input.float(12.0,  "Minimum stop (points — MNQ default 12)",
+i_stop_floor  = input.float(12.0,  "Minimum stop (points - MNQ default 12)",
                              minval=0.0,                   group=grp_risk)
 i_rr          = input.float(1.0,   "Take-profit R:R",
                              minval=0.25, step=0.25,       group=grp_risk)
@@ -73,23 +73,23 @@ i_show_struct = input.bool (true,  "Highlight BOS / CHOCH bars",
                                                             group=grp_display)
 i_show_pivots = input.bool (false, "Show pivot dots",      group=grp_display)
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // CORE INDICATORS
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-// ── Session-anchored VWAP (same anchor as the live bot's Databento VWAP) ──
+// Session-anchored VWAP (same anchor as the live bot's Databento VWAP)
 [vwap_val, _, _] = ta.vwap(hlc3)
 
-// ── ATR ──
+// ATR
 atr = ta.atr(i_atr_len)
 
-// ── Volume / RVOL ──
+// Volume / RVOL
 vol_avg  = ta.sma(volume, 20)
 rvol     = volume / math.max(vol_avg, 1)
 vol_conf = rvol >= i_rvol_thresh
 
-// ── CVD proxy ──
-// Approximates cumulative delta using bar direction × volume.
+// CVD proxy
+// Approximates cumulative delta using bar direction x volume.
 // Bullish when the running CVD is above its own N-bar SMA baseline.
 delta_bar = close > open ? volume : close < open ? -volume : 0
 cvd_raw   = ta.cum(delta_bar)
@@ -97,9 +97,9 @@ cvd_base  = ta.sma(cvd_raw, i_cvd_len)
 cvd_bull  = cvd_raw > cvd_base
 cvd_bear  = cvd_raw < cvd_base
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // MARKET STRUCTURE  (pivot-based)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 ph = ta.pivothigh(high, i_pivot_len, i_pivot_len)
 pl = ta.pivotlow (low,  i_pivot_len, i_pivot_len)
 
@@ -115,57 +115,55 @@ if not na(pl)
     pl2 := pl1
     pl1 := pl
 
-// ── Structure labels ──
-hh = not na(ph1) and not na(ph2) and ph1 > ph2   // higher high  → bullish
-lh = not na(ph1) and not na(ph2) and ph1 < ph2   // lower  high  → bearish
-hl = not na(pl1) and not na(pl2) and pl1 > pl2   // higher low   → bullish
-ll = not na(pl1) and not na(pl2) and pl1 < pl2   // lower  low   → bearish
+// Structure labels (look at last two pivots of each type)
+hh = not na(ph1) and not na(ph2) and ph1 > ph2   // higher high  -> bullish
+lh = not na(ph1) and not na(ph2) and ph1 < ph2   // lower  high  -> bearish
+hl = not na(pl1) and not na(pl2) and pl1 > pl2   // higher low   -> bullish
+ll = not na(pl1) and not na(pl2) and pl1 < pl2   // lower  low   -> bearish
 
-// ── Break of Structure (BOS) ──
-// Price closes BEYOND the last confirmed pivot on this bar.
+// BOS: price closes beyond the last confirmed pivot on this bar
 bos_long  = not na(ph1) and close > ph1 and close[1] <= ph1
 bos_short = not na(pl1) and close < pl1 and close[1] >= pl1
 
-// ── Change of Character (CHOCH) ──
-// A BOS that also reverses the prevailing structure — highest-quality signal.
-choch_long  = (lh or ll) and bos_long    // was bearish structure, now breaks up
-choch_short = (hh or hl) and bos_short   // was bullish structure, now breaks down
+// CHOCH: structural character change (was going one way, now reverses)
+choch_long  = (lh or ll) and bos_long    // bearish structure -> bullish break
+choch_short = (hh or hl) and bos_short  // bullish structure -> bearish break
 
-// ── Any valid directional structure (ONE is sufficient for the gate) ──
+// Any valid directional structure (ONE is enough for the gate)
 struct_long  = bos_long  or choch_long  or hh or hl
 struct_short = bos_short or choch_short or lh or ll
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // LIQUIDITY SWEEP
-// ═══════════════════════════════════════════════════════════════════════════
-// Bullish sweep: wick dips below the last pivot low then closes above it.
-// Bearish sweep: wick spikes above the last pivot high then closes below it.
+// ===========================================================================
+// Bullish sweep: wick dips below prior pivot low then closes above it
+// Bearish sweep: wick spikes above prior pivot high then closes below it
 sweep_bull = not na(pl1) and low  < pl1 and close > pl1
 sweep_bear = not na(ph1) and high > ph1 and close < ph1
 
-// ═══════════════════════════════════════════════════════════════════════════
-// SESSION BONUS  (+10 during preferred CME/GLBX hours)
-// Live bot: 05:00–08:00 ET, 08:00–11:00 ET, 20:00–23:00 ET → +10
-// (Set your chart timezone to America/New_York for correct session detection)
-// ═══════════════════════════════════════════════════════════════════════════
-hhmm        = hour * 100 + minute
-in_session  = (hhmm >= 500  and hhmm < 800)  or
-              (hhmm >= 800  and hhmm < 1100) or
-              (hhmm >= 2000 and hhmm < 2300)
+// ===========================================================================
+// SESSION BONUS  (+10 during preferred CME hours)
+// Set your chart timezone to America/New_York for correct session detection
+// Preferred windows: 05:00-08:00 ET, 08:00-11:00 ET, 20:00-23:00 ET
+// ===========================================================================
+hhmm       = hour * 100 + minute
+in_session = (hhmm >= 500  and hhmm < 800)  or
+             (hhmm >= 800  and hhmm < 1100) or
+             (hhmm >= 2000 and hhmm < 2300)
 
-// ═══════════════════════════════════════════════════════════════════════════
-// EDGE SCORE  (0–110, mirrors live bot component weights)
-// ─────────────────────────────────────────────────────────────────────────
-//  BOS confirmed      +20
-//  CHOCH confirmed    +20  (can stack with BOS on a character-change bar)
-//  VWAP side          +15
-//  Liquidity sweep    +15
-//  Volume (RVOL≥1.5)  +15
-//  CVD agreement      +15
-//  Preferred session  +10
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// EDGE SCORE  (0-110, mirrors live bot component weights)
+// --------------------------------------------------------------------------
+//  BOS confirmed       +20
+//  CHOCH confirmed     +20  (stacks with BOS on a character-change bar)
+//  VWAP side           +15
+//  Liquidity sweep     +15
+//  Volume (RVOL>=1.5)  +15
+//  CVD agreement       +15
+//  Preferred session   +10
+// ===========================================================================
 
-// ── LONG score ──
+// LONG score
 s_l_bos   = bos_long   ? 20 : 0
 s_l_choch = choch_long ? 20 : 0
 s_l_vwap  = close > vwap_val ? 15 : 0
@@ -175,7 +173,7 @@ s_l_cvd   = cvd_bull   ? 15 : 0
 s_l_sess  = in_session ? 10 : 0
 score_long = s_l_bos + s_l_choch + s_l_vwap + s_l_sweep + s_l_vol + s_l_cvd + s_l_sess
 
-// ── SHORT score ──
+// SHORT score
 s_s_bos   = bos_short   ? 20 : 0
 s_s_choch = choch_short ? 20 : 0
 s_s_vwap  = close < vwap_val ? 15 : 0
@@ -185,21 +183,21 @@ s_s_cvd   = cvd_bear     ? 15 : 0
 s_s_sess  = in_session   ? 10 : 0
 score_short = s_s_bos + s_s_choch + s_s_vwap + s_s_sweep + s_s_vol + s_s_cvd + s_s_sess
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // SIGNAL CONDITIONS
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 above_vwap = close > vwap_val
 below_vwap = close < vwap_val
 
-// All required hard gates pass AND score reaches threshold AND this direction wins
+// All required hard gates pass AND score meets threshold AND this direction wins
 sig_long  = above_vwap and struct_long  and score_long  >= i_edge_min
             and score_long  > score_short
 sig_short = below_vwap and struct_short and score_short >= i_edge_min
             and score_short > score_long
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // DAILY TRADE CAP
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 var int trades_today = 0
 
 if ta.change(dayofmonth) != 0
@@ -207,9 +205,9 @@ if ta.change(dayofmonth) != 0
 
 cap_hit = trades_today >= i_max_day
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // STOP & TARGET  (ATR-based, MNQ minimum stop floor = 12 points)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 stop_dist = math.max(atr * i_atr_mult, i_stop_floor)
 
 sl_long  = close - stop_dist
@@ -217,9 +215,9 @@ tp_long  = close + stop_dist * i_rr
 sl_short = close + stop_dist
 tp_short = close - stop_dist * i_rr
 
-// ═══════════════════════════════════════════════════════════════════════════
-// STRATEGY ENTRIES  (one position at a time — no pyramid)
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
+// STRATEGY ENTRIES  (one position at a time - no pyramid)
+// ===========================================================================
 if sig_long and strategy.position_size == 0 and not cap_hit
     strategy.entry("Long", strategy.long)
     strategy.exit("Long TP/SL", "Long", stop=sl_long, limit=tp_long)
@@ -230,26 +228,26 @@ if sig_short and strategy.position_size == 0 and not cap_hit
     strategy.exit("Short TP/SL", "Short", stop=sl_short, limit=tp_short)
     trades_today := trades_today + 1
 
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 // VISUALS
-// ═══════════════════════════════════════════════════════════════════════════
+// ===========================================================================
 
-// ── Session VWAP (same blue used in the dashboard) ──
+// Session VWAP (same blue used in the dashboard)
 plot(vwap_val, "VWAP", color=#38bdf8, linewidth=2)
 
-// ── Pivot confirmation dots ──
+// Pivot confirmation dots
 plotshape(i_show_pivots and not na(ph), "Pivot High", shape.circle,
           location.abovebar, color.new(color.orange, 50), size=size.tiny)
 plotshape(i_show_pivots and not na(pl), "Pivot Low",  shape.circle,
           location.belowbar, color.new(color.aqua,   50), size=size.tiny)
 
-// ── BOS / CHOCH bar highlight ──
+// BOS / CHOCH bar highlight
 bgcolor(i_show_struct and choch_long  ? color.new(color.teal,   88) : na, title="CHOCH Bullish")
 bgcolor(i_show_struct and choch_short ? color.new(color.purple, 88) : na, title="CHOCH Bearish")
 bgcolor(i_show_struct and bos_long  and not choch_long  ? color.new(color.lime, 94) : na, title="BOS Long")
 bgcolor(i_show_struct and bos_short and not choch_short ? color.new(color.red,  94) : na, title="BOS Short")
 
-// ── Buy / Sell signal arrows ──
+// Buy / Sell signal arrows
 entry_long_viz  = sig_long  and strategy.position_size == 0 and not cap_hit
 entry_short_viz = sig_short and strategy.position_size == 0 and not cap_hit
 
@@ -258,17 +256,17 @@ plotshape(entry_long_viz,  "BUY",  shape.triangleup,   location.belowbar,
 plotshape(entry_short_viz, "SELL", shape.triangledown, location.abovebar,
           color.new(color.red,  0), size=size.normal)
 
-// ── Edge score + tier label on each signal ──
+// Edge score + tier label on each signal
 if i_show_score
     if entry_long_viz
         sc   = score_long
         tier = sc >= 70 ? "READY" : "EARLY"
         lbl  = tier + "  " + str.tostring(sc) + "/110\n" +
-               (s_l_bos   > 0 ? "BOS " : "") +
+               (s_l_bos   > 0 ? "BOS "   : "") +
                (s_l_choch > 0 ? "CHOCH " : "") +
                (s_l_sweep > 0 ? "SWEEP " : "") +
-               (s_l_cvd   > 0 ? "CVD " : "") +
-               (s_l_vol   > 0 ? "VOL " : "")
+               (s_l_cvd   > 0 ? "CVD "   : "") +
+               (s_l_vol   > 0 ? "VOL "   : "")
         label.new(bar_index, low - atr * 1.5, lbl,
                   color     = color.new(color.black, 60),
                   textcolor = sc >= 70 ? color.lime : color.yellow,
@@ -279,11 +277,11 @@ if i_show_score
         sc   = score_short
         tier = sc >= 70 ? "READY" : "EARLY"
         lbl  = tier + "  " + str.tostring(sc) + "/110\n" +
-               (s_s_bos   > 0 ? "BOS " : "") +
+               (s_s_bos   > 0 ? "BOS "   : "") +
                (s_s_choch > 0 ? "CHOCH " : "") +
                (s_s_sweep > 0 ? "SWEEP " : "") +
-               (s_s_cvd   > 0 ? "CVD " : "") +
-               (s_s_vol   > 0 ? "VOL " : "")
+               (s_s_cvd   > 0 ? "CVD "   : "") +
+               (s_s_vol   > 0 ? "VOL "   : "")
         label.new(bar_index, high + atr * 1.5, lbl,
                   color     = color.new(color.black, 60),
                   textcolor = sc >= 70 ? color.lime : color.yellow,
