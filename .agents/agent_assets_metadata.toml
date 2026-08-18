@@ -35,3 +35,10 @@ id = "qFIAn1APV_r8BNHrCau1J"
 uri = "file://dashboard-panel-inventory.md"
 type = "text"
 title = "Dashboard Panel Inventory"
+
+[[outputs]]
+id = "i2KO-vvAB_TYwfQXpBecw"
+uri = "file://artifacts/tradingview-webhook/pine_scripts/mnq_scalp_bot.pine"
+type = "unspecified"
+title = "MNQ Scalp Bot — Pine Script v5 Strategy"
+description = "Paste into TradingView's Pine Script editor on a MNQ1! 1-minute chart. Includes buy/sell arrows, edge score labels, BOS/CHOCH highlights, and full backtest stats."
