@@ -1,0 +1,220 @@
+//@version=5
+// ───────────────────────────────────────────────────────────────────────────
+// READY Signal Indicator  (MGC / MNQ / MES / MYM)
+//
+// Mirrors the live bot's SCALP gate logic and plots a visual signal on every
+// bar where the bot WOULD call READY or EARLY — without running a backtest.
+//
+// Gate checklist (matches the live bot):
+//   ✓ VWAP side          — price above VWAP for longs, below for shorts
+//   ✓ Market structure   — BOS or CHOCH in the signal direction
+//   ✓ Liquidity sweep    — optional sweep of the last swing level
+//   ✓ CVD (approx)       — cumulative delta above/below its EMA
+//   ✓ Volume             — RVOL ≥ threshold
+//   ✓ Session bonus      — active CME session window
+//   ✓ Edge score         — sum of components; READY ≥ 70, EARLY 60-69
+//
+// NOTE: The bot also uses Databento CVD, server-side VWAP, and per-instrument
+//       state (zone mitigation, daily loss cap) that Pine can't access live.
+//       This indicator is a close approximation — expect ~80-90% alignment.
+//
+// SETUP:
+//   1. Add to any chart: MGC1!, MNQ1!, MES1!, MYM1!
+//   2. No alert required — this is display-only (no webhook).
+//   3. Optionally stack on top of your existing structure / zone scripts.
+// ───────────────────────────────────────────────────────────────────────────
+indicator("READY Signal", overlay=true, max_labels_count=500)
+
+// ── Inputs ──────────────────────────────────────────────────────────────────
+grpSig  = "Signal gates"
+grpRisk = "Risk display"
+grpViz  = "Display"
+
+i_ready_thresh  = input.int(70,   "READY threshold (edge score)",  minval=50, maxval=110, group=grpSig, tooltip="Score ≥ this → READY (bright). Score 60–69 → EARLY (dim).")
+i_early_thresh  = input.int(60,   "EARLY threshold (edge score)",  minval=40, maxval=100, group=grpSig)
+i_pivot_left    = input.int(10,   "Pivot left bars",               minval=3,  maxval=50,  group=grpSig)
+i_pivot_right   = input.int(3,    "Pivot right bars",              minval=1,  maxval=20,  group=grpSig, tooltip="Higher = fewer, stronger pivots. 3 is the live bot default.")
+i_rvol_thresh   = input.float(1.5,"RVOL threshold",                minval=0.5, step=0.1,  group=grpSig)
+i_cvd_len       = input.int(20,   "CVD EMA length",                minval=5,  maxval=200, group=grpSig)
+i_require_cvd   = input.bool(false,"Require CVD agreement",                               group=grpSig, tooltip="OFF = CVD adds score but doesn't hard-block (matches live bot default).")
+
+i_atr_len       = input.int(14,   "ATR length",                    minval=1,              group=grpRisk)
+i_atr_mult      = input.float(2.5,"ATR stop multiplier",           minval=0.5, step=0.25, group=grpRisk)
+i_stop_floor    = input.float(12, "Min stop (points)",             minval=0.0,            group=grpRisk)
+i_rr            = input.float(1.0,"R:R for TP line",               minval=0.25,step=0.25, group=grpRisk)
+
+i_show_ready    = input.bool(true, "Show READY arrows",                                   group=grpViz)
+i_show_early    = input.bool(true, "Show EARLY arrows (dimmer)",                          group=grpViz)
+i_show_labels   = input.bool(true, "Show score labels",                                   group=grpViz)
+i_show_vwap     = input.bool(true, "Plot VWAP",                                           group=grpViz)
+i_show_struct   = input.bool(true, "Highlight BOS/CHOCH bars",                            group=grpViz)
+i_show_pivots   = input.bool(false,"Show pivot dots",                                     group=grpViz)
+i_show_lines    = input.bool(false,"Show stop / TP lines on signal bars",                 group=grpViz)
+
+// ── VWAP ────────────────────────────────────────────────────────────────────
+vwap_val = ta.vwap(hlc3)
+
+// ── ATR ─────────────────────────────────────────────────────────────────────
+atr = ta.atr(i_atr_len)
+
+// ── Volume / RVOL ───────────────────────────────────────────────────────────
+vol_avg  = ta.sma(volume, 20)
+rvol     = volume / math.max(vol_avg, 1)
+vol_conf = rvol >= i_rvol_thresh
+
+// ── CVD approximation ───────────────────────────────────────────────────────
+// Per-bar delta: volume weighted by close position in bar range.
+// Resets at each new session so it doesn't drift across days.
+rng       = high - low
+delta_bar = rng > 0 ? volume * (close - open) / rng : 0.0
+var float cvd = 0.0
+cvd := ta.change(time("D")) != 0 ? delta_bar : cvd + delta_bar
+cvd_sig  = ta.ema(cvd, i_cvd_len)
+cvd_bull = cvd > cvd_sig
+cvd_bear = cvd < cvd_sig
+
+// ── Market structure (pivots → BOS / CHOCH) ─────────────────────────────────
+ph = ta.pivothigh(high, i_pivot_left, i_pivot_right)
+pl = ta.pivotlow(low,   i_pivot_left, i_pivot_right)
+
+var float ph1 = na
+var float ph2 = na
+var float pl1 = na
+var float pl2 = na
+
+// Track last two confirmed swing highs and lows
+if not na(ph)
+    ph2 := ph1
+    ph1 := ph
+if not na(pl)
+    pl2 := pl1
+    pl1 := pl
+
+// Trend structure
+hh = not na(ph1) and not na(ph2) and ph1 > ph2   // higher high
+lh = not na(ph1) and not na(ph2) and ph1 < ph2   // lower high
+hl = not na(pl1) and not na(pl2) and pl1 > pl2   // higher low
+ll = not na(pl1) and not na(pl2) and pl1 < pl2   // lower low
+
+// BOS: price closes through the most-recent swing pivot
+bos_long  = not na(ph1) and close > ph1 and close[1] <= ph1
+bos_short = not na(pl1) and close < pl1 and close[1] >= pl1
+
+// CHOCH: BOS that also flips the prior trend
+choch_long  = bos_long  and (lh or ll)   // was bearish, now breaks up
+choch_short = bos_short and (hh or hl)   // was bullish, now breaks down
+
+// Structure confirmed in each direction
+struct_long  = bos_long  or choch_long  or hh or hl
+struct_short = bos_short or choch_short or lh or ll
+
+// ── Liquidity sweep ──────────────────────────────────────────────────────────
+sweep_bull = not na(pl1) and low  < pl1 and close > pl1   // swept lows, closed above
+sweep_bear = not na(ph1) and high > ph1 and close < ph1   // swept highs, closed below
+
+// ── Session bonus (CME active windows, ET) ───────────────────────────────────
+hhmm       = hour(time, "America/New_York") * 100 + minute(time, "America/New_York")
+in_session = (hhmm >= 500  and hhmm < 800)  or   // London/pre-market
+             (hhmm >= 930  and hhmm < 1200) or   // NY open prime
+             (hhmm >= 1300 and hhmm < 1600)       // NY afternoon
+
+// ── Edge score (mirrors the live bot's component weights) ────────────────────
+// LONG components
+sc_l_bos   = (bos_long   and not choch_long)  ? 20 : 0
+sc_l_choch = choch_long   ? 20 : 0
+sc_l_vwap  = close > vwap_val ? 15 : 0
+sc_l_sweep = sweep_bull   ? 15 : 0
+sc_l_vol   = vol_conf     ? 15 : 0
+sc_l_cvd   = cvd_bull     ? 15 : 0
+sc_l_sess  = in_session   ? 10 : 0
+score_long  = sc_l_bos + sc_l_choch + sc_l_vwap + sc_l_sweep + sc_l_vol + sc_l_cvd + sc_l_sess
+
+// SHORT components
+sc_s_bos   = (bos_short  and not choch_short) ? 20 : 0
+sc_s_choch = choch_short  ? 20 : 0
+sc_s_vwap  = close < vwap_val ? 15 : 0
+sc_s_sweep = sweep_bear   ? 15 : 0
+sc_s_vol   = vol_conf     ? 15 : 0
+sc_s_cvd   = cvd_bear     ? 15 : 0
+sc_s_sess  = in_session   ? 10 : 0
+score_short = sc_s_bos + sc_s_choch + sc_s_vwap + sc_s_sweep + sc_s_vol + sc_s_cvd + sc_s_sess
+
+// ── Gate conditions ──────────────────────────────────────────────────────────
+// CVD is a hard filter only when i_require_cvd is ON (matches bot's fail-open default)
+cvd_gate_long  = i_require_cvd ? cvd_bull : true
+cvd_gate_short = i_require_cvd ? cvd_bear : true
+
+gate_long  = close > vwap_val and struct_long  and cvd_gate_long  and score_long  >= i_early_thresh and score_long  > score_short
+gate_short = close < vwap_val and struct_short and cvd_gate_short and score_short >= i_early_thresh and score_short > score_long
+
+// Tier
+ready_long  = gate_long  and score_long  >= i_ready_thresh
+ready_short = gate_short and score_short >= i_ready_thresh
+early_long  = gate_long  and not ready_long
+early_short = gate_short and not ready_short
+
+// ── Stop / TP levels (for display lines only) ────────────────────────────────
+stop_dist = math.max(atr * i_atr_mult, i_stop_floor)
+sl_long   = close - stop_dist
+tp_long   = close + stop_dist * i_rr
+sl_short  = close + stop_dist
+tp_short  = close - stop_dist * i_rr
+
+// ── Plot VWAP ────────────────────────────────────────────────────────────────
+plot(i_show_vwap ? vwap_val : na, "VWAP", color=color.new(#38bdf8, 0), linewidth=2)
+
+// ── Pivot dots ───────────────────────────────────────────────────────────────
+plotshape(i_show_pivots and not na(ph), "Pivot High", shape.circle, location.abovebar, color.new(color.orange, 50), size=size.tiny)
+plotshape(i_show_pivots and not na(pl), "Pivot Low",  shape.circle, location.belowbar, color.new(color.aqua,   50), size=size.tiny)
+
+// ── BOS / CHOCH bar highlights ───────────────────────────────────────────────
+bgcolor(i_show_struct and choch_long  ? color.new(color.teal,   88) : na, title="CHOCH Bull")
+bgcolor(i_show_struct and choch_short ? color.new(color.purple, 88) : na, title="CHOCH Bear")
+bgcolor(i_show_struct and bos_long  and not choch_long  ? color.new(color.lime, 94) : na, title="BOS Long")
+bgcolor(i_show_struct and bos_short and not choch_short ? color.new(color.red,  94) : na, title="BOS Short")
+
+// ── READY arrows (bright, larger) ────────────────────────────────────────────
+plotshape(i_show_ready and ready_long,  "READY Long",  shape.triangleup,   location.belowbar, color.new(color.lime,    0), size=size.normal,  title="READY Long")
+plotshape(i_show_ready and ready_short, "READY Short", shape.triangledown, location.abovebar, color.new(color.red,     0), size=size.normal,  title="READY Short")
+
+// ── EARLY arrows (muted, smaller) ────────────────────────────────────────────
+plotshape(i_show_early and early_long,  "EARLY Long",  shape.triangleup,   location.belowbar, color.new(color.lime,   60), size=size.small,   title="EARLY Long")
+plotshape(i_show_early and early_short, "EARLY Short", shape.triangledown, location.abovebar, color.new(color.red,    60), size=size.small,   title="EARLY Short")
+
+// ── Score labels ─────────────────────────────────────────────────────────────
+if i_show_labels and barstate.isconfirmed
+    if ready_long or early_long
+        tier = ready_long ? "READY" : "EARLY"
+        clr  = ready_long ? color.lime : color.yellow
+        txt  = tier + "  " + str.tostring(score_long) + "/110\n" +
+               (sc_l_choch > 0 ? "CHoCH " : sc_l_bos > 0 ? "BOS " : "") +
+               (sc_l_sweep > 0 ? "SWEEP " : "") +
+               (sc_l_cvd   > 0 ? "CVD "   : "") +
+               (sc_l_vol   > 0 ? "VOL "   : "") +
+               (sc_l_sess  > 0 ? "SESS"   : "")
+        label.new(bar_index, low - atr * 1.5, txt,
+                  color=color.new(color.black, 60), textcolor=clr,
+                  style=label.style_label_up, size=size.small)
+
+    if ready_short or early_short
+        tier = ready_short ? "READY" : "EARLY"
+        clr  = ready_short ? color.red : color.orange
+        txt  = tier + "  " + str.tostring(score_short) + "/110\n" +
+               (sc_s_choch > 0 ? "CHoCH " : sc_s_bos > 0 ? "BOS " : "") +
+               (sc_s_sweep > 0 ? "SWEEP " : "") +
+               (sc_s_cvd   > 0 ? "CVD "   : "") +
+               (sc_s_vol   > 0 ? "VOL "   : "") +
+               (sc_s_sess  > 0 ? "SESS"   : "")
+        label.new(bar_index, high + atr * 1.5, txt,
+                  color=color.new(color.black, 60), textcolor=clr,
+                  style=label.style_label_down, size=size.small)
+
+// ── Stop / TP lines on signal bars ───────────────────────────────────────────
+if i_show_lines and barstate.isconfirmed
+    if ready_long or early_long
+        line.new(bar_index, sl_long, bar_index + 10, sl_long, color=color.new(color.red,  40), width=1, style=line.style_dashed)
+        line.new(bar_index, tp_long, bar_index + 10, tp_long, color=color.new(color.lime, 40), width=1, style=line.style_dashed)
+    if ready_short or early_short
+        line.new(bar_index, sl_short, bar_index + 10, sl_short, color=color.new(color.red,  40), width=1, style=line.style_dashed)
+        line.new(bar_index, tp_short, bar_index + 10, tp_short, color=color.new(color.lime, 40), width=1, style=line.style_dashed)
+// © sluchansky
