@@ -79,9 +79,9 @@ function useTTS() {
   const voicesRef     = useRef<SpeechSynthesisVoice[]>([]);
   // mutedRef mirrors the muted state synchronously so _fire can check it without
   // relying on a closure that may be stale (e.g. queued calls that fire after mute).
-  const mutedRef   = useRef<boolean>(() => {
-    try { return localStorage.getItem('brain_muted') === '1'; } catch { return false; }
-  });
+  const mutedRef   = useRef<boolean>(
+    (() => { try { return localStorage.getItem('brain_muted') === '1'; } catch { return false; } })()
+  );
   useEffect(() => { voicesRef.current = voices; }, [voices]);
 
   useEffect(() => {

@@ -1003,6 +1003,7 @@ const Sentinel = memo(function Sentinel({
     const t0 = Date.now(); let lastT = t0;
 
     function frame() {
+      if (!ctx) return;
       const now     = Date.now();
       const elapsed = now - t0;
       const dt      = Math.min((now - lastT) / 1000, 0.05);

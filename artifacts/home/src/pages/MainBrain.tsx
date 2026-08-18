@@ -902,9 +902,9 @@ function SeqCard({ seq }: { seq: SeqRec }) {
         <div style={{ marginTop: 6, fontSize: 10, color: '#64748b',
           padding: '6px 8px', borderRadius: 5,
           background: 'rgba(0,0,0,0.25)', border: '1px solid rgba(255,255,255,0.06)' }}>
-          {exWhy['why_ready']  && <div style={{ color: '#22c55e', marginBottom: 3 }}>✓ {String(exWhy['why_ready'])}</div>}
-          {exWhy['why_not_ready'] && <div style={{ color: '#f59e0b', marginBottom: 3 }}>⊘ {String(exWhy['why_not_ready'])}</div>}
-          {exWhy['why_exists'] && <div style={{ color: '#64748b' }}>ℹ {String(exWhy['why_exists'])}</div>}
+          {!!(exWhy['why_ready'])  && <div style={{ color: '#22c55e', marginBottom: 3 }}>✓ {String(exWhy['why_ready'])}</div>}
+          {!!(exWhy['why_not_ready']) && <div style={{ color: '#f59e0b', marginBottom: 3 }}>⊘ {String(exWhy['why_not_ready'])}</div>}
+          {!!(exWhy['why_exists']) && <div style={{ color: '#64748b' }}>ℹ {String(exWhy['why_exists'])}</div>}
         </div>
       )}
     </div>
@@ -2678,7 +2678,7 @@ const ConsensusPanel: React.FC<{ p: Record<string, unknown>; consensus: Consensu
                 {/* Badges row */}
                 <div style={{ display:'flex', gap:5, flexWrap:'wrap', alignItems:'center' }}>
                   <Badge label={safeStr(bestMatch.readiness, 'WAIT')} color={readinessColor(safeStr(bestMatch.readiness, ''))} />
-                  {bestMatch.direction && (
+                  {!!(bestMatch.direction) && (
                     <Badge label={safeStr(bestMatch.direction, '').toUpperCase()} color={dirColor(safeStr(bestMatch.direction, ''))} />
                   )}
                   {safeStr(bestMatch.skip_reason, '') && (
@@ -4093,7 +4093,7 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
                 ].map(({ l, v }) => (
                   <div key={l} style={{ display: 'flex', flexDirection: 'column' }}>
                     <span style={{ fontSize: 7.5, color: `${T.txtMuted}80` }}>{l}</span>
-                    <span style={{ fontSize: 9.5, fontWeight: 600, color: T.txt }}>{v}</span>
+                    <span style={{ fontSize: 9.5, fontWeight: 600, color: T.txtPri }}>{v}</span>
                   </div>
                 ))}
               </div>
@@ -4144,7 +4144,7 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
                       <td style={{ padding: '4px 5px', color: catCol(c.pct_of_blocked), fontWeight: 600, whiteSpace: 'nowrap' }}>
                         {c.category}
                       </td>
-                      <td style={{ padding: '4px 5px', textAlign: 'right', color: T.txt }}>{c.n_blocks}</td>
+                      <td style={{ padding: '4px 5px', textAlign: 'right', color: T.txtPri }}>{c.n_blocks}</td>
                       <td style={{ padding: '4px 5px', textAlign: 'right', fontWeight: 700, color: catCol(c.pct_of_blocked) }}>
                         {c.pct_of_blocked}%
                       </td>
@@ -4223,7 +4223,7 @@ const GateEffectivenessPanel: React.FC<{ authHeader: string }> = ({ authHeader }
                     <tbody>
                       {stratRows.map(s => (
                         <tr key={s.strategy} style={{ borderBottom: `1px solid ${T.border}15` }}>
-                          <td style={{ padding: '4px 5px', color: T.txt, fontWeight: 600, whiteSpace: 'nowrap', maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis' }}>
+                          <td style={{ padding: '4px 5px', color: T.txtPri, fontWeight: 600, whiteSpace: 'nowrap', maxWidth: 130, overflow: 'hidden', textOverflow: 'ellipsis' }}>
                             {s.strategy}
                           </td>
                           <td style={{ padding: '4px 5px', textAlign: 'right', color: T.txtMuted }}>{s.raw_evaluations}</td>
@@ -5000,12 +5000,14 @@ const TradePlanPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                   const isUnknown = e.outcome.type === 'unknown';
                   const col   = isSuccess ? T.green : isUnknown ? T.amber : T.red;
                   const icon  = isSuccess ? '✓' : isUnknown ? '⚠' : '✗';
+                  const outS  = e.outcome as Extract<MbSendOutcome, { type: 'success' }>;
+                  const outR  = e.outcome as Extract<MbSendOutcome, { type: 'rejected' }>;
                   const label = isSuccess
-                    ? (e.outcome.status === 'sent'       ? 'SENT'
-                     : e.outcome.status === 'simulated'  ? 'PAPER'
-                     :                                     'MANUAL')
+                    ? (outS.status === 'sent'       ? 'SENT'
+                     : outS.status === 'simulated'  ? 'PAPER'
+                     :                               'MANUAL')
                     : isUnknown ? 'UNKNOWN'
-                    : `${e.outcome.reason}`;
+                    : `${outR.reason}`;
                   const timeStr = e.ts
                     ? new Date(e.ts).toLocaleTimeString('en-US',
                         { hour: '2-digit', minute: '2-digit', hour12: true,
