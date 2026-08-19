@@ -12277,6 +12277,13 @@ const Header: React.FC<{
             onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(255,255,255,0.28)'}>
             RESEARCH ↗
           </a>
+          <a href="https://vwap-pullback-indicator.replit.app" target="_blank" rel="noopener noreferrer"
+            title="VWAP Pullback Indicator"
+            style={{ fontSize:9.5, fontFamily:T.mono, color:'rgba(56,189,248,0.72)', padding:'3px 9px', borderRadius:4, textDecoration:'none', letterSpacing:'0.08em', transition:'color 0.15s' }}
+            onMouseEnter={e => (e.currentTarget as HTMLAnchorElement).style.color=T.cyan}
+            onMouseLeave={e => (e.currentTarget as HTMLAnchorElement).style.color='rgba(56,189,248,0.72)'}>
+            VWAP ↗
+          </a>
         </div>
       </div>
     </header>
