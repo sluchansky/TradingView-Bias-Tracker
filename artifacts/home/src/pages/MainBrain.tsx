@@ -452,11 +452,123 @@ const EdgeGauge: React.FC<{ score: number | null; max?: number }> = ({ score, ma
 
 // NAV_ITEMS and related constants are imported from ../lib/navItems
 
+// ── Mobile navigation drawer ──────────────────────────────────────────────────
+const MobileNavDrawer: React.FC<{
+  open: boolean;
+  onClose: () => void;
+  systemOk: boolean;
+}> = ({ open, onClose, systemOk }) => {
+  const [location] = useLocation();
+  const dialogRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const previousOverflow = document.body.style.overflow;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const focusFirstControl = window.requestAnimationFrame(() => {
+      dialogRef.current?.querySelector<HTMLElement>(focusableSelector)?.focus();
+    });
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(focusableSelector) ?? [])
+        .filter(control => !control.hasAttribute('disabled'));
+      if (!controls.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    document.body.style.overflow = 'hidden';
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFirstControl);
+      document.body.style.overflow = previousOverflow;
+      window.removeEventListener('keydown', handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      className="mb-mobile-nav-overlay"
+      onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}
+      aria-hidden={!open}
+    >
+      <aside ref={dialogRef} id="main-brain-mobile-menu" className="mb-mobile-nav-drawer" role="dialog" aria-modal="true" aria-label="Main Brain navigation">
+        <div className="mb-mobile-nav-head">
+          <div>
+            <div style={{ fontSize: 13, color: T.txtPri, fontWeight: 800 }}>Main Brain</div>
+            <div style={{ fontSize: 9, color: T.cyan, letterSpacing: '0.1em', marginTop: 2 }}>OPERATOR CONSOLE</div>
+          </div>
+          <button className="mb-mobile-nav-close" onClick={onClose} autoFocus aria-label="Close navigation menu">×</button>
+        </div>
+
+        <div className="mb-mobile-nav-section-label">Workspace</div>
+        <nav aria-label="Main Brain sections" className="mb-mobile-nav-items">
+          {NAV_ITEMS.map(item => {
+            const isActive = item.id === 'main-brain'
+              ? location === '/' || location === item.path
+              : location === item.path;
+            return (
+              <Link
+                key={item.id}
+                to={item.path}
+                onClick={onClose}
+                className="mb-mobile-nav-item"
+                aria-current={isActive ? 'page' : undefined}
+                style={{
+                  background: isActive ? `${T.cyan}14` : 'transparent',
+                  borderColor: isActive ? `${T.cyan}44` : T.border,
+                  color: isActive ? T.cyan : T.txtSec,
+                }}
+              >
+                <span aria-hidden="true" style={{ fontSize: 18, width: 24, textAlign: 'center' }}>{item.icon}</span>
+                <span>{item.label}</span>
+                {isActive && <span style={{ marginLeft: 'auto', fontSize: 12 }}>●</span>}
+              </Link>
+            );
+          })}
+        </nav>
+
+        <div className="mb-mobile-nav-section-label">Other destinations</div>
+        <div className="mb-mobile-nav-items">
+          <a href="/dashboard" onClick={onClose} className="mb-mobile-nav-item"><span aria-hidden="true">▦</span><span>Dashboard</span></a>
+          <a href="/cockpit" onClick={onClose} className="mb-mobile-nav-item"><span aria-hidden="true">◈</span><span>Cockpit</span></a>
+          <a href="/manual" onClick={onClose} className="mb-mobile-nav-item"><span aria-hidden="true">📖</span><span>Operator Manual</span></a>
+          <a href="https://vwap-pullback-indicator.replit.app" onClick={onClose} target="_blank" rel="noopener noreferrer" className="mb-mobile-nav-item">
+            <span aria-hidden="true">↗</span><span>VWAP Pullback</span>
+          </a>
+        </div>
+
+        <div className="mb-mobile-nav-system">
+          {statusDot(systemOk)}
+          <span>{systemOk ? 'System ready' : 'System status pending'}</span>
+        </div>
+      </aside>
+    </div>
+  );
+};
+
 // ── Sidenav ───────────────────────────────────────────────────────────────────
 const SideNav: React.FC<{ systemOk: boolean }> = ({ systemOk }) => {
   const [location] = useLocation();
   return (
-    <nav aria-label="Main navigation" style={{
+    <nav className="mb-desktop-sidenav" aria-label="Main navigation" style={{
       width: 58, flexShrink: 0, background: '#040d1e', borderRight: `1px solid ${T.border}`,
       display: 'flex', flexDirection: 'column', alignItems: 'center', padding: '12px 0',
       position: 'sticky', top: 0, height: '100vh', overflowY: 'auto',
@@ -472,7 +584,9 @@ const SideNav: React.FC<{ systemOk: boolean }> = ({ systemOk }) => {
       </div>
 
       {NAV_ITEMS.map(item => {
-        const isActive = location === item.path;
+        const isActive = item.id === 'main-brain'
+          ? location === '/' || location === item.path
+          : location === item.path;
         const col = isActive ? T.cyan : T.txtSec;
         return (
           <Link key={item.id} to={item.path} style={{ textDecoration:'none', marginBottom:4 }}
@@ -12171,7 +12285,9 @@ const Header: React.FC<{
   setTicker: (t: string) => void;
   refresh: () => void;
   onAskAi: () => void;
-}> = ({ p, fetchState, lastOk, ticker, setTicker, refresh, onAskAi }) => {
+  onOpenMenu: () => void;
+  menuOpen: boolean;
+}> = ({ p, fetchState, lastOk, ticker, setTicker, refresh, onAskAi, onOpenMenu, menuOpen }) => {
   const clock = useClock();
   const mkt = ((p?.market ?? {}) as Record<string, unknown>);
   const sys = ((p?.system_status ?? {}) as Record<string, unknown>);
@@ -12180,9 +12296,18 @@ const Header: React.FC<{
   const loading = fetchState === 'loading' || fetchState === 'refreshing';
 
   return (
-    <header style={{ background:'#030b1a', borderBottom:`1px solid ${T.border}`, padding:'0 20px', display:'flex', alignItems:'center', gap:12, height:52, flexShrink:0, position:'sticky', top:0, zIndex:20 }}>
+    <header className="mb-main-header" style={{ background:'#030b1a', borderBottom:`1px solid ${T.border}`, padding:'0 20px', display:'flex', alignItems:'center', gap:12, height:52, flexShrink:0, position:'sticky', top:0, zIndex:20 }}>
+      <button
+        className="mb-mobile-menu-toggle"
+        onClick={onOpenMenu}
+        aria-label="Open navigation menu"
+        aria-expanded={menuOpen}
+        aria-controls="main-brain-mobile-menu"
+      >
+        ☰
+      </button>
       {/* Brand */}
-      <div style={{ display:'flex', alignItems:'center', gap:8 }}>
+      <div className="mb-header-brand" style={{ display:'flex', alignItems:'center', gap:8 }}>
         <span style={{ fontSize:14, lineHeight:1 }}>🧠</span>
         <div>
           <div style={{ fontSize:12, fontWeight:800, color:T.txtPri, lineHeight:1 }}>Main Brain</div>
@@ -12203,7 +12328,7 @@ const Header: React.FC<{
       </div>
 
       {/* Market context */}
-      <div style={{ display:'flex', gap:16, marginLeft:8 }}>
+      <div className="mb-header-context" style={{ display:'flex', gap:16, marginLeft:8 }}>
         <div>
           <div style={{ fontSize:8.5, color:T.txtMuted, letterSpacing:'0.08em' }}>TIME (UTC-4)</div>
           <div style={{ fontSize:12, fontWeight:700, color:T.txtPri, fontFamily:T.mono }}>{clock}</div>
@@ -12221,7 +12346,7 @@ const Header: React.FC<{
       </div>
 
       {/* System status */}
-      <div style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:12 }}>
+      <div className="mb-header-actions" style={{ marginLeft:'auto', display:'flex', alignItems:'center', gap:12 }}>
         {stale && <span style={{ fontSize:10, color:T.amber, fontWeight:700 }}>⚠ STALE DATA</span>}
         {fetchState === 'error' && <span style={{ fontSize:10, color:T.red, fontWeight:700 }}>✗ CONNECTION ERROR</span>}
         {fetchState === 'auth_fail' && <span style={{ fontSize:10, color:T.red }}>AUTH REQUIRED — <a href="/" style={{ color:T.cyan }}>Go to login</a></span>}
@@ -12255,7 +12380,7 @@ const Header: React.FC<{
         </button>
 
         {/* ── Page nav pill ── */}
-        <div style={{ display:'flex', gap:1, borderRadius:6, border:`1px solid rgba(255,255,255,0.07)`, padding:'2px 3px', background:'rgba(255,255,255,0.020)', marginLeft:4 }}>
+        <div className="mb-header-page-nav" style={{ display:'flex', gap:1, borderRadius:6, border:`1px solid rgba(255,255,255,0.07)`, padding:'2px 3px', background:'rgba(255,255,255,0.020)', marginLeft:4 }}>
           <span style={{ fontSize:9.5, fontFamily:T.mono, fontWeight:700, color:T.cyan, padding:'3px 9px', borderRadius:4, background:`${T.cyan}18`, letterSpacing:'0.08em' }}>MAIN BRAIN</span>
           {([
             { label:'DASHBOARD', href:'/dashboard' },
@@ -13742,6 +13867,11 @@ export default function MainBrain() {
   // Open/close only — all chat state lives inside AskAiPanel so closing the
   // panel does not reset message history when the operator re-opens it.
   const [askOpen, setAskOpen] = useState(false);
+  const [mobileNavOpen, setMobileNavOpen] = useState(false);
+
+  useEffect(() => {
+    setMobileNavOpen(false);
+  }, [section]);
 
   // ── Cleanest Trade state ──────────────────────────────────────────────────
   // scanGenRef is a generation counter incremented on every scan attempt.
@@ -14174,7 +14304,7 @@ export default function MainBrain() {
   };
 
   return showLogin ? <MainBrainLoginScreen onSubmit={authenticate} /> : (
-    <div style={{ display:'flex', minHeight:'100vh', background:T.bg, color:T.txtPri, fontFamily:"'Inter',system-ui,sans-serif" }}>
+    <div className="mb-shell" style={{ display:'flex', minHeight:'100vh', background:T.bg, color:T.txtPri, fontFamily:"'Inter',system-ui,sans-serif" }}>
       {/* Skip link */}
       <a href="#main-content" style={{ position:'absolute', left:-9999, top:0, background:T.cyan, color:'#000', padding:'4px 12px', borderRadius:4, zIndex:100, fontSize:12, fontWeight:700 }}
         onFocus={e => { e.currentTarget.style.left='0'; }} onBlur={e => { e.currentTarget.style.left='-9999px'; }}>
@@ -14183,12 +14313,23 @@ export default function MainBrain() {
 
       {/* Side nav */}
       <SideNav systemOk={allOk} />
+      <MobileNavDrawer open={mobileNavOpen} onClose={() => setMobileNavOpen(false)} systemOk={allOk} />
 
       {/* Main area */}
-      <div style={{ flex:1, display:'flex', flexDirection:'column', minWidth:0, overflowX:'hidden' }}>
-        <Header p={p} fetchState={fetchState} lastOk={lastOk} ticker={ticker} setTicker={handleSetTicker} refresh={refresh} onAskAi={() => setAskOpen(true)} />
+      <div className="mb-main-area" style={{ flex:1, display:'flex', flexDirection:'column', minWidth:0, overflowX:'hidden' }}>
+        <Header
+          p={p}
+          fetchState={fetchState}
+          lastOk={lastOk}
+          ticker={ticker}
+          setTicker={handleSetTicker}
+          refresh={refresh}
+          onAskAi={() => setAskOpen(true)}
+          onOpenMenu={() => setMobileNavOpen(true)}
+          menuOpen={mobileNavOpen}
+        />
 
-        <main id="main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
+        <main id="main-content" className="mb-main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
           {/* Execution and Research render immediately — they have own data sources, no brain poll needed */}
           {(section === 'execution' || section === 'research') ? renderSectionPanels() :
           isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
@@ -14266,7 +14407,7 @@ export default function MainBrain() {
         </main>
 
         {/* Footer */}
-        <footer style={{ borderTop:`1px solid ${T.border}`, padding:'8px 20px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
+        <footer className="mb-main-footer" style={{ borderTop:`1px solid ${T.border}`, padding:'8px 20px', display:'flex', justifyContent:'space-between', alignItems:'center' }}>
           <span style={{ fontSize:9.5, color:T.txtMuted }}>V1 Main Brain Operator Console — read-only display, no backend mutations</span>
           <span style={{ fontSize:9.5, color:T.txtMuted, fontFamily:T.mono }}>Poll: {POLL_INTERVAL_MS / 1000}s</span>
         </footer>
@@ -14312,11 +14453,31 @@ export default function MainBrain() {
 
       {/* Responsive styles */}
       <style>{`
+        .mb-mobile-menu-toggle { display: none; }
+        .mb-mobile-nav-overlay { position: fixed; inset: 0; z-index: 120; background: rgba(2, 8, 20, 0.68); backdrop-filter: blur(3px); }
+        .mb-mobile-nav-drawer { width: min(340px, calc(100vw - 32px)); height: 100%; background: #071327; border-right: 1px solid ${T.borderMid}; box-shadow: 16px 0 36px rgba(0,0,0,0.38); overflow-y: auto; padding: calc(env(safe-area-inset-top) + 16px) 14px calc(env(safe-area-inset-bottom) + 18px); animation: mbNavIn 0.18s ease-out; }
+        .mb-mobile-nav-head { display:flex; align-items:center; justify-content:space-between; padding:0 5px 14px; border-bottom:1px solid ${T.border}; }
+        .mb-mobile-nav-close { width:36px; height:36px; border-radius:9px; border:1px solid ${T.borderMid}; color:${T.txtPri}; background:${T.panel}; font-size:24px; line-height:1; cursor:pointer; }
+        .mb-mobile-nav-section-label { margin:18px 6px 8px; font-size:9px; font-weight:800; color:${T.txtMuted}; letter-spacing:0.12em; text-transform:uppercase; }
+        .mb-mobile-nav-items { display:flex; flex-direction:column; gap:5px; }
+        .mb-mobile-nav-item { min-height:46px; display:flex; align-items:center; gap:12px; padding:10px 12px; border:1px solid ${T.border}; border-radius:9px; color:${T.txtSec}; text-decoration:none; font-size:13px; font-weight:700; letter-spacing:0.01em; }
+        .mb-mobile-nav-system { display:flex; align-items:center; gap:8px; margin:20px 5px 0; padding-top:14px; border-top:1px solid ${T.border}; color:${T.txtMuted}; font-size:10px; }
+        @keyframes mbNavIn { from { opacity:0; transform:translateX(-18px); } to { opacity:1; transform:translateX(0); } }
         @media (max-width: 1024px) {
           .mb-grid-3 { grid-template-columns: 1fr 1fr !important; }
         }
         @media (max-width: 768px) {
           .mb-grid-3, .mb-grid-2 { grid-template-columns: 1fr !important; }
+          .mb-desktop-sidenav { display: none !important; }
+          .mb-mobile-menu-toggle { width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; border-radius:8px; border:1px solid ${T.borderMid}; color:${T.cyan}; background:${T.cyan}12; cursor:pointer; font-size:20px; line-height:1; }
+          .mb-main-header { min-height:58px !important; height:auto !important; padding:8px 12px !important; gap:8px !important; flex-wrap:wrap; }
+          .mb-header-brand { min-width:0; }
+          .mb-header-context, .mb-header-page-nav { display:none !important; }
+          .mb-header-actions { gap:6px !important; margin-left:auto !important; }
+          .mb-header-actions > span { display:none; }
+          .mb-header-actions button { padding:7px 9px !important; min-height:34px; }
+          .mb-main-content { padding:12px 12px 28px !important; }
+          .mb-main-footer { padding:10px 12px calc(10px + env(safe-area-inset-bottom)) !important; gap:4px; align-items:flex-start !important; flex-direction:column; }
         }
         @media (prefers-reduced-motion: reduce) {
           * { transition: none !important; animation: none !important; }

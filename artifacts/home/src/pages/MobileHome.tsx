@@ -1,4 +1,6 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
+import { useLocation } from 'wouter';
+import { NAV_ITEMS } from '../lib/navItems';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const BULL  = '#22c55e';
@@ -504,7 +506,12 @@ const TAB_DEF: { id: Tab; icon: string; label: string }[] = [
   { id:'position', icon:'📊', label:'Position' },
 ];
 
-function BottomNav({ active, onChange }: { active: Tab; onChange: (t: Tab) => void }) {
+function BottomNav({ active, onChange, moreOpen, onMore }: {
+  active: Tab;
+  onChange: (t: Tab) => void;
+  moreOpen: boolean;
+  onMore: () => void;
+}) {
   return (
     <div style={{ position:'fixed', bottom:0, left:0, right:0,
       background:'rgba(6,8,16,0.96)', backdropFilter:'blur(16px)',
@@ -513,7 +520,7 @@ function BottomNav({ active, onChange }: { active: Tab; onChange: (t: Tab) => vo
       zIndex:100 }}>
       {TAB_DEF.map(t => (
         <button key={t.id} onClick={() => onChange(t.id)}
-          style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center',
+          style={{ flex:1, position:'relative', display:'flex', flexDirection:'column', alignItems:'center',
             justifyContent:'center', padding:'10px 0 8px', gap:3, border:'none', cursor:'pointer',
             background:'none',
             color: active === t.id ? BLUE : 'rgba(255,255,255,0.30)',
@@ -527,6 +534,130 @@ function BottomNav({ active, onChange }: { active: Tab; onChange: (t: Tab) => vo
           )}
         </button>
       ))}
+      <button onClick={onMore} aria-label="Open more dashboard destinations" aria-expanded={moreOpen}
+        style={{ flex:1, position:'relative', display:'flex', flexDirection:'column', alignItems:'center',
+          justifyContent:'center', padding:'10px 0 8px', gap:3, border:'none', cursor:'pointer',
+          background:'none', color: moreOpen ? BLUE : 'rgba(255,255,255,0.30)',
+          transition:'color 0.2s' }}>
+        <span style={{ fontSize:18, lineHeight:1 }}>☰</span>
+        <span style={{ fontSize:9.5, fontFamily:'monospace', fontWeight:700,
+          letterSpacing:'0.08em', textTransform:'uppercase' }}>More</span>
+        {moreOpen && (
+          <div style={{ position:'absolute', top:0, width:28, height:2,
+            background:BLUE, borderRadius:1, boxShadow:`0 0 8px ${BLUE}` }} />
+        )}
+      </button>
+    </div>
+  );
+}
+
+function MobileMoreMenu({ open, onClose }: { open: boolean; onClose: () => void }) {
+  const [location] = useLocation();
+  const dialogRef = useRef<HTMLElement | null>(null);
+
+  useEffect(() => {
+    if (!open) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const focusableSelector = 'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
+    const focusFirstControl = window.requestAnimationFrame(() => {
+      dialogRef.current?.querySelector<HTMLElement>(focusableSelector)?.focus();
+    });
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === 'Escape') {
+        onClose();
+        return;
+      }
+      if (event.key !== 'Tab') return;
+      const controls = Array.from(dialogRef.current?.querySelectorAll<HTMLElement>(focusableSelector) ?? [])
+        .filter(control => !control.hasAttribute('disabled'));
+      if (!controls.length) {
+        event.preventDefault();
+        return;
+      }
+      const first = controls[0];
+      const last = controls[controls.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener('keydown', handleKeyDown);
+    return () => {
+      window.cancelAnimationFrame(focusFirstControl);
+      window.removeEventListener('keydown', handleKeyDown);
+      previousFocus?.focus();
+    };
+  }, [open, onClose]);
+
+  if (!open) return null;
+
+  return (
+    <div
+      role="presentation"
+      onMouseDown={event => { if (event.target === event.currentTarget) onClose(); }}
+      style={{ position:'fixed', inset:0, zIndex:110, background:'rgba(0,0,0,0.60)',
+        display:'flex', alignItems:'flex-end' }}
+    >
+      <section ref={dialogRef} role="dialog" aria-modal="true" aria-label="More dashboard destinations"
+        style={{ width:'100%', maxHeight:'calc(100dvh - 64px)', overflowY:'auto',
+          background:'#0a101e', borderTop:'1px solid rgba(255,255,255,0.12)',
+          borderRadius:'20px 20px 0 0', padding:'16px 16px calc(18px + env(safe-area-inset-bottom))',
+          boxShadow:'0 -16px 40px rgba(0,0,0,0.35)' }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', marginBottom:14 }}>
+          <div>
+            <div style={{ fontSize:15, color:'rgba(255,255,255,0.90)', fontWeight:800 }}>More tools</div>
+            <div style={{ fontSize:10, color:'rgba(255,255,255,0.36)', marginTop:2 }}>Open any Main Brain workspace</div>
+          </div>
+          <button onClick={onClose} autoFocus aria-label="Close more destinations"
+            style={{ width:36, height:36, borderRadius:10, border:'1px solid rgba(255,255,255,0.14)',
+              background:'rgba(255,255,255,0.05)', color:'rgba(255,255,255,0.82)', fontSize:22, cursor:'pointer' }}>×</button>
+        </div>
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(2, minmax(0, 1fr))', gap:8 }}>
+          {NAV_ITEMS.map(item => {
+            const isCurrent = item.id === 'main-brain'
+              ? location === '/' || location === item.path
+              : location === item.path;
+            return (
+            <a key={item.id} href={item.path} onClick={onClose} aria-current={isCurrent ? 'page' : undefined}
+              style={{ minHeight:62, display:'flex', flexDirection:'column', justifyContent:'center', gap:4,
+                padding:'10px 11px', borderRadius:12, textDecoration:'none',
+                background: isCurrent ? 'rgba(59,130,246,0.15)' : 'rgba(255,255,255,0.035)',
+                border:`1px solid ${isCurrent ? 'rgba(59,130,246,0.52)' : 'rgba(255,255,255,0.08)'}`,
+                color: isCurrent ? '#7dd3fc' : 'rgba(255,255,255,0.82)' }}>
+              <span style={{ color:BLUE, fontSize:16 }}>{item.icon}</span>
+              <span style={{ fontSize:11, fontWeight:700 }}>{item.label}</span>
+            </a>
+            );
+          })}
+        </div>
+        <div style={{ height:1, background:'rgba(255,255,255,0.08)', margin:'16px 0 12px' }} />
+        <div style={{ display:'grid', gridTemplateColumns:'repeat(2, minmax(0, 1fr))', gap:8 }}>
+          {[
+            { href:'/dashboard', icon:'▦', label:'Dashboard' },
+            { href:'/cockpit', icon:'◈', label:'Cockpit' },
+            { href:'/manual', icon:'📖', label:'Manual' },
+            { href:'https://vwap-pullback-indicator.replit.app', icon:'↗', label:'VWAP Pullback', external:true },
+          ].map(item => {
+            const isCurrent = !item.external && (
+              location === item.href ||
+              (item.href === '/dashboard' && ['/dashboard', '/legacy', '/mobile'].includes(location))
+            );
+            return (
+            <a key={item.label} href={item.href} onClick={onClose} aria-current={isCurrent ? 'page' : undefined}
+              target={item.external ? '_blank' : undefined} rel={item.external ? 'noopener noreferrer' : undefined}
+              style={{ minHeight:46, display:'flex', alignItems:'center', gap:8, padding:'9px 10px', borderRadius:10,
+                textDecoration:'none', background: isCurrent ? 'rgba(59,130,246,0.18)' : 'rgba(59,130,246,0.07)',
+                border:`1px solid ${isCurrent ? 'rgba(59,130,246,0.58)' : 'rgba(59,130,246,0.18)'}`,
+                color: isCurrent ? '#7dd3fc' : 'rgba(255,255,255,0.70)', fontSize:11, fontWeight:700 }}>
+              <span style={{ color:BLUE }}>{item.icon}</span><span>{item.label}</span>
+            </a>
+            );
+          })}
+        </div>
+      </section>
     </div>
   );
 }
@@ -1830,6 +1961,7 @@ export default function MobileHome() {
     try { return (localStorage.getItem('brain_ticker') as Ticker) || 'MNQ'; } catch { return 'MNQ'; }
   });
   const [tab, setTab]         = useState<Tab>('signal');
+  const [moreOpen, setMoreOpen] = useState(false);
   const [narration, setNarr]  = useState('');
   const [avatarState, setAvSt] = useState('WAIT');
 
@@ -1953,7 +2085,7 @@ export default function MobileHome() {
 
   if (!authed) return <MobileLogin onSubmit={tryAuth} />;
 
-  const TAB_BOTTOM_PAD = 72;
+  const TAB_BOTTOM_PAD = 82;
 
   return (
     <div style={{ position:'fixed', inset:0, background:BG, color:'rgba(255,255,255,0.88)',
@@ -2042,7 +2174,8 @@ export default function MobileHome() {
       </div>
 
       {/* ── Bottom nav ── */}
-      <BottomNav active={tab} onChange={setTab} />
+      <BottomNav active={tab} onChange={setTab} moreOpen={moreOpen} onMore={() => setMoreOpen(open => !open)} />
+      <MobileMoreMenu open={moreOpen} onClose={() => setMoreOpen(false)} />
     </div>
   );
 }
