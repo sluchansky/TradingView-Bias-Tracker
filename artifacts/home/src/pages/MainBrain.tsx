@@ -12314,6 +12314,52 @@ const ErrorScreen: React.FC<{ msg: string | null; refresh: () => void }> = ({ ms
   </div>
 );
 
+// MainBrain is the primary route. Validate here so an expired local credential
+// has a recovery path instead of leaving the operator on "Connecting".
+const MainBrainLoginScreen: React.FC<{ onSubmit: (password: string) => Promise<boolean> }> = ({ onSubmit }) => {
+  const [password, setPassword] = useState('');
+  const [error, setError] = useState('');
+  const [checking, setChecking] = useState(false);
+  const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => { setTimeout(() => inputRef.current?.focus(), 80); }, []);
+
+  const attemptLogin = async () => {
+    // Prefer the live input value so a browser-autofill or automation update
+    // cannot leave React state one event behind at submit time.
+    const value = inputRef.current?.value ?? password;
+    if (!value || checking) return;
+    setChecking(true);
+    setError('');
+    const accepted = await onSubmit(value);
+    setChecking(false);
+    if (!accepted) {
+      setError('Password was not accepted. Check it and try again.');
+      inputRef.current?.focus();
+    }
+  };
+
+  return (
+    <div style={{ position:'fixed', inset:0, zIndex:10000, minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center', background:T.bg, color:T.txtPri, fontFamily:"'Inter',system-ui,sans-serif", padding:20 }}>
+      <form onSubmit={event => { event.preventDefault(); void attemptLogin(); }} style={{ position:'relative', zIndex:1, width:'min(360px, 100%)', display:'flex', flexDirection:'column', gap:14, background:T.panel, border:`1px solid ${T.border}`, borderRadius:12, padding:28, boxShadow:'0 24px 80px rgba(0,0,0,.34)' }}>
+        <div style={{ fontSize:28, lineHeight:1 }}>🧠</div>
+        <div>
+          <div style={{ fontSize:14, fontWeight:800, color:T.txtPri, letterSpacing:'.06em' }}>MAIN BRAIN ACCESS</div>
+          <div style={{ marginTop:6, fontSize:11, color:T.txtMuted, lineHeight:1.5 }}>Enter your dashboard password to connect to the operator console.</div>
+        </div>
+        <input type="text" value="admin" readOnly autoComplete="username" tabIndex={-1} aria-hidden="true" style={{ display:'none' }} />
+        <input ref={inputRef} type="password" value={password} onChange={event => { setPassword(event.target.value); setError(''); }}
+          name="dashboard-password" placeholder="Dashboard password" autoComplete="current-password" aria-invalid={Boolean(error)}
+          style={{ width:'100%', boxSizing:'border-box', background:T.panelAlt, border:`1px solid ${error ? T.red : T.border}`, borderRadius:7, padding:'11px 12px', color:T.txtPri, outline:'none', fontSize:13 }} />
+        {error && <div role="alert" style={{ color:T.red, fontSize:11 }}>{error}</div>}
+        <button data-testid="main-brain-login-submit" type="button" onClick={() => { void attemptLogin(); }} disabled={checking} style={{ background:`${T.cyan}20`, border:`1px solid ${T.cyan}55`, color:T.cyan, borderRadius:7, padding:'10px 14px', cursor:checking?'wait':'pointer', fontWeight:800, fontSize:12, opacity:checking ? .65 : 1 }}>
+          {checking ? 'Checking…' : 'Connect'}
+        </button>
+      </form>
+    </div>
+  );
+};
+
 // ── Main Page ─────────────────────────────────────────────────────────────────
 // ── Execution Arm Control Panel ────────────────────────────────────────────────
 // Polls GET /api/execution/state every 30 s. Backend is sole source of truth —
@@ -13655,12 +13701,35 @@ export default function MainBrain() {
   }, [section]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { payload, fetchState, lastOk, error, isAuthFail, refresh } = useMainBrain(ticker);
+  const [showLogin, setShowLogin] = useState<boolean>(() => {
+    try { return !localStorage.getItem('brain_auth'); } catch { return true; }
+  });
+
+  useEffect(() => {
+    if (isAuthFail) setShowLogin(true);
+  }, [isAuthFail]);
+
+  const authenticate = useCallback(async (password: string): Promise<boolean> => {
+    try {
+      const response = await fetch(`/api/main-brain?ticker=${encodeURIComponent(ticker)}`, {
+        credentials: 'include',
+        headers: { Authorization: 'Basic ' + btoa('admin:' + password) },
+      });
+      if (!response.ok) return false;
+      try { localStorage.setItem('brain_auth', password); } catch {}
+      setShowLogin(false);
+      refresh();
+      return true;
+    } catch {
+      return false;
+    }
+  }, [ticker, refresh]);
 
   const p = (payload ?? {}) as Record<string, unknown>;
   const sys = (p.system_status ?? {}) as Record<string, unknown>;
   const allOk = !!(sys.db_ready && sys.learning_ready);
   const isLoading = fetchState === 'loading' && !payload;
-  const isError   = (fetchState === 'error' || isAuthFail) && !payload;
+  const isError   = fetchState === 'error' && !payload;
 
   // ── Ask AI state ─────────────────────────────────────────────────────────
   // Open/close only — all chat state lives inside AskAiPanel so closing the
@@ -14097,7 +14166,7 @@ export default function MainBrain() {
     }
   };
 
-  return (
+  return showLogin ? <MainBrainLoginScreen onSubmit={authenticate} /> : (
     <div style={{ display:'flex', minHeight:'100vh', background:T.bg, color:T.txtPri, fontFamily:"'Inter',system-ui,sans-serif" }}>
       {/* Skip link */}
       <a href="#main-content" style={{ position:'absolute', left:-9999, top:0, background:T.cyan, color:'#000', padding:'4px 12px', borderRadius:4, zIndex:100, fontSize:12, fontWeight:700 }}

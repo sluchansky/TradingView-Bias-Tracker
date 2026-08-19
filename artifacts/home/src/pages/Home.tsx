@@ -403,10 +403,24 @@ type GazeEvt = { dx: number; dy: number; widen: boolean; dur: number; id: number
 
 
 // ── Login overlay ──────────────────────────────────────────────────────────────
-function LoginOverlay({ onSubmit }: { onSubmit: (pwd: string) => void }) {
-  const [val, setVal] = useState(''); const ref = useRef<HTMLInputElement>(null);
+function LoginOverlay({ onSubmit }: { onSubmit: (pwd: string) => Promise<boolean> }) {
+  const [val, setVal] = useState('');
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const ref = useRef<HTMLInputElement>(null);
   useEffect(() => { setTimeout(() => ref.current?.focus(), 80); }, []);
-  const submit = () => { const p = val.trim(); if (p) onSubmit(p); };
+  const submit = async () => {
+    const p = val.trim();
+    if (!p || submitting) return;
+    setSubmitting(true);
+    setError('');
+    const accepted = await onSubmit(p);
+    setSubmitting(false);
+    if (!accepted) {
+      setError('Password was not accepted. Check it and try again.');
+      ref.current?.focus();
+    }
+  };
   return (
     <div style={{ position:'fixed', inset:0, background:'#060810', display:'flex', flexDirection:'column',
       alignItems:'center', justifyContent:'center', gap:28, zIndex:999 }}>
@@ -423,12 +437,16 @@ function LoginOverlay({ onSubmit }: { onSubmit: (pwd: string) => void }) {
         <span style={{ fontSize:13, color:'rgba(255,255,255,0.5)', fontFamily:'monospace', letterSpacing:'0.10em' }}>ACCESS REQUIRED</span>
         <span style={{ fontSize:11, color:'#374151', fontFamily:'monospace' }}>Enter your dashboard password</span>
       </div>
-      <form onSubmit={e => { e.preventDefault(); submit(); }} style={{ display:'flex', gap:8, width:300 }}>
-        <input ref={ref} type="password" value={val} onChange={e => setVal(e.target.value)}
+      <form onSubmit={e => { e.preventDefault(); void submit(); }} style={{ display:'flex', flexDirection:'column', gap:8, width:300 }}>
+        <div style={{ display:'flex', gap:8 }}>
+        <input ref={ref} type="password" value={val} onChange={e => { setVal(e.target.value); setError(''); }}
+          aria-invalid={Boolean(error)}
           placeholder="Password" style={{ flex:1, background:'rgba(255,255,255,0.04)', border:'1px solid rgba(255,255,255,0.10)',
           borderRadius:8, padding:'10px 14px', fontSize:14, color:'rgba(255,255,255,0.85)', fontFamily:'inherit', outline:'none' }} />
-        <button type="submit" style={{ padding:'10px 18px', background:'rgba(59,130,246,0.15)',
-          border:'1px solid rgba(59,130,246,0.3)', borderRadius:8, color:'#93c5fd', fontSize:13, fontFamily:'inherit', cursor:'pointer' }}>Enter</button>
+        <button type="submit" disabled={submitting} style={{ padding:'10px 18px', background:'rgba(59,130,246,0.15)',
+          border:'1px solid rgba(59,130,246,0.3)', borderRadius:8, color:'#93c5fd', fontSize:13, fontFamily:'inherit', cursor:submitting?'wait':'pointer', opacity:submitting?0.65:1 }}>{submitting ? 'Checking…' : 'Enter'}</button>
+        </div>
+        {error && <span role="alert" style={{ fontSize:11, color:'#fca5a5', fontFamily:'monospace' }}>{error}</span>}
       </form>
     </div>
   );
@@ -2442,9 +2460,21 @@ export default function Home() {
     authPwd ? { 'Authorization': 'Basic ' + btoa('admin:' + authPwd) } : {}
   , [authPwd]);
 
-  const handleAuth = useCallback((pwd: string) => {
-    try { localStorage.setItem('brain_auth', pwd); } catch {}
-    setAuthPwd(pwd); setAuthNeeded(false);
+  const handleAuth = useCallback(async (pwd: string): Promise<boolean> => {
+    const header = { 'Authorization': 'Basic ' + btoa('admin:' + pwd) };
+    try {
+      const response = await fetch('/api/status', {
+        credentials: 'include',
+        headers: header,
+      });
+      if (!response.ok) return false;
+      try { localStorage.setItem('brain_auth', pwd); } catch {}
+      setAuthPwd(pwd);
+      setAuthNeeded(false);
+      return true;
+    } catch {
+      return false;
+    }
   }, []);
 
   const poll = useCallback(async () => {
