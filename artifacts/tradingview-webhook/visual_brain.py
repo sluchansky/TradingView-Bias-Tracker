@@ -277,7 +277,11 @@ def _generate_chart_from_bars(bars: list, instrument: str) -> bytes:
             cum_pv += tp * v; cum_v += v
             all_vwap.append(cum_pv / cum_v if cum_v else tp)
         vwap_vals = all_vwap[-len(recent):]      # trim to visible bars
-        ax1.plot(times, vwap_vals, color="#38bdf8", linewidth=1.2, linestyle="--",
+        # A session can begin inside the visible lookback. In that case the VWAP
+        # series is intentionally shorter than the candles, so align it to the
+        # right instead of passing mismatched x/y arrays to matplotlib.
+        vwap_times = times[-len(vwap_vals):] if vwap_vals else []
+        ax1.plot(vwap_times, vwap_vals, color="#38bdf8", linewidth=1.2, linestyle="--",
                  label="VWAP", zorder=3)
 
         # ── Live VWAP overlay — authoritative value from VWAP_BY_TICKER ──────────
@@ -453,13 +457,52 @@ Required schema (all fields mandatory):
   "confidence": 72,
   "state_changed": true,
   "state_change_reason": "one sentence or empty string",
-  "summary": "Maximum 2 concise sentences describing what you see."
+  "summary": "Maximum 2 concise sentences describing what you see.",
+  "mode_assessments": {{
+    "scalp": {{
+      "posture": "LONG_BIAS|SHORT_BIAS|NEUTRAL",
+      "setup_status": "TRIGGER_READY|FORMING|WAIT|NO_TRADE",
+      "confidence": 65,
+      "validation": "Immediate trigger, VWAP, or structure confirmation required",
+      "invalidation": "The fast condition that would invalidate this read",
+      "reason": "One concise chart-based reason"
+    }},
+    "intraday_trend": {{
+      "posture": "LONG_BIAS|SHORT_BIAS|NEUTRAL",
+      "setup_status": "TRIGGER_READY|FORMING|WAIT|NO_TRADE",
+      "confidence": 60,
+      "timeframe_alignment": "ALIGNED|MIXED|OPPOSED|UNKNOWN",
+      "market_phase": "CONTINUATION|PULLBACK|EXHAUSTION|RANGE|UNKNOWN",
+      "session_level": "Relevant visible session level or UNKNOWN",
+      "validation": "What would validate the intraday continuation or reversal",
+      "invalidation": "What would invalidate the intraday read",
+      "reason": "One concise chart-based reason"
+    }},
+    "swing": {{
+      "posture": "LONG_BIAS|SHORT_BIAS|NEUTRAL",
+      "setup_status": "TRIGGER_READY|FORMING|WAIT|NO_TRADE",
+      "confidence": 50,
+      "timeframe_alignment": "ALIGNED|MIXED|OPPOSED|UNKNOWN",
+      "thesis_quality": "HIGH|MEDIUM|LOW|UNKNOWN",
+      "structural_stop": "Visible structural invalidation level or UNKNOWN",
+      "target_context": "Larger visible target context or UNKNOWN",
+      "validation": "What would validate the higher-timeframe thesis",
+      "invalidation": "What would invalidate the swing thesis",
+      "reason": "One concise chart-based reason"
+    }}
+  }}
 }}
 
 Rules:
 - confidence: integer 0-100
 - approx_price: null when unreadable — NEVER hallucinate a price
 - state_changed: compare to the previous state summary provided; set true only if something meaningful shifted
+- The three mode_assessments are ADVISORY observations, never instructions to place a trade.
+- SCALP focuses on immediate trigger quality, VWAP/structure confirmation, and fast invalidation.
+- INTRADAY_TREND focuses on 15m/1h alignment, continuation versus exhaustion, and session levels.
+- SWING focuses on 1h/4h/daily alignment, thesis quality, structural invalidation, and larger target context.
+- The image is primarily a 1-minute chart. Do NOT invent unseen 15m, 1h, 4h, or daily evidence. Use UNKNOWN alignment/quality and a cautious WAIT or NO_TRADE status when the needed timeframe cannot be confirmed from the supplied context.
+- Keep each validation, invalidation, and reason concise and based only on visible chart evidence.
 - Respond ONLY with the JSON object, nothing else
 """
 
@@ -469,10 +512,20 @@ _VALID_EVENTS      = {"LIQUIDITY_SWEEP","RECLAIM","REJECTION","BREAKOUT","BREAKD
                       "FAILED_BREAKOUT","FAILED_BREAKDOWN","STRUCTURE_SHIFT","NONE"}
 _VALID_ACTIONS     = {"LONG_WATCH","SHORT_WATCH","WAIT","NO_TRADE"}
 _VALID_SHORT_TERM  = {"HH_HL","LH_LL","RANGE","TRANSITION","UNCLEAR"}
+_VALID_MODE_POSTURES = {"LONG_BIAS", "SHORT_BIAS", "NEUTRAL"}
+_VALID_MODE_SETUP_STATUSES = {"TRIGGER_READY", "FORMING", "WAIT", "NO_TRADE"}
+_VALID_ALIGNMENT = {"ALIGNED", "MIXED", "OPPOSED", "UNKNOWN"}
+_VALID_INTRADAY_PHASES = {"CONTINUATION", "PULLBACK", "EXHAUSTION", "RANGE", "UNKNOWN"}
+_VALID_THESIS_QUALITY = {"HIGH", "MEDIUM", "LOW", "UNKNOWN"}
+_MODE_ASSESSMENT_KEYS = {
+    "scalp",
+    "intraday_trend",
+    "swing",
+}
 _REQUIRED_KEYS     = {"instrument","timestamp","bias","market_state","structure",
                       "last_event","support","resistance","long_condition",
                       "short_condition","action","confidence","state_changed",
-                      "state_change_reason","summary"}
+                      "state_change_reason","summary","mode_assessments"}
 
 
 def _build_history_text(recent_history: list[dict]) -> str:
@@ -516,8 +569,55 @@ def _validate_observation(obs: dict) -> tuple[bool, str]:
     if struct.get("short_term") not in _VALID_SHORT_TERM:
         return False, f"invalid structure.short_term: {struct.get('short_term')}"
     conf = obs.get("confidence")
-    if not isinstance(conf, (int, float)) or not (0 <= conf <= 100):
+    if isinstance(conf, bool) or not isinstance(conf, (int, float)) or not (0 <= conf <= 100):
         return False, f"invalid confidence: {conf}"
+    assessments = obs.get("mode_assessments")
+    if not isinstance(assessments, dict):
+        return False, "mode_assessments must be a dict"
+    if set(assessments) != _MODE_ASSESSMENT_KEYS:
+        return False, "mode_assessments must contain scalp, intraday_trend, and swing only"
+    for mode, assessment in assessments.items():
+        ok, reason = _validate_mode_assessment(mode, assessment)
+        if not ok:
+            return False, reason
+    return True, ""
+
+
+def _validate_mode_assessment(mode: str, assessment: Any) -> tuple[bool, str]:
+    """Validate one advisory mode assessment without touching trading logic."""
+    if not isinstance(assessment, dict):
+        return False, f"mode_assessments.{mode} must be a dict"
+    required = {"posture", "setup_status", "confidence", "validation", "invalidation", "reason"}
+    if mode in ("intraday_trend", "swing"):
+        required |= {"timeframe_alignment"}
+    if mode == "intraday_trend":
+        required |= {"market_phase", "session_level"}
+    if mode == "swing":
+        required |= {"thesis_quality", "structural_stop", "target_context"}
+    missing = required - set(assessment)
+    if missing:
+        return False, f"mode_assessments.{mode} missing keys: {missing}"
+    if assessment.get("posture") not in _VALID_MODE_POSTURES:
+        return False, f"invalid mode_assessments.{mode}.posture"
+    if assessment.get("setup_status") not in _VALID_MODE_SETUP_STATUSES:
+        return False, f"invalid mode_assessments.{mode}.setup_status"
+    confidence = assessment.get("confidence")
+    if isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not (0 <= confidence <= 100):
+        return False, f"invalid mode_assessments.{mode}.confidence"
+    if mode in ("intraday_trend", "swing") and assessment.get("timeframe_alignment") not in _VALID_ALIGNMENT:
+        return False, f"invalid mode_assessments.{mode}.timeframe_alignment"
+    if mode == "intraday_trend" and assessment.get("market_phase") not in _VALID_INTRADAY_PHASES:
+        return False, "invalid mode_assessments.intraday_trend.market_phase"
+    if mode == "swing" and assessment.get("thesis_quality") not in _VALID_THESIS_QUALITY:
+        return False, "invalid mode_assessments.swing.thesis_quality"
+    text_fields = {"validation", "invalidation", "reason"}
+    if mode == "intraday_trend":
+        text_fields.add("session_level")
+    if mode == "swing":
+        text_fields |= {"structural_stop", "target_context"}
+    for field in text_fields:
+        if not isinstance(assessment.get(field), str):
+            return False, f"mode_assessments.{mode}.{field} must be a string"
     return True, ""
 
 
@@ -744,6 +844,11 @@ def _flatten_obs(obs: dict) -> dict:
                 "p10m", "p15m", "mfe", "mae"):
         flat.setdefault(key, None)
     flat.setdefault("outcome_resolved", False)
+    # Mode assessments live in raw_json rather than dedicated DB columns, keeping
+    # the existing table schema stable. Older observations intentionally surface
+    # an empty object so callers can show an unavailable state without breaking.
+    assessments = flat.get("mode_assessments")
+    flat["mode_assessments"] = assessments if isinstance(assessments, dict) else {}
     return flat
 
 
@@ -800,7 +905,7 @@ def get_history(instrument: str = "MNQ", limit: int = 20) -> list[dict]:
                        long_condition, short_condition,
                        state_changed, state_change_reason, summary,
                        screenshot_path, p1m, p3m, p5m, p10m, p15m,
-                       mfe, mae, outcome_resolved
+                       mfe, mae, outcome_resolved, raw_json
                 FROM visual_brain_observations
                 WHERE instrument = %s
                 ORDER BY timestamp DESC
@@ -824,7 +929,15 @@ def get_history(instrument: str = "MNQ", limit: int = 20) -> list[dict]:
                     v = row_dict.get(key)
                     if v is not None:
                         row_dict[key] = float(v)
-                result.append(row_dict)
+                raw = row_dict.pop("raw_json", None)
+                if raw:
+                    try:
+                        raw_obs = raw if isinstance(raw, dict) else json.loads(raw)
+                        if isinstance(raw_obs, dict):
+                            row_dict["mode_assessments"] = raw_obs.get("mode_assessments")
+                    except Exception:
+                        pass
+                result.append(_flatten_obs(row_dict))
             return result
     except Exception as exc:
         logger.debug("[VISUAL_BRAIN] get_history: %s", exc)

@@ -23,4 +23,7 @@ The probe function now takes `db_conn_fn` so the correct `_learning_conn` from `
 ## Runtime dependencies
 `openai`, `playwright`, `Pillow`, and `matplotlib` are declared in `requirements.txt`. The Playwright Chromium binary is installed separately (`playwright install chromium`). Any new deployment that enables `VISUAL_BRAIN_ENABLED=true` must confirm both the package and the binary are present.
 
+## Mode-aware assessment contract
+Keep the established generic Visual Brain observation compatible and put SCALP, INTRADAY_TREND, and SWING assessments inside its existing `raw_json` payload; do not add a table column just for an advisory model response. New observations require all three assessments, while old rows hydrate to an empty assessment map. Treat every persisted mode field as untrusted at the UI boundary and reject invalid model payloads before persistence. **Why:** model output can evolve or be malformed, and the historical table already contains legacy observations; a schema change would add operational risk without any execution benefit. **How to apply:** this data is display-only and must never feed gating, scoring, sizing, alerts, broker routing, or execution. If a new displayed field is added, validate it on the backend and render it defensively in the dashboard.
+
 **How to apply:** Any future vision-model sub-module should follow the same injection pattern. Never add `import app` inside a helper module that app.py imports — it silently creates a second module instance.

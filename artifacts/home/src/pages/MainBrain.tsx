@@ -24,6 +24,9 @@ import {
   extractExplainData, buildPlainEnglishSummary,
   type ScoreComponent,
 } from '../lib/explainDecision';
+import {
+  visualBrainConfidence, visualBrainText, visualBrainToken,
+} from '../lib/visualBrainModes';
 
 // ── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -3379,6 +3382,12 @@ const ModeOverviewPanel: React.FC<{ ticker: string; authHeader: string }> = ({ t
 // DISPLAY-ONLY — never touches gate rules, thresholds, or execution.
 // ── Visual Brain Panel ────────────────────────────────────────────────────────
 const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
+  type ModeAssessment = {
+    posture: unknown; setup_status: unknown; confidence: unknown;
+    validation: unknown; invalidation: unknown; reason: unknown;
+    timeframe_alignment?: unknown; market_phase?: unknown; session_level?: unknown;
+    thesis_quality?: unknown; structural_stop?: unknown; target_context?: unknown;
+  };
   type VBObs = {
     timestamp: string; instrument: string; bias: string; market_state: string;
     short_term_structure: string | null; last_event: string; action: string;
@@ -3389,6 +3398,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
     p1m: number | null; p3m: number | null; p5m: number | null;
     p10m: number | null; p15m: number | null; mfe: number | null; mae: number | null;
     outcome_resolved: boolean;
+    mode_assessments?: Partial<Record<'scalp' | 'intraday_trend' | 'swing', ModeAssessment>>;
   };
   type AllStatus = {
     enabled: boolean; db_ready: boolean; symbols: string[];
@@ -3474,6 +3484,18 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
     if (v === 'CHOP' || v === 'UNCLEAR') return T.txtMuted;
     return T.cyan;
   };
+  const modePostureColor = (posture: unknown) => {
+    const p = visualBrainText(posture, '').toUpperCase();
+    if (p === 'LONG_BIAS') return T.green;
+    if (p === 'SHORT_BIAS') return T.red;
+    return T.txtMuted;
+  };
+  const modeSetupColor = (status: unknown) => {
+    const s = visualBrainText(status, '').toUpperCase();
+    if (s === 'TRIGGER_READY') return T.green;
+    if (s === 'FORMING') return T.amber;
+    return T.txtMuted;
+  };
   const fmtPct = (v: number | null | undefined) =>
     v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(3)}%`;
 
@@ -3483,6 +3505,53 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   const obsMap   = allStatus?.instruments ?? {};
   const obs      = activeTab ? (obsMap[activeTab]?.observation ?? null) : null;
   const transitions = hist.filter(h => h.state_changed);
+  const modeAssessments = obs?.mode_assessments ?? {};
+
+  const ModeAssessmentCard: React.FC<{
+    label: string; assessment?: ModeAssessment; details: Array<[string, unknown]>;
+  }> = ({ label, assessment, details }) => {
+    if (!assessment) {
+      return (
+        <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 11px', border: `1px solid ${T.border}` }}>
+          <div style={{ fontSize: 9, fontWeight: 700, color: T.txtSec, letterSpacing: '0.08em' }}>{label}</div>
+          <div style={{ fontSize: 10, color: T.txtMuted, lineHeight: 1.45, marginTop: 8 }}>
+            Available on new observations.
+          </div>
+        </div>
+      );
+    }
+    const postureColor = modePostureColor(assessment.posture);
+    const setupColor = modeSetupColor(assessment.setup_status);
+    const posture = visualBrainToken(assessment.posture);
+    const setupStatus = visualBrainToken(assessment.setup_status);
+    return (
+      <div style={{ background: T.panelAlt, borderRadius: 8, padding: '10px 11px',
+        border: `1px solid ${postureColor}33`, minWidth: 0 }}>
+        <div style={{ display: 'flex', alignItems: 'center', gap: 5, marginBottom: 8 }}>
+          <span style={{ fontSize: 9, fontWeight: 800, color: T.txtSec, letterSpacing: '0.08em', flex: 1 }}>{label}</span>
+          <Badge label={setupStatus} color={setupColor} />
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 10, marginBottom: 7 }}>
+          <span style={{ color: postureColor, fontWeight: 700 }}>{posture}</span>
+          <span style={{ color: T.txtMuted }}>{visualBrainConfidence(assessment.confidence)}</span>
+        </div>
+        {details.filter(([, value]) => visualBrainText(value, '')).map(([name, value]) => (
+          <div key={name} style={{ fontSize: 9.5, color: T.txtMuted, marginBottom: 3, lineHeight: 1.35 }}>
+            <span style={{ color: T.txtSec }}>{name}: </span>{visualBrainText(value)}
+          </div>
+        ))}
+        <div style={{ marginTop: 7, paddingTop: 7, borderTop: `1px solid ${T.border}`, fontSize: 9.5, color: T.txtSec, lineHeight: 1.4 }}>
+          {visualBrainText(assessment.reason)}
+        </div>
+        <div style={{ marginTop: 7, fontSize: 9.5, color: T.green, lineHeight: 1.35 }}>
+          <span style={{ color: T.txtMuted }}>Validate: </span>{visualBrainText(assessment.validation)}
+        </div>
+        <div style={{ marginTop: 4, fontSize: 9.5, color: T.red, lineHeight: 1.35 }}>
+          <span style={{ color: T.txtMuted }}>Invalidates: </span>{visualBrainText(assessment.invalidation)}
+        </div>
+      </div>
+    );
+  };
 
   // Compact bias chip for tabs — shows bias of each instrument at a glance
   const biasDot = (inst: string) => {
@@ -3647,6 +3716,43 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
                       {obs.summary}
                     </div>
                   )}
+
+                  {/* ── Advisory mode assessments — never used for trading decisions ── */}
+                  <div style={{ marginTop: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 7 }}>
+                      <span style={{ fontSize: 9.5, fontWeight: 700, color: T.txtSec,
+                        letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                        Mode Assessments
+                      </span>
+                      <Badge label="ADVISORY ONLY" color={T.purple} />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(215px, 1fr))', gap: 8 }}>
+                      <ModeAssessmentCard
+                        label="SCALP"
+                        assessment={modeAssessments.scalp}
+                        details={[]}
+                      />
+                      <ModeAssessmentCard
+                        label="INTRADAY TREND"
+                        assessment={modeAssessments.intraday_trend}
+                        details={[
+                          ['15m / 1h', visualBrainToken(modeAssessments.intraday_trend?.timeframe_alignment)],
+                          ['Phase', visualBrainToken(modeAssessments.intraday_trend?.market_phase)],
+                          ['Session level', modeAssessments.intraday_trend?.session_level],
+                        ]}
+                      />
+                      <ModeAssessmentCard
+                        label="SWING"
+                        assessment={modeAssessments.swing}
+                        details={[
+                          ['1h / 4h / Daily', visualBrainToken(modeAssessments.swing?.timeframe_alignment)],
+                          ['Thesis', modeAssessments.swing?.thesis_quality],
+                          ['Structural stop', modeAssessments.swing?.structural_stop],
+                          ['Target context', modeAssessments.swing?.target_context],
+                        ]}
+                      />
+                    </div>
+                  </div>
 
                   {/* ── State change notice ── */}
                   {obs.state_changed && obs.state_change_reason && (

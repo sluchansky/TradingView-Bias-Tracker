@@ -34,6 +34,42 @@ if str(ROOT) not in sys.path:
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+def _make_mode_assessments() -> dict:
+    return {
+        "scalp": {
+            "posture": "LONG_BIAS",
+            "setup_status": "FORMING",
+            "confidence": 72,
+            "validation": "Hold above VWAP with a fresh higher low",
+            "invalidation": "Lose VWAP and the latest higher low",
+            "reason": "Bullish structure is intact but needs an immediate trigger.",
+        },
+        "intraday_trend": {
+            "posture": "LONG_BIAS",
+            "setup_status": "FORMING",
+            "confidence": 64,
+            "timeframe_alignment": "MIXED",
+            "market_phase": "PULLBACK",
+            "session_level": "VWAP support",
+            "validation": "Reclaim the session high with momentum",
+            "invalidation": "Sustain below VWAP support",
+            "reason": "The visible pullback is constructive but higher-timeframe confirmation is unavailable.",
+        },
+        "swing": {
+            "posture": "NEUTRAL",
+            "setup_status": "WAIT",
+            "confidence": 35,
+            "timeframe_alignment": "UNKNOWN",
+            "thesis_quality": "UNKNOWN",
+            "structural_stop": "UNKNOWN",
+            "target_context": "UNKNOWN",
+            "validation": "Wait for confirmed higher-timeframe alignment",
+            "invalidation": "No thesis until alignment is confirmed",
+            "reason": "A one-minute chart cannot establish a swing thesis alone.",
+        },
+    }
+
+
 def _make_obs(bias="BULLISH", state="TRENDING_UP", event="RECLAIM",
               action="LONG_WATCH", conf=75, changed=True, reason="Reclaim above VWAP") -> dict:
     return {
@@ -56,6 +92,7 @@ def _make_obs(bias="BULLISH", state="TRENDING_UP", event="RECLAIM",
         "state_changed":    changed,
         "state_change_reason": reason,
         "summary":          "Price reclaimed VWAP after a sweep. Structure remains bullish.",
+        "mode_assessments": _make_mode_assessments(),
     }
 
 
@@ -115,6 +152,32 @@ class TestValidJsonParsing(unittest.TestCase):
         obs = _make_obs(conf=101)
         ok, _ = self.vb._validate_observation(obs)
         self.assertFalse(ok)
+
+    def test_mode_assessments_are_required_and_validated(self):
+        obs = _make_obs()
+        del obs["mode_assessments"]["swing"]["target_context"]
+        ok, reason = self.vb._validate_observation(obs)
+        self.assertFalse(ok)
+        self.assertIn("mode_assessments.swing", reason)
+
+    def test_invalid_mode_assessment_enum_fails(self):
+        obs = _make_obs()
+        obs["mode_assessments"]["intraday_trend"]["market_phase"] = "GUESSING"
+        ok, reason = self.vb._validate_observation(obs)
+        self.assertFalse(ok)
+        self.assertIn("market_phase", reason)
+
+    def test_rendered_mode_text_fields_must_be_strings(self):
+        for mode, field in (
+            ("intraday_trend", "session_level"),
+            ("swing", "structural_stop"),
+            ("swing", "target_context"),
+        ):
+            obs = _make_obs()
+            obs["mode_assessments"][mode][field] = {"unexpected": "object"}
+            ok, reason = self.vb._validate_observation(obs)
+            self.assertFalse(ok)
+            self.assertIn(field, reason)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -398,6 +461,37 @@ class TestHistoryRetrieval(unittest.TestCase):
             result = self.vb.get_history("MNQ")  # must not raise
 
         self.assertEqual(result, [])
+
+    def test_get_history_hydrates_mode_assessments_from_raw_json(self):
+        """New assessments use existing raw_json; no schema migration is needed."""
+        mock_conn = MagicMock()
+        mock_cursor = MagicMock()
+        mock_cursor.__enter__ = MagicMock(return_value=mock_cursor)
+        mock_cursor.__exit__ = MagicMock(return_value=False)
+        obs = _make_obs()
+        cols = ["id", "timestamp", "instrument", "bias", "market_state", "short_term_structure",
+                "last_event", "action", "confidence", "support_description", "support_price",
+                "resistance_description", "resistance_price", "long_condition", "short_condition",
+                "state_changed", "state_change_reason", "summary", "screenshot_path",
+                "p1m", "p3m", "p5m", "p10m", "p15m", "mfe", "mae", "outcome_resolved", "raw_json"]
+        mock_cursor.description = [(column,) for column in cols]
+        mock_cursor.fetchall.return_value = [(
+            1, datetime.now(timezone.utc), "MNQ", "BULLISH", "TRENDING_UP", "HH_HL",
+            "RECLAIM", "LONG_WATCH", 75, "VWAP", 30100.0, "Prior high", 30250.0,
+            "Hold above VWAP", "Break below 30100", True, "Reclaim", "Bullish.", None,
+            None, None, None, None, None, None, None, False, json.dumps(obs),
+        )]
+        mock_conn.cursor.return_value = mock_cursor
+
+        with patch("visual_brain._get_conn", return_value=mock_conn):
+            rows = self.vb.get_history("MNQ", limit=1)
+
+        self.assertEqual(rows[0]["mode_assessments"]["scalp"]["setup_status"], "FORMING")
+        self.assertEqual(rows[0]["mode_assessments"]["swing"]["thesis_quality"], "UNKNOWN")
+
+    def test_older_history_rows_have_safe_empty_mode_assessments(self):
+        flat = self.vb._flatten_obs({"instrument": "MNQ", "bias": "NEUTRAL"})
+        self.assertEqual(flat["mode_assessments"], {})
 
 
 # ─────────────────────────────────────────────────────────────────────────────
