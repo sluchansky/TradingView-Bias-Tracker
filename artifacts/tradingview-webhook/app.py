@@ -39847,6 +39847,16 @@ def _nj_close_by_instrument(instrument, direction, exit_reason,
 # deliberately outside the execution gateway: it does not build a broker payload,
 # post HTTP, arm execution, or change a trading verdict.
 PAPER_JOURNAL_INSTRUMENTS = frozenset(("MGC", "MNQ", "MES", "MYM"))
+_MANAGED_PAPER_STATE_KEYS = (
+    "key", "instrument", "direction", "symbol", "entry", "entry_lo", "entry_hi",
+    "stop", "tp1", "tp2", "tp3", "be_level", "partial", "runner",
+    "tp1_pct", "tp2_pct", "runner_pct", "risk_points", "point_value",
+    "registered_at", "entry_epoch", "updates", "mfe", "mae", "be_active",
+    "closed", "initial_stop", "remaining_pct", "realized_r", "tp1_hit",
+    "tp2_hit", "runner_hit", "be_moved", "exit_reason", "trade_strength",
+    "edge_score", "journal_id", "learning_ctx", "auto_setup_key",
+    "auto_exec_status", "auto_opened_at",
+)
 
 
 def _managed_paper_journal_id(mt):
@@ -39859,6 +39869,47 @@ def _managed_paper_journal_id(mt):
         return str(uuid.uuid5(uuid.NAMESPACE_URL, "managed-paper|" + stable_key))
     except Exception:
         return None
+
+
+def _managed_paper_state_snapshot(mt):
+    """Return the JSON-safe managed state needed to continue after a restart."""
+    state = {key: mt.get(key) for key in _MANAGED_PAPER_STATE_KEYS if key in mt}
+    state["events_sent"] = list(mt.get("events_sent") or [])
+    return _swing_json_safe(state)
+
+
+def _restore_managed_paper_state(payload, internal_trade_id):
+    """Rebuild one open display-paper managed trade without side effects."""
+    if not isinstance(payload, dict):
+        return None
+    mt = dict(payload)
+    instrument = _instrument_from_text(mt.get("instrument") or mt.get("symbol"))
+    if instrument not in PAPER_JOURNAL_INSTRUMENTS or not mt.get("key"):
+        return None
+    mt["instrument"] = instrument
+    mt["key"] = tuple(mt["key"]) if isinstance(mt.get("key"), list) else mt["key"]
+    mt["events_sent"] = set(mt.get("events_sent") or [])
+    mt["native_journal_internal_trade_id"] = str(internal_trade_id)
+    mt["native_journal_source"] = "paper"
+    mt["paper_journal_activated"] = True
+    mt["source"] = "postgres"
+    mt["rehydrated_at"] = now_utc().isoformat()
+    mt["_paper_state_persisted"] = _managed_paper_state_snapshot(mt)
+    return mt
+
+
+def _persist_managed_paper_state(mt):
+    """Persist state changes needed for a paper managed trade to survive restart."""
+    if not isinstance(mt, dict) or mt.get("closed"):
+        return
+    iid = mt.get("native_journal_internal_trade_id")
+    if not iid or (mt.get("native_journal_source") or "").lower() != "paper":
+        return
+    state = _managed_paper_state_snapshot(mt)
+    if state == mt.get("_paper_state_persisted"):
+        return
+    _nj_update_execution(iid, {"managed_paper_state": state})
+    mt["_paper_state_persisted"] = state
 
 
 def _managed_trade_match_for_snapshot(snapshot):
@@ -40007,6 +40058,7 @@ def _ensure_managed_paper_journal(mt):
             source="system_auto",
         )
         mt["paper_journal_activated"] = True
+    _persist_managed_paper_state(mt)
 
 
 def _close_managed_paper_journal(mt):
@@ -85597,6 +85649,7 @@ if __name__ == "__main__":
         if _swing_htf_enabled():                   # SWING flag-on only — SCALP boot stays untouched
             _check_swing_thesis_db_ready()         # probe swing_theses (no DDL; table created via DB tool/publish diff)
             _load_swing_theses_from_db()           # rehydrate open multi-day SWING holds (INERT) BEFORE the worker/watcher
+        _load_managed_paper_trades_from_db()       # rehydrate open display-paper managed trades (INERT)
         _check_active_trades_db_ready()            # probe open_trades (no DDL; created via DB tool/publish diff)
         _load_active_trades_from_db()              # rehydrate open active positions (INERT) BEFORE the webhook worker
         _check_manual_trade_db_ready()             # probe manual_trades (no DDL; created via DB tool/publish diff)
