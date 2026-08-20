@@ -163,6 +163,16 @@ class TestNJCreateFromSnapshot(unittest.TestCase):
         self.assertIsNotNone(params)
         self.assertEqual(params[6], "PAPER")
 
+    def test_paper_execution_mode_is_labeled_paper_for_auto_origin(self):
+        """`source=auto` identifies the initiator; `mode=paper` is the safety mode."""
+        import app
+        snap = _make_snapshot(mode="paper", source="auto",
+                              broker_order_id=None, broker_signal_id=None)
+        app._nj_create_from_snapshot(snap)
+        _, params = self._get_insert_args()
+        self.assertIsNotNone(params)
+        self.assertEqual(params[6], "PAPER")
+
     def test_no_op_when_nj_db_not_ready(self):
         import app
         app.NJ_DB_READY = False
@@ -897,6 +907,135 @@ class TestNJNoDuplicates(unittest.TestCase):
         # Both calls fire the SQL — dedup is enforced by ON CONFLICT at DB level
         for c in insert_calls:
             self.assertIn("DO NOTHING", c[0][0])
+
+
+class TestManagedPaperJournalBridge(unittest.TestCase):
+    """Four-instrument paper journal coverage for managed display trades."""
+
+    def setUp(self):
+        import app
+        self.app = app
+        self.original_ready = app.NJ_DB_READY
+        self.original_managed = dict(app.MANAGED_TRADES_BY_KEY)
+        app.NJ_DB_READY = True
+        app.MANAGED_TRADES_BY_KEY.clear()
+
+    def tearDown(self):
+        self.app.NJ_DB_READY = self.original_ready
+        self.app.MANAGED_TRADES_BY_KEY.clear()
+        self.app.MANAGED_TRADES_BY_KEY.update(self.original_managed)
+
+    @staticmethod
+    def _managed_trade(inst, direction="Long", entry=100.0):
+        key = (inst, direction, round(entry, 0), "2026-08-20")
+        return {
+            "key": key,
+            "instrument": inst,
+            "symbol": inst + "1!",
+            "direction": direction,
+            "entry": entry,
+            "initial_stop": entry - 10.0,
+            "stop": entry - 10.0,
+            "tp1": entry + 10.0,
+            "risk_points": 10.0,
+            "point_value": 1.0,
+            "registered_at": "2026-08-20T14:00:00+00:00",
+            "learning_ctx": {
+                "strategy_key": "VWAP_PULLBACK_CONTINUATION",
+                "strategy": "VWAP Pullback",
+                "edge_score": 80,
+                "grade": "A",
+            },
+        }
+
+    def test_creates_explicit_paper_rows_for_all_four_instruments(self):
+        """Every canonical contract gets the same paper row shape, never a broker row."""
+        for index, inst in enumerate(("MGC", "MNQ", "MES", "MYM")):
+            mt = self._managed_trade(inst, entry=100.0 + index)
+            with self.subTest(instrument=inst), \
+                 patch.object(self.app, "_nj_create_from_snapshot") as create, \
+                 patch.object(self.app, "_nj_update_lifecycle") as lifecycle:
+                self.app._ensure_managed_paper_journal(mt)
+                create.assert_called_once()
+                snapshot = create.call_args.args[0]
+                self.assertEqual(snapshot["instrument"], inst)
+                self.assertEqual(snapshot["mode"], "paper")
+                self.assertEqual(snapshot["source"], "paper")
+                self.assertIsNone(snapshot["broker_order_id"])
+                self.assertIsNone(snapshot["broker_signal_id"])
+                self.assertEqual(create.call_args.kwargs["link_edge_ledger"], False)
+                lifecycle.assert_called_once()
+                self.assertEqual(mt["native_journal_source"], "paper")
+
+    def test_repeated_watcher_pass_keeps_one_stable_paper_identity(self):
+        mt = self._managed_trade("MNQ")
+        with patch.object(self.app, "_nj_create_from_snapshot") as create, \
+             patch.object(self.app, "_nj_update_lifecycle"):
+            self.app._ensure_managed_paper_journal(mt)
+            first_id = mt["native_journal_internal_trade_id"]
+            self.app._ensure_managed_paper_journal(mt)
+        self.assertEqual(create.call_count, 1)
+        self.assertEqual(mt["native_journal_internal_trade_id"], first_id)
+
+    def test_gateway_paper_snapshot_links_then_prevents_display_duplicate(self):
+        mt = self._managed_trade("MES", direction="Short", entry=200.0)
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        gateway_iid = str(uuid.uuid4())
+        snapshot = _make_snapshot(
+            internal_trade_id=gateway_iid,
+            instrument="MES",
+            direction="Short",
+            planned_entry=200.0,
+            planned_stop=210.0,
+            mode="paper",
+            source="auto",
+        )
+        self.app._link_gateway_snapshot_to_managed_trade(snapshot)
+        self.assertEqual(mt["native_journal_internal_trade_id"], gateway_iid)
+        self.assertEqual(mt["native_journal_source"], "paper")
+        with patch.object(self.app, "_nj_create_from_snapshot") as create, \
+             patch.object(self.app, "_nj_update_lifecycle"):
+            self.app._ensure_managed_paper_journal(mt)
+        create.assert_not_called()
+
+    def test_paper_close_persists_outcome_by_exact_internal_id(self):
+        mt = self._managed_trade("MYM")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "outcome": "Win",
+            "result_label": "Win (TP1)",
+            "exit_price": 110.0,
+            "pnl_dollars": 10.0,
+            "r_multiple": 1.0,
+        })
+        with patch.object(self.app, "_nj_set_outcome") as set_outcome:
+            self.app._close_managed_paper_journal(mt)
+        set_outcome.assert_called_once()
+        self.assertEqual(set_outcome.call_args.args[0], mt["native_journal_internal_trade_id"])
+        self.assertEqual(set_outcome.call_args.kwargs["actual_exit"], 110.0)
+        self.assertEqual(set_outcome.call_args.kwargs["pnl_dollars"], 10.0)
+        self.assertTrue(set_outcome.call_args.args[1]["paper_tracking"])
+
+    def test_paper_managed_close_skips_broad_instrument_fallback(self):
+        """Exact-ID paper closes must not claim a different same-side paper row."""
+        mt = self._managed_trade("MGC")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "outcome": "Win",
+            "result_label": "Win (TP1)",
+            "pnl_dollars": 10.0,
+        })
+        original_journal = list(self.app.JOURNAL)
+        self.app.JOURNAL.clear()
+        try:
+            with patch.object(self.app, "_nj_close_by_instrument") as close_by_instrument:
+                self.app._apply_outcome_to_journal(mt)
+            close_by_instrument.assert_not_called()
+        finally:
+            self.app.JOURNAL.clear()
+            self.app.JOURNAL.extend(original_journal)
 
 
 if __name__ == "__main__":

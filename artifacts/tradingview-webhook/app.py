@@ -34581,6 +34581,15 @@ def _watch_managed_trades():
         bar = bars.get(mt["instrument"])
         if not bar:
             continue
+        # A managed READY card normally represents a display/research observation,
+        # not an order.  Mirror those observations into the native journal as
+        # explicit PAPER trades once the watcher has seen the setup.  Gateway-originated
+        # paper trades attach their existing snapshot row before this loop runs, so
+        # this is idempotent and never creates a second journal row for one entry.
+        try:
+            _ensure_managed_paper_journal(mt)
+        except Exception as exc:
+            logger.debug("managed paper-journal bridge fail-open: %s", exc)
         # ── Same-bar / pre-entry fill guard ────────────────────────────────────
         # Never resolve a trade against a bar that OPENED at or before its entry:
         # that bar's high/low can include price action from BEFORE the trade was
@@ -35319,6 +35328,14 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
         except Exception as exc:
             logger.warning("session quality grade error: %s", exc)
 
+    # Native-journal paper bridge: close the exact row attached at entry, rather
+    # than using the broad instrument/direction fallback.  This keeps concurrent
+    # same-direction paper setups isolated and never changes broker execution.
+    try:
+        _close_managed_paper_journal(mt)
+    except Exception as exc:
+        logger.debug("managed paper-journal close fail-open: %s", exc)
+
     _send_outcome_update(mt)
     _apply_outcome_to_journal(mt)
 
@@ -35543,6 +35560,11 @@ def _apply_outcome_to_journal(mt):
     # _nj_set_outcome). Only mirror terminal states — skip Pending / T1-partial.
     _nj_outcome = mt.get("outcome") or ""
     if _nj_outcome in ("Win", "Loss", "Breakeven"):
+        # Managed PAPER rows have already been closed above by their exact UUID.
+        # Do not also use the old instrument/direction fallback: multiple paper
+        # setups can share both and the fallback could close a different row.
+        if (mt.get("native_journal_source") or "").lower() == "paper":
+            return
         try:
             _nj_close_by_instrument(
                 instrument  = mt.get("instrument") or "",
@@ -39158,6 +39180,10 @@ def _capture_send_time_snapshot(a, instrument, mode, source, contracts,
         )
         _persist_trade_snapshot(snap)
         _nj_create_from_snapshot(snap)   # Phase A: create native journal record
+        # If this paper/live gateway send belongs to a managed setup, retain its
+        # canonical native-journal ID on that setup.  The managed watcher then
+        # updates this exact row at close instead of creating a display-paper twin.
+        _link_gateway_snapshot_to_managed_trade(snap)
     except Exception as exc:
         logger.debug("_capture_send_time_snapshot fail-open: %s", exc)
 
@@ -39286,7 +39312,7 @@ def _boot_native_journal_table():
         logger.warning("native_journal table NOT ready: %s — native journal disabled", exc)
 
 
-def _nj_create_from_snapshot(snapshot):
+def _nj_create_from_snapshot(snapshot, *, link_edge_ledger=True):
     """Insert one native_journal row from an immutable snapshot dict.
 
     Idempotent: ON CONFLICT (internal_trade_id) DO NOTHING.
@@ -39298,7 +39324,8 @@ def _nj_create_from_snapshot(snapshot):
     if not iid:
         return
     raw_source = (snapshot.get("source") or "").lower()
-    if raw_source == "paper":
+    is_paper = raw_source == "paper" or (snapshot.get("mode") or "").lower() == "paper"
+    if is_paper:
         src_label = "PAPER"
     elif raw_source == "simulation":
         src_label = "SIMULATION"
@@ -39391,11 +39418,12 @@ def _nj_create_from_snapshot(snapshot):
     # within the last 10 minutes and records the internal_trade_id so the
     # managed outcome can be linked when the trade closes.  Promotes the
     # sample_partition from SHADOW → LIVE.  No-op when EL_DB_READY=False.
-    _el_try_link_to_journal(
-        iid=iid,
-        instrument=snapshot.get("instrument"),
-        direction=snapshot.get("direction"),
-    )
+    if link_edge_ledger:
+        _el_try_link_to_journal(
+            iid=iid,
+            instrument=snapshot.get("instrument"),
+            direction=snapshot.get("direction"),
+        )
 
 
 def _nj_update_lifecycle(internal_trade_id, new_status,
@@ -39808,6 +39836,199 @@ def _nj_close_by_instrument(instrument, direction, exit_reason,
     if actual_exit is not None:
         outcome_data["actual_exit"] = actual_exit
     _nj_set_outcome(iid, outcome_data, exit_reason=exit_reason, pnl_dollars=pnl_dollars)
+
+
+# ── Managed display/research → paper native-journal bridge ────────────────────
+#
+# The managed-trade watcher creates the `strategy_trades` display/research
+# outcomes that the operator sees today.  Those observations are useful paper
+# evidence, but they are not broker executions.  Keep them in native_journal as
+# explicit PAPER rows for the four supported contracts only.  The bridge is
+# deliberately outside the execution gateway: it does not build a broker payload,
+# post HTTP, arm execution, or change a trading verdict.
+PAPER_JOURNAL_INSTRUMENTS = frozenset(("MGC", "MNQ", "MES", "MYM"))
+
+
+def _managed_paper_journal_id(mt):
+    """Return a stable UUID for one managed paper setup, or None when unkeyed."""
+    try:
+        key = mt.get("key")
+        if not isinstance(key, tuple) or not key:
+            return None
+        stable_key = "|".join(str(part) for part in key)
+        return str(uuid.uuid5(uuid.NAMESPACE_URL, "managed-paper|" + stable_key))
+    except Exception:
+        return None
+
+
+def _managed_trade_match_for_snapshot(snapshot):
+    """Find the open managed setup corresponding to a gateway snapshot.
+
+    This is a narrow, in-memory correlation used only to attach a journal ID.
+    A missing/ambiguous match safely returns None; the gateway record remains
+    authoritative and no execution behavior changes.
+    """
+    if not isinstance(snapshot, dict):
+        return None
+    inst = _instrument_from_text(snapshot.get("instrument")) or snapshot.get("instrument")
+    direction = snapshot.get("direction")
+    try:
+        entry = float(snapshot.get("planned_entry"))
+    except (TypeError, ValueError):
+        return None
+    if not inst or not direction:
+        return None
+    best, best_distance = None, None
+    for mt in MANAGED_TRADES_BY_KEY.values():
+        if mt.get("closed") or mt.get("instrument") != inst:
+            continue
+        if mt.get("direction") != direction or mt.get("entry") is None:
+            continue
+        try:
+            distance = abs(float(mt.get("entry")) - entry)
+        except (TypeError, ValueError):
+            continue
+        tolerance = float(mt.get("risk_points") or 0.0)
+        if tolerance <= 0:
+            tolerance = max(abs(entry) * 0.001, 0.01)
+        if distance > tolerance:
+            continue
+        if best is None or distance < best_distance:
+            best, best_distance = mt, distance
+    return best
+
+
+def _link_gateway_snapshot_to_managed_trade(snapshot):
+    """Attach an existing gateway journal row to its managed paper setup.
+
+    This is what prevents a simulated gateway entry from also being inserted as
+    a managed display-paper row later in the watcher.
+    """
+    if not NJ_DB_READY or not isinstance(snapshot, dict):
+        return
+    iid = snapshot.get("internal_trade_id")
+    if not iid:
+        return
+    mt = _managed_trade_match_for_snapshot(snapshot)
+    if mt is None:
+        return
+    mt["native_journal_internal_trade_id"] = str(iid)
+    # Gateway callers use `source` for the initiator (auto/manual/micro_scalp),
+    # while `mode=paper` is the execution safety boundary.  Preserve that
+    # distinction in the immutable snapshot, but classify the attached journal
+    # row as PAPER so it receives the paper lifecycle/outcome bridge.
+    mt["native_journal_source"] = (
+        "paper" if (snapshot.get("mode") or "").lower() == "paper"
+        else (snapshot.get("source") or "").lower()
+    )
+
+
+def _managed_paper_snapshot(mt, internal_trade_id):
+    """Build an immutable, broker-free native-journal snapshot for a managed setup."""
+    ctx = mt.get("learning_ctx") or {}
+    instrument = _instrument_from_text(mt.get("instrument") or mt.get("symbol"))
+    targets = {
+        key: mt.get(key)
+        for key in ("tp1", "tp2", "tp3")
+        if mt.get(key) is not None
+    }
+    registered_at = mt.get("registered_at") or now_utc().isoformat()
+    strategy_key = ctx.get("strategy_key") or "MANAGED_DISPLAY_PAPER"
+    return {
+        "internal_trade_id": internal_trade_id,
+        "signal_id": "managed-paper:" + internal_trade_id,
+        "execution_fingerprint": "managed-paper:" + internal_trade_id,
+        "instrument": instrument,
+        "contract": mt.get("symbol") or instrument,
+        "mode": "paper",
+        "direction": mt.get("direction"),
+        "source": "paper",
+        "canonical_strategy_key": strategy_key,
+        "strategy_display_name": ctx.get("strategy") or strategy_key,
+        "setup_name": ctx.get("entry_reason") or "Managed display paper trade",
+        "playbook": ctx.get("strategy") or strategy_key,
+        "thesis_direction": mt.get("direction"),
+        "thesis_strength": mt.get("trade_strength"),
+        "thesis_alignment": None,
+        "edge_score": mt.get("edge_score") or ctx.get("edge_score"),
+        "grade": ctx.get("grade") or ctx.get("scalper_grade"),
+        "readiness": "PAPER_TRACKED",
+        "confirmations": [],
+        "blockers": [],
+        "opposing_structure": None,
+        "risk_state": "paper_tracking",
+        "planned_entry": mt.get("entry"),
+        "planned_stop": mt.get("initial_stop") or mt.get("stop"),
+        "planned_targets": targets,
+        "planned_risk": mt.get("risk_points"),
+        "planned_contracts": 1,
+        "broker_order_id": None,
+        "broker_signal_id": None,
+        "broker_metadata": {},
+        "created_at": registered_at,
+        "sent_at": registered_at,
+    }
+
+
+def _ensure_managed_paper_journal(mt):
+    """Create/activate one PAPER native-journal row for a display managed trade.
+
+    Existing gateway rows are linked first by `_capture_send_time_snapshot`, so
+    this helper only creates a row for managed display/research trades that never
+    entered any broker or gateway path.  The UUIDv5 identity plus DB conflict
+    guard makes repeated watcher passes harmless.
+    """
+    if not NJ_DB_READY or not isinstance(mt, dict) or mt.get("closed"):
+        return
+    instrument = _instrument_from_text(mt.get("instrument") or mt.get("symbol"))
+    if instrument not in PAPER_JOURNAL_INSTRUMENTS:
+        return
+    iid = mt.get("native_journal_internal_trade_id")
+    source = (mt.get("native_journal_source") or "").lower()
+    if not iid:
+        iid = _managed_paper_journal_id(mt)
+        if not iid:
+            return
+        _nj_create_from_snapshot(
+            _managed_paper_snapshot(mt, iid),
+            link_edge_ledger=False,
+        )
+        mt["native_journal_internal_trade_id"] = iid
+        mt["native_journal_source"] = "paper"
+        source = "paper"
+    # A gateway record may be paper or a live system row.  Paper records get an
+    # explicit active lifecycle; live records are intentionally left untouched.
+    if source == "paper" and not mt.get("paper_journal_activated"):
+        _nj_update_lifecycle(
+            iid,
+            "ACTIVE",
+            event_type="POSITION_OPENED",
+            event_data={"tracking": "managed_paper", "paper_only": True},
+            source="system_auto",
+        )
+        mt["paper_journal_activated"] = True
+
+
+def _close_managed_paper_journal(mt):
+    """Persist a terminal managed-paper outcome on its exact native row."""
+    if not NJ_DB_READY or not isinstance(mt, dict):
+        return
+    iid = mt.get("native_journal_internal_trade_id")
+    if not iid or (mt.get("native_journal_source") or "").lower() != "paper":
+        return
+    _nj_set_outcome(
+        iid,
+        {
+            "paper_tracking": True,
+            "managed_result": mt.get("outcome"),
+            # Dynamic SCALP exits can be blended; retain that authoritative
+            # managed calculation alongside the immutable-plan realized_r.
+            "managed_r_multiple": mt.get("r_multiple"),
+        },
+        exit_reason=mt.get("result_label") or mt.get("outcome") or "paper_trade_closed",
+        pnl_dollars=mt.get("pnl_dollars"),
+        actual_exit=mt.get("exit_price"),
+    )
 
 
 # ─────────────────────────────────────────────────────────────────────────────

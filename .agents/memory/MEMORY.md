@@ -1,9 +1,5 @@
 # Memory Index
 
-- [INTRADAY_TREND tiered verdict: READY_REDUCED](it-tiered-verdict.md) — AWAITING_CONFIRMATION 90% win-rate → READY_REDUCED at 50% dollar-risk; 4-tuple confirmation return; gate_effectiveness IT-native extraction; 40 tests.
-- [INTRADAY_TREND native gate routing](intraday-trend-native-gate.md) — IT bypasses SWING strict gate; `_it_legacy_strict` shadow-only; 2 surgical edits in full_analysis.
-- [INTRADAY_TREND strategy](intraday-trend-strategy.md) — MODES["INTRADAY_TREND"]=dict(MODES["SWING"]); MNQ-only; 3 gates; panel reuses mod-swingdiag; full_analysis wiring pattern.
-- [INTRADAY_TREND Phase 2 gaps](intraday-trend-phase2.md) — 7 ghost columns, 8 new helpers, confirmation/structural-stop/sizing/daily-cap/mgmt gaps closed; 105 tests in test_intraday_trend_phase2.py; prod schema needs Publish.
 - [INTRADAY_TREND dedicated plan engine](intraday-trend-plan-engine.md) — build_intraday_trade_plan() fully separated from SWING; structural stop only, targets from real session levels ≥2R, 15:15 cutoff, chase gate; _swing_htf_enabled() SWING-only.
 - [INTRADAY_TREND native engine](intraday-trend-native-engine.md) — 6 native IT helpers + analyze_intraday_trend(); BLOCKED_EXTENSION/OPPOSED_1H status codes; 5 ghost_obs columns; 109 tests; ghost/shadow only.
 
@@ -15,7 +11,6 @@
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); MGC/MNQ string symmetry; any scoring change must keep invariants.
-- [ATR stop multiplier history](atr-stop-multiplier-history.md) — now 2.5/3.0 (normal/high); MAX_RISK_DOLLARS must be raised in lockstep or MNQ goes over_cap and is silently blocked.
 - [Switching the live trading mode](switching-live-trading-mode.md) — durable mode switch = TRADING_MODE env + republish; /mode toggle is in-memory/non-durable; "correctly quiet vs broken" via swing_diagnostics.
 - [Strict trade ruleset](strict-trade-ruleset.md) — READY gate MODE-TUNABLE: SWING zone+vwap+structure@80; SCALP demotes ZONE ONLY; Edge bands 40/50/60; alert_level≠conviction_tier; ticker-authoritative.
 - [full_analysis single return path](full-analysis-return-parity.md) — one return dict; hard-indexed consumers make a missing key a state-dependent 500; mirror keys if an early return is re-added.
@@ -43,7 +38,6 @@
 - [Managed-trade close persistence](managed-trade-close-persistence.md) — closing a managed trade must _persist_swing_thesis() for is_swing or it resurrects OPEN on boot; /stop-managing flushes all 3 local position stores.
 - [R:R model: SWING 1:3, SCALP 1:1, ORB 1:4](fixed-1to1-rr.md) — SWING_MIN_RR(3.0) primary freq lever; SCALP default 1:1 (2R caused stop-outs with single-TP broker); RR from rr_num.
 - [Dual-timeframe SCALP engine](dual-tf-engine.md) — flag-gated DUAL_TF_ENGINE: READY = standing bias + ≥2 distinct confirms (CVD/sweep/volume ONLY — VWAP/DELTA never count) within 10s; flag-OFF byte-identical needs dormant guard.
-- [Golden session-bonus pin](golden-session-bonus-flakiness.md) — goldens PINNED to fixed 03:00 ET (bonus 0); uniform ±10 score drift = pin reverted (restore, don't rebaseline); parity always clock-independent.
 - [SCALP auto-execute trigger timing](scalp-auto-execute-trigger.md) — SCALP auto fires on LIVE is_actionable (EARLY 50-59 INCLUDED half-size); AUTO_FIRED_KEYS EARLY≡FULL same zone = one entry; SCALP STACKS bounded by daily cap; STOP_HIT re-arms.
 - [SWING HTF data layer](swing-htf-data-layer.md) — _swing_htf_enabled() master gate; auto-computed 1H/4H(resampled)/Daily bias+levels in HTF_STATE_BY_INST; compute_swing_context() stable schema fail-OPEN; SCALP+flag-off byte-identical.
 - [Per-instrument open-position isolation](per-instrument-active-trade-isolation.md) — ACTIVE_TRADES_BY_INST (one slot per instrument, RLock); _resolve_active_trade explicit bad ticker→400; ALERT_HISTORY stays SHARED+widened.
@@ -76,7 +70,6 @@
 - [Canonical Decision Contract Phase 3](decision-contract-phase3.md) — shadow-only typed state machine; 5 app.py hooks; 166 tests; DC_DB_READY flag; /decision-state route; never gates.
 - [Decision Contract boot flags](decision-contract-boot-flags.md) — TWO separate DC_DB_READY flags; registry.boot() must be called or persistence silently skips; get_all_states() returns Dict not list.
 - [Signal source ownership](signal-source-ownership.md) — CVD/RVOL now Databento-only via _databento_is_canonical guard; FVG already clean; BOS/sweep/VWAP/zones still dual or legacy.
-- [SCALP Feedback Loop Repair](scalp-feedback-loop-repair.md) — 6 root causes fixed; schema patch comment-parse trap; ghost_obs uses signal_time not ts; INSERT=39 params.
 - [Order Flow Engine V1](order-flow-v1.md) — bar buy/sell vol in databento_brain + cvd_snapshot; compute_order_flow() LAST in full_analysis; 14 of_* columns in ghost_observations; flag OFF byte-identical; cvd_slope n=bars-back-from-last (not len-n); sweep = range spike vs avg_range (not wick/body).
 - [Ghost Research Engine Phase 2](ghost-research-engine-phase2.md) — 10-variant shadow experiment platform; OrbEngine BREAKOUT_DETECTED hook; bootstrap CI + Monte Carlo; evidence state machine; 118 tests; GRE_DB_READY flag; 7 Flask routes + proxy whitelist; RESEARCH_READY_FOR_REVIEW dock alert.
 - [GRE Phase 4 — FVG_REVISIT Research Family](gre-phase4-fvg-revisit.md) — FVG_REVISIT as Research Family #2; strategy_family/strategy SEPARATE fields; deterministic rfid/revisit_id; 10 variants; 86 tests; prod DB apply still needed.
@@ -116,6 +109,7 @@
 - [Native Journal Phase B — Management Timeline](native-journal-phase-b.md) — 10 wire points; _nj_set_outcome idempotency guard + 5-col SELECT; _mock_db_row needs 5 values in Phase A tests; managed-trade close gap fixed via _close_managed_trade NJ hook.
 - [Native Journal read API (Phase 7K-A.2)](native-journal-read-api.md) — 3 Flask routes + proxy whitelist + JNativeTradesTab + source selector in JTradesTab; React.Fragment wrapper required (bare <> gets consumed by inner detail-pane fragment); prod schema not yet applied (Publish first).
 - [Native Journal Phase C — Review workflow](native-journal-phase-c.md) — PATCH /review + screenshot routes placed BEFORE @_arm_owner_required definition → decorator removed (Express auth sufficient); Phase A _set_row needs 7 cols after source_label added; 53 tests.
+- [Managed paper journal bridge](managed-paper-journal-bridge.md) — Display-managed MGC/MNQ/MES/MYM trades mirror as PAPER by stable UUID; gateway paper rows attach first to prevent duplicates.
 - [Journal Coaching Drill-Down (Phase 7O.1)](journal-coaching-drilldown.md) — _RATING_FIELDS frozenset at module level; JDrillFilter 15-field contract; JCoachingTab onDrill prop; JournalFullPage URL sync + popstate; 41 tests.
 - [Directional Symmetry Audit (Phase 7M)](directional-symmetry-audit.md) — Market-Driven verdict; 23 tests; fixture lessons: MITIGATED_FLAG=False for SCALP, INST not TICKER key, stale-VWAP tests gate_debug.vwap_confirmed not score delta.
 - [Candidate Preview Panel](candidate-preview-panel.md) — TradePlanPanel reads p.candidate_preview (not strategy_scanner.trade_plan); 5-state model; _mb_candidate_preview() is the backend source; 18 tests.
