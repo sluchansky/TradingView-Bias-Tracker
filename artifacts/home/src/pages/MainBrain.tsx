@@ -8150,22 +8150,24 @@ const JTradesTab: React.FC<{
 
   useEffect(() => { fetchTrades(1); }, [fetchTrades]);
 
-  // Phase 7N Batch C: load eligibility map once on mount
-  useEffect(() => {
-    (async () => {
-      try {
-        const r = await fetch('/api/journal/learning-eligibility', { headers: getAuthHeader() });
-        const d = await r.json();
-        if (d.ok && d.records) {
-          const m: Record<string, { status: string; reason: string }> = {};
-          for (const rec of d.records as { source: string; trade_id: number; status: string; reason: string }[]) {
-            m[`${rec.source}-${rec.trade_id}`] = { status: rec.status, reason: rec.reason };
-          }
-          setEligibilityMap(m);
+  // Phase 7N Batch C: load the per-trade eligibility map.
+  // This is display-only, but it must be refreshable after a review save so
+  // the badge reflects the server's current review status without a reload.
+  const refreshEligibility = useCallback(async () => {
+    try {
+      const r = await fetch('/api/journal/learning-eligibility', { headers: getAuthHeader() });
+      const d = await r.json();
+      if (d.ok && d.records) {
+        const m: Record<string, { status: string; reason: string }> = {};
+        for (const rec of d.records as { source: string; trade_id: number; status: string; reason: string }[]) {
+          m[`${rec.source}-${rec.trade_id}`] = { status: rec.status, reason: rec.reason };
         }
-      } catch { /* fail silently — badge is display-only */ }
-    })();
+        setEligibilityMap(m);
+      }
+    } catch { /* fail silently — badge is display-only */ }
   }, []);
+
+  useEffect(() => { refreshEligibility(); }, [refreshEligibility]);
 
   // Phase 7K-A.2 — fetch source counts on mount (fail-open; display-only)
   useEffect(() => {
@@ -8241,6 +8243,7 @@ const JTradesTab: React.FC<{
       ));
     }
     fetchQueueCount();
+    refreshEligibility();
   };
 
   const saveNote = async () => {
