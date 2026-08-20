@@ -309,6 +309,7 @@ _WEBHOOK_TS       = deque(maxlen=5000)   # inbound POST /webhook timestamps (UTC
 _DUP_TS           = deque(maxlen=5000)   # duplicate-signal timestamps (UTC)
 # ── Trade-management watcher state (additive; separate from manual ACTIVE_TRADE) ──
 MANAGED_TRADES_BY_KEY = {}  # (instrument,direction,entry_lo,date) -> managed-trade dict
+_MANAGED_PAPER_EFFECTS = threading.local()
 LAST_READY_BY_TICKER  = {}  # instrument -> last READY card entry snapshot (for /why)
 ZONE_BROKEN_AT      = None   # {"price": float, "alerts_since": int}
 # Zone-mitigation state is tracked PER INSTRUMENT so one instrument's mitigation
@@ -34571,13 +34572,34 @@ def _watch_managed_trades():
     """Evaluate every open managed trade against the latest bar (one fetch per
     instrument per cycle). Called from _managed_watch_loop on its own fast timer
     (MANAGED_WATCH_INTERVAL)."""
-    active = [mt for mt in MANAGED_TRADES_BY_KEY.values() if not mt.get("closed")]
+    active = [
+        mt for mt in MANAGED_TRADES_BY_KEY.values()
+        if (not mt.get("closed") or mt.get("_paper_terminal_pending")
+            or mt.get("_paper_cancel_pending"))
+    ]
     if not active:
         return
     bars = {}
     for inst in {mt["instrument"] for mt in active}:
         bars[inst] = _fetch_latest_bar(inst)
     for mt in active:
+        if mt.get("_paper_terminal_pending"):
+            # A terminal PAPER outcome was observed, but neither its exact-row
+            # close nor the durable terminal fence succeeded yet. Retry only the
+            # persistence bridge; never evaluate, notify, or book it again.
+            if _close_managed_paper_journal(mt):
+                mt.pop("_paper_terminal_pending", None)
+            continue
+        if mt.get("_paper_cancel_pending"):
+            # A failed stop request remains locally inert until the durable
+            # journal/intent fence succeeds. It must never be evaluated as open.
+            mt["closed"] = True
+            _cancel_managed_paper_journal(mt)
+            if not mt.get("_paper_cancel_pending"):
+                mt.pop("_paper_cancel_pending", None)
+            elif not mt.get("_paper_stop_fenced"):
+                mt["closed"] = False
+            continue
         bar = bars.get(mt["instrument"])
         if not bar:
             continue
@@ -34587,9 +34609,15 @@ def _watch_managed_trades():
         # paper trades attach their existing snapshot row before this loop runs, so
         # this is idempotent and never creates a second journal row for one entry.
         try:
-            _ensure_managed_paper_journal(mt)
+            paper_journal_ready = _ensure_managed_paper_journal(mt)
         except Exception as exc:
-            logger.debug("managed paper-journal bridge fail-open: %s", exc)
+            logger.debug("managed paper-journal bridge not ready: %s", exc)
+            paper_journal_ready = False
+        # A paper lifecycle cannot advance beyond the latest recoverable snapshot.
+        # Retry the bridge next pass rather than allowing a partial/runner/terminal
+        # transition to exist only in memory across a restart.
+        if not paper_journal_ready:
+            continue
         # ── Same-bar / pre-entry fill guard ────────────────────────────────────
         # Never resolve a trade against a bar that OPENED at or before its entry:
         # that bar's high/low can include price action from BEFORE the trade was
@@ -34602,10 +34630,32 @@ def _watch_managed_trades():
         if (_bar_start is not None and _entry_epoch is not None
                 and _bar_start <= _entry_epoch):
             continue
+        state_before_eval = copy.deepcopy(mt)
+        deferred_effects = []
+        _MANAGED_PAPER_EFFECTS.queue = deferred_effects
         try:
             _evaluate_managed_trade_levels(mt, bar)
         except Exception as exc:
             logger.error("Managed-trade eval error (%s): %s", mt.get("key"), exc)
+            continue
+        finally:
+            _MANAGED_PAPER_EFFECTS.queue = None
+        # Terminal outcomes have their own immutable terminal fence and exact-row
+        # retry path. Every non-terminal lifecycle mutation must itself be durable
+        # before remaining visible to the next watcher pass.
+        if not mt.get("closed"):
+            try:
+                state_durable = _persist_managed_paper_state(mt)
+            except Exception as exc:
+                logger.debug("managed paper state persist not ready: %s", exc)
+                state_durable = False
+            if not state_durable:
+                mt.clear()
+                mt.update(state_before_eval)
+                logger.warning("managed paper lifecycle paused for %s; recovery state not durable",
+                               mt.get("instrument") or mt.get("symbol") or "unknown")
+                continue
+        _flush_managed_paper_effects(deferred_effects)
 
 
 def _scalp_dynamic_lifecycle_enabled(mt):
@@ -34672,10 +34722,21 @@ def _maybe_move_be_to_entry(mt, bar):
     _send_management_update(mt, "Stop \u2192 break-even",
                             f"Stop moved to entry ({entry}) after TP1.")
     # Best-effort mirror onto the broker/dashboard tracker so manual views agree.
+    # During a PAPER watcher transition it is deferred until that transition has
+    # durable native-journal state.
+    effects = getattr(_MANAGED_PAPER_EFFECTS, "queue", None)
+    if effects is not None:
+        effects.append(("mirror_break_even", mt.get("instrument"), mt.get("direction"), entry))
+        return
+    _mirror_managed_break_even(mt.get("instrument"), mt.get("direction"), entry)
+
+
+def _mirror_managed_break_even(instrument, direction, entry):
+    """Apply the dashboard active-trade BE mirror after a durable transition."""
     try:
-        _at = active_trade_for(mt.get("instrument"))
+        _at = active_trade_for(instrument)
         if (_at and _at.get("status") != "closed"
-                and _at.get("direction") == mt.get("direction")):
+                and _at.get("direction") == direction):
             _at["stop_loss"] = entry
     except Exception:
         pass
@@ -35276,6 +35337,7 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
     card, and write the result back to the linked journal entry."""
     if mt.get("closed"):
         return
+    pre_close_state = copy.deepcopy(mt)
     mt["closed"]       = True
     mt["outcome"]      = outcome
     mt["result_label"] = result_label
@@ -35306,6 +35368,26 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
     mt["mfe_r"]       = round(mt["mfe"] / risk, 2) if risk else 0.0
     mt["mae_r"]       = round(mt["mae"] / risk, 2) if risk else 0.0
 
+    # Native-journal paper bridge: a terminal PAPER outcome must first gain a
+    # durable fence (or exact-row confirmation). Without either, roll back before
+    # any notification, learning, or display side-effect can make it look closed.
+    paper_close_ok = None
+    if (mt.get("native_journal_source") or "").lower() == "paper":
+        try:
+            paper_close_ok = _close_managed_paper_journal(mt)
+        except Exception as exc:
+            logger.debug("managed paper-journal close unavailable: %s", exc)
+            paper_close_ok = False
+        if not paper_close_ok:
+            if mt.get("_paper_terminal_fenced"):
+                mt["_paper_terminal_pending"] = True
+            else:
+                mt.clear()
+                mt.update(pre_close_state)
+                logger.warning("managed paper terminal outcome paused for %s; no durable fence",
+                               mt.get("instrument") or mt.get("symbol") or "unknown")
+                return False
+
     # ── Trade-management analytics sidecar (DISPLAY/ANALYTICS; flag-gated) ──
     # Computes MFE/MAE booleans + commission impact + the oversized-loss flag from the
     # already-finalised result and persists a metrics row (INSERT/SELECT only, fail-open
@@ -35327,14 +35409,6 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
                 _persist_session_quality_grade(_grade)
         except Exception as exc:
             logger.warning("session quality grade error: %s", exc)
-
-    # Native-journal paper bridge: close the exact row attached at entry, rather
-    # than using the broad instrument/direction fallback.  This keeps concurrent
-    # same-direction paper setups isolated and never changes broker execution.
-    try:
-        _close_managed_paper_journal(mt)
-    except Exception as exc:
-        logger.debug("managed paper-journal close fail-open: %s", exc)
 
     _send_outcome_update(mt)
     _apply_outcome_to_journal(mt)
@@ -35444,15 +35518,37 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
 def _send_management_update(mt, title, detail):
     """Record + post a single trade-management update to the instrument channel."""
     mt.setdefault("updates", []).append(f"{title} — {detail}")
-    url = _discord_url(mt.get("symbol") or mt.get("instrument"))
+    effects = getattr(_MANAGED_PAPER_EFFECTS, "queue", None)
+    if effects is not None:
+        effects.append(("management_update", mt.get("symbol") or mt.get("instrument"),
+                        mt.get("instrument"), mt.get("direction"), title, detail))
+        return
+    _post_management_update(mt.get("symbol") or mt.get("instrument"),
+                            mt.get("instrument"), mt.get("direction"), title, detail)
+
+
+def _post_management_update(symbol, instrument, direction, title, detail):
+    """Post a management transition that has already been made durable."""
+    url = _discord_url(symbol)
     if not url:
         return
-    content = (f"**{mt.get('instrument')} {mt.get('direction')} — Trade Management**\n"
+    content = (f"**{instrument} {direction} — Trade Management**\n"
                f"{title}\n{detail}")
     try:
         requests.post(url, json={"content": content[:1900]}, timeout=5)
     except Exception as exc:
         logger.error("Management update post error: %s", exc)
+
+
+def _flush_managed_paper_effects(effects):
+    """Publish deferred non-terminal effects only after state persistence succeeds."""
+    for effect in effects or []:
+        if effect[0] == "management_update":
+            _, symbol, instrument, direction, title, detail = effect
+            _post_management_update(symbol, instrument, direction, title, detail)
+        elif effect[0] == "mirror_break_even":
+            _, instrument, direction, entry = effect
+            _mirror_managed_break_even(instrument, direction, entry)
 
 
 def _send_outcome_update(mt):
@@ -36806,6 +36902,8 @@ def _swing_mt_snapshot(mt):
         "thesis_key", "swing_thesis", "is_swing",
         "swing_reduced", "swing_stop_moved", "swing_exit_advised",
         "auto_setup_key", "auto_exec_status", "auto_opened_at",
+        "native_journal_internal_trade_id", "native_journal_source",
+        "paper_journal_activated",
     )
     snap = {k: mt.get(k) for k in keys if k in mt}
     snap["events_sent"] = list(mt.get("events_sent") or [])
@@ -39178,12 +39276,14 @@ def _capture_send_time_snapshot(a, instrument, mode, source, contracts,
             direction=direction, entry=entry, stop=stop, t1=t1, t2=t2,
             broker_out=broker_out or {},
         )
+        _attach_managed_paper_state_to_gateway_snapshot(snap)
         _persist_trade_snapshot(snap)
-        _nj_create_from_snapshot(snap)   # Phase A: create native journal record
+        native_created = _nj_create_from_snapshot(snap)   # Phase A: create native journal record
         # If this paper/live gateway send belongs to a managed setup, retain its
         # canonical native-journal ID on that setup.  The managed watcher then
         # updates this exact row at close instead of creating a display-paper twin.
-        _link_gateway_snapshot_to_managed_trade(snap)
+        if native_created:
+            _link_gateway_snapshot_to_managed_trade(snap)
     except Exception as exc:
         logger.debug("_capture_send_time_snapshot fail-open: %s", exc)
 
@@ -39319,10 +39419,10 @@ def _nj_create_from_snapshot(snapshot, *, link_edge_ledger=True):
     FAIL-OPEN — never raises, never blocks the trade path.
     """
     if not NJ_DB_READY or not isinstance(snapshot, dict):
-        return
+        return False
     iid = snapshot.get("internal_trade_id")
     if not iid:
-        return
+        return False
     raw_source = (snapshot.get("source") or "").lower()
     is_paper = raw_source == "paper" or (snapshot.get("mode") or "").lower() == "paper"
     if is_paper:
@@ -39340,9 +39440,14 @@ def _nj_create_from_snapshot(snapshot, *, link_edge_ledger=True):
     }
     if broker_meta:
         exec_block["broker_metadata"] = broker_meta
+    managed_paper_state = snapshot.get("managed_paper_state")
+    if isinstance(managed_paper_state, dict):
+        # Written in the same INSERT as the PAPER row so a restart cannot observe
+        # an ACTIVE managed trade without enough state to rehydrate it.
+        exec_block["managed_paper_state"] = managed_paper_state
     conn = _learning_conn()
     if conn is None:
-        return
+        return False
     try:
         cur = conn.cursor()
         cur.execute(
@@ -39406,8 +39511,10 @@ def _nj_create_from_snapshot(snapshot, *, link_edge_ledger=True):
             src_label,
             str(iid),
         )
+        created = True
     except Exception as exc:
         logger.debug("_nj_create_from_snapshot fail-open: %s", exc)
+        created = False
     finally:
         try:
             conn.close()
@@ -39424,6 +39531,7 @@ def _nj_create_from_snapshot(snapshot, *, link_edge_ledger=True):
             instrument=snapshot.get("instrument"),
             direction=snapshot.get("direction"),
         )
+    return created
 
 
 def _nj_update_lifecycle(internal_trade_id, new_status,
@@ -39433,10 +39541,10 @@ def _nj_update_lifecycle(internal_trade_id, new_status,
     FAIL-OPEN — never raises.
     """
     if not NJ_DB_READY or not internal_trade_id:
-        return
+        return False
     if new_status not in _NJ_VALID_STATUSES:
         logger.debug("_nj_update_lifecycle: unknown status %r — ignored", new_status)
-        return
+        return False
     evt = {
         "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
         "event_type": event_type or "STATUS_CHANGE",
@@ -39449,7 +39557,7 @@ def _nj_update_lifecycle(internal_trade_id, new_status,
         evt.update(event_data)
     conn = _learning_conn()
     if conn is None:
-        return
+        return False
     try:
         cur = conn.cursor()
         cur.execute(
@@ -39460,11 +39568,14 @@ def _nj_update_lifecycle(internal_trade_id, new_status,
                WHERE internal_trade_id = %s""",
             (new_status, json.dumps([evt], default=str), str(internal_trade_id)),
         )
+        matched_row = cur.rowcount > 0
         conn.commit()
         cur.close()
         logger.debug("native_journal %.8s → %s", str(internal_trade_id), new_status)
+        return matched_row
     except Exception as exc:
         logger.debug("_nj_update_lifecycle fail-open: %s", exc)
+        return False
     finally:
         try:
             conn.close()
@@ -39479,10 +39590,10 @@ def _nj_update_execution(internal_trade_id, patch):
     FAIL-OPEN — never raises.
     """
     if not NJ_DB_READY or not internal_trade_id or not isinstance(patch, dict):
-        return
+        return False
     conn = _learning_conn()
     if conn is None:
-        return
+        return False
     try:
         cur = conn.cursor()
         cur.execute(
@@ -39492,10 +39603,13 @@ def _nj_update_execution(internal_trade_id, patch):
                WHERE internal_trade_id = %s""",
             (json.dumps(patch, default=str), str(internal_trade_id)),
         )
+        matched_row = cur.rowcount > 0
         conn.commit()
         cur.close()
+        return matched_row
     except Exception as exc:
         logger.debug("_nj_update_execution fail-open: %s", exc)
+        return False
     finally:
         try:
             conn.close()
@@ -39671,10 +39785,10 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
     FAIL-OPEN — never raises.
     """
     if not NJ_DB_READY or not internal_trade_id:
-        return
+        return False
     conn = _learning_conn()
     if conn is None:
-        return
+        return False
     try:
         cur = conn.cursor()
         cur.execute(
@@ -39685,12 +39799,12 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
         row = cur.fetchone()
         if not row:
             cur.close()
-            return
+            return False
         planned_entry, planned_stop, direction, created_at_row, current_lifecycle = row
         # Idempotency guard — already terminal
         if (current_lifecycle or "") in _NJ_TERMINAL_OUTCOMES:
             cur.close()
-            return
+            return True
         out = dict(outcome_data) if isinstance(outcome_data, dict) else {}
         if actual_exit is not None:
             out["actual_exit"] = actual_exit
@@ -39763,6 +39877,7 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
                 str(internal_trade_id),
             ),
         )
+        updated = cur.rowcount > 0
         conn.commit()
         # ── Phase 8A: propagate managed outcome to edge_ledger (FAIL-OPEN) ──
         # `out` has actual_exit, net_pnl, realized_r computed above.
@@ -39775,6 +39890,7 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
         )
     except Exception as exc:
         logger.debug("_nj_set_outcome fail-open: %s", exc)
+        updated = False
     finally:
         try:
             conn.close()
@@ -39782,6 +39898,7 @@ def _nj_set_outcome(internal_trade_id, outcome_data,
             pass
     # Eligibility check runs outside the connection block (fail-open pattern)
     _nj_check_and_set_learning_eligible(internal_trade_id)
+    return bool(updated)
 
 def _nj_find_open_by_instrument(instrument, direction=None):
     """Return internal_trade_id (str) for the most recent open NJ row.
@@ -39853,9 +39970,13 @@ _MANAGED_PAPER_STATE_KEYS = (
     "tp1_pct", "tp2_pct", "runner_pct", "risk_points", "point_value",
     "registered_at", "entry_epoch", "updates", "mfe", "mae", "be_active",
     "closed", "initial_stop", "remaining_pct", "realized_r", "tp1_hit",
-    "tp2_hit", "runner_hit", "be_moved", "exit_reason", "trade_strength",
+    "tp2_hit", "runner_hit", "be_moved", "cp_peak", "cp_trough", "exit_reason", "trade_strength",
     "edge_score", "journal_id", "learning_ctx", "auto_setup_key",
     "auto_exec_status", "auto_opened_at",
+    # SWING dispatch and thesis-review continuity. A recovered SWING must not
+    # fall into the SCALP lifecycle or lose a once-only advisory decision.
+    "is_swing", "thesis_key", "swing_thesis",
+    "swing_reduced", "swing_stop_moved", "swing_exit_advised",
 )
 
 
@@ -39901,15 +40022,24 @@ def _restore_managed_paper_state(payload, internal_trade_id):
 def _persist_managed_paper_state(mt):
     """Persist state changes needed for a paper managed trade to survive restart."""
     if not isinstance(mt, dict) or mt.get("closed"):
-        return
+        return True
     iid = mt.get("native_journal_internal_trade_id")
     if not iid or (mt.get("native_journal_source") or "").lower() != "paper":
-        return
+        return True
     state = _managed_paper_state_snapshot(mt)
     if state == mt.get("_paper_state_persisted"):
-        return
-    _nj_update_execution(iid, {"managed_paper_state": state})
-    mt["_paper_state_persisted"] = state
+        return True
+    if _nj_update_execution(iid, {"managed_paper_state": state}):
+        mt["_paper_state_persisted"] = state
+        mt.pop("_paper_state_persist_warning", None)
+        return True
+    elif not mt.get("_paper_state_persist_warning"):
+        # One visible warning per pending retry protects the operator from a
+        # silently non-recoverable paper lifecycle without spamming each watch pass.
+        logger.warning("managed paper journal state not durable for %s; will retry",
+                       mt.get("instrument") or mt.get("symbol") or "unknown")
+        mt["_paper_state_persist_warning"] = True
+    return False
 
 
 def _managed_trade_match_for_snapshot(snapshot):
@@ -39947,6 +40077,15 @@ def _managed_trade_match_for_snapshot(snapshot):
         if best is None or distance < best_distance:
             best, best_distance = mt, distance
     return best
+
+
+def _attach_managed_paper_state_to_gateway_snapshot(snapshot):
+    """Embed managed PAPER recovery state before the gateway row is inserted."""
+    if not isinstance(snapshot, dict) or (snapshot.get("mode") or "").lower() != "paper":
+        return
+    mt = _managed_trade_match_for_snapshot(snapshot)
+    if mt is not None:
+        snapshot["managed_paper_state"] = _managed_paper_state_snapshot(mt)
 
 
 def _link_gateway_snapshot_to_managed_trade(snapshot):
@@ -40016,6 +40155,10 @@ def _managed_paper_snapshot(mt, internal_trade_id):
         "broker_order_id": None,
         "broker_signal_id": None,
         "broker_metadata": {},
+        # Kept in native_journal.execution by _nj_create_from_snapshot. It is
+        # deliberately included in the initial INSERT, not only a later UPDATE,
+        # so a process crash between create and activate remains recoverable.
+        "managed_paper_state": _managed_paper_state_snapshot(mt),
         "created_at": registered_at,
         "sent_at": registered_at,
     }
@@ -40029,46 +40172,67 @@ def _ensure_managed_paper_journal(mt):
     entered any broker or gateway path.  The UUIDv5 identity plus DB conflict
     guard makes repeated watcher passes harmless.
     """
-    if not NJ_DB_READY or not isinstance(mt, dict) or mt.get("closed"):
-        return
+    if not isinstance(mt, dict) or mt.get("closed"):
+        return True
     instrument = _instrument_from_text(mt.get("instrument") or mt.get("symbol"))
     if instrument not in PAPER_JOURNAL_INSTRUMENTS:
-        return
+        return True
+    if not NJ_DB_READY:
+        return False
     iid = mt.get("native_journal_internal_trade_id")
     source = (mt.get("native_journal_source") or "").lower()
     if not iid:
         iid = _managed_paper_journal_id(mt)
         if not iid:
-            return
-        _nj_create_from_snapshot(
+            return False
+        if not _nj_create_from_snapshot(
             _managed_paper_snapshot(mt, iid),
             link_edge_ledger=False,
-        )
+        ):
+            return False
         mt["native_journal_internal_trade_id"] = iid
         mt["native_journal_source"] = "paper"
         source = "paper"
-    # A gateway record may be paper or a live system row.  Paper records get an
+    # State must be durable before the row becomes ACTIVE. For a new display row
+    # it was included atomically in the INSERT; this confirms/retries it. For an
+    # attached gateway-paper row it establishes the managed recovery state first.
+    if source == "paper":
+        if not _persist_managed_paper_state(mt):
+            return False
+    # A gateway record may be paper or a live system row. Paper records get an
     # explicit active lifecycle; live records are intentionally left untouched.
     if source == "paper" and not mt.get("paper_journal_activated"):
-        _nj_update_lifecycle(
+        if not _nj_update_lifecycle(
             iid,
             "ACTIVE",
             event_type="POSITION_OPENED",
             event_data={"tracking": "managed_paper", "paper_only": True},
             source="system_auto",
-        )
+        ):
+            return False
         mt["paper_journal_activated"] = True
-    _persist_managed_paper_state(mt)
+    # Keep the independent SWING recovery snapshot aware of the paper journal
+    # identity. The native-journal loader also reconciles boot ordering, but this
+    # makes a later SWING-only recovery retain the exact close target.
+    if mt.get("is_swing"):
+        try:
+            _persist_swing_thesis(mt)
+        except Exception as exc:
+            logger.warning("managed paper swing-link persist failed: %s", exc)
+    return True
 
 
 def _close_managed_paper_journal(mt):
     """Persist a terminal managed-paper outcome on its exact native row."""
     if not NJ_DB_READY or not isinstance(mt, dict):
-        return
+        return False
     iid = mt.get("native_journal_internal_trade_id")
     if not iid or (mt.get("native_journal_source") or "").lower() != "paper":
-        return
-    _nj_set_outcome(
+        return False
+    terminal_intent_ok = _save_managed_paper_terminal_intent(mt)
+    if terminal_intent_ok:
+        mt["_paper_terminal_fenced"] = True
+    outcome_ok = _nj_set_outcome(
         iid,
         {
             "paper_tracking": True,
@@ -40081,6 +40245,141 @@ def _close_managed_paper_journal(mt):
         pnl_dollars=mt.get("pnl_dollars"),
         actual_exit=mt.get("exit_price"),
     )
+    if not (terminal_intent_ok or outcome_ok):
+        logger.warning("managed paper terminal outcome not durable for %s; will retry",
+                       mt.get("instrument") or mt.get("symbol") or "unknown")
+    # The intent fences boot recovery; only an exact native outcome write confirms
+    # the journal is finalized. Callers keep failed writes inert and retry them.
+    return bool(outcome_ok)
+
+
+def _cancel_managed_paper_journal(mt):
+    """Durably stop local PAPER tracking without recording a broker-side exit."""
+    if not NJ_DB_READY or not isinstance(mt, dict):
+        return False
+    iid = mt.get("native_journal_internal_trade_id")
+    if not iid or (mt.get("native_journal_source") or "").lower() != "paper":
+        return False
+    stop_intent_ok = _save_managed_paper_stop_intent(mt)
+    # Persist closed recovery state and a terminal lifecycle independently. Either
+    # native result or the independent stop intent keeps boot recovery from
+    # resurrecting an operator-stopped trade.
+    state_ok = _nj_update_execution(iid, {
+        "managed_paper_state": _managed_paper_state_snapshot(mt),
+        "paper_tracking_stopped": True,
+    })
+    lifecycle_ok = _nj_update_lifecycle(
+        iid,
+        "CANCELED",
+        event_type="OPERATOR_OVERRIDE",
+        event_data={
+            "tracking": "managed_paper",
+            "paper_only": True,
+            "reason": "stopped_by_user",
+        },
+        source="operator",
+    )
+    native_terminal_ok = bool(state_ok or lifecycle_ok)
+    if native_terminal_ok:
+        mt["_paper_cancel_native_confirmed"] = True
+        mt.pop("_paper_cancel_pending", None)
+        mt.pop("_paper_stop_fenced", None)
+    else:
+        # The cache fence prevents restart resurrection, but retain an inert
+        # in-process retry until native_journal itself is terminal.
+        mt["_paper_cancel_pending"] = True
+        if stop_intent_ok:
+            mt["_paper_stop_fenced"] = True
+    if not (stop_intent_ok or state_ok or lifecycle_ok):
+        logger.warning("managed paper stop state not durable for %s; journal cancel requested",
+                       mt.get("instrument") or mt.get("symbol") or "unknown")
+    return bool(stop_intent_ok or state_ok or lifecycle_ok)
+
+
+def _load_managed_paper_trades_from_db():
+    """Rehydrate open display-paper managed trades from native_journal."""
+    if not NJ_DB_READY:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT internal_trade_id, execution
+                   FROM native_journal
+                   WHERE source_label = 'PAPER'
+                     AND lifecycle_status IN ('SUBMITTED', 'ACTIVE')"""
+            )
+            rows = cur.fetchall()
+        restored = 0
+        for internal_trade_id, execution in rows:
+            state = execution.get("managed_paper_state") if isinstance(execution, dict) else None
+            terminal_intent = _load_managed_paper_terminal_intent(internal_trade_id)
+            if isinstance(terminal_intent, dict):
+                # A finished PAPER result is terminal even if the native row
+                # remained ACTIVE during a transient outcome-write outage.
+                terminal_state = terminal_intent.get("managed_paper_state")
+                if isinstance(terminal_state, dict):
+                    terminal_mt = _restore_managed_paper_state(terminal_state, internal_trade_id)
+                    if terminal_mt is not None:
+                        terminal_payload = terminal_intent.get("terminal_outcome")
+                        if isinstance(terminal_payload, dict):
+                            terminal_mt.update(terminal_payload)
+                        terminal_mt["closed"] = True
+                        if not _close_managed_paper_journal(terminal_mt):
+                            # The independent fence is durable, but the exact
+                            # native row is not terminal yet. Retain this closed
+                            # trade solely for the inert watcher retry.
+                            terminal_mt["_paper_terminal_pending"] = True
+                            terminal_mt["_paper_terminal_fenced"] = True
+                            MANAGED_TRADES_BY_KEY[terminal_mt["key"]] = terminal_mt
+                continue
+            stop_intent = _load_managed_paper_stop_intent(internal_trade_id)
+            if isinstance(stop_intent, dict):
+                # The intent is an independent durable fence. Retry native
+                # cancellation when possible, but never restore this trade while
+                # the fence exists, even if the previous native writes failed.
+                stopped_state = stop_intent.get("managed_paper_state")
+                if isinstance(stopped_state, dict):
+                    stopped_mt = _restore_managed_paper_state(stopped_state, internal_trade_id)
+                    if stopped_mt is not None:
+                        stopped_mt["closed"] = True
+                        _cancel_managed_paper_journal(stopped_mt)
+                        if not stopped_mt.get("_paper_cancel_native_confirmed"):
+                            # A durable stop intent already fences recovery. Keep
+                            # the reconstruction inert until native cancellation
+                            # confirms, including when DB access is unavailable.
+                            stopped_mt["_paper_cancel_pending"] = True
+                            stopped_mt["_paper_stop_fenced"] = True
+                            MANAGED_TRADES_BY_KEY[stopped_mt["key"]] = stopped_mt
+                continue
+            mt = _restore_managed_paper_state(state, internal_trade_id)
+            if mt is None or mt.get("closed"):
+                continue
+            existing = MANAGED_TRADES_BY_KEY.get(mt["key"])
+            if existing is not None:
+                # Startup restores swing_theses before native_journal. When both
+                # records represent the same open SWING trade, PAPER recovery is
+                # authoritative for journal identity/progress and must merge rather
+                # than be discarded, otherwise a later close could use a broad
+                # instrument fallback.
+                if existing.get("is_swing") or mt.get("is_swing"):
+                    existing.update(mt)
+                    MANAGED_TRADES_BY_KEY[mt["key"]] = existing
+                    restored += 1
+                continue
+            MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+            restored += 1
+        if restored:
+            logger.info("Managed paper trades restored from native journal: %d open", restored)
+    except Exception as exc:
+        logger.warning("managed paper trade load failed: %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -41218,6 +41517,125 @@ def _load_market_state(key, max_age_sec=None):
     except Exception as exc:
         logger.debug("_load_market_state(%r) fail-open: %s", key, exc)
         return None
+
+
+def _managed_paper_stop_intent_key(internal_trade_id):
+    """Stable cache key for a durable operator-stop fence."""
+    return f"managed-paper-stop:{internal_trade_id}"
+
+
+def _managed_paper_terminal_intent_key(internal_trade_id):
+    """Stable cache key for a durable managed PAPER outcome fence."""
+    return f"managed-paper-terminal:{internal_trade_id}"
+
+
+def _managed_paper_terminal_payload(mt):
+    """Immutable inputs needed to retry the exact native PAPER outcome."""
+    return {
+        key: mt.get(key)
+        for key in (
+            "outcome", "result_label", "exit_price", "pnl_dollars",
+            "r_multiple", "closed_at", "exit_reason", "realized_r",
+            "mfe_r", "mae_r",
+        )
+        if key in mt
+    }
+
+
+def _save_managed_paper_terminal_intent(mt):
+    """Persist a completed-paper fence before its native outcome is written."""
+    if not MARKET_STATE_CACHE_DB_READY or not isinstance(mt, dict):
+        return False
+    iid = mt.get("native_journal_internal_trade_id")
+    if not iid:
+        return False
+    data = {
+        "managed_paper_state": _managed_paper_state_snapshot(mt),
+        "terminal_outcome": _managed_paper_terminal_payload(mt),
+        "reason": "terminal_outcome",
+    }
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO market_state_cache (key, data, schema_version, updated_at)
+                   VALUES (%s, %s::jsonb, %s, NOW())
+                   ON CONFLICT (key) DO UPDATE
+                     SET data = EXCLUDED.data,
+                         schema_version = EXCLUDED.schema_version,
+                         updated_at = EXCLUDED.updated_at""",
+                (_managed_paper_terminal_intent_key(iid),
+                 json.dumps(data, default=str), _MSC_SCHEMA_VERSION),
+            )
+        conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning("managed paper terminal intent persist failed: %s", exc)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _load_managed_paper_terminal_intent(internal_trade_id):
+    """Return a durable terminal-paper fence, if one exists."""
+    if not internal_trade_id:
+        return None
+    return _load_market_state(_managed_paper_terminal_intent_key(internal_trade_id))
+
+
+def _save_managed_paper_stop_intent(mt):
+    """Persist a stop fence independently of the native-journal row.
+
+    A transient native-journal failure must not allow an operator-stopped PAPER
+    trade to return as open after a process restart. The existing market-state
+    cache is a durable, no-schema-change ledger for that narrow stop intent.
+    """
+    if not MARKET_STATE_CACHE_DB_READY or not isinstance(mt, dict):
+        return False
+    iid = mt.get("native_journal_internal_trade_id")
+    if not iid:
+        return False
+    data = {
+        "managed_paper_state": _managed_paper_state_snapshot(mt),
+        "reason": "stopped_by_user",
+    }
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO market_state_cache (key, data, schema_version, updated_at)
+                   VALUES (%s, %s::jsonb, %s, NOW())
+                   ON CONFLICT (key) DO UPDATE
+                     SET data = EXCLUDED.data,
+                         schema_version = EXCLUDED.schema_version,
+                         updated_at = EXCLUDED.updated_at""",
+                (_managed_paper_stop_intent_key(iid),
+                 json.dumps(data, default=str), _MSC_SCHEMA_VERSION),
+            )
+        conn.commit()
+        return True
+    except Exception as exc:
+        logger.warning("managed paper stop intent persist failed: %s", exc)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _load_managed_paper_stop_intent(internal_trade_id):
+    """Return a durable paper-stop fence, if one exists."""
+    if not internal_trade_id:
+        return None
+    return _load_market_state(_managed_paper_stop_intent_key(internal_trade_id))
 
 
 def _restore_market_state_from_db():
@@ -65025,8 +65443,24 @@ def stop_managing():
             continue
         if not _in_scope(mt.get("instrument") or mt.get("symbol")):
             continue
+        was_closed = mt.get("closed")
         mt["closed"]      = True
         mt["exit_reason"] = mt.get("exit_reason") or "stopped_by_user"
+        # PAPER tracking must be terminal across a restart. This persists only
+        # local journal state and never sends a broker order or synthetic PnL.
+        try:
+            stopped_paper = _cancel_managed_paper_journal(mt)
+        except Exception as exc:
+            logger.warning("stop-managing paper journal cancel error: %s", exc)
+            stopped_paper = False
+        if ((mt.get("native_journal_source") or "").lower() == "paper"
+                and not stopped_paper):
+            # Do not claim a durable stop that could be lost on restart. Keep the
+            # trade inert and retry its terminal fence from the watcher.
+            mt["closed"] = bool(was_closed)
+            mt["_paper_cancel_pending"] = True
+            details.append(f"{mt.get('instrument') or mt.get('symbol') or '?'} managed stop pending")
+            continue
         # SWING (flag-on) theses persist to swing_theses and rehydrate on boot
         # WHERE closed = FALSE — mirror _close_managed_trade and persist the closed
         # flag so a stopped SWING trade is NOT resurrected as OPEN on the next
@@ -85649,7 +86083,6 @@ if __name__ == "__main__":
         if _swing_htf_enabled():                   # SWING flag-on only — SCALP boot stays untouched
             _check_swing_thesis_db_ready()         # probe swing_theses (no DDL; table created via DB tool/publish diff)
             _load_swing_theses_from_db()           # rehydrate open multi-day SWING holds (INERT) BEFORE the worker/watcher
-        _load_managed_paper_trades_from_db()       # rehydrate open display-paper managed trades (INERT)
         _check_active_trades_db_ready()            # probe open_trades (no DDL; created via DB tool/publish diff)
         _load_active_trades_from_db()              # rehydrate open active positions (INERT) BEFORE the webhook worker
         _check_manual_trade_db_ready()             # probe manual_trades (no DDL; created via DB tool/publish diff)
@@ -85686,6 +86119,7 @@ if __name__ == "__main__":
         _restore_execution_enabled_from_db()       # restore execution_enabled from last enable/disable audit record (fail-open; safe default=False)
         _boot_snapshots_table()                    # probe internal_trade_snapshots (no DDL; created via DB tool/publish diff) — immutable send-time context for TradeZella matching
         _boot_native_journal_table()               # probe native_journal (no DDL; created via DB tool/publish diff) — canonical per-trade journal record (Phase A)
+        _load_managed_paper_trades_from_db()       # rehydrate open display-paper managed trades (INERT; native journal probe first)
         # FVG Engine boot probe — no DDL; fvg_zones table created via DB tool / publish schema-diff.
         # SHADOW/DISPLAY-ONLY. FAIL-OPEN: if the table is missing, _DB_READY stays False and
         # zones are tracked in-memory only (no persistence). Never touches gate or execution.

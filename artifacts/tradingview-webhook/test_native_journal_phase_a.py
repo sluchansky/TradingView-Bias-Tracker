@@ -820,6 +820,53 @@ class TestNJWiring(unittest.TestCase):
                 entry=19500.0, stop=19480.0, t1=19520.0, t2=19540.0,
             )
 
+    def test_failed_gateway_paper_insert_does_not_link_missing_journal_row(self):
+        """A failed gateway INSERT leaves its managed trade retryable, not linked."""
+        import app
+        snap = _make_snapshot()
+        snap.update({
+            "internal_trade_id": str(uuid.uuid4()),
+            "instrument": "MNQ",
+            "mode": "paper",
+            "direction": "Long",
+            "planned_entry": 19500.0,
+        })
+        mt = {
+            "key": ("MNQ", "Long", 19500.0, "gateway-failure"),
+            "instrument": "MNQ",
+            "symbol": "MNQ1!",
+            "direction": "Long",
+            "entry": 19500.0,
+            "initial_stop": 19480.0,
+            "stop": 19480.0,
+            "tp1": 19520.0,
+            "risk_points": 20.0,
+        }
+        original_managed = dict(app.MANAGED_TRADES_BY_KEY)
+        app.MANAGED_TRADES_BY_KEY.clear()
+        app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        mock_ts = MagicMock()
+        mock_ts.build_trade_snapshot.return_value = snap
+        try:
+            with patch.dict("sys.modules", {"trade_snapshot": mock_ts}), \
+                 patch.object(app, "_persist_trade_snapshot"), \
+                 patch.object(app, "_nj_create_from_snapshot", return_value=False), \
+                 patch.object(app, "_link_gateway_snapshot_to_managed_trade") as link:
+                app._capture_send_time_snapshot(
+                    a={}, instrument="MNQ", mode="paper", source="auto",
+                    contracts=1, direction="Long",
+                    entry=19500.0, stop=19480.0, t1=19520.0, t2=19540.0,
+                )
+            link.assert_not_called()
+            self.assertNotIn("native_journal_internal_trade_id", mt)
+            with patch.object(app, "_nj_create_from_snapshot", return_value=True):
+                app._ensure_managed_paper_journal(mt)
+            self.assertEqual(mt["native_journal_internal_trade_id"],
+                             app._managed_paper_journal_id(mt))
+        finally:
+            app.MANAGED_TRADES_BY_KEY.clear()
+            app.MANAGED_TRADES_BY_KEY.update(original_managed)
+
     def test_update_journal_outcome_calls_nj_close_on_terminal(self):
         """_update_journal_outcome must call _nj_close_by_instrument on a terminal outcome."""
         import app
@@ -954,7 +1001,8 @@ class TestManagedPaperJournalBridge(unittest.TestCase):
             mt = self._managed_trade(inst, entry=100.0 + index)
             with self.subTest(instrument=inst), \
                  patch.object(self.app, "_nj_create_from_snapshot") as create, \
-                 patch.object(self.app, "_nj_update_lifecycle") as lifecycle:
+                 patch.object(self.app, "_nj_update_lifecycle") as lifecycle, \
+                 patch.object(self.app, "_nj_update_execution", return_value=True) as save_state:
                 self.app._ensure_managed_paper_journal(mt)
                 create.assert_called_once()
                 snapshot = create.call_args.args[0]
@@ -965,6 +1013,7 @@ class TestManagedPaperJournalBridge(unittest.TestCase):
                 self.assertIsNone(snapshot["broker_signal_id"])
                 self.assertEqual(create.call_args.kwargs["link_edge_ledger"], False)
                 lifecycle.assert_called_once()
+                save_state.assert_called_once()
                 self.assertEqual(mt["native_journal_source"], "paper")
 
     def test_repeated_watcher_pass_keeps_one_stable_paper_identity(self):
@@ -990,13 +1039,30 @@ class TestManagedPaperJournalBridge(unittest.TestCase):
             mode="paper",
             source="auto",
         )
+        self.app._attach_managed_paper_state_to_gateway_snapshot(snapshot)
+        self.assertIn("managed_paper_state", snapshot)
         self.app._link_gateway_snapshot_to_managed_trade(snapshot)
         self.assertEqual(mt["native_journal_internal_trade_id"], gateway_iid)
         self.assertEqual(mt["native_journal_source"], "paper")
         with patch.object(self.app, "_nj_create_from_snapshot") as create, \
-             patch.object(self.app, "_nj_update_lifecycle"):
+             patch.object(self.app, "_nj_update_lifecycle"), \
+             patch.object(self.app, "_nj_update_execution", return_value=True):
             self.app._ensure_managed_paper_journal(mt)
         create.assert_not_called()
+
+        # If the service restarts before the watcher, the state already present
+        # in the gateway row still rehydrates the attached managed trade.
+        self.app.MANAGED_TRADES_BY_KEY.clear()
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(
+            gateway_iid, {"managed_paper_state": snapshot["managed_paper_state"]}
+        )]
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+        restored = self.app.MANAGED_TRADES_BY_KEY[mt["key"]]
+        self.assertEqual(restored["native_journal_internal_trade_id"], gateway_iid)
 
     def test_paper_close_persists_outcome_by_exact_internal_id(self):
         mt = self._managed_trade("MYM")
@@ -1036,6 +1102,567 @@ class TestManagedPaperJournalBridge(unittest.TestCase):
         finally:
             self.app.JOURNAL.clear()
             self.app.JOURNAL.extend(original_journal)
+
+    def test_all_four_paper_trades_rehydrate_and_close_exact_rows_after_restart(self):
+        """A restart retains one broker-free paper row and exact close target per instrument."""
+        rows = []
+        for index, inst in enumerate(("MGC", "MNQ", "MES", "MYM")):
+            mt = self._managed_trade(inst, entry=100.0 + index)
+            with patch.object(self.app, "_nj_create_from_snapshot"), \
+                 patch.object(self.app, "_nj_update_lifecycle"), \
+                 patch.object(self.app, "_nj_update_execution") as save_state:
+                self.app._ensure_managed_paper_journal(mt)
+            # This is the state committed in the initial INSERT, before the
+            # follow-up ACTIVE transition or any later execution JSONB update.
+            state = self.app._managed_paper_snapshot(
+                mt, mt["native_journal_internal_trade_id"]
+            )["managed_paper_state"]
+            rows.append((
+                mt["native_journal_internal_trade_id"],
+                {"managed_paper_state": state},
+            ))
+
+        # Simulate a new webhook-server process with only its active journal rows.
+        self.app.MANAGED_TRADES_BY_KEY.clear()
+        cursor = MagicMock()
+        cursor.fetchall.return_value = rows
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+
+        self.assertEqual(len(self.app.MANAGED_TRADES_BY_KEY), 4)
+        self.assertIn("FROM native_journal", cursor.execute.call_args.args[0])
+        restored = list(self.app.MANAGED_TRADES_BY_KEY.values())
+        self.assertEqual({mt["instrument"] for mt in restored},
+                         {"MGC", "MNQ", "MES", "MYM"})
+
+        with patch.object(self.app, "_nj_set_outcome") as set_outcome, \
+             patch.object(self.app.requests, "post") as broker_post:
+            for mt in restored:
+                mt.update({
+                    "outcome": "Win",
+                    "result_label": "Win (TP1)",
+                    "exit_price": float(mt["entry"]) + 10.0,
+                    "pnl_dollars": 10.0,
+                    "r_multiple": 1.0,
+                })
+                self.app._close_managed_paper_journal(mt)
+
+        self.assertEqual(set_outcome.call_count, 4)
+        self.assertEqual(
+            {call.args[0] for call in set_outcome.call_args_list},
+            {internal_trade_id for internal_trade_id, _ in rows},
+        )
+        broker_post.assert_not_called()
+
+    def test_conditional_runner_watermarks_preserve_the_exit_after_restart(self):
+        """A restarted runner must retain its pre-restart high-water trailing anchor."""
+        mt = self._managed_trade("MNQ")
+        mt.update({"remaining_pct": 1.0, "entry_epoch": self.app.time.time()})
+        bar = {"high": 110.0, "low": 101.0, "close": 108.0}
+        neutral_market = {"open": True}
+
+        # First bar reaches TP1 and observes a strong runner high-water mark.
+        with patch.object(self.app, "current_price_for", return_value=160.0), \
+             patch.object(self.app, "market_session_status", return_value=neutral_market), \
+             patch.object(self.app, "get_volatility", return_value={"atr_pts": 5.0}), \
+             patch.object(self.app, "VWAP_BY_TICKER", {}), \
+             patch.object(self.app, "CVD_BY_TICKER", {}), \
+             patch.object(self.app, "_send_management_update"), \
+             patch.object(self.app, "_maybe_move_be_to_entry"):
+            self.app._evaluate_conditional_paper_runner(mt, bar)
+        self.assertTrue(mt["tp1_hit"])
+        self.assertEqual(mt["cp_peak"], 160.0)
+
+        state = self.app._managed_paper_state_snapshot(mt)
+        internal_trade_id = str(uuid.uuid4())
+        restored = self.app._restore_managed_paper_state(state, internal_trade_id)
+        self.assertEqual(restored["cp_peak"], 160.0)
+        self.assertEqual(restored["cp_trough"], mt["cp_trough"])
+
+        # The same trailing pullback must produce the same runner decision on
+        # both sides of the restart boundary.
+        with patch.object(self.app, "current_price_for", return_value=120.0), \
+             patch.object(self.app, "market_session_status", return_value=neutral_market), \
+             patch.object(self.app, "get_volatility", return_value={"atr_pts": 5.0}), \
+             patch.object(self.app, "VWAP_BY_TICKER", {}), \
+             patch.object(self.app, "CVD_BY_TICKER", {}):
+            before_restart = self.app._runner_exit_signal(self.app._mt_to_runner_rec(mt))
+            after_restart = self.app._runner_exit_signal(self.app._mt_to_runner_rec(restored))
+        self.assertEqual(before_restart, after_restart)
+        self.assertEqual(before_restart, (True, "ATR trail"))
+
+    def test_stop_managing_is_terminal_after_restart_without_broker_order(self):
+        """An operator stop must not restore the paper lifecycle on the next boot."""
+        mt = self._managed_trade("MGC")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+        })
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        with self.app.app.test_request_context(
+            "/stop-managing", method="POST", json={"ticker": "MGC"}
+        ), patch.object(self.app, "_nj_update_execution", return_value=True) as save_state, \
+             patch.object(self.app, "_nj_update_lifecycle") as lifecycle, \
+             patch.object(self.app.requests, "post") as broker_post:
+            response, status = self.app.stop_managing()
+
+        self.assertEqual(status, 200)
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(mt["closed"])
+        state = save_state.call_args.args[1]["managed_paper_state"]
+        self.assertTrue(state["closed"])
+        lifecycle.assert_called_once()
+        self.assertEqual(lifecycle.call_args.args[1], "CANCELED")
+        broker_post.assert_not_called()
+
+        # Even if a stale pre-cancel lifecycle query returns the row, its closed
+        # recovery payload must prevent it from returning to the watcher.
+        self.app.MANAGED_TRADES_BY_KEY.clear()
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(
+            mt["native_journal_internal_trade_id"], {"managed_paper_state": state}
+        )]
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+        self.assertNotIn(mt["key"], self.app.MANAGED_TRADES_BY_KEY)
+
+    def test_stop_fence_blocks_recovery_after_native_cancel_outage(self):
+        """An independently durable stop intent fences an old open row at boot."""
+        mt = self._managed_trade("MNQ")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+        })
+        open_state = self.app._managed_paper_state_snapshot(mt)
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        with self.app.app.test_request_context(
+            "/stop-managing", method="POST", json={"ticker": "MNQ"}
+        ), patch.object(self.app, "_save_managed_paper_stop_intent", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=False), \
+             patch.object(self.app, "_nj_update_lifecycle", return_value=False):
+            _response, status = self.app.stop_managing()
+        self.assertEqual(status, 200)
+        self.assertTrue(mt["closed"])
+        stopped_state = self.app._managed_paper_state_snapshot(mt)
+
+        # Simulate restart after the native row remained ACTIVE with its old
+        # snapshot. Once DB access recovers, the durable stop fence wins and the
+        # old row is canceled rather than restored into the watcher.
+        self.app.MANAGED_TRADES_BY_KEY.clear()
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(
+            mt["native_journal_internal_trade_id"],
+            {"managed_paper_state": open_state},
+        )]
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(
+            self.app, "_load_managed_paper_stop_intent",
+            return_value={"managed_paper_state": stopped_state},
+        ), patch.object(self.app, "_save_managed_paper_stop_intent", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=True), \
+             patch.object(self.app, "_nj_update_lifecycle", return_value=True), \
+             patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+        self.assertNotIn(mt["key"], self.app.MANAGED_TRADES_BY_KEY)
+
+    def test_stop_fence_retries_native_cancel_while_process_stays_up(self):
+        """A fenced stop remains inert and retries until native state is terminal."""
+        mt = self._managed_trade("MYM")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "closed": True,
+        })
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        with patch.object(self.app, "_save_managed_paper_stop_intent", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=False), \
+             patch.object(self.app, "_nj_update_lifecycle", return_value=False):
+            self.assertTrue(self.app._cancel_managed_paper_journal(mt))
+        self.assertTrue(mt["_paper_cancel_pending"])
+        self.assertTrue(mt["_paper_stop_fenced"])
+
+        with patch.object(self.app, "_fetch_latest_bar", return_value=None), \
+             patch.object(self.app, "_save_managed_paper_stop_intent", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=True) as update_state, \
+             patch.object(self.app, "_nj_update_lifecycle", return_value=True) as cancel_row:
+            self.app._watch_managed_trades()
+        update_state.assert_called_once()
+        self.assertEqual(cancel_row.call_args.args[1], "CANCELED")
+        self.assertTrue(mt["closed"])
+        self.assertNotIn("_paper_cancel_pending", mt)
+        self.assertNotIn("_paper_stop_fenced", mt)
+
+    def test_terminal_fence_blocks_recovery_after_outcome_write_outage(self):
+        """A failed exact-row close must not restore or double-finalize on boot."""
+        mt = self._managed_trade("MES")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "closed": True,
+            "outcome": "Win",
+            "result_label": "Win (TP1)",
+            "exit_price": 110.0,
+            "pnl_dollars": 10.0,
+            "r_multiple": 1.0,
+        })
+        open_state = self.app._managed_paper_state_snapshot({
+            **mt, "closed": False, "outcome": None,
+        })
+        with patch.object(self.app, "_save_managed_paper_terminal_intent", return_value=True), \
+             patch.object(self.app, "_nj_set_outcome", return_value=False):
+            self.assertFalse(self.app._close_managed_paper_journal(mt))
+        terminal_state = self.app._managed_paper_state_snapshot(mt)
+        terminal_payload = self.app._managed_paper_terminal_payload(mt)
+
+        self.app.MANAGED_TRADES_BY_KEY.clear()
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(
+            mt["native_journal_internal_trade_id"],
+            {"managed_paper_state": open_state},
+        )]
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(
+            self.app, "_load_managed_paper_terminal_intent",
+            return_value={
+                "managed_paper_state": terminal_state,
+                "terminal_outcome": terminal_payload,
+            },
+        ), patch.object(self.app, "_save_managed_paper_terminal_intent", return_value=True), \
+             patch.object(self.app, "_nj_set_outcome", return_value=True) as set_outcome, \
+             patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+        self.assertNotIn(mt["key"], self.app.MANAGED_TRADES_BY_KEY)
+        self.assertEqual(set_outcome.call_args.args[0], mt["native_journal_internal_trade_id"])
+        self.assertEqual(set_outcome.call_args.args[1]["managed_result"], "Win")
+        self.assertEqual(set_outcome.call_args.kwargs["exit_reason"], "Win (TP1)")
+        self.assertEqual(set_outcome.call_args.kwargs["actual_exit"], 110.0)
+        self.assertEqual(set_outcome.call_args.kwargs["pnl_dollars"], 10.0)
+        self.assertEqual(set_outcome.call_args.args[1]["managed_r_multiple"], 1.0)
+
+    def test_terminal_outcome_write_retries_while_fenced_and_inert(self):
+        """A fenced but unconfirmed close stays out of evaluation until retried."""
+        mt = self._managed_trade("MGC")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "closed": True,
+            "_paper_terminal_pending": True,
+            "outcome": "Loss",
+        })
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        with patch.object(self.app, "_fetch_latest_bar", return_value=None), \
+             patch.object(self.app, "_close_managed_paper_journal", return_value=True) as retry_close:
+            self.app._watch_managed_trades()
+        retry_close.assert_called_once_with(mt)
+        self.assertNotIn("_paper_terminal_pending", mt)
+
+    def test_boot_terminal_retry_stays_inert_until_native_row_confirms(self):
+        """A boot-time close outage remains retryable without another restart."""
+        mt = self._managed_trade("MGC")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "closed": True,
+            "outcome": "Win",
+        })
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(
+            mt["native_journal_internal_trade_id"],
+            {"managed_paper_state": self.app._managed_paper_state_snapshot({**mt, "closed": False})},
+        )]
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        intent = {
+            "managed_paper_state": self.app._managed_paper_state_snapshot(mt),
+            "terminal_outcome": self.app._managed_paper_terminal_payload(mt),
+        }
+        with patch.object(self.app, "_load_managed_paper_terminal_intent", return_value=intent), \
+             patch.object(self.app, "_close_managed_paper_journal", return_value=False), \
+             patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+        recovered = self.app.MANAGED_TRADES_BY_KEY[mt["key"]]
+        self.assertTrue(recovered["closed"])
+        self.assertTrue(recovered["_paper_terminal_pending"])
+        with patch.object(self.app, "_fetch_latest_bar", return_value=None), \
+             patch.object(self.app, "_close_managed_paper_journal", return_value=True):
+            self.app._watch_managed_trades()
+        self.assertNotIn("_paper_terminal_pending", recovered)
+
+    def test_boot_stop_retry_stays_inert_until_native_row_confirms(self):
+        """A boot-time cancel outage remains retryable without another restart."""
+        mt = self._managed_trade("MNQ")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "closed": True,
+        })
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(
+            mt["native_journal_internal_trade_id"],
+            {"managed_paper_state": self.app._managed_paper_state_snapshot({**mt, "closed": False})},
+        )]
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        intent = {"managed_paper_state": self.app._managed_paper_state_snapshot(mt)}
+        with patch.object(self.app, "_load_managed_paper_stop_intent", return_value=intent), \
+             patch.object(self.app, "_cancel_managed_paper_journal", return_value=False), \
+             patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+        recovered = self.app.MANAGED_TRADES_BY_KEY[mt["key"]]
+        self.assertTrue(recovered["closed"])
+        self.assertTrue(recovered["_paper_cancel_pending"])
+        with patch.object(self.app, "_fetch_latest_bar", return_value=None), \
+             patch.object(self.app, "_cancel_managed_paper_journal", side_effect=lambda trade: trade.pop("_paper_cancel_pending", None)):
+            self.app._watch_managed_trades()
+        self.assertNotIn("_paper_cancel_pending", recovered)
+
+    def test_unfenced_terminal_close_rolls_back_before_outcome_side_effects(self):
+        """No fence plus no exact close leaves the paper trade open and unbooked."""
+        mt = self._managed_trade("MES")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "mfe": 0.0,
+            "mae": 0.0,
+        })
+        with patch.object(self.app, "_save_managed_paper_terminal_intent", return_value=False), \
+             patch.object(self.app, "_nj_set_outcome", return_value=False), \
+             patch.object(self.app, "_send_outcome_update") as notify, \
+             patch.object(self.app, "_record_strategy_trade") as record:
+            self.assertFalse(self.app._close_managed_trade(mt, "Win", "Win (TP1)", 110.0))
+        self.assertFalse(mt.get("closed"))
+        self.assertNotIn("outcome", mt)
+        notify.assert_not_called()
+        record.assert_not_called()
+
+    def test_swing_paper_state_restores_its_thesis_lifecycle(self):
+        """A rehydrated SWING keeps the dispatcher and once-only thesis flags."""
+        mt = self._managed_trade("MYM")
+        mt.update({
+            "is_swing": True,
+            "thesis_key": "swing-restart-test",
+            "swing_thesis": {
+                "status": "WEAKENING",
+                "next_review_at": "2026-08-20T15:00:00+00:00",
+                "last_review_decision": "REDUCE",
+            },
+            "swing_reduced": True,
+            "swing_stop_moved": True,
+            "swing_exit_advised": True,
+        })
+        restored = self.app._restore_managed_paper_state(
+            self.app._managed_paper_state_snapshot(mt), str(uuid.uuid4())
+        )
+        self.assertTrue(restored["is_swing"])
+        self.assertEqual(restored["thesis_key"], mt["thesis_key"])
+        self.assertEqual(restored["swing_thesis"], mt["swing_thesis"])
+        self.assertTrue(restored["swing_reduced"])
+        self.assertTrue(restored["swing_stop_moved"])
+        self.assertTrue(restored["swing_exit_advised"])
+        with patch.object(self.app, "_swing_htf_enabled", return_value=True):
+            self.assertTrue(self.app._swing_lifecycle_enabled(restored))
+
+    def test_paper_recovery_merges_exact_id_into_swing_restored_first(self):
+        """Boot order must not make a SWING close fall back to instrument matching."""
+        mt = self._managed_trade("MES")
+        mt.update({
+            "is_swing": True,
+            "thesis_key": "swing-paper-merge-test",
+            "swing_thesis": {"status": "VALID", "last_review_decision": "HOLD"},
+            "swing_stop_moved": True,
+        })
+        paper_id = str(uuid.uuid4())
+        paper_state = self.app._managed_paper_state_snapshot(mt)
+        swing_first = self.app._restore_swing_mt_snapshot(
+            self.app._swing_mt_snapshot(mt)
+        )
+        self.assertNotIn("native_journal_internal_trade_id", swing_first)
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = swing_first
+
+        cursor = MagicMock()
+        cursor.fetchall.return_value = [(paper_id, {"managed_paper_state": paper_state})]
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(self.app, "_learning_conn", return_value=conn):
+            self.app._load_managed_paper_trades_from_db()
+
+        recovered = self.app.MANAGED_TRADES_BY_KEY[mt["key"]]
+        self.assertTrue(recovered["is_swing"])
+        self.assertEqual(recovered["thesis_key"], mt["thesis_key"])
+        self.assertTrue(recovered["swing_stop_moved"])
+        self.assertEqual(recovered["native_journal_internal_trade_id"], paper_id)
+        self.assertEqual(recovered["native_journal_source"], "paper")
+        with patch.object(self.app, "_nj_set_outcome") as set_outcome, \
+             patch.object(self.app, "requests") as requests_mock:
+            recovered.update({"outcome": "Win", "result_label": "Win (target hit)"})
+            self.app._close_managed_paper_journal(recovered)
+        self.assertEqual(set_outcome.call_args.args[0], paper_id)
+        requests_mock.post.assert_not_called()
+
+    def test_failed_state_write_is_retried_before_restart(self):
+        """A failed JSONB update must not mark paper state as safely persisted."""
+        mt = self._managed_trade("MNQ")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+        })
+        with patch.object(self.app, "_nj_update_execution", return_value=False) as save_state:
+            self.app._persist_managed_paper_state(mt)
+        self.assertNotIn("_paper_state_persisted", mt)
+        save_state.assert_called_once()
+
+        with patch.object(self.app, "_nj_update_execution", return_value=True) as save_state:
+            self.app._persist_managed_paper_state(mt)
+        self.assertIn("_paper_state_persisted", mt)
+        save_state.assert_called_once()
+
+    def test_failed_initial_create_retries_without_claiming_a_journal_id(self):
+        """A transient INSERT failure leaves the managed trade retryable on the next pass."""
+        mt = self._managed_trade("MES")
+        with patch.object(self.app, "_nj_create_from_snapshot", return_value=False) as create:
+            self.app._ensure_managed_paper_journal(mt)
+        create.assert_called_once()
+        self.assertNotIn("native_journal_internal_trade_id", mt)
+
+        with patch.object(self.app, "_nj_create_from_snapshot", return_value=True) as create, \
+             patch.object(self.app, "_nj_update_lifecycle"), \
+             patch.object(self.app, "_nj_update_execution", return_value=True):
+            self.app._ensure_managed_paper_journal(mt)
+        create.assert_called_once()
+        self.assertEqual(
+            mt["native_journal_internal_trade_id"],
+            self.app._managed_paper_journal_id(mt),
+        )
+
+    def test_watcher_pauses_until_initial_paper_insert_is_durable(self):
+        """A failed insert cannot let a paper trade advance only in memory."""
+        mt = self._managed_trade("MGC")
+        mt["entry_epoch"] = 1
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        bar = {"high": 120.0, "low": 80.0, "start": 2}
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_nj_create_from_snapshot", return_value=False), \
+             patch.object(self.app, "_evaluate_managed_trade_levels") as evaluate:
+            self.app._watch_managed_trades()
+        evaluate.assert_not_called()
+        self.assertNotIn("native_journal_internal_trade_id", mt)
+
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_nj_create_from_snapshot", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=True), \
+             patch.object(self.app, "_nj_update_lifecycle", return_value=True), \
+             patch.object(self.app, "_evaluate_managed_trade_levels") as evaluate:
+            self.app._watch_managed_trades()
+        evaluate.assert_called_once_with(mt, bar)
+
+    def test_watcher_pauses_attached_paper_until_state_update_is_durable(self):
+        """A gateway-linked PAPER row cannot advance before its recovery state saves."""
+        mt = self._managed_trade("MNQ")
+        mt.update({
+            "entry_epoch": 1,
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+        })
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        bar = {"high": 120.0, "low": 80.0, "start": 2}
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_nj_update_execution", return_value=False), \
+             patch.object(self.app, "_evaluate_managed_trade_levels") as evaluate:
+            self.app._watch_managed_trades()
+        evaluate.assert_not_called()
+
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_nj_update_execution", return_value=True), \
+             patch.object(self.app, "_nj_update_lifecycle", return_value=True), \
+             patch.object(self.app, "_evaluate_managed_trade_levels") as evaluate:
+            self.app._watch_managed_trades()
+        evaluate.assert_called_once_with(mt, bar)
+
+    def test_watcher_reverts_nonterminal_change_when_state_update_fails(self):
+        """A non-terminal lifecycle mutation stays absent until it is recoverable."""
+        mt = self._managed_trade("MES")
+        mt.update({
+            "entry_epoch": 1,
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "paper_journal_activated": True,
+        })
+        mt["_paper_state_persisted"] = self.app._managed_paper_state_snapshot(mt)
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        bar = {"high": 120.0, "low": 80.0, "start": 2}
+
+        def advance_runner(trade, _bar):
+            trade["tp1_hit"] = True
+            trade["runner_active"] = True
+
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_nj_update_execution", return_value=False), \
+             patch.object(self.app, "_evaluate_managed_trade_levels", side_effect=advance_runner):
+            self.app._watch_managed_trades()
+        self.assertNotIn("tp1_hit", mt)
+        self.assertNotIn("runner_active", mt)
+
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_nj_update_execution", return_value=True), \
+             patch.object(self.app, "_evaluate_managed_trade_levels", side_effect=advance_runner):
+            self.app._watch_managed_trades()
+        self.assertTrue(mt["tp1_hit"])
+        self.assertTrue(mt["runner_active"])
+
+    def test_tp1_break_even_effects_wait_for_durable_paper_state(self):
+        """A failed TP1 state write cannot notify or advance the active-trade mirror."""
+        mt = self._managed_trade("MGC")
+        mt.update({
+            "entry_epoch": 1,
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "paper_journal_activated": True,
+            "mfe": 0.0,
+            "mae": 0.0,
+            "remaining_pct": 1.0,
+            "tp1_pct": 0.5,
+            "tp2_pct": 0.5,
+            "tp2": 120.0,
+            "runner": None,
+        })
+        mt["_paper_state_persisted"] = self.app._managed_paper_state_snapshot(mt)
+        self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+        self.app.ACTIVE_TRADES_BY_INST["MGC"] = {
+            "status": "open", "direction": "Long", "stop_loss": 90.0,
+        }
+        bar = {"high": 111.0, "low": 95.0, "close": 111.0, "start": 2}
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_scalp_dynamic_lifecycle_enabled", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=False), \
+             patch.object(self.app, "_post_management_update") as post:
+            self.app._watch_managed_trades()
+        self.assertFalse(mt.get("tp1_hit"))
+        self.assertFalse(mt.get("be_moved"))
+        self.assertEqual(self.app.ACTIVE_TRADES_BY_INST["MGC"]["stop_loss"], 90.0)
+        post.assert_not_called()
+
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_scalp_dynamic_lifecycle_enabled", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=True), \
+             patch.object(self.app, "_post_management_update") as post:
+            self.app._watch_managed_trades()
+        self.assertTrue(mt["tp1_hit"])
+        self.assertTrue(mt["be_moved"])
+        self.assertEqual(self.app.ACTIVE_TRADES_BY_INST["MGC"]["stop_loss"], 100.0)
+        self.assertEqual(post.call_count, 2)
+
+        with patch.object(self.app, "_fetch_latest_bar", return_value=bar), \
+             patch.object(self.app, "_scalp_dynamic_lifecycle_enabled", return_value=True), \
+             patch.object(self.app, "_nj_update_execution", return_value=True), \
+             patch.object(self.app, "_post_management_update") as retry_post:
+            self.app._watch_managed_trades()
+        retry_post.assert_not_called()
 
 
 if __name__ == "__main__":
