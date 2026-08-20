@@ -332,5 +332,52 @@ class TestNJSourceCounts(unittest.TestCase):
         self.assertEqual(d["native"], 0)
 
 
+# ===========================================================================
+# 16. Review queue survives process restart because it reads persisted rows
+# ===========================================================================
+class TestNJReviewQueue(unittest.TestCase):
+
+    def test_not_ready_returns_explicit_unavailable_state(self):
+        with patch.object(APP, "NJ_DB_READY", False):
+            r = _client().get("/journal/native-review-queue")
+        self.assertEqual(r.status_code, 503)
+        d = json.loads(r.data)
+        self.assertFalse(d["ok"])
+        self.assertFalse(d["db_ready"])
+
+    def test_persisted_unreviewed_terminal_trade_is_visible_after_boot(self):
+        import datetime
+        import uuid
+
+        trade_id = uuid.uuid4()
+        internal_id = uuid.uuid4()
+        created_at = datetime.datetime(2026, 8, 20, 13, 30)
+        queue_row = (
+            trade_id, internal_id, created_at,
+            "MGC", "LONG", "SCALP",
+            "VWAP_TREND_CONTINUATION", "VWAP Trend Continuation",
+            72.0, "A", "SYSTEM_AUTO", "UNREVIEWED", False,
+            "awaiting_review",
+        )
+        conn, cur = _make_conn(rows=[], count=0)
+        cur.fetchall.side_effect = [
+            [("UNREVIEWED", 1)],
+            [queue_row],
+        ]
+        with patch.object(APP, "NJ_DB_READY", True), \
+             patch.object(APP, "_learning_conn", return_value=conn):
+            r = _client().get("/journal/native-review-queue")
+
+        self.assertEqual(r.status_code, 200)
+        d = json.loads(r.data)
+        self.assertTrue(d["ok"])
+        self.assertEqual(d["unreviewed_count"], 1)
+        self.assertEqual(d["buckets"]["UNREVIEWED"], 1)
+        self.assertEqual(len(d["trades"]), 1)
+        self.assertEqual(d["trades"][0]["id"], str(trade_id))
+        self.assertEqual(d["trades"][0]["review_status"], "UNREVIEWED")
+        self.assertEqual(d["next_trade"]["internal_trade_id"], str(internal_id))
+
+
 if __name__ == "__main__":
     unittest.main()
