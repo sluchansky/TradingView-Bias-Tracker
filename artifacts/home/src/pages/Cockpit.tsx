@@ -277,7 +277,7 @@ export default function Cockpit() {
     try {
       const headers: Record<string, string> = {};
       const p = pwdRef.current;
-      if (p) headers["Authorization"] = `Basic ${btoa(":" + p)}`;
+      if (p) headers["Authorization"] = `Basic ${btoa("admin:" + p)}`;
       const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include", headers });
       if (res.status === 401) {
         const hadPwd = !!pwdRef.current;
@@ -305,7 +305,7 @@ export default function Cockpit() {
     try {
       const headers: Record<string, string> = {};
       const p = pwdRef.current;
-      if (p) headers["Authorization"] = `Basic ${btoa(":" + p)}`;
+      if (p) headers["Authorization"] = `Basic ${btoa("admin:" + p)}`;
       const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include", headers });
       if (!res.ok) {
         setStaleSnaps(prev => ({ ...prev, [ticker]: true }));

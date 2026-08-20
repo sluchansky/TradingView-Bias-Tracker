@@ -16,15 +16,11 @@ import { createHash, createHmac, timingSafeEqual, randomBytes } from "node:crypt
 // for an OFFLINE dictionary attack against the admin password. This is acceptable
 // only while DASHBOARD_PASSWORD is strong/high-entropy — keep it long and random.
 
-const DEV = process.env.NODE_ENV === "development";
-
 // The base secret for key derivation. In production this MUST be the admin
-// password (callers fail closed when it is absent); a fixed dev fallback keeps
-// local work unblocked and never applies in production.
+// password. Share links fail closed when it is absent in every environment.
 function baseSecret(): string | null {
   const pw = process.env.DASHBOARD_PASSWORD;
   if (pw && pw.length > 0) return pw;
-  if (DEV) return "dev-only-view-link-secret";
   return null;
 }
 
@@ -67,6 +63,7 @@ interface SessPayload {
   v: number;
   typ: "sess";
   exp: number; // epoch ms — mirrors the link expiry
+  nonce: string; // random per-login value prevents a predictable shared cookie
 }
 
 // base64 (not url) of the fixed-length HMAC of the password — embedded in the link.
@@ -134,7 +131,12 @@ export function checkPassword(entered: string, payload: LinkPayload): boolean {
 }
 
 export function mintSessionCookie(exp: number): string {
-  const payload: SessPayload = { v: 1, typ: "sess", exp };
+  const payload: SessPayload = {
+    v: 1,
+    typ: "sess",
+    exp,
+    nonce: randomBytes(16).toString("base64url"),
+  };
   const body = b64url(JSON.stringify(payload));
   const sig = b64url(hmac(SESS_SIG, body));
   return `${body}.${sig}`;
@@ -142,7 +144,7 @@ export function mintSessionCookie(exp: number): string {
 
 export function verifySessionCookie(value: string | undefined | null): SessPayload | null {
   const p = verifySigned(value, SESS_SIG);
-  if (!p || p.typ !== "sess") return null;
+  if (!p || p.typ !== "sess" || typeof p.nonce !== "string" || p.nonce.length < 16) return null;
   return p as SessPayload;
 }
 

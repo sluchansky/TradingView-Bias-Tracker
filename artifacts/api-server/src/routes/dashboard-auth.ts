@@ -24,12 +24,56 @@ const OPEN_PATHS = new Set([
 
 // Methods that do not change state — no CSRF (origin) check needed.
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
+const AUTH_WINDOW_MS = 15 * 60 * 1000;
+const AUTH_MAX_FAILURES = 8;
+const AUTH_ATTEMPTS = new Map<string, { count: number; resetAt: number }>();
 
 function safeEqual(a: string, b: string): boolean {
   const ab = Buffer.from(a);
   const bb = Buffer.from(b);
   if (ab.length !== bb.length) return false;
   return timingSafeEqual(ab, bb);
+}
+
+function authAttemptKey(req: { headers: Record<string, unknown>; socket?: { remoteAddress?: string } }): string {
+  // Replit's proxy supplies the client chain in x-forwarded-for. Use only its
+  // first address and cap its length so this in-memory protection cannot itself
+  // become an unbounded-memory input.
+  const forwarded = req.headers["x-forwarded-for"];
+  const first = Array.isArray(forwarded) ? forwarded[0] : forwarded;
+  const ip = String(first ?? req.socket?.remoteAddress ?? "unknown")
+    .split(",")[0]
+    .trim()
+    .slice(0, 80);
+  return ip || "unknown";
+}
+
+function authRateLimited(key: string, now = Date.now()): boolean {
+  const entry = AUTH_ATTEMPTS.get(key);
+  if (!entry) return false;
+  if (now >= entry.resetAt) {
+    AUTH_ATTEMPTS.delete(key);
+    return false;
+  }
+  return entry.count >= AUTH_MAX_FAILURES;
+}
+
+function noteAuthFailure(key: string, now = Date.now()): void {
+  const entry = AUTH_ATTEMPTS.get(key);
+  if (!entry || now >= entry.resetAt) {
+    AUTH_ATTEMPTS.set(key, { count: 1, resetAt: now + AUTH_WINDOW_MS });
+  } else {
+    entry.count += 1;
+  }
+  if (AUTH_ATTEMPTS.size > 10_000) {
+    for (const [oldKey, oldEntry] of AUTH_ATTEMPTS) {
+      if (now >= oldEntry.resetAt) AUTH_ATTEMPTS.delete(oldKey);
+    }
+  }
+}
+
+function clearAuthFailures(key: string): void {
+  AUTH_ATTEMPTS.delete(key);
 }
 
 // The public host(s) the browser actually connected to. Replit's proxy sets
@@ -75,17 +119,8 @@ export const dashboardAuth: RequestHandler = (req, res, next) => {
   }
 
   const password = process.env.DASHBOARD_PASSWORD;
+  const username = process.env.DASHBOARD_USERNAME || "admin";
   if (!password) {
-    // In development, fail OPEN so a missing secret never blocks local work.
-    // Everywhere else (production/deployment) fail CLOSED — for a live trading
-    // app an unconfigured password must lock the dashboard, not expose it.
-    if (process.env.NODE_ENV === "development") {
-      console.warn(
-        "[auth] DASHBOARD_PASSWORD is not set — dashboard endpoints are UNLOCKED (development only)",
-      );
-      next();
-      return;
-    }
     console.error(
       "[auth] DASHBOARD_PASSWORD is not set — refusing dashboard access",
     );
@@ -93,21 +128,42 @@ export const dashboardAuth: RequestHandler = (req, res, next) => {
     return;
   }
 
-  // 1) Password gate (HTTP Basic Auth). Username is ignored; only the
-  //    password is checked, with a timing-safe comparison.
+  // 1) HTTP Basic Auth gate. Both the configured username and password are
+  // checked using constant-time comparisons. The username defaults to "admin"
+  // so existing operator clients remain compatible unless explicitly changed.
   const header = req.headers.authorization ?? "";
+  // A browser on the login screen may poll protected data before a user has
+  // supplied credentials. That is not a login attempt and must not exhaust the
+  // brute-force budget; only malformed or invalid Basic credentials count.
+  const hasCredentialAttempt = header.startsWith("Basic ");
+  const attemptKey = authAttemptKey(req);
+  if (hasCredentialAttempt && authRateLimited(attemptKey)) {
+    res.set("Retry-After", String(Math.ceil(AUTH_WINDOW_MS / 1000)));
+    res.status(429).json({ error: "Too many authentication attempts. Try again later." });
+    return;
+  }
   let authed = false;
   if (header.startsWith("Basic ")) {
-    const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
-    const sep = decoded.indexOf(":");
-    const pass = sep >= 0 ? decoded.slice(sep + 1) : "";
-    if (pass.length > 0 && safeEqual(pass, password)) authed = true;
+    try {
+      const decoded = Buffer.from(header.slice(6), "base64").toString("utf8");
+      const sep = decoded.indexOf(":");
+      const user = sep >= 0 ? decoded.slice(0, sep) : "";
+      const pass = sep >= 0 ? decoded.slice(sep + 1) : "";
+      authed = user.length > 0
+        && pass.length > 0
+        && safeEqual(user, username)
+        && safeEqual(pass, password);
+    } catch {
+      authed = false;
+    }
   }
   if (!authed) {
+    if (hasCredentialAttempt) noteAuthFailure(attemptKey);
     res.set("WWW-Authenticate", 'Basic realm="AI Trading Partner", charset="UTF-8"');
     res.status(401).json({ error: "Authentication required" });
     return;
   }
+  clearAuthFailures(attemptKey);
 
   // 2) CSRF gate for state-changing requests: must be same-origin. This stops
   //    a malicious site from using the owner's cached credentials to trigger

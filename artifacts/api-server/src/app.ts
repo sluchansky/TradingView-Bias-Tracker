@@ -1,11 +1,11 @@
 import express, { type Express } from "express";
-import cors from "cors";
 import pinoHttp from "pino-http";
 import router, { api2Router } from "./routes";
 import { createViewOnlyRouter } from "./routes/view-only";
 import { logger } from "./lib/logger";
 
 const app: Express = express();
+app.disable("x-powered-by");
 
 app.use(
   pinoHttp({
@@ -26,7 +26,18 @@ app.use(
     },
   }),
 );
-app.use(cors());
+// The dashboard, API proxy, and webhook receiver are all same-origin. Do not
+// grant arbitrary websites browser access to protected responses via permissive
+// CORS headers. TradingView sends server-to-server webhooks and needs no CORS.
+app.use((_req, res, next) => {
+  res.setHeader("X-Content-Type-Options", "nosniff");
+  res.setHeader("Referrer-Policy", "same-origin");
+  res.setHeader("Permissions-Policy", "camera=(), geolocation=(), microphone=()");
+  if (process.env.NODE_ENV === "production") {
+    res.setHeader("Strict-Transport-Security", "max-age=31536000; includeSubDomains");
+  }
+  next();
+});
 // Capture the raw request body for EVERY content type (as a Buffer) so the
 // Flask proxy can forward it verbatim. TradingView posts webhook alerts as
 // text/plain, which express.json() silently ignores — leaving req.body empty

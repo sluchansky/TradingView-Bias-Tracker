@@ -47,9 +47,6 @@ def _client():
     return APP.app.test_client()
 
 
-AUTH = {"Authorization": "Basic YWRtaW46dGVzdA=="}  # admin:test (any password works in tests)
-
-
 # ===========================================================================
 # 1. List endpoint requires authentication  (Express enforces; Flask allows
 #    through — test that 503 returned when NJ_DB_READY=False, not 401)

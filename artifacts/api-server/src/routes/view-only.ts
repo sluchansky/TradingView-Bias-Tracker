@@ -222,18 +222,19 @@ function noteFail(token: string): void {
 export function createViewOnlyRouter(): Router {
   const router = Router();
 
-  // GET /view — open (no token): serve the read-only dashboard directly, no auth.
-  //             with ?t=<token>: existing password-protected expiring link flow.
+  // GET /view — a signed session is required. A first-time viewer supplies an
+  // expiring signed link token, then logs in to receive that session. There is
+  // deliberately no anonymous dashboard path.
   router.get("/", async (req: any, res: any) => {
     const token = typeof req.query.t === "string" ? req.query.t : "";
+    if (!viewConfigured()) {
+      noStoreHtml(res);
+      res.status(503).send(notConfiguredPage());
+      return;
+    }
 
-    // ── Token-based flow (existing: expiring + password-protected) ──
+    // ── Token-based first visit: validate link, then require its session. ──
     if (token) {
-      if (!viewConfigured()) {
-        noStoreHtml(res);
-        res.status(503).send(notConfiguredPage());
-        return;
-      }
       const link = verifyLinkToken(token);
       if (!link) {
         noStoreHtml(res);
@@ -246,9 +247,14 @@ export function createViewOnlyRouter(): Router {
         res.status(200).send(loginPage(token, null));
         return;
       }
+    } else if (!verifySessionCookie(parseCookies(req)[COOKIE])) {
+      // Never serve dashboard HTML or data to an anonymous /view request.
+      noStoreHtml(res);
+      res.status(401).send(pageShell("View access required", "<h1>Access required</h1><p>Use a valid shared link to sign in.</p>"));
+      return;
     }
 
-    // ── Open path (no token) OR authenticated session → serve the dashboard ──
+    // ── Authenticated session → serve the read-only dashboard ────────────────
     let data: { status: number; body: string };
     try {
       data = await fetchFlaskDashboard();
@@ -317,14 +323,17 @@ export function createViewOnlyRouter(): Router {
     }
     const cookieVal = mintSessionCookie(link.exp);
     const maxAge = Math.max(1, Math.floor((link.exp - Date.now()) / 1000));
-    res.setHeader(
-      "Set-Cookie",
-      `${COOKIE}=${encodeURIComponent(cookieVal)}; Path=/view; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${
-        DEV ? "" : "; Secure"
-      }`,
-    );
+    res.cookie(COOKIE, cookieVal, {
+      path: "/view",
+      httpOnly: true,
+      sameSite: "lax",
+      secure: !DEV,
+      maxAge: maxAge * 1000,
+    });
     res.set("cache-control", "no-store");
-    res.redirect(302, `/view?t=${encodeURIComponent(token)}`);
+    // The signed link token belongs only in the initial request. Removing it
+    // from the address bar keeps it out of browser history and referrers.
+    res.redirect(303, "/view");
   });
 
   // GET /view/logout — clear the view session cookie.
@@ -335,12 +344,16 @@ export function createViewOnlyRouter(): Router {
   });
 
   // GET /view/api/status — the ONLY data path viewers get. Upstream path is
-  // HARDCODED to /status (traversal-proof); only the query is relayed.
-  // No session required: the open /view link (no ?t=) has no cookie, and this
-  // endpoint is read-only so open access is intentional and safe.
+  // HARDCODED to /status (traversal-proof); only the query is relayed. A signed
+  // view session is required, so this endpoint cannot expose market data to an
+  // anonymous caller.
   router.get("/api/status", (req: any, res: any) => {
     if (!viewConfigured()) {
       res.status(503).json({ error: "not configured" });
+      return;
+    }
+    if (!verifySessionCookie(parseCookies(req)[COOKIE])) {
+      res.status(401).json({ error: "View authentication required" });
       return;
     }
     const query = Object.keys(req.query).length
