@@ -200,6 +200,25 @@ class TestScreenshotFailure(unittest.TestCase):
 
         self.assertTrue(reschedule_called.is_set(), "_schedule_next should be called even on failure")
 
+    def test_databento_bars_produce_a_real_jpeg(self):
+        """The primary production capture path returns an actual image."""
+        self.vb._bars_fn = lambda _symbol: [
+            {
+                "ts": 1770000000 + i * 60,
+                "open": 21000 + i * 3,
+                "high": 21008 + i * 3,
+                "low": 20996 + i * 3,
+                "close": 21003 + i * 3,
+                "volume": 100 + i,
+            }
+            for i in range(12)
+        ]
+
+        image = self.vb.capture_chart_screenshot("MNQ")
+
+        self.assertTrue(image.startswith(b"\xff\xd8\xff"))
+        self.assertGreater(len(image), 1000)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Test 4: State persistence (in-memory cache)
