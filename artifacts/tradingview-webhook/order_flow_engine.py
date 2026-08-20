@@ -1,13 +1,15 @@
 """
-Order Flow Engine V1 — SHADOW / DISPLAY / RESEARCH ONLY.
+Order Flow Engine V1 — live directional Edge Score confluence.
 
-Computes order-flow metrics from Databento 1-minute bars and CVD state.
-All outputs are display-only context attached to the full_analysis result dict.
+Computes order-flow metrics from Databento 1-minute bars and CVD state. The parent
+analysis optionally maps the composite result to a bounded, direction-aware Edge
+Score adjustment.
 
 SAFETY CONTRACT
 ───────────────
-• NEVER modifies gate, scoring, sizing, arm state, or execution.
-• NEVER causes a READY → WAIT demotion.
+• This module never mutates gate, sizing, arm state, or execution itself.
+• Its computed 0..100 score may be consumed by app.py as a bounded ±15 Edge
+  confluence adjustment; unavailable data is always a no-op.
 • Flag-gated: ORDER_FLOW_V1_ENABLED env var (default "0" = OFF).
 • Fail-open: compute_order_flow() always returns a dict, never raises.
 • bar buy_volume/sell_volume fields only exist on bars captured after
@@ -357,7 +359,7 @@ def compute_order_flow(
         (no order-book subscription available).  All fields are nullable.
 
     FAIL-OPEN: always returns a dict, never raises.
-    DISPLAY-ONLY: this dict must never feed gate, sizing, or execution logic.
+    This function is pure/fail-open. app.py owns any bounded Edge Score integration.
     """
     if not ORDER_FLOW_V1_ENABLED:
         return {"available": False, "reason": "flag_off"}

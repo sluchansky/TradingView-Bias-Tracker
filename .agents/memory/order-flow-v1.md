@@ -1,11 +1,11 @@
 ---
 name: Order Flow Engine V1
-description: Bar-level buy/sell volume accumulation + delta scoring; shadow/display/research only; flag-gated default OFF.
+description: Bar-level buy/sell volume accumulation + delta scoring; bounded direction-aware Edge Score confluence; flag-gated default OFF.
 ---
 
 ## What was built
 
-`order_flow_engine.py` (new) — `compute_order_flow(inst, bars_deque, cvd_record)` computes all metrics and returns a display-only dict. Imported lazily in `full_analysis()` **after all gate/verdict computation** (hard constraint: must never precede any gate).
+`order_flow_engine.py` computes the directional 0–100 order-flow read. `full_analysis()` snapshots it before the strict gate and applies its bounded score adjustment through the same per-direction modifier path used by the canonical Edge Score.
 
 `databento_brain.py` — `_tick_bar()` now accepts `side` param (A/B/None); accumulates `buy_volume` / `sell_volume` per partial bar. `_on_bar_close()` publishes these plus `cvd_snapshot = self._cvd_acc[inst]` to the public bar in `DATABENTO_BARS_BY_INST`. Bars before V1 deployment lack these fields — `_bars_have_of_fields()` detects absence and returns `available=False, reason=bars_pre_v1`.
 
@@ -18,10 +18,12 @@ description: Bar-level buy/sell volume accumulation + delta scoring; shadow/disp
 
 ## Safety contract
 
-- DISPLAY / SHADOW / RESEARCH ONLY
-- No existing READY can become WAIT because of this engine
-- `compute_order_flow()` is always fail-open (never raises)
-- Called **last** in full_analysis, after all gate/verdict/execution hooks
+- Direction-aware Edge Score adjustment only: score 50 is neutral; bullish flow helps Longs and hurts Shorts, with the reverse for bearish flow.
+- Bounded at ±15 points, clamped inside the existing 0–110 Edge Score range.
+- Missing, stale, malformed, or unavailable flow is a strict 0-point no-op.
+- The exact pre-gate snapshot is reused for result display; do not take a second read later in analysis.
+- Hard-zero setups remain zero because the existing zone/structure hard-block applies after signed modifiers.
+- The Order Flow engine itself remains pure/fail-open; it does not route orders or alter sizing directly.
 
 ## Metric notes
 
@@ -55,4 +57,4 @@ of_reversal_confirmed BOOLEAN
 
 ## Tests
 
-66 tests in `tests/test_order_flow_v1.py`, all passing.
+70 tests across `tests/test_order_flow_v1.py` and the Edge Score integration suite.

@@ -9771,6 +9771,7 @@ EDGE_COMPONENTS = (
 # confluences present, clamped to this ceiling; no soft modifiers raise it.
 EDGE_SCORE_MAX = 110
 EDGE_READY_THRESHOLD = 70   # default minimum Edge Score for a READY setup (mode-tunable)
+ORDER_FLOW_EDGE_MAX_DELTA = 15  # bounded, directional order-flow confluence adjustment
 CONFLICT_WINDOW_MIN  = 10   # opposing structure within this many minutes = conflict
 # A volume-spike alert is only treated as a live volume confirmation for this many
 # minutes after it arrives (a spike is a momentary event, unlike persistent CVD state).
@@ -9793,20 +9794,44 @@ def _rvol_adjustment(rvol_value):
     return 0
 
 
+def order_flow_edge_adjustment(order_flow, direction):
+    """Translate live order-flow pressure into a bounded Edge Score adjustment.
+
+    Order Flow's 0..100 score is directional: 50 is neutral, higher values indicate
+    buying pressure, and lower values indicate selling pressure.  This maps it
+    symmetrically to [-15, +15] for the *candidate* direction: bullish flow helps a
+    Long and hurts a Short; bearish flow does the opposite.  Missing, stale, malformed,
+    or unavailable data is a strict no-op, so the data feed remains fail-open.
+    """
+    if not isinstance(order_flow, dict) or order_flow.get("available") is not True:
+        return 0
+    try:
+        score = float(order_flow.get("order_flow_score"))
+    except (TypeError, ValueError):
+        return 0
+    if score != score:  # NaN
+        return 0
+    score = max(0.0, min(100.0, score))
+    pressure = (score - 50.0) / 50.0
+    if direction == "Short":
+        pressure = -pressure
+    return int(round(max(-ORDER_FLOW_EDGE_MAX_DELTA,
+                         min(ORDER_FLOW_EDGE_MAX_DELTA,
+                             pressure * ORDER_FLOW_EDGE_MAX_DELTA))))
+
+
 def compute_trade_edge_components(signals, modifiers=None):
     """THE Edge Score — additive sum of the weighted confluence components
     (BOS+20, CHOCH+20, VWAP+15, Sweep+15, Volume+15, CVD+15, Session+10 = max 110),
     optionally reduced by SOFT negative `modifiers`, then clamped to [0, EDGE_SCORE_MAX].
     `signals` is a dict of booleans keyed by EDGE_COMPONENTS[*][0]. `modifiers` is an
-    optional list of {"label", "points"} dicts with points < 0 (SCALP only: cooldown
-    -5, location mismatch -5, CVD conflict -10) — SWING passes None so its score is
-    the pure additive sum (byte-for-byte unchanged). Volatility and RVOL do not feed
-    the score (volume is a first-class +15 component instead; volatility is
-    informational + a SWING hard gate). Returns (score, breakdown) where `breakdown`
-    lists ONLY the credited POSITIVE components (modifiers are NOT folded into it, so
-    the raw/uncapped additive accounting for the cap display stays correct); the
-    caller surfaces the modifier lines separately. Shared by the READY gate and the
-    display layer so the gate score and the shown Edge Score are identical."""
+    optional list of signed {"label", "points"} dicts. SCALP soft penalties remain
+    negative; a live order-flow read can add a bounded direction-aware adjustment in
+    either direction. Volatility and RVOL do not feed the score (volume is a
+    first-class +15 component instead; volatility is informational + a SWING hard
+    gate). Returns (score, breakdown) where `breakdown` lists ONLY the credited
+    components; the caller surfaces modifier lines separately. Shared by the READY
+    gate and display layer so the gate score and the shown Edge Score are identical."""
     breakdown = []
     for key, label, pts in EDGE_COMPONENTS:
         if signals.get(key):
@@ -9821,7 +9846,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                           nearest_supply, nearest_demand,
                           bullish, bearish, confidence, alert_history,
                           volatility=None, session=None, cooldown_active=False,
-                          learning_score_influence=None, mode=None):
+                          learning_score_influence=None, order_flow=None, mode=None):
     """Strict checklist recommendation.
 
     `learning_score_influence` (Task #18, OFF by default / None): optional per-direction
@@ -9831,7 +9856,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     capped to ±LEARNING_SCORE_MAX_DELTA) INSIDE _edge_for — so the gate, conflict
     resolution, readiness bands, confluences and diagnostics all read the SAME adjusted
     score. None (default; goldens + flag-off never pass it) → byte-identical raw scoring.
-    FAIL-CLOSED: any error applying the adjustment falls back to the unmodified base.
+    `order_flow`: optional live, already-computed Order Flow V1 dict. When available,
+    it applies a bounded ±15 direction-aware score adjustment; unavailable data is a
+    no-op. FAIL-CLOSED: any error applying either adjustment falls back to the
+    unmodified base.
 
     A trade is recommended ONLY when ALL of:
         LONG : BOS Demand + Bullish CHOCH + 5m bullish confirmation + price > VWAP
@@ -10312,32 +10340,37 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     _fvg_inst = _recent_smc_signals(inst)
 
     def _edge_modifiers(direction):
-        """SOFT negative Edge penalties for `direction` (SCALP only; SWING returns []
-        because GATE_SOFT_MODIFIERS is False). cooldown_active -5 (a repeat signal
+        """Signed Edge adjustments for `direction`. SCALP soft penalties are negative:
+        cooldown_active -5 (a repeat signal
         inside the dedup window), location mismatch -5 (price not near VWAP nor the
         trade-side zone), CVD conflict -10 (delta opposes the trade — ONLY when CVD is
         not a hard veto), opposing FVG -10 (unfilled gap in the opposing direction acts
-        as a price magnet). These nudge the Edge Score but NEVER hard-block. The list is
-        stamped into gate_debug so the display layer reuses the EXACT same modifiers
-        (gate score == shown Edge Score)."""
-        if not soft_modifiers:
-            return []
+        as a price magnet). Order flow is independent of the SCALP-only soft modifier
+        flag and adds up to ±15 for directional agreement/conflict. These nudge the
+        Edge Score but NEVER hard-block. The list is stamped into gate_debug so the
+        display layer reuses the EXACT same modifiers (gate score == shown Edge Score)."""
         mods = []
-        loc_ok = location_long if direction == "Long" else location_short
-        cvd_cf = cvd_conflict_long if direction == "Long" else cvd_conflict_short
-        if not loc_ok:
-            mods.append({"label": "Location mismatch", "points": -5})
-        if cvd_cf and not cvd_hard:
-            mods.append({"label": "CVD conflict", "points": -10})
-        if cooldown_active:
-            mods.append({"label": "Cooldown (repeat signal)", "points": -5})
-        # Opposing Fair-Value Gap: an unfilled gap in the opposing direction is a magnet
-        # that pulls price back — penalises the same magnitude as CVD conflict (-10).
-        # Fail-open: _fvg_inst is all-False when no FVG alerts → no penalty added.
-        if direction == "Long" and _fvg_inst.get("fvg_short"):
-            mods.append({"label": "Opposing FVG (bearish gap)", "points": -10})
-        elif direction == "Short" and _fvg_inst.get("fvg_long"):
-            mods.append({"label": "Opposing FVG (bullish gap)", "points": -10})
+        if soft_modifiers:
+            loc_ok = location_long if direction == "Long" else location_short
+            cvd_cf = cvd_conflict_long if direction == "Long" else cvd_conflict_short
+            if not loc_ok:
+                mods.append({"label": "Location mismatch", "points": -5})
+            if cvd_cf and not cvd_hard:
+                mods.append({"label": "CVD conflict", "points": -10})
+            if cooldown_active:
+                mods.append({"label": "Cooldown (repeat signal)", "points": -5})
+            # Opposing Fair-Value Gap: an unfilled gap in the opposing direction is a magnet
+            # that pulls price back — penalises the same magnitude as CVD conflict (-10).
+            # Fail-open: _fvg_inst is all-False when no FVG alerts → no penalty added.
+            if direction == "Long" and _fvg_inst.get("fvg_short"):
+                mods.append({"label": "Opposing FVG (bearish gap)", "points": -10})
+            elif direction == "Short" and _fvg_inst.get("fvg_long"):
+                mods.append({"label": "Opposing FVG (bullish gap)", "points": -10})
+        _of_delta = order_flow_edge_adjustment(order_flow, direction)
+        if _of_delta:
+            _of_relation = "Confirms" if _of_delta > 0 else "Opposes"
+            mods.append({"label": "Order Flow %s %s" % (_of_relation, direction),
+                         "points": _of_delta})
         return mods
 
     def _edge_raw(direction):
@@ -10749,9 +10782,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "full_ready_threshold":  full_ready_threshold,
             "strong_threshold":      strong_threshold,
             "setup_building_threshold": setup_building_threshold,
-            # SOFT Edge penalties applied to THIS direction's score (SCALP only).
-            # Stamped so the display layer reuses the identical modifiers (parity).
+            # Signed Edge adjustments applied to THIS direction. Stamped so the display
+            # layer reuses the identical modifiers (gate/display parity).
             "edge_modifiers":        _edge_modifiers(direction),
+            **({"order_flow_edge_delta": order_flow_edge_adjustment(order_flow, direction)}
+               if order_flow is not None else {}),
             "conflicting_structure": true_conflict,
             "volatility_block":      vol_block,
             "edge_score":            score,
@@ -28991,6 +29026,26 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # all result keys still exist (single-return-path invariant) and the gate is
     # paused — not deleted — while the market is closed.
     market = market_session_status()
+    # Order Flow V1 is computed before the strict gate because its bounded directional
+    # adjustment is now part of the authoritative Edge Score. The engine remains
+    # fail-open: absent, stale, or malformed feed data is a zero-point adjustment.
+    # Keeping this local snapshot also guarantees the status panel shows the exact data
+    # that influenced this evaluation rather than a second, potentially newer read.
+    order_flow_snapshot = None
+    order_flow_enabled = False
+    try:
+        import order_flow_engine as _ofe_pre  # noqa: PLC0415
+        order_flow_enabled = bool(_ofe_pre.ORDER_FLOW_V1_ENABLED)
+        if order_flow_enabled:
+            from databento_brain import DATABENTO_BARS_BY_INST as _dbi_of_pre  # noqa: PLC0415
+            order_flow_snapshot = _ofe_pre.compute_order_flow(
+                active_ticker,
+                _dbi_of_pre.get(active_ticker) or [],
+                CVD_BY_TICKER.get(active_ticker),
+            )
+    except Exception as _of_pre_exc:
+        logger.debug("order_flow_engine pre-gate (%s): %s", active_ticker, _of_pre_exc)
+
     # Task #18 — learning-influences-scoring: resolve the per-direction learning-weight
     # metadata ONLY when the master flag is armed (else None → byte-identical scoring).
     # Edge-independent + FAIL-OPEN, so it is safe to compute before the gate decides.
@@ -29002,6 +29057,7 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
             volatility=volatility, session=session_state, cooldown_active=cooldown_active,
             learning_score_influence=learning_score_influence,
+            order_flow=order_flow_snapshot,
         )
     strict_label     = strict["label"]
     strict_score     = strict["score"]
@@ -30936,25 +30992,13 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         except Exception as _ge_fa_exc:
             logger.debug("GateEffectiveness full_analysis (%s): %s", active_ticker, _ge_fa_exc)
 
-    # ── Order Flow V1 — SHADOW / DISPLAY / RESEARCH ONLY ─────────────────────
-    # MUST come after ALL gate/verdict computation — it is observation-only and
-    # must never influence any earlier decision in this function.
-    # Flag-gated (ORDER_FLOW_V1_ENABLED env, default OFF). Fail-open.
-    # No existing READY can become WAIT because of this block.
-    # DATABENTO_BARS_BY_INST lives in databento_brain — lazy-import like the
-    # existing bar-reader pattern (cf. line ~7981 in this file).
-    try:
-        import order_flow_engine as _ofe  # noqa: PLC0415
-        if _ofe.ORDER_FLOW_V1_ENABLED:
-            from databento_brain import DATABENTO_BARS_BY_INST as _dbi_of  # noqa: PLC0415
-            _of_result = _ofe.compute_order_flow(
-                active_ticker,
-                _dbi_of.get(active_ticker) or [],
-                CVD_BY_TICKER.get(active_ticker),
-            )
-            result["order_flow"] = _of_result
-    except Exception as _of_exc:
-        logger.debug("order_flow_engine full_analysis (%s): %s", active_ticker, _of_exc)
+    # ── Order Flow V1 — bounded, direction-aware Edge Score confluence ─────────
+    # This is the exact pre-gate snapshot used by evaluate_strict_setup(), never a
+    # second read. Flag-off keeps the key absent; unavailable flow carries a visible
+    # no-op reason. The adjustment is bounded ±15 and can never resurrect a hard-zero
+    # setup because compute_edge_breakdown applies hard blockers last.
+    if order_flow_enabled and isinstance(order_flow_snapshot, dict):
+        result["order_flow"] = order_flow_snapshot
 
     return result
 
@@ -36075,13 +36119,14 @@ def compute_edge_breakdown(a, entry):
     }
     # SOFT Edge modifiers (SCALP only) — the EXACT list the gate stamped for THIS
     # direction (entry.edge_modifiers), so the displayed Edge Score equals the gate
-    # score. SWING stamps none → pure additive sum (byte-for-byte unchanged). The
-    # modifiers reduce the final score but are NOT folded into raw_breakdown, so the
-    # cap accounting below stays the additive-only positive total.
+    # score. The modifiers adjust the final score but are NOT folded into raw_breakdown,
+    # so the cap accounting below stays transparent: raw_score is the base component total,
+    # while signed modifiers are rendered as their own lines.
     modifiers = entry.get("edge_modifiers") or []
     score, raw_breakdown = compute_trade_edge_components(signals, modifiers)
     raw_score   = sum(it["points"] for it in raw_breakdown)
-    cap_applied = raw_score > EDGE_SCORE_MAX
+    modifier_sum = sum(int(m.get("points") or 0) for m in modifiers if m)
+    cap_applied = (raw_score + modifier_sum) > EDGE_SCORE_MAX
 
     # Direction-aware display labels for the generic component names.
     relabel = {
