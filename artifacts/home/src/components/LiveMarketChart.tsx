@@ -602,9 +602,15 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       };
     }
 
-    // When SSE is live, skip the poll-driven partial bar update — the SSE
-    // handler is already keeping it current tick-by-tick.
-    const pollPartial = sseActiveRef.current ? null : partial;
+    // Once SSE has rendered this exact minute, keep the poll response from
+    // overwriting its tick-by-tick updates.  Do not suppress the first partial
+    // candle merely because the SSE connection opened: immediately after a
+    // restart there may be no completed bars, and suppressing that only visible
+    // candle leaves an otherwise live chart as a blank canvas.
+    const sseHasCurrentPartial =
+      sseActiveRef.current &&
+      partialBarRef.current?.ts === partial?.ts;
+    const pollPartial = sseHasCurrentPartial ? null : partial;
 
     // Build full candle list
     const allCandles = [...bars, ...(pollPartial ? [pollPartial] : [])].map(barToCandle);
@@ -929,6 +935,11 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   const conn       = data?.connection;
   const status     = conn?.status ?? (data?.enabled === false ? "DISCONNECTED" : "—");
   const isDisabled = data?.enabled === false;
+  const isWarming  =
+    !isDisabled &&
+    !!data &&
+    (data.bars?.length ?? 0) === 0 &&
+    !!data.partial_bar;
   const at         = data?.active_trade;
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -1059,6 +1070,17 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
                   <code style={{ fontFamily: T.mono, color: T.cyan }}>DATABENTO_ENABLED=1</code>
                   {" "}to enable live data
                 </span>
+              </div>
+            )}
+            {isWarming && (
+              <div style={{
+                position: "absolute", top: 10, left: 10,
+                padding: "5px 8px", borderRadius: 4,
+                background: `${T.surface}e8`, border: `1px solid ${T.amber}55`,
+                fontFamily: T.mono, fontSize: 10, color: T.amber,
+                pointerEvents: "none",
+              }}>
+                FIRST BAR FORMING · LIVE TICKS CONNECTED
               </div>
             )}
           </div>
