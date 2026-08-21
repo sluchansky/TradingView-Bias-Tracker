@@ -28940,6 +28940,21 @@ def build_main_brain_payload(result, instrument=None):
     except Exception as _pfexc:
         logger.debug("build_main_brain_payload prop_firm: %s", _pfexc)
 
+    # MBP-1 is a display-only read.  This intentionally bypasses the Order Flow
+    # score snapshot so the operator sees current selected-instrument pressure
+    # even before enough bars exist for an Order Flow composite.  The helper
+    # never returns stale bid/ask sizes.
+    top_of_book = {
+        "available": False, "state": "UNAVAILABLE", "instrument": inst,
+        "bid_size": None, "ask_size": None, "imbalance": None,
+        "updated_at": None, "age_s": None,
+    }
+    try:
+        from databento_brain import get_top_of_book_display  # noqa: PLC0415
+        top_of_book = get_top_of_book_display(inst)
+    except Exception as _book_exc:
+        logger.debug("build_main_brain_payload top_of_book: %s", _book_exc)
+
     return {
         "_version":          "v1",
         "generated_at":      now_utc().isoformat(),
@@ -28960,6 +28975,7 @@ def build_main_brain_payload(result, instrument=None):
         "system_status":     system_status,
         "candidate_preview": candidate_preview,
         "prop_firm":         prop_firm_snap,
+        "top_of_book":       top_of_book,
         "volatility_intelligence": (result or {}).get("volatility_intelligence"),
         "fvg_summary":       (result or {}).get("fvg_summary"),
         "fvg_sequences":     (result or {}).get("fvg_sequences"),

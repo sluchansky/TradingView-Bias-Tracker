@@ -87,6 +87,53 @@ def test_invalid_quote_is_ignored_and_freshness_expires():
     assert dbb.get_top_of_book_snapshot("MNQ", max_age_s=5) is None
 
 
+def test_display_view_hides_expired_sizes_and_labels_state():
+    brain = _brain()
+    brain._id_to_inst[101] = "MNQ"
+    brain._on_mbp1(_mbp1(101, 20000.0, 20000.25, 80, 20))
+
+    now = time.time()
+    live = dbb.get_top_of_book_display("MNQ", now_epoch=now)
+    assert live == {
+        "available": True,
+        "state": "LIVE",
+        "instrument": "MNQ",
+        "bid_size": 80,
+        "ask_size": 20,
+        "imbalance": 0.6,
+        "updated_at": live["updated_at"],
+        "age_s": live["age_s"],
+    }
+
+    stale = dbb.get_top_of_book_display(
+        "MNQ", now_epoch=now + dbb.TOP_OF_BOOK_STALE_S + 1,
+    )
+    assert stale["available"] is False
+    assert stale["state"] == "STALE"
+    assert stale["bid_size"] is None
+    assert stale["ask_size"] is None
+    assert stale["imbalance"] is None
+    assert stale["age_s"] > dbb.TOP_OF_BOOK_STALE_S
+
+    unavailable = dbb.get_top_of_book_display("MGC", now_epoch=now)
+    assert unavailable["available"] is False
+    assert unavailable["state"] == "UNAVAILABLE"
+
+    with dbb._TOP_OF_BOOK_LOCK:
+        dbb.DATABENTO_TOP_OF_BOOK_BY_INST["MGC"] = {
+            "available": True,
+            "instrument": "MGC",
+            "bid_size": "not-a-size",
+            "ask_size": 10,
+            "_received_at": now,
+        }
+    malformed = dbb.get_top_of_book_display("MGC", now_epoch=now)
+    assert malformed["available"] is False
+    assert malformed["state"] == "UNAVAILABLE"
+    assert malformed["bid_size"] is None
+    assert malformed["ask_size"] is None
+
+
 def test_mixed_live_session_subscribes_to_trades_and_mbp1(monkeypatch):
     instances = []
 

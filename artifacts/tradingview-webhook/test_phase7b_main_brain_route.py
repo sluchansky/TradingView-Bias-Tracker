@@ -162,6 +162,16 @@ class TestSchemaCompleteness(unittest.TestCase):
         payload = self.app.build_main_brain_payload(dict(FAKE_RESULT_BASE))
         self.assertIsInstance(payload["errors"], list)
 
+    def test_005a_top_of_book_is_display_only_and_copied_to_payload(self):
+        expected = {
+            "available": True, "state": "LIVE", "instrument": "MGC",
+            "bid_size": 48, "ask_size": 32, "imbalance": 0.2,
+            "updated_at": "2026-08-20T14:00:00+00:00", "age_s": 0.1,
+        }
+        with patch("databento_brain.get_top_of_book_display", return_value=expected):
+            payload = self.app.build_main_brain_payload(dict(FAKE_RESULT_BASE))
+        self.assertEqual(payload["top_of_book"], expected)
+
 
 # ============================================================================
 # TC-P7B-002  _mb_safe_num helper

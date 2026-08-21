@@ -27,6 +27,7 @@ import {
 import {
   visualBrainConfidence, visualBrainText, visualBrainToken,
 } from '../lib/visualBrainModes';
+import { getTopOfBookPresentation } from '../lib/topOfBookPresentation';
 
 // ── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -426,6 +427,67 @@ const UnavailableNote: React.FC<{ msg?: string }> = ({ msg }) => (
     {msg ?? 'Data unavailable'}
   </div>
 );
+
+// ── Databento MBP-1 pressure (read-only display) ───────────────────────────────
+// The server redacts bid/ask sizes as soon as a quote becomes stale.  This panel
+// only renders that contract; it does not derive, score, or submit trading data.
+const TopOfBookPressurePanel: React.FC<{ p: Record<string, unknown>; ticker: string }> = ({ p, ticker }) => {
+  const book = getTopOfBookPresentation((p.top_of_book ?? {}) as Record<string, unknown>);
+  const { state, bid, ask, imbalance, age } = book;
+  const isUsable = book.live;
+  const displayImbalance = imbalance ?? 0;
+  const side = displayImbalance > 0 ? 'BID HEAVY' : displayImbalance < 0 ? 'ASK HEAVY' : 'BALANCED';
+  const pressureColor = displayImbalance > 0 ? T.green : displayImbalance < 0 ? T.red : T.txtSec;
+  const stateColor = state === 'LIVE' ? T.green : state === 'STALE' ? T.amber : T.txtMuted;
+  const ageLabel = age == null ? '—' : age < 1 ? '<1s' : `${age.toFixed(age < 10 ? 1 : 0)}s`;
+
+  return (
+    <Panel
+      id="top-of-book-pressure"
+      title={`Live Bid / Ask Pressure · ${ticker}`}
+      badge={<Badge label={state} color={stateColor} />}
+    >
+      {!isUsable ? (
+        <div role="status" style={{ padding:'5px 0 2px', color: state === 'STALE' ? T.amber : T.txtMuted, fontSize:11, lineHeight:1.5 }}>
+          {state === 'STALE'
+            ? `Quote is stale (${ageLabel}); bid and ask sizes are intentionally hidden until the feed refreshes.`
+            : book.message}
+        </div>
+      ) : (
+        <>
+          <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+            <div style={{ background:`${T.green}12`, border:`1px solid ${T.green}2f`, borderRadius:7, padding:'8px 10px' }}>
+              <div style={{ fontSize:9, letterSpacing:'0.08em', color:T.txtMuted, fontWeight:700 }}>BID SIZE</div>
+              <div style={{ marginTop:3, color:T.green, fontFamily:T.mono, fontSize:19, fontWeight:800 }}>{fmtNum(bid, 0)}</div>
+            </div>
+            <div style={{ background:`${T.red}12`, border:`1px solid ${T.red}2f`, borderRadius:7, padding:'8px 10px' }}>
+              <div style={{ fontSize:9, letterSpacing:'0.08em', color:T.txtMuted, fontWeight:700 }}>ASK SIZE</div>
+              <div style={{ marginTop:3, color:T.red, fontFamily:T.mono, fontSize:19, fontWeight:800 }}>{fmtNum(ask, 0)}</div>
+            </div>
+          </div>
+          <div style={{ marginTop:10, display:'flex', alignItems:'center', gap:8 }}>
+            <div style={{ flex:1, height:6, borderRadius:999, background:`${T.red}4d`, overflow:'hidden' }} aria-label={`Normalized book imbalance ${(displayImbalance * 100).toFixed(1)} percent`}>
+              <div style={{
+                height:'100%', width:`${Math.max(0, Math.min(100, ((displayImbalance + 1) / 2) * 100))}%`,
+                background:pressureColor, transition:'width 0.35s ease',
+              }} />
+            </div>
+            <span style={{ fontFamily:T.mono, fontSize:11, fontWeight:800, color:pressureColor, minWidth:52, textAlign:'right' }}>
+              {displayImbalance > 0 ? '+' : ''}{(displayImbalance * 100).toFixed(1)}%
+            </span>
+          </div>
+          <div style={{ marginTop:7, display:'flex', justifyContent:'space-between', gap:8, fontSize:10 }}>
+            <span style={{ color:pressureColor, fontWeight:700, letterSpacing:'0.05em' }}>{side}</span>
+            <span style={{ color:T.txtMuted }}>Quote age {ageLabel}</span>
+          </div>
+        </>
+      )}
+      <div style={{ marginTop:10, color:T.txtMuted, fontSize:9.5, lineHeight:1.45 }}>
+        Advisory market-depth data only · never changes a trade decision or execution.
+      </div>
+    </Panel>
+  );
+};
 
 // ── Edge score gauge (0–110 scale) ────────────────────────────────────────────
 const EdgeGauge: React.FC<{ score: number | null; max?: number }> = ({ score, max = 110 }) => {
@@ -14446,6 +14508,9 @@ export default function MainBrain() {
             <div style={{ marginTop: 10 }}>
               <VolatilityIntelligencePanel p={p} />
             </div>
+            <div style={{ marginTop: 10 }}>
+              <TopOfBookPressurePanel p={p} ticker={ticker} />
+            </div>
             <CanonicalStatePanel />
           </>
         );
@@ -14637,6 +14702,11 @@ export default function MainBrain() {
                 authHeader={getAuthHeader()['Authorization']}
                 tall={section === 'desk'}
               />
+
+              {/* ── Databento MBP-1 selected-instrument pressure ───────────── */}
+              <div style={{ marginTop:12 }}>
+                <TopOfBookPressurePanel p={p} ticker={ticker} />
+              </div>
 
               {/* ── Cleanest Trade Available button strip ──────────────────── */}
               <CleanestTradeButton

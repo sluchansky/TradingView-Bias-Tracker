@@ -120,6 +120,67 @@ def get_top_of_book_snapshot(
     return out
 
 
+def get_top_of_book_display(inst: str, *, now_epoch: float | None = None) -> dict[str, Any]:
+    """Return a UI-safe MBP-1 view without ever serving an expired quote.
+
+    This is intentionally separate from ``get_top_of_book_snapshot``: consumers
+    of a display need to distinguish a feed that has gone stale from one that has
+    not produced a quote yet, while neither condition may expose old bid/ask
+    sizes.  It is advisory-only and does not participate in any trade decision.
+    """
+    empty = {
+        "available": False,
+        "state": "UNAVAILABLE",
+        "instrument": inst,
+        "bid_size": None,
+        "ask_size": None,
+        "imbalance": None,
+        "updated_at": None,
+        "age_s": None,
+    }
+    if not inst:
+        return empty
+
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    with _TOP_OF_BOOK_LOCK:
+        snapshot = DATABENTO_TOP_OF_BOOK_BY_INST.get(inst)
+        if not isinstance(snapshot, dict):
+            return empty
+        received_at = snapshot.get("_received_at")
+        try:
+            age_s = max(0.0, now_epoch - float(received_at))
+            bid_size = int(snapshot.get("bid_size"))
+            ask_size = int(snapshot.get("ask_size"))
+            bid_price = float(snapshot.get("bid_price"))
+            ask_price = float(snapshot.get("ask_price"))
+        except (TypeError, ValueError):
+            return empty
+
+        if age_s > TOP_OF_BOOK_STALE_S:
+            return {
+                **empty,
+                "state": "STALE",
+                "age_s": round(age_s, 3),
+                "updated_at": snapshot.get("updated_at"),
+            }
+        if bid_size <= 0 or ask_size <= 0 or bid_price <= 0 or ask_price <= bid_price:
+            return empty
+
+        total = bid_size + ask_size
+        if total <= 0:
+            return empty
+        return {
+            "available": True,
+            "state": "LIVE",
+            "instrument": inst,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "imbalance": round((bid_size - ask_size) / total, 4),
+            "updated_at": snapshot.get("updated_at"),
+            "age_s": round(age_s, 3),
+        }
+
+
 DATABENTO_STATUS: dict[str, Any] = {
     "connected":   False,
     "reconnects":  0,
