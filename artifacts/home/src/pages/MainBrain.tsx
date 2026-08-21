@@ -3388,6 +3388,14 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
     timeframe_alignment?: unknown; market_phase?: unknown; session_level?: unknown;
     thesis_quality?: unknown; structural_stop?: unknown; target_context?: unknown;
   };
+  type MarketTimeframe = {
+    bars?: number; bias?: string; confidence?: number; last_close?: number | null;
+  };
+  type MarketContext = {
+    source?: string; bias?: string; alignment?: string; price?: number | null;
+    vwap?: number | null; session_high?: number | null; session_low?: number | null;
+    timeframes?: Record<string, MarketTimeframe>;
+  };
   type VBObs = {
     timestamp: string; instrument: string; bias: string; market_state: string;
     short_term_structure: string | null; last_event: string; action: string;
@@ -3399,6 +3407,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
     p10m: number | null; p15m: number | null; mfe: number | null; mae: number | null;
     outcome_resolved: boolean;
     mode_assessments?: Partial<Record<'scalp' | 'intraday_trend' | 'swing', ModeAssessment>>;
+    market_context?: MarketContext;
   };
   type AllStatus = {
     enabled: boolean; db_ready: boolean; symbols: string[];
@@ -3498,6 +3507,10 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   };
   const fmtPct = (v: number | null | undefined) =>
     v == null ? '—' : `${v > 0 ? '+' : ''}${v.toFixed(3)}%`;
+  const fmtContextPrice = (v: number | null | undefined) =>
+    typeof v === 'number' && Number.isFinite(v)
+      ? v.toLocaleString('en-US', { maximumFractionDigits: 2 })
+      : '—';
 
   const enabled  = allStatus?.enabled ?? null;
   const dbReady  = allStatus?.db_ready ?? false;
@@ -3506,6 +3519,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   const obs      = activeTab ? (obsMap[activeTab]?.observation ?? null) : null;
   const transitions = hist.filter(h => h.state_changed);
   const modeAssessments = obs?.mode_assessments ?? {};
+  const marketContext = obs?.market_context;
 
   const ModeAssessmentCard: React.FC<{
     label: string; assessment?: ModeAssessment; details: Array<[string, unknown]>;
@@ -3714,6 +3728,47 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
                       borderRadius: 6, borderLeft: `3px solid ${T.cyan}`, fontSize: 11, color: T.txtSec,
                       lineHeight: 1.5 }}>
                       {obs.summary}
+                    </div>
+                  )}
+
+                  {/* ── Native multi-timeframe context — deterministic, display-only ── */}
+                  {marketContext && (
+                    <div style={{ marginTop: 12, padding: '10px', background: T.panelAlt,
+                      borderRadius: 8, border: `1px solid ${T.border}` }}>
+                      <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 9, flexWrap: 'wrap' }}>
+                        <span style={{ fontSize: 9.5, fontWeight: 700, color: T.txtSec,
+                          letterSpacing: '0.08em', textTransform: 'uppercase', marginRight: 'auto' }}>
+                          Native Multi-Timeframe Context
+                        </span>
+                        <Badge label={`DATA ${visualBrainToken(marketContext.bias)}`}
+                          color={biasColor(marketContext.bias)} />
+                        <Badge label={visualBrainToken(marketContext.alignment)}
+                          color={marketContext.alignment === 'ALIGNED' ? T.green : T.txtMuted} />
+                      </div>
+                      <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 9, fontSize: 9.5, color: T.txtMuted }}>
+                        <span>Price <strong style={{ color: T.txtSec }}>{fmtContextPrice(marketContext.price)}</strong></span>
+                        <span>VWAP <strong style={{ color: T.cyan }}>{fmtContextPrice(marketContext.vwap)}</strong></span>
+                        <span>Session H <strong style={{ color: T.red }}>{fmtContextPrice(marketContext.session_high)}</strong></span>
+                        <span>Session L <strong style={{ color: T.green }}>{fmtContextPrice(marketContext.session_low)}</strong></span>
+                      </div>
+                      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(80px, 1fr))', gap: 5 }}>
+                        {['1m', '5m', '15m', '1h', '4h', '1D'].map(tf => {
+                          const reading = marketContext.timeframes?.[tf];
+                          const tfBias = reading?.bias ?? 'UNKNOWN';
+                          return (
+                            <div key={tf} style={{ minWidth: 0, padding: '6px 5px', borderRadius: 5,
+                              background: T.panel, border: `1px solid ${biasColor(tfBias)}2b`, textAlign: 'center' }}>
+                              <div style={{ fontSize: 8.5, color: T.txtMuted, marginBottom: 3 }}>{tf}</div>
+                              <div style={{ fontSize: 9, fontWeight: 800, color: biasColor(tfBias), whiteSpace: 'nowrap' }}>
+                                {tfBias}
+                              </div>
+                              <div style={{ fontSize: 8, color: T.txtMuted, marginTop: 3 }}>
+                                {typeof reading?.bars === 'number' ? `${reading.bars} bars` : '—'}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
                     </div>
                   )}
 

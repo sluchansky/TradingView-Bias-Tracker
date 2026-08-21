@@ -895,6 +895,58 @@ class TestBarsFnInjection(unittest.TestCase):
                              f"Expected 21500.0 from price_store, got {entry_price}")
 
 
+class TestNativeMultiTimeframeContext(unittest.TestCase):
+    """Higher-timeframe bias must be supplied beside the 1m chart image."""
+
+    def setUp(self):
+        self.vb = _import_vb()
+
+    def _make_hourly_bars(self, n=80):
+        now = int(time.time())
+        bars = []
+        for i in range(n):
+            close = 20000.0 + i * 8.0
+            bars.append({
+                "ts": now - (n - i) * 3600,
+                "open": close - 3.0, "high": close + 7.0, "low": close - 8.0,
+                "close": close, "volume": 1000 + i,
+            })
+        return bars
+
+    def test_context_contains_required_timeframes_and_decided_bias(self):
+        context = self.vb._build_market_context(self._make_hourly_bars(), "MNQ")
+
+        self.assertEqual(set(context["timeframes"]), {"1m", "5m", "15m", "1h", "4h", "1D"})
+        self.assertEqual(context["timeframes"]["1h"]["bias"], "BULLISH")
+        self.assertEqual(context["timeframes"]["4h"]["bias"], "BULLISH")
+        self.assertEqual(context["timeframes"]["1D"]["bias"], "BULLISH")
+        self.assertEqual(context["bias"], "BULLISH")
+        self.assertEqual(context["alignment"], "ALIGNED")
+
+    def test_model_prompt_includes_native_context(self):
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps(_make_obs())
+        mock_resp = MagicMock()
+        mock_resp.choices = [mock_choice]
+        mock_resp.usage.prompt_tokens = 100
+        mock_resp.usage.completion_tokens = 50
+        context = {
+            "bias": "BULLISH", "alignment": "ALIGNED",
+            "timeframes": {"1h": {"bias": "BULLISH"}},
+        }
+
+        with patch("openai.OpenAI") as MockOpenAI:
+            MockOpenAI.return_value.chat.completions.create.return_value = mock_resp
+            self.vb.analyze_visual_market(
+                b"fake-img", None, [], "MNQ", market_context=context,
+            )
+
+        messages = MockOpenAI.return_value.chat.completions.create.call_args.kwargs["messages"]
+        prompt_text = messages[1]["content"][0]["text"]
+        self.assertIn("NATIVE MULTI-TIMEFRAME CONTEXT", prompt_text)
+        self.assertIn('"alignment":"ALIGNED"', prompt_text)
+
+
 class TestSingleFlightReschedule(unittest.TestCase):
     """_schedule_next must be called exactly once per _vb_tick, regardless of path.
 

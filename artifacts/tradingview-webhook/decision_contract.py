@@ -225,6 +225,9 @@ def _build_legal_transitions() -> frozenset:
         (DS.EXECUTABLE,       DS.WAIT),
         (DS.EXECUTABLE,       DS.OBSERVING),
         (DS.WAIT,             DS.OBSERVING),
+        # A full evaluation can skip transient SETUP_FORMING/EARLY states and
+        # promote a previously waiting instrument directly to a confirmed setup.
+        (DS.WAIT,             DS.READY),
         # ── OBSERVING → WAIT: confirmed legitimate production path ────────────
         # After OrbEngine resets DC to OBSERVING (SESSION_CLOSED), the next
         # full_analysis cycle legitimately evaluates the instrument as WAIT
@@ -281,6 +284,20 @@ def _build_legal_transitions() -> frozenset:
     # Any resettable → OBSERVING (new session resets)
     for src in _RESETTABLE:
         pairs.add((src, DS.OBSERVING))
+    # A non-terminal block is a snapshot of a failed prerequisite, not a
+    # permanent decision.  A subsequent full-analysis cycle may legitimately
+    # recover directly to a later signal state because intermediate evaluations
+    # are not guaranteed to run (for example, fresh data can make
+    # BLOCKED_DATA → EARLY/READY in one tick).  Keep this shadow contract in
+    # lockstep with the authoritative live verdict rather than pinning records
+    # in a stale block state.
+    _RECOVERY_STATES = [
+        DS.WAIT, DS.SETUP_FORMING, DS.EARLY, DS.READY, DS.QUALIFIED,
+        DS.RISK_PENDING, DS.RISK_APPROVED, DS.EXECUTABLE,
+    ]
+    for src in _BLOCKED:
+        for dst in _RECOVERY_STATES:
+            pairs.add((src, dst))
     # Self-transitions (repeated signal, no state change)
     for s in [DS.OBSERVING, DS.WAIT, DS.SETUP_FORMING, DS.EARLY,
               DS.READY, DS.MANAGING, DS.POSITION_ACTIVE]:

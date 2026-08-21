@@ -1,9 +1,10 @@
-"""Visual Brain V1 — Multi-Instrument 1-Minute Stateful Market Observer.
+"""Visual Brain V1 — Multi-Instrument Stateful Market Observer.
 
 Captures the live chart (or a locally-generated candlestick
-chart from Databento bars) once per 60 seconds, sends the image plus a compact
-text history to a vision-capable LLM, receives a strict JSON market state, and
-persists every observation to visual_brain_observations.
+chart from Databento bars) once per 60 seconds, sends the image plus native
+multi-timeframe context and a compact text history to a vision-capable LLM,
+receives a strict JSON market state, and persists every observation to
+visual_brain_observations.
 
 SHADOW / OBSERVATION ONLY.
 - Does NOT place trades.
@@ -185,6 +186,169 @@ _TV_EMBED_URLS: dict = {
         "&theme=dark&hide_side_toolbar=1&hide_top_toolbar=1&allow_symbol_change=0"
     ),
 }
+
+
+def _bar_epoch(bar: dict) -> Optional[float]:
+    """Return a bar timestamp as Unix seconds, tolerating native bar shapes."""
+    raw = bar.get("ts_event", bar.get("ts"))
+    if raw is None:
+        return None
+    try:
+        if isinstance(raw, datetime):
+            dt = raw if raw.tzinfo else raw.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        if isinstance(raw, str):
+            text = raw.strip().replace("Z", "+00:00")
+            return datetime.fromisoformat(text).timestamp()
+        value = float(raw)
+        # Databento can expose nanoseconds; other sources commonly use seconds.
+        if value > 1e14:
+            return value / 1e9
+        if value > 1e11:
+            return value / 1e3
+        return value
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _resample_bars(bars: list[dict], bucket_seconds: int) -> list[dict]:
+    """Resample native OHLCV bars into deterministic UTC buckets."""
+    buckets: dict[int, dict] = {}
+    for bar in bars:
+        ts = _bar_epoch(bar)
+        if ts is None:
+            continue
+        try:
+            o = float(bar.get("open"))
+            h = float(bar.get("high"))
+            lo = float(bar.get("low"))
+            c = float(bar.get("close"))
+            v = float(bar.get("volume") or 0)
+        except (TypeError, ValueError):
+            continue
+        if not all(map(lambda n: n == n and abs(n) != float("inf"), (o, h, lo, c))):
+            continue
+        bucket = int(ts // bucket_seconds) * bucket_seconds
+        current = buckets.get(bucket)
+        if current is None:
+            buckets[bucket] = {
+                "ts": float(bucket), "open": o, "high": h, "low": lo,
+                "close": c, "volume": v,
+            }
+        else:
+            current["high"] = max(current["high"], h)
+            current["low"] = min(current["low"], lo)
+            current["close"] = c
+            current["volume"] += v
+    return [buckets[key] for key in sorted(buckets)]
+
+
+def _timeframe_bias(tf_bars: list[dict]) -> tuple[str, float]:
+    """Classify a resampled timeframe without inventing a bias from one bar."""
+    closes = [float(b["close"]) for b in tf_bars if b.get("close") is not None]
+    if len(closes) < 3:
+        return "UNKNOWN", 0.0
+    recent = closes[-min(8, len(closes)):]
+    first, last = recent[0], recent[-1]
+    avg_range = sum(
+        max(float(b.get("high", 0)) - float(b.get("low", 0)), 0.0)
+        for b in tf_bars[-len(recent):]
+    ) / max(len(recent), 1)
+    threshold = max(avg_range * 0.18, abs(last) * 0.00008)
+    delta = last - first
+    if abs(delta) <= threshold:
+        return "NEUTRAL", min(abs(delta) / max(threshold, 1e-9), 1.0)
+    return ("BULLISH" if delta > 0 else "BEARISH"), min(abs(delta) / max(threshold * 3, 1e-9), 1.0)
+
+
+def _build_market_context(bars: list[dict], instrument: str) -> dict:
+    """Build the native context supplied beside the screenshot to the model.
+
+    The screenshot remains a 1-minute visual input, but the model also receives
+    deterministic 5m/15m/1h/4h/1D summaries made from the same native bars.
+    This is display-only context: it never feeds the trading engine.
+    """
+    context: dict = {
+        "source": "Databento native bars; deterministic UTC resampling",
+        "instrument": instrument,
+        "bias": "UNKNOWN",
+        "alignment": "UNKNOWN",
+        "price": None,
+        "vwap": None,
+        "session_high": None,
+        "session_low": None,
+        "timeframes": {},
+    }
+    if not bars:
+        return context
+
+    valid = [b for b in bars if _bar_epoch(b) is not None]
+    if not valid:
+        return context
+    valid.sort(key=lambda b: _bar_epoch(b) or 0)
+
+    try:
+        last = valid[-1]
+        context["price"] = round(float(last.get("close")), 4)
+    except (TypeError, ValueError):
+        pass
+
+    # Session levels use the current UTC trading date. They are descriptive
+    # levels, not an execution signal.
+    try:
+        now = datetime.now(timezone.utc)
+        session_start = now.replace(hour=0, minute=0, second=0, microsecond=0).timestamp()
+        session_bars = [b for b in valid if (_bar_epoch(b) or 0) >= session_start]
+        if session_bars:
+            context["session_high"] = round(max(float(b["high"]) for b in session_bars), 4)
+            context["session_low"] = round(min(float(b["low"]) for b in session_bars), 4)
+    except (TypeError, ValueError):
+        pass
+
+    for label, seconds in (
+        ("1m", 60), ("5m", 5 * 60), ("15m", 15 * 60),
+        ("1h", 60 * 60), ("4h", 4 * 60 * 60), ("1D", 24 * 60 * 60),
+    ):
+        tf_bars = valid if label == "1m" else _resample_bars(valid, seconds)
+        bias, confidence = _timeframe_bias(tf_bars)
+        last_bar = tf_bars[-1] if tf_bars else {}
+        tf = {
+            "bars": len(tf_bars),
+            "bias": bias,
+            "confidence": round(confidence, 3),
+            "last_close": round(float(last_bar["close"]), 4) if last_bar.get("close") is not None else None,
+            "last_bar_utc": (
+                datetime.fromtimestamp(float(last_bar["ts"]), timezone.utc).isoformat()
+                if last_bar.get("ts") is not None else None
+            ),
+        }
+        context["timeframes"][label] = tf
+
+    decided = [
+        context["timeframes"][label]["bias"]
+        for label in ("15m", "1h", "4h", "1D")
+        if context["timeframes"].get(label, {}).get("bias") in {"BULLISH", "BEARISH", "NEUTRAL"}
+    ]
+    if decided:
+        bulls = decided.count("BULLISH")
+        bears = decided.count("BEARISH")
+        context["bias"] = "BULLISH" if bulls > bears else "BEARISH" if bears > bulls else "NEUTRAL"
+        if bulls == len(decided) or bears == len(decided):
+            context["alignment"] = "ALIGNED"
+        elif bulls == 0 or bears == 0:
+            context["alignment"] = "NEUTRAL"
+        else:
+            context["alignment"] = "MIXED"
+
+    if _vwap_store is not None:
+        try:
+            live_vwap = (_vwap_store.get(instrument) or {}).get("value")
+            if live_vwap is not None:
+                context["vwap"] = round(float(live_vwap), 4)
+        except (TypeError, ValueError):
+            pass
+    return context
+
 
 def _compress_image(raw_png: bytes, max_px: int = _VB_IMAGE_MAX_PX) -> bytes:
     """Resize + JPEG-compress screenshot bytes; returns JPEG bytes."""
@@ -412,9 +576,9 @@ _INSTRUMENT_LABELS: dict = {
 def _get_system_prompt(instrument: str) -> str:
     """Return the analysis system prompt with the correct instrument label."""
     label = _INSTRUMENT_LABELS.get(instrument, instrument)
-    return f"""You are a disciplined institutional futures trader analyzing a 1-minute {label} chart image.
+    return f"""You are a disciplined institutional futures trader analyzing a native multi-timeframe market context and a 1-minute {label} chart image.
 
-Your job: describe ONLY what you can directly observe in the chart. Never guess or predict specific future prices.
+Your job: describe ONLY what you can directly observe in the chart or the supplied native context. Never guess or predict specific future prices.
 
 Analyze:
 - Market structure (HH/HL = bullish; LH/LL = bearish; range)
@@ -501,7 +665,8 @@ Rules:
 - SCALP focuses on immediate trigger quality, VWAP/structure confirmation, and fast invalidation.
 - INTRADAY_TREND focuses on 15m/1h alignment, continuation versus exhaustion, and session levels.
 - SWING focuses on 1h/4h/daily alignment, thesis quality, structural invalidation, and larger target context.
-- The image is primarily a 1-minute chart. Do NOT invent unseen 15m, 1h, 4h, or daily evidence. Use UNKNOWN alignment/quality and a cautious WAIT or NO_TRADE status when the needed timeframe cannot be confirmed from the supplied context.
+- The image is primarily a 1-minute chart, but the user message also contains deterministic native-bar context for 5m/15m/1h/4h/1D. Use that context for higher-timeframe bias and alignment; do not downgrade to UNKNOWN merely because those candles are not drawn in the image.
+- Treat the native context's timeframe bias, alignment, price, VWAP, and session levels as observed data. Do not fabricate values that are absent or marked UNKNOWN.
 - Keep each validation, invalidation, and reason concise and based only on visible chart evidence.
 - Respond ONLY with the JSON object, nothing else
 """
@@ -626,6 +791,7 @@ def analyze_visual_market(
     previous_state: Optional[dict],
     recent_history: list[dict],
     instrument: str = "MNQ",
+    market_context: Optional[dict] = None,
 ) -> dict:
     """Send screenshot + compact history to GPT-4o vision; return parsed dict.
 
@@ -656,6 +822,7 @@ def analyze_visual_market(
         )
 
     b64_img = base64.b64encode(screenshot_bytes).decode()
+    context_text = json.dumps(market_context or {}, separators=(",", ":"), sort_keys=True)
 
     user_content = [
         {
@@ -665,7 +832,8 @@ def analyze_visual_market(
                 f"Current UTC time: {now_utc}\n\n"
                 f"--- PREVIOUS STATE ---\n{prev_summary or 'First observation.'}\n\n"
                 f"--- STATE HISTORY (newest last) ---\n{history_text}\n\n"
-                "Analyze the attached chart image and respond with ONLY the JSON object."
+                f"--- NATIVE MULTI-TIMEFRAME CONTEXT ---\n{context_text}\n\n"
+                "Analyze the native context and attached chart image. Respond with ONLY the JSON object."
             ),
         },
         {
@@ -1141,6 +1309,12 @@ def _vb_tick(instrument: str = "MNQ") -> None:
         # disk.  Saving delete=False temp files would exhaust local storage over
         # time.  screenshot_path is always stored as NULL; use object storage if
         # permanent retention is needed (see Task #189).
+        market_context = {}
+        try:
+            if _bars_fn is not None:
+                market_context = _build_market_context(_bars_fn(instrument), instrument)
+        except Exception as context_exc:
+            logger.warning("[VISUAL_BRAIN] market context failed: %s", context_exc)
         try:
             screenshot_bytes = capture_chart_screenshot(instrument)
         except Exception as cap_exc:
@@ -1166,10 +1340,15 @@ def _vb_tick(instrument: str = "MNQ") -> None:
                 previous_state=prev_state,
                 recent_history=recent_history,
                 instrument=instrument,
+                market_context=market_context,
             )
         except Exception as analyze_exc:
             logger.warning("[VISUAL_BRAIN] analysis failed: %s", analyze_exc)
             return   # finally → _schedule_next() fires exactly once
+
+        # Keep the deterministic context with the observation so the dashboard
+        # can show the actual HTF inputs even when the model chooses WAIT.
+        obs["market_context"] = market_context
 
         # ── Persist ──────────────────────────────────────────────────────────
         obs_id = _insert_observation(obs, screenshot_path=None)

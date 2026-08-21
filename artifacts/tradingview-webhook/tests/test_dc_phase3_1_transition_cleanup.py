@@ -480,5 +480,37 @@ class TestMapFullAnalysisCanonicalization(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TestBlockedStateRecovery(unittest.TestCase):
+
+    def test_35_wait_to_ready_is_legal_when_intermediate_tick_is_skipped(self):
+        """A fresh full analysis can promote WAIT directly to READY."""
+        ok, err = validate_transition(DS.WAIT, DS.READY, "test")
+        self.assertTrue(ok, f"WAIT → READY must be legal: {err}")
+
+    def test_36_blocked_data_recovers_to_each_full_analysis_signal_state(self):
+        """Fresh data must not leave the display-only state machine stuck."""
+        for state in (DS.WAIT, DS.SETUP_FORMING, DS.EARLY, DS.READY,
+                      DS.QUALIFIED, DS.RISK_PENDING, DS.RISK_APPROVED,
+                      DS.EXECUTABLE):
+            ok, err = validate_transition(DS.BLOCKED_DATA, state, "test")
+            self.assertTrue(ok, f"BLOCKED_DATA → {state} must be legal: {err}")
+
+    def test_37_full_analysis_promotes_blocked_data_to_ready(self):
+        """Observed live recovery: data arrives and the next cycle is READY."""
+        registry = _make_registry(["MNQ"])
+        registry.observe_full_analysis(
+            "MNQ",
+            _fa(
+                inst="MNQ", strict_reason="data unavailable",
+                gate_debug={"data_available": False},
+            ),
+            None,
+        )
+        self.assertEqual(registry.get_record("MNQ").state, DS.BLOCKED_DATA)
+
+        registry.observe_full_analysis("MNQ", _fa_ready("MNQ"), _ARM_READY)
+        self.assertEqual(registry.get_record("MNQ").state, DS.READY)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
