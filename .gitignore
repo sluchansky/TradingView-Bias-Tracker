@@ -46,9 +46,31 @@ Thumbs.db
 
 # Replit
 .cache/
+
+# Pasted operational notes are workspace inputs, not production source.
+attached_assets/Pasted-*
 .local/
 
 # Historical market data — must not be committed
 market_data/
 *.dbn
 *.dbn.zst
+
+# Local Windows/Linux runtime state and secrets
+.env
+.env.*
+!.env.example
+*.db
+*.sqlite
+*.sqlite3
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+logs/
+*.log
+screenshots/
+*.tmp
+*.temp
+tmp/
+.cache/
