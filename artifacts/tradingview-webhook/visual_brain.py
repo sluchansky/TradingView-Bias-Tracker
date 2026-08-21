@@ -882,6 +882,17 @@ def analyze_visual_market(
                 raise ValueError(f"Schema violation: {reason}")
             obs["timestamp"] = now_utc   # authoritative server timestamp
             obs["instrument"] = instrument
+            # Phase 1 Central Ghost Coordinator: Visual Brain stays explicitly
+            # non-trade-like.  It contributes only a deduped telemetry event,
+            # never a direction/entry/stop/target observation.
+            try:
+                import ghost_coordinator as _gc  # noqa: PLC0415
+                _gc.record_observational_event(
+                    "visual_brain",
+                    "%s|%s|%s" % (instrument, now_utc, obs.get("market_state", "UNKNOWN")),
+                )
+            except Exception:
+                pass
             return obs
 
         except Exception as exc:

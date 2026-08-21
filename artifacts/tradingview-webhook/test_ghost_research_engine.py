@@ -881,6 +881,34 @@ class TestLookaheadPrevention(unittest.TestCase):
 # ══════════════════════════════════════════════════════════════════════════════
 
 class TestBreakoutMissedForceNoEntry(unittest.TestCase):
+    def test_completion_runs_outside_lock_and_engine_remains_usable(self):
+        engine = _make_engine()
+        engine._active_opp["MNQ"] = "OPP_UNLOCKED"
+        engine._open_results["RES_UNLOCKED"] = {
+            "result_id": "RES_UNLOCKED", "opportunity_id": "OPP_UNLOCKED",
+            "status": ResultStatus.WATCHING_ENTRY, "instrument": "MNQ",
+        }
+        completed = []
+
+        def complete(result_id, **_kwargs):
+            # This models the real completion path's re-entry into _lock.
+            with engine._lock:
+                completed.append(result_id)
+                engine._open_results.pop(result_id, None)
+
+        engine._complete_experiment = complete
+        worker = threading.Thread(
+            target=engine._on_breakout_missed,
+            args=("MNQ", _orb_status(state="BREAKOUT_MISSED"), "2026-08-21"),
+        )
+        worker.start()
+        worker.join(timeout=1)
+        self.assertFalse(worker.is_alive(), "BREAKOUT_MISSED must not self-deadlock")
+        self.assertEqual(completed, ["RES_UNLOCKED"])
+        # A fresh state operation proves subsequent GRE processing can use the lock.
+        with engine._lock:
+            engine._last_orb_state["MNQ"] = "BREAKOUT_MISSED"
+
     def test_watching_entry_becomes_no_entry(self):
         engine = _make_engine()
         engine._active_opp["MNQ"] = "OPP_MISSED"

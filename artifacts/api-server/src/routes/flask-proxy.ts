@@ -424,6 +424,7 @@ export const BOT1_ROUTES = [
   // Never touches gate, scoring, sizing, learning, or execution.
   "/research-health",
   "/research-events",
+  "/research-coordinator-report",
   // Research Operations panel — lightweight aggregated status for GRE/FVG/SCALP/IT
   // engines: observation counts, evidence-state breakdown, READY_FOR_REVIEW queue.
   // DISPLAY-ONLY; owner-only; NOT in OPEN_PATHS. Never touches gate or execution.

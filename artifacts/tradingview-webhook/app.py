@@ -47650,6 +47650,26 @@ SCALP_SIM_WATCH_LOCK      = threading.Lock()   # single-flight: one watcher cycl
 SCALP_SIM_WATCH_INTERVAL  = max(10, int(os.environ.get("SCALP_SIM_WATCH_INTERVAL", 15)))
 SCALP_SIM_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("SCALP_SIM_COOLDOWN_SECS", 300)))
 SCALP_SIM_MAX_HOLD_HOURS  = max(1, int(os.environ.get("SCALP_SIM_MAX_HOLD_HOURS", 8)))
+# Phase 1 observability only: the watcher remains deliberately live-instance
+# gated, but its lifecycle is now visible when open sim rows appear stale.
+_SCALP_SIM_WATCH_HEALTH_LOCK = threading.Lock()
+_SCALP_SIM_WATCH_HEALTH = {
+    "last_started_at": None, "last_completed_at": None, "last_error": None,
+    "last_skip_reason": None, "cycles_started": 0, "cycles_completed": 0,
+    "cycles_skipped": 0, "cycles_failed": 0, "last_open_rows": 0,
+    "last_closed_rows": 0, "last_missing_bar_count": 0,
+}
+
+# Central Ghost Coordinator is shadow-only and disabled by default.  It observes
+# copies of legacy research events; it never becomes a gate, outcome resolver,
+# promotion input, or execution dependency.
+CENTRAL_GHOST_COORDINATOR_ENABLED = os.environ.get(
+    "CENTRAL_GHOST_COORDINATOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+try:
+    import ghost_coordinator as _ghost_coordinator  # noqa: PLC0415
+    _ghost_coordinator.configure(enabled=CENTRAL_GHOST_COORDINATOR_ENABLED)
+except Exception:
+    _ghost_coordinator = None
 
 # ════════════════════════════════════════════════════════════════════════════
 # SCALP-STRATEGY ADVISORY (Main Brain "potential trades") — DISPLAY/ADVISORY ONLY
@@ -48970,6 +48990,14 @@ def _maybe_observe_scalp_live_sim(result, source="webhook"):
         if _scalp_sim_open_insert(sim_key, setup_anchor, key, inst, direction,
                                   cand, session, regime, edge):
             opened += 1
+            _coordinator_submit_analysis(
+                result, inst=inst, source_system="scalp_live_sim",
+                setup_family="SCALP_RESEARCH", strategy_name=key,
+                direction=direction, entry=cand["entry"], stop=cand["stop"],
+                targets=(cand["target"],), source_event_id=sim_key,
+                context={"legacy_sim_key": sim_key, "session": session,
+                         "regime": regime, "edge_score": edge},
+            )
             with _SCALP_SIM_COOLDOWN_LOCK:
                 _SCALP_SIM_COOLDOWN[ckey] = now_mono
     if opened:
@@ -49047,10 +49075,10 @@ def _watch_scalp_sim_trades():
     scalp_strategy_sim_trades — never MANAGED_TRADES, strategy_trades,
     _record_strategy_trade, or the money path. FAIL-OPEN."""
     if not SCALP_SIM_DB_READY:
-        return
+        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0}
     conn = _learning_conn()
     if conn is None:
-        return
+        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0}
     open_rows = []
     try:
         with conn.cursor() as cur:
@@ -49075,16 +49103,19 @@ def _watch_scalp_sim_trades():
         except Exception:
             pass
     if not open_rows:
-        return
+        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0}
     bars = {}
     for inst in {r["symbol"] for r in open_rows}:
         try:
             bars[inst] = _fetch_latest_bar(inst)
         except Exception:
             bars[inst] = None
+    closed_rows = 0
+    missing_bars = 0
     for row in open_rows:
         bar = bars.get(row["symbol"])
         if not bar:
+            missing_bars += 1
             continue
         bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
         if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
@@ -49106,7 +49137,9 @@ def _watch_scalp_sim_trades():
                     outcome = ("expired", round(cl, 4), round(r, 4))
         if outcome is None:
             continue
-        _scalp_sim_close(row["id"], outcome[0], outcome[1], outcome[2])
+        if _scalp_sim_close(row["id"], outcome[0], outcome[1], outcome[2]):
+            closed_rows += 1
+    return {"open_rows": len(open_rows), "closed_rows": closed_rows, "missing_bars": missing_bars}
 
 
 def _scalp_sim_watch_loop():
@@ -49115,14 +49148,42 @@ def _scalp_sim_watch_loop():
     SCALP_SIM_WATCH_LOCK. FAIL-OPEN — any error just skips this cycle. Never
     touches the money path."""
     try:
-        if SCALP_LIVE_SIM_ENABLED and DISCORD_LIVE_ENABLED and SCALP_SIM_DB_READY:
-            if SCALP_SIM_WATCH_LOCK.acquire(blocking=False):
-                try:
-                    _watch_scalp_sim_trades()
-                finally:
-                    SCALP_SIM_WATCH_LOCK.release()
+        with _SCALP_SIM_WATCH_HEALTH_LOCK:
+            _SCALP_SIM_WATCH_HEALTH["cycles_started"] += 1
+            _SCALP_SIM_WATCH_HEALTH["last_started_at"] = now_utc().isoformat()
+        if not SCALP_LIVE_SIM_ENABLED:
+            reason = "feature_disabled"
+        elif not DISCORD_LIVE_ENABLED:
+            reason = "not_live_instance"
+        elif not SCALP_SIM_DB_READY:
+            reason = "db_not_ready"
+        elif not SCALP_SIM_WATCH_LOCK.acquire(blocking=False):
+            reason = "cycle_already_running"
+        else:
+            reason = None
+            try:
+                cycle = _watch_scalp_sim_trades() or {}
+                with _SCALP_SIM_WATCH_HEALTH_LOCK:
+                    _SCALP_SIM_WATCH_HEALTH["cycles_completed"] += 1
+                    _SCALP_SIM_WATCH_HEALTH["last_completed_at"] = now_utc().isoformat()
+                    _SCALP_SIM_WATCH_HEALTH["last_error"] = None
+                    _SCALP_SIM_WATCH_HEALTH["last_open_rows"] = int(cycle.get("open_rows", 0))
+                    _SCALP_SIM_WATCH_HEALTH["last_closed_rows"] = int(cycle.get("closed_rows", 0))
+                    _SCALP_SIM_WATCH_HEALTH["last_missing_bar_count"] = int(cycle.get("missing_bars", 0))
+            finally:
+                SCALP_SIM_WATCH_LOCK.release()
+        if reason:
+            with _SCALP_SIM_WATCH_HEALTH_LOCK:
+                changed = _SCALP_SIM_WATCH_HEALTH["last_skip_reason"] != reason
+                _SCALP_SIM_WATCH_HEALTH["cycles_skipped"] += 1
+                _SCALP_SIM_WATCH_HEALTH["last_skip_reason"] = reason
+            if changed:
+                logger.info("scalp live-sim watcher skipped: %s", reason)
     except Exception as exc:
         logger.warning("scalp live-sim watch loop error: %s", exc)
+        with _SCALP_SIM_WATCH_HEALTH_LOCK:
+            _SCALP_SIM_WATCH_HEALTH["cycles_failed"] += 1
+            _SCALP_SIM_WATCH_HEALTH["last_error"] = str(exc)[:180]
     finally:
         threading.Timer(SCALP_SIM_WATCH_INTERVAL, _scalp_sim_watch_loop).start()
 
@@ -50045,6 +50106,14 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
             except Exception:
                 pass
         if inserted:
+            _coordinator_submit_analysis(
+                result, inst=inst, source_system="generic_ghost",
+                setup_family="STRICT_SETUP", strategy_name=strategy_key,
+                direction=direction, entry=entry, stop=stop_px,
+                targets=(target1, target2), source_event_id=obs_key,
+                context={"legacy_obs_key": obs_key, "legacy_source": source,
+                         "session": sess_name, "edge_score": edge_score},
+            )
             logger.info(
                 "ghost_obs opened: %s %s %s @ %.4f strategy=%s key=%s",
                 source, inst, direction, entry, strategy_short, obs_key,
@@ -50078,6 +50147,40 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                 _GHOST_OBS_COOLDOWN.pop(ckey, None)
     except Exception as exc:
         logger.debug("ghost_observe_setup error (%s): %s", inst, exc)
+
+
+def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
+                                 strategy_name, direction, entry, stop, targets,
+                                 source_event_id=None, variant=None, context=None):
+    """Thin fail-open adapter from legacy producers into the Phase-1 coordinator.
+
+    The coordinator receives a copy after a legacy observation was accepted. It
+    cannot change the existing observation, its lifecycle, or execution access.
+    """
+    if not CENTRAL_GHOST_COORDINATOR_ENABLED or _ghost_coordinator is None:
+        return None
+    try:
+        tp = result.get("trade_plan") if isinstance(result, dict) else {}
+        source_bar = (
+            (result.get("source_bar_time") if isinstance(result, dict) else None)
+            or (result.get("bar_ts") if isinstance(result, dict) else None)
+            or (tp or {}).get("source_bar_time")
+            or now_utc().isoformat()
+        )
+        event_id = source_event_id or "%s|%s|%s|%s" % (
+            inst, setup_family, direction, source_bar)
+        return _ghost_coordinator.submit_shadow(_ghost_coordinator.ObservationRequest(
+            source_system=source_system, source_event_id=str(event_id),
+            instrument=inst, timeframe="1m", setup_family=setup_family,
+            strategy_name=str(strategy_name or "UNKNOWN"),
+            strategy_version=str(STRATEGY_VERSION), direction=direction,
+            signal_time=now_utc(), source_bar_time=source_bar,
+            entry=entry, stop=stop, targets=tuple(t for t in targets if t is not None),
+            experiment_variant=variant, context=context or {},
+        ))
+    except Exception as exc:
+        logger.debug("ghost coordinator adapter (%s): %s", source_system, exc)
+        return None
 
 
 def _ghost_obs_watcher_cycle():
@@ -50798,6 +50901,14 @@ def _maybe_open_micro_ghost(result, source="webhook"):
         anchor_px = 0
     sim_key = "micro|%s|%s|%s:%d:%d" % (inst, direction, et_day, bucket, anchor_px)
     if _micro_ghost_open_insert(sim_key, inst, block):
+        _coordinator_submit_analysis(
+            result, inst=inst, source_system="micro_scalp_ghost",
+            setup_family="MICRO_SCALP", strategy_name=block.get("setup_type") or "MICRO",
+            direction=direction, entry=block["suggested_entry"],
+            stop=block["suggested_stop"], targets=(block["tp1"], block["tp2"]),
+            source_event_id=sim_key,
+            context={"legacy_sim_key": sim_key, "entry_reason": block.get("entry_reason")},
+        )
         with _MICRO_GHOST_COOLDOWN_LOCK:
             _MICRO_GHOST_COOLDOWN[ckey] = now_mono
         logger.info("micro scalp GHOST opened: %s %s @ %s (no order — ghost only)",
@@ -51327,6 +51438,14 @@ def _maybe_observe_dual_mode_sim(result, source="webhook"):
                                  verdict, entry, stop, target, rr,
                                  _learning_session_name(), None, edge_sc):
             opened += 1
+            _coordinator_submit_analysis(
+                result, inst=inst, source_system="dual_mode_sim",
+                setup_family="STRICT_SETUP", strategy_name="DUAL_%s" % mode,
+                direction=direction, entry=entry, stop=stop, targets=(target,),
+                source_event_id=sim_key, variant=mode,
+                context={"legacy_sim_key": sim_key, "verdict": verdict,
+                         "edge_score": edge_sc, "mode": mode},
+            )
             with _DUAL_SIM_COOLDOWN_LOCK:
                 _DUAL_SIM_COOLDOWN[ckey] = now_mono
     if opened:
@@ -62965,6 +63084,24 @@ def _training_record_once(inst, intent, plan_public, source, stage, status):
             return False
         _TRAINING_REC_LAST[inst] = (fp, nowm)
     _record_training_call(inst, intent, plan_public, source, stage, status, fingerprint=fp)
+    # Shadow-only companion of the existing asynchronous training record.  This
+    # intentionally happens after legacy dedupe/record scheduling and is never a
+    # prerequisite for training's fail-closed execution policy.
+    try:
+        plan = plan_public or {}
+        direction = plan.get("direction") or (intent or {}).get("direction")
+        if direction in ("Long", "Short"):
+            _coordinator_submit_analysis(
+                {"trade_plan": plan}, inst=inst, source_system="bot_training",
+                setup_family="TRAINING_SUGGESTION",
+                strategy_name=(intent or {}).get("provider") or "TRAINING",
+                direction=direction, entry=plan.get("entry"), stop=plan.get("stop"),
+                targets=(plan.get("target"), plan.get("target2")),
+                source_event_id=fp, variant="stage_%s" % stage,
+                context={"status": status, "source": source, "stage": stage},
+            )
+    except Exception:
+        pass
     return True
 
 
@@ -82813,8 +82950,41 @@ def route_research_health():
         except Exception as _gre_h_exc:
             gre_health["error"] = str(_gre_h_exc)
     out["ghost_research_engine"] = gre_health
+    # Phase 1 coordinator + Scalp watcher state are diagnostic-only.  They do
+    # not participate in ready_for_market or any execution/safety decision.
+    try:
+        out["central_ghost_coordinator"] = (
+            _ghost_coordinator.get_report(limit=25)
+            if _ghost_coordinator is not None
+            else {"ok": True, "enabled": False, "reason": "module unavailable"}
+        )
+    except Exception as exc:
+        out["central_ghost_coordinator"] = {"ok": False, "error": str(exc)[:180]}
+    with _SCALP_SIM_WATCH_HEALTH_LOCK:
+        out["scalp_live_sim_watcher"] = {
+            **_SCALP_SIM_WATCH_HEALTH,
+            "enabled": SCALP_LIVE_SIM_ENABLED,
+            "live_instance": DISCORD_LIVE_ENABLED,
+            "db_ready": SCALP_SIM_DB_READY,
+            "max_hold_hours": SCALP_SIM_MAX_HOLD_HOURS,
+        }
 
     return jsonify(out)
+
+
+@app.route("/research-coordinator-report", methods=["GET"])
+def route_research_coordinator_report():
+    """Phase 1 Central Ghost Coordinator diagnostic (GET-only, shadow-only)."""
+    try:
+        limit = min(500, max(1, int(request.args.get("limit", 100))))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        if _ghost_coordinator is None:
+            return jsonify({"ok": True, "enabled": False, "reason": "module unavailable"})
+        return jsonify(_ghost_coordinator.get_report(limit=limit))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:180]}), 500
 
 
 @app.route("/ghost-research/health", methods=["GET"])

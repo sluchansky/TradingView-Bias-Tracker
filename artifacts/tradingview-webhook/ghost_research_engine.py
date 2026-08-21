@@ -956,6 +956,22 @@ class GhostResearchEngine:
             cost_r = _commission_r(inst, entry, stop)
             self._enter_experiment(result_id, baseline_exp_id, opp_id, entry, stop, tp1, tp2,
                                    cost_r=cost_r, qualified_ts=_now_utc())
+            # Phase 1 coordinator mirror: a copy of the legacy GRE event only.
+            # No coordinator result is read back by GRE or any money path.
+            try:
+                import ghost_coordinator as _gc  # noqa: PLC0415
+                _gc.submit_shadow(_gc.ObservationRequest(
+                    source_system="gre_orb", source_event_id=opp_id,
+                    instrument=inst, timeframe="1m", setup_family="ORB",
+                    strategy_name=STRATEGY_NAME, strategy_version=STRATEGY_VERSION,
+                    direction=direction, signal_time=_now_utc(),
+                    source_bar_time=orb.get("breakout_bar_ts") or _now_utc(),
+                    entry=entry, stop=stop, targets=(tp1, tp2),
+                    experiment_variant=Variant.BASELINE,
+                    context={"legacy_opportunity_id": opp_id, "state": "POSITION_ACTIVE"},
+                ))
+            except Exception:
+                pass
             self._re_event("GHOST_EXPERIMENT_ENTERED", inst=inst,
                            extra={"result_id": result_id, "variant": Variant.BASELINE})
 
@@ -981,14 +997,20 @@ class GhostResearchEngine:
         """Entry window closed without a qualified trade. Force-expire WATCHING_ENTRY experiments."""
         opp_id = self._active_opp.get(inst)
         if not opp_id: return
+        # Snapshot under the non-reentrant state lock, then complete outside it.
+        # _complete_experiment() owns its own lock acquisition; calling it while
+        # holding this lock previously self-deadlocked on BREAKOUT_MISSED.
         with self._lock:
-            for result_id, rd in list(self._open_results.items()):
+            pending_ids = [
+                result_id for result_id, rd in self._open_results.items()
                 if rd.get("opportunity_id") == opp_id and rd.get("status") in (
-                        ResultStatus.PENDING, ResultStatus.WATCHING_ENTRY):
-                    self._complete_experiment(result_id, exit_price=None,
-                                              exit_reason="BREAKOUT_MISSED",
-                                              result=OutcomeResult.NO_ENTRY,
-                                              exit_ts=_now_utc())
+                    ResultStatus.PENDING, ResultStatus.WATCHING_ENTRY)
+            ]
+        for result_id in pending_ids:
+            self._complete_experiment(result_id, exit_price=None,
+                                      exit_reason="BREAKOUT_MISSED",
+                                      result=OutcomeResult.NO_ENTRY,
+                                      exit_ts=_now_utc())
 
     # ── Opportunity DB insert ─────────────────────────────────────────────────
 
@@ -2170,6 +2192,29 @@ class GhostResearchEngine:
         n = self._create_fvg_variants(
             opp_id, inst, zone, rfid, revisit_id, revisit_n, snap, depth_pct, price,
         )
+        # Mirror the exact deterministic baseline geometry already used by the
+        # FVG legacy variants.  This is a shadow copy, never a replacement.
+        try:
+            direction = "Long" if str(zone.get("direction", "")).upper() == "BULLISH" else "Short"
+            tick = _TICK_SIZE.get(inst, 0.25)
+            stop = (float(zone.get("lower")) - 2 * tick) if direction == "Long" \
+                else (float(zone.get("upper")) + 2 * tick)
+            risk = abs(float(price) - stop)
+            target = float(price) + (_FVG_BASELINE_TARGET_R * risk if direction == "Long"
+                                     else -_FVG_BASELINE_TARGET_R * risk)
+            import ghost_coordinator as _gc  # noqa: PLC0415
+            _gc.submit_shadow(_gc.ObservationRequest(
+                source_system="gre_fvg_revisit", source_event_id=opp_id,
+                instrument=inst, timeframe="1m", setup_family="FVG_REVISIT",
+                strategy_name="FVG_REVISIT", strategy_version=STRATEGY_VERSION,
+                direction=direction, signal_time=bar_ts, source_bar_time=bar_ts,
+                entry=price, stop=stop, targets=(target,),
+                experiment_variant=FvgVariant.BASELINE,
+                context={"legacy_opportunity_id": opp_id, "research_fvg_id": rfid,
+                         "revisit_n": revisit_n, "depth_pct": depth_pct},
+            ))
+        except Exception:
+            pass
         self._re_event("FVG_VARIANTS_CREATED", inst=inst, extra={
             "opportunity_id": opp_id, "count": n,
         })

@@ -830,6 +830,26 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                 _cohort, _session_bkt,
             ))
         conn.commit()
+        # Phase 1 central coordinator mirror.  This runs only after the legacy
+        # gate-audit row has been committed and is strictly fail-open; the
+        # coordinator cannot alter this audit, its resolver, or execution.
+        if has_geometry:
+            try:
+                import app as _app  # noqa: PLC0415
+                submit = getattr(_app, "_coordinator_submit_analysis", None)
+                if callable(submit):
+                    submit(
+                        result, inst=inst, source_system="gate_effectiveness",
+                        setup_family="STRICT_SETUP", strategy_name=strategy,
+                        direction=direction, entry=info["entry_price"],
+                        stop=info["stop_price"],
+                        targets=(info["target1_price"], info["target2_price"]),
+                        source_event_id=audit_id, variant=mode,
+                        context={"legacy_audit_id": audit_id, "gate_verdict": gate_verdict,
+                                 "geometry_source": info.get("geometry_source")},
+                    )
+            except Exception:
+                pass
         logger.info(
             "GATE_AUDIT_TRACE instrument=%s direction=%s mode=%s "
             "decision=%s recorder_called=true audit_id=%s edge=%s blocker=%s",
