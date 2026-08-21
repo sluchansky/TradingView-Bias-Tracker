@@ -5795,6 +5795,22 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const perf  = (p.performance ?? {}) as Record<string, unknown>;
   const avail = coach.available !== false;
 
+  const formatBestSetup = (value: unknown): string => {
+    if (typeof value === 'string') return value;
+    if (!value || typeof value !== 'object') return '—';
+    const setup = value as Record<string, unknown>;
+    const name = setup.setup_type ?? setup.strategy ?? setup.name ?? 'Unknown setup';
+    const winRate = setup.win_rate ?? setup.winRate;
+    const avgR = setup.avg_r ?? setup.avgR;
+    const count = setup.n ?? setup.count ?? setup.sample;
+    const details = [
+      winRate != null ? `${fmtNum(Number(winRate), 0)}% WR` : null,
+      avgR != null ? `${fmtNum(Number(avgR))}R` : null,
+      count != null ? `n=${String(count)}` : null,
+    ].filter(Boolean);
+    return `${String(name)}${details.length ? ` (${details.join(' · ')})` : ''}`;
+  };
+
   // ── learning_diagnostics from Phase 7I audit ───────────────────────────────
   const ld = (coach.learning_diagnostics ?? {}) as Record<string, unknown>;
   const weightStatus   = safeStr(ld.weight_status, '');
@@ -5925,8 +5941,8 @@ const CoachPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
               <div style={{ fontSize:9, color:T.purple, letterSpacing:'0.1em', marginBottom:6 }}>PERFORMANCE REVIEW</div>
               {perf.win_rate  != null && <KV label="Win Rate"   value={`${fmtNum(perf.win_rate, 0)}%`} mono />}
               {perf.avg_r     != null && <KV label="Avg R"      value={fmtNum(perf.avg_r)}              mono />}
-              {perf.trade_count != null && <KV label="Sample"   value={String(perf.trade_count)}        mono />}
-              {perf.best_setup != null && <KV label="Best Setup" value={String(perf.best_setup)} />}
+              {perf.trade_count != null && <KV label="Review Sample" value={String(perf.trade_count)} mono />}
+              {perf.best_setup != null && <KV label="Best Setup" value={formatBestSetup(perf.best_setup)} />}
             </div>
           )}
 
