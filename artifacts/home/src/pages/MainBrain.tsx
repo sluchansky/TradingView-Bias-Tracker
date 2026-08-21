@@ -3520,6 +3520,29 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   const transitions = hist.filter(h => h.state_changed);
   const modeAssessments = obs?.mode_assessments ?? {};
   const marketContext = obs?.market_context;
+  const tfBars = (timeframe: string) =>
+    marketContext?.timeframes?.[timeframe]?.bars ?? 0;
+  const modeDataReadiness = (mode: 'scalp' | 'intraday_trend' | 'swing') => {
+    if (mode === 'scalp') {
+      return {
+        label: tfBars('1m') >= 5 && tfBars('5m') >= 2 ? 'LIVE 1m / 5m' : 'WARMING UP',
+        ready: tfBars('1m') >= 5 && tfBars('5m') >= 2,
+        detail: `${tfBars('1m')}× 1m · ${tfBars('5m')}× 5m bars`,
+      };
+    }
+    if (mode === 'intraday_trend') {
+      return {
+        label: tfBars('15m') >= 3 && tfBars('1h') >= 2 ? 'HTF READY' : 'HTF WARMING',
+        ready: tfBars('15m') >= 3 && tfBars('1h') >= 2,
+        detail: `${tfBars('15m')}× 15m · ${tfBars('1h')}× 1h bars`,
+      };
+    }
+    return {
+      label: tfBars('1h') >= 4 && tfBars('4h') >= 3 && tfBars('1D') >= 2 ? 'SWING READY' : 'SWING WARMING',
+      ready: tfBars('1h') >= 4 && tfBars('4h') >= 3 && tfBars('1D') >= 2,
+      detail: `${tfBars('1h')}× 1h · ${tfBars('4h')}× 4h · ${tfBars('1D')}× 1D bars`,
+    };
+  };
 
   const ModeAssessmentCard: React.FC<{
     label: string; assessment?: ModeAssessment; details: Array<[string, unknown]>;
@@ -3563,6 +3586,43 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
         <div style={{ marginTop: 4, fontSize: 9.5, color: T.red, lineHeight: 1.35 }}>
           <span style={{ color: T.txtMuted }}>Invalidates: </span>{visualBrainText(assessment.invalidation)}
         </div>
+      </div>
+    );
+  };
+
+  const ModeLens: React.FC<{
+    mode: 'scalp' | 'intraday_trend' | 'swing';
+    label: string;
+    horizon: string;
+    assessment?: ModeAssessment;
+  }> = ({ mode, label, horizon, assessment }) => {
+    const posture = visualBrainToken(assessment?.posture);
+    const status = visualBrainToken(assessment?.setup_status);
+    const postureColor = modePostureColor(assessment?.posture);
+    const setupColor = modeSetupColor(assessment?.setup_status);
+    const readiness = modeDataReadiness(mode);
+    return (
+      <div style={{
+        minWidth: 0, padding: '10px 11px', borderRadius: 8,
+        background: `${postureColor}0b`,
+        border: `1px solid ${postureColor}55`,
+        borderLeft: `3px solid ${postureColor}`,
+      }}>
+        <div style={{ display: 'flex', alignItems: 'baseline', gap: 6, marginBottom: 7 }}>
+          <span style={{ fontSize: 10, fontWeight: 800, letterSpacing: '0.08em', color: T.txtPri }}>{label}</span>
+          <span style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.04em' }}>{horizon}</span>
+        </div>
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+          <span style={{ fontSize: 13, fontWeight: 800, color: setupColor }}>{status}</span>
+          <span style={{ fontSize: 10, fontWeight: 800, color: postureColor }}>{posture}</span>
+        </div>
+        <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, marginTop: 6 }}>
+          <span style={{ fontSize: 9.5, color: T.txtSec }}>{visualBrainConfidence(assessment?.confidence)}</span>
+          <span style={{ fontSize: 8.5, color: readiness.ready ? T.green : T.amber, textAlign: 'right' }}>
+            {readiness.label}
+          </span>
+        </div>
+        <div style={{ marginTop: 4, fontSize: 8.5, color: T.txtMuted }}>{readiness.detail}</div>
       </div>
     );
   };
@@ -3692,6 +3752,29 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
                         {obs.confidence ?? 0}% conf
                       </div>
                     </div>
+                  </div>
+
+                  {/* ── Mode lenses — lead with the independent mode reads ── */}
+                  <div style={{ marginBottom: 12 }}>
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 7, marginBottom: 7 }}>
+                      <span style={{ fontSize: 9.5, fontWeight: 800, color: T.txtSec,
+                        letterSpacing: '0.09em', textTransform: 'uppercase' }}>
+                        Mode Assessment Contrast
+                      </span>
+                      <Badge label="ADVISORY ONLY" color={T.purple} />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(210px, 1fr))', gap: 8 }}>
+                      <ModeLens mode="scalp" label="SCALP" horizon="1m → 5m" assessment={modeAssessments.scalp} />
+                      <ModeLens mode="intraday_trend" label="INTRADAY TREND" horizon="15m → 1h" assessment={modeAssessments.intraday_trend} />
+                      <ModeLens mode="swing" label="SWING" horizon="1h → 4h → 1D" assessment={modeAssessments.swing} />
+                    </div>
+                    {!modeDataReadiness('intraday_trend').ready || !modeDataReadiness('swing').ready ? (
+                      <div style={{ marginTop: 7, padding: '6px 8px', borderRadius: 5, background: `${T.amber}0d`,
+                        border: `1px solid ${T.amber}2c`, fontSize: 9.5, color: T.txtMuted, lineHeight: 1.4 }}>
+                        Higher-timeframe assessments are deliberately conservative while native bars rebuild after a restart.
+                        SCALP can read current price action first; INTRADAY TREND and SWING gain conviction as their larger windows fill.
+                      </div>
+                    ) : null}
                   </div>
 
                   {/* ── Last Event ── */}
