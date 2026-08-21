@@ -946,6 +946,23 @@ class TestNativeMultiTimeframeContext(unittest.TestCase):
         self.assertIn("NATIVE MULTI-TIMEFRAME CONTEXT", prompt_text)
         self.assertIn('"alignment":"ALIGNED"', prompt_text)
 
+    def test_dense_chart_payload_uses_adaptive_image_detail(self):
+        """MNQ's dense 1-minute candles must not be forced into low detail."""
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps(_make_obs())
+        mock_resp = MagicMock()
+        mock_resp.choices = [mock_choice]
+        mock_resp.usage.prompt_tokens = 100
+        mock_resp.usage.completion_tokens = 50
+
+        with patch("openai.OpenAI") as MockOpenAI:
+            MockOpenAI.return_value.chat.completions.create.return_value = mock_resp
+            self.vb.analyze_visual_market(b"fake-img", None, [], "MNQ")
+
+        messages = MockOpenAI.return_value.chat.completions.create.call_args.kwargs["messages"]
+        image_payload = messages[1]["content"][1]["image_url"]
+        self.assertEqual(image_payload["detail"], "auto")
+
 
 class TestSingleFlightReschedule(unittest.TestCase):
     """_schedule_next must be called exactly once per _vb_tick, regardless of path.
