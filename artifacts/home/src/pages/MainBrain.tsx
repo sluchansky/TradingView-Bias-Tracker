@@ -14728,6 +14728,11 @@ export default function MainBrain() {
                 <MarketStrip p={p} />
               </div>
 
+              {/* ── Authoritative verdict — always visible on the overview ───── */}
+              <div style={{ marginBottom:12 }}>
+                <VerdictPanel p={p} />
+              </div>
+
               {/* ── Mode Overview — best setup across SCALP / Intraday / SWING ── */}
               <ModeOverviewPanel
                 ticker={ticker}
