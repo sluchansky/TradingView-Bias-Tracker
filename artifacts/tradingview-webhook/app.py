@@ -47665,6 +47665,9 @@ _SCALP_SIM_WATCH_HEALTH = {
 # promotion input, or execution dependency.
 CENTRAL_GHOST_COORDINATOR_ENABLED = os.environ.get(
     "CENTRAL_GHOST_COORDINATOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED = os.environ.get(
+    "CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+CENTRAL_GHOST_COORDINATOR_DB_READY = False
 try:
     import ghost_coordinator as _ghost_coordinator  # noqa: PLC0415
     _ghost_coordinator.configure(enabled=CENTRAL_GHOST_COORDINATOR_ENABLED)
@@ -50181,6 +50184,145 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
     except Exception as exc:
         logger.debug("ghost coordinator adapter (%s): %s", source_system, exc)
         return None
+
+
+def _check_ghost_coordinator_db_ready():
+    """No-DDL probe for the optional Phase-1 coordinator shadow store."""
+    global CENTRAL_GHOST_COORDINATOR_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM ghost_coordinator_observations LIMIT 1")
+            cur.fetchone()
+        CENTRAL_GHOST_COORDINATOR_DB_READY = True
+        logger.info("Central Ghost Coordinator persistence tables ready")
+    except Exception as exc:
+        logger.info("Central Ghost Coordinator persistence unavailable (shadow intake stays in-memory): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _coordinator_persist(kind, record):
+    """Append-only coordinator storage callback. Never writes legacy tables."""
+    if not CENTRAL_GHOST_COORDINATOR_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            if kind == "observation":
+                cur.execute(
+                    """INSERT INTO ghost_coordinator_observations
+                       (observation_id, market_opportunity_id, source_system, source_event_id,
+                        instrument, timeframe, setup_family, strategy_name, strategy_version,
+                        direction, signal_time, source_bar_time, entry_price, stop_price,
+                        targets, context, experiment_variant)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s::jsonb,%s::jsonb,%s)
+                       ON CONFLICT (observation_id) DO NOTHING""",
+                    (record["observation_id"], record["market_opportunity_id"],
+                     record["source_system"], record["source_event_id"], record["instrument"],
+                     record["timeframe"], record["setup_family"], record["strategy_name"],
+                     record["strategy_version"], record["direction"], record["signal_time"],
+                     record["source_bar_time"], record["entry"], record["stop"],
+                     json.dumps(list(record["targets"])), json.dumps(record["context"]),
+                     record.get("experiment_variant")))
+            elif kind == "telemetry":
+                cur.execute(
+                    """INSERT INTO ghost_coordinator_telemetry_events
+                       (telemetry_id, source_system, event_id)
+                       VALUES (%s,%s,%s) ON CONFLICT (telemetry_id) DO NOTHING""",
+                    (record["telemetry_id"], record["source_system"], record["event_id"]))
+            else:
+                return False
+            wrote = cur.rowcount == 1
+        conn.commit()
+        return wrote
+    except Exception as exc:
+        logger.debug("ghost coordinator persistence (%s): %s", kind, exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _restore_ghost_coordinator():
+    """Restore only the coordinator's own shadow evidence after its probe passes."""
+    if not (CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED
+            and CENTRAL_GHOST_COORDINATOR_DB_READY
+            and _ghost_coordinator is not None):
+        return 0
+    conn = _learning_conn()
+    if conn is None:
+        return 0
+    rows = []
+    telemetry_rows = []
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT observation_id, market_opportunity_id, source_system, source_event_id,
+                          instrument, timeframe, setup_family, strategy_name, strategy_version,
+                          direction, signal_time, source_bar_time, entry_price, stop_price,
+                          targets, context, experiment_variant
+                   FROM ghost_coordinator_observations
+                   ORDER BY created_at ASC LIMIT 50000""")
+            for row in cur.fetchall():
+                rows.append({
+                    "observation_id": row["observation_id"],
+                    "market_opportunity_id": row["market_opportunity_id"],
+                    "source_system": row["source_system"],
+                    "source_event_id": row["source_event_id"],
+                    "instrument": row["instrument"], "timeframe": row["timeframe"],
+                    "setup_family": row["setup_family"], "strategy_name": row["strategy_name"],
+                    "strategy_version": row["strategy_version"], "direction": row["direction"],
+                    "signal_time": row["signal_time"].isoformat() if row["signal_time"] else "",
+                    "source_bar_time": row["source_bar_time"], "entry": float(row["entry_price"]),
+                    "stop": float(row["stop_price"]), "targets": tuple(row["targets"] or []),
+                    "context": row["context"] or {}, "experiment_variant": row["experiment_variant"],
+                })
+            cur.execute(
+                """SELECT telemetry_id, source_system, event_id
+                   FROM ghost_coordinator_telemetry_events
+                   ORDER BY created_at ASC LIMIT 50000""")
+            telemetry_rows = [dict(row) for row in cur.fetchall()]
+    except Exception as exc:
+        logger.info("Central Ghost Coordinator restore skipped: %s", exc)
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    restored = _ghost_coordinator.restore(rows)
+    telemetry = _ghost_coordinator.restore_telemetry(telemetry_rows)
+    logger.info("Central Ghost Coordinator restored %d shadow observation(s), %d telemetry event(s)",
+                restored, telemetry)
+    return restored + telemetry
+
+
+def _configure_ghost_coordinator_persistence():
+    """Attach the app-owned storage boundary only after the no-DDL readiness probe."""
+    if _ghost_coordinator is None:
+        return
+    enabled = bool(CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED and CENTRAL_GHOST_COORDINATOR_DB_READY)
+    _ghost_coordinator.configure(
+        enabled=CENTRAL_GHOST_COORDINATOR_ENABLED,
+        persistence_enabled=enabled,
+        persist_fn=_coordinator_persist if enabled else None,
+    )
 
 
 def _ghost_obs_watcher_cycle():
@@ -82958,6 +83100,11 @@ def route_research_health():
             if _ghost_coordinator is not None
             else {"ok": True, "enabled": False, "reason": "module unavailable"}
         )
+        out["central_ghost_coordinator"]["persistence"] = (
+            "postgres_shadow_only" if CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED
+            and CENTRAL_GHOST_COORDINATOR_DB_READY else "in_memory_shadow_only"
+        )
+        out["central_ghost_coordinator"]["persistence_db_ready"] = CENTRAL_GHOST_COORDINATOR_DB_READY
     except Exception as exc:
         out["central_ghost_coordinator"] = {"ok": False, "error": str(exc)[:180]}
     with _SCALP_SIM_WATCH_HEALTH_LOCK:
@@ -86343,6 +86490,9 @@ if __name__ == "__main__":
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
         _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
         _check_ghost_obs_db_ready()                # probe ghost_observations (no DDL; created via DB tool/publish diff) — PROFITABILITY ENGINE PHASE 1, RESEARCH/DISPLAY-ONLY
+        _check_ghost_coordinator_db_ready()        # probe additive coordinator tables (no DDL; apply db_ghost_coordinator_schema.sql)
+        _configure_ghost_coordinator_persistence() # optional shadow-only storage boundary; default OFF
+        _restore_ghost_coordinator()               # restores coordinator evidence only when persistence is explicitly enabled
         _check_gre_db_ready()                      # probe ghost_opportunities/experiments/results (no DDL; created via DB tool/publish diff) — PHASE 2 GHOST RESEARCH ENGINE, RESEARCH/DISPLAY-ONLY
         _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
         _check_gate_audit_db_ready()               # probe gate_audit_log (no DDL; apply db_gate_effectiveness_schema.sql) — PHASE 8C Gate Effectiveness Audit, DISPLAY/MEASUREMENT-ONLY

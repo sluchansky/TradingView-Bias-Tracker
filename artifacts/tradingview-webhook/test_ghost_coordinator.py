@@ -87,6 +87,27 @@ def test_nontrade_visual_event_never_creates_a_trade_opportunity():
     assert report["unique_market_opportunities"] == 0
 
 
+def test_opt_in_persistence_and_restore_keep_shadow_evidence():
+    writes = []
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.configure(
+        enabled=True, persistence_enabled=True,
+        persist_fn=lambda kind, record: writes.append((kind, dict(record))) or True,
+    )
+    accepted = coordinator.submit(_request())
+    coordinator.record_observational_event("visual_brain", "MNQ|image-1")
+    assert accepted.accepted is True
+    assert [kind for kind, _ in writes] == ["observation", "telemetry"]
+
+    restored = gc.CentralGhostCoordinator(enabled=False)
+    assert restored.restore([writes[0][1]]) == 1
+    assert restored.restore_telemetry([writes[1][1]]) == 1
+    report = restored.report()
+    assert report["unique_observations"] == 1
+    assert report["visual_or_nontrade_events"] == 1
+    assert report["restored_observations"] == 1
+
+
 def test_coordinator_cannot_reach_execution_code():
     tree = ast.parse(Path(gc.__file__).read_text(encoding="utf-8"))
     imported = set()

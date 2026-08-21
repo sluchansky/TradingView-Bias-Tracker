@@ -18,7 +18,7 @@ import threading
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
-from typing import Any, Dict, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, Mapping, Optional, Sequence, Tuple
 
 
 VALID_DIRECTIONS = frozenset(("Long", "Short"))
@@ -90,6 +90,8 @@ class CentralGhostCoordinator:
 
     def __init__(self, enabled: bool = False) -> None:
         self._enabled = bool(enabled)
+        self._persistence_enabled = False
+        self._persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None
         self._lock = threading.Lock()
         self._requests_received = 0
         self._duplicates = 0
@@ -102,11 +104,17 @@ class CentralGhostCoordinator:
         self._opportunities: Dict[str, Dict[str, Any]] = {}
         self._observations: Dict[str, Dict[str, Any]] = {}
         self._last_error: Optional[str] = None
+        self._persistence_writes = 0
+        self._persistence_errors = 0
+        self._restored_observations = 0
 
-    def configure(self, *, enabled: bool) -> None:
+    def configure(self, *, enabled: bool, persistence_enabled: bool = False,
+                  persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None) -> None:
         """Enable or disable shadow intake without clearing observed evidence."""
         with self._lock:
             self._enabled = bool(enabled)
+            self._persistence_enabled = bool(persistence_enabled)
+            self._persist_fn = persist_fn
 
     @property
     def enabled(self) -> bool:
@@ -165,12 +173,14 @@ class CentralGhostCoordinator:
                     self._opportunities[market_id] = opportunity
                 opportunity["source_systems"].add(normalized["source_system"])
                 opportunity["observation_ids"].append(observation_id)
-                self._observations[observation_id] = {
+                stored = {
                     **normalized,
                     "market_opportunity_id": market_id,
                     "observation_id": observation_id,
                 }
+                self._observations[observation_id] = stored
                 self._source_unique[normalized["source_system"]].add(market_id)
+            self._persist("observation", stored)
             return SubmissionResult(
                 accepted=True,
                 ignored=False,
@@ -220,7 +230,12 @@ class CentralGhostCoordinator:
                 "ok": True,
                 "phase": 1,
                 "enabled": self._enabled,
-                "persistence": "in_memory_shadow_only",
+                "persistence": ("postgres_shadow_only" if self._persistence_enabled
+                                else "in_memory_shadow_only"),
+                "persistence_enabled": self._persistence_enabled,
+                "persistence_writes": self._persistence_writes,
+                "persistence_errors": self._persistence_errors,
+                "restored_observations": self._restored_observations,
                 "requests_received": self._requests_received,
                 "unique_market_opportunities": len(self._opportunities),
                 "unique_observations": len(self._observations),
@@ -297,15 +312,91 @@ class CentralGhostCoordinator:
                 self._duplicates += 1
                 return SubmissionResult(accepted=True, ignored=False, duplicate=True)
             self._telemetry_events.add(telemetry_id)
-            return SubmissionResult(accepted=True, ignored=False)
+        self._persist("telemetry", {
+            "source_system": source,
+            "event_id": event,
+            "telemetry_id": telemetry_id,
+        })
+        return SubmissionResult(accepted=True, ignored=False)
+
+    def restore(self, records: Iterable[Mapping[str, Any]]) -> int:
+        """Rehydrate prior shadow evidence without re-writing it or running rules."""
+        restored = 0
+        for raw in records:
+            try:
+                stored = dict(raw)
+                market_id = str(stored["market_opportunity_id"])
+                observation_id = str(stored["observation_id"])
+                source = str(stored["source_system"])
+                with self._lock:
+                    if observation_id in self._observations:
+                        continue
+                    opportunity = self._opportunities.setdefault(market_id, {
+                        "market_opportunity_id": market_id,
+                        "instrument": stored["instrument"],
+                        "timeframe": stored["timeframe"],
+                        "source_event_id": stored["source_event_id"],
+                        "source_bar_time": stored["source_bar_time"],
+                        "direction": stored["direction"],
+                        "setup_family": stored["setup_family"],
+                        "strategy_version": stored["strategy_version"],
+                        "source_systems": set(),
+                        "observation_ids": [],
+                    })
+                    opportunity["source_systems"].add(source)
+                    opportunity["observation_ids"].append(observation_id)
+                    self._observations[observation_id] = stored
+                    self._source_unique[source].add(market_id)
+                    self._source_counts[source] += 1
+                    self._restored_observations += 1
+                    restored += 1
+            except Exception:
+                with self._lock:
+                    self._persistence_errors += 1
+        return restored
+
+    def restore_telemetry(self, records: Iterable[Mapping[str, Any]]) -> int:
+        """Restore non-trade telemetry without fabricating market opportunities."""
+        restored = 0
+        for raw in records:
+            try:
+                source = str(raw["source_system"])
+                event = str(raw["event_id"])
+                telemetry_id = str(raw.get("telemetry_id") or "%s|%s" % (source, event))
+                with self._lock:
+                    if telemetry_id in self._telemetry_events:
+                        continue
+                    self._telemetry_events.add(telemetry_id)
+                    self._source_counts[source] += 1
+                    restored += 1
+            except Exception:
+                with self._lock:
+                    self._persistence_errors += 1
+        return restored
+
+    def _persist(self, kind: str, record: Mapping[str, Any]) -> None:
+        """Best-effort boundary: storage failure is never an intake failure."""
+        with self._lock:
+            enabled, fn = self._persistence_enabled, self._persist_fn
+        if not enabled or fn is None:
+            return
+        try:
+            if fn(kind, record):
+                with self._lock:
+                    self._persistence_writes += 1
+        except Exception:
+            with self._lock:
+                self._persistence_errors += 1
 
 
 _DEFAULT_COORDINATOR = CentralGhostCoordinator(enabled=False)
 
 
-def configure(*, enabled: bool) -> None:
+def configure(*, enabled: bool, persistence_enabled: bool = False,
+              persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None) -> None:
     """Configure the module-level coordinator used by legacy shadow adapters."""
-    _DEFAULT_COORDINATOR.configure(enabled=enabled)
+    _DEFAULT_COORDINATOR.configure(
+        enabled=enabled, persistence_enabled=persistence_enabled, persist_fn=persist_fn)
 
 
 def submit_shadow(request: ObservationRequest) -> SubmissionResult:
@@ -327,3 +418,13 @@ def record_observational_event(source_system: str, event_id: str) -> SubmissionR
         return _DEFAULT_COORDINATOR.record_observational_event(source_system, event_id)
     except Exception as exc:
         return SubmissionResult(accepted=False, ignored=False, error=str(exc)[:180])
+
+
+def restore(records: Iterable[Mapping[str, Any]]) -> int:
+    """Restore persisted shadow observations after the app's no-DDL boot probe."""
+    return _DEFAULT_COORDINATOR.restore(records)
+
+
+def restore_telemetry(records: Iterable[Mapping[str, Any]]) -> int:
+    """Restore persisted non-trade coordinator telemetry after the no-DDL probe."""
+    return _DEFAULT_COORDINATOR.restore_telemetry(records)
