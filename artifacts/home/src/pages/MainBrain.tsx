@@ -433,13 +433,23 @@ const UnavailableNote: React.FC<{ msg?: string }> = ({ msg }) => (
 // only renders that contract; it does not derive, score, or submit trading data.
 const TopOfBookPressurePanel: React.FC<{ p: Record<string, unknown>; ticker: string }> = ({ p, ticker }) => {
   const book = getTopOfBookPresentation((p.top_of_book ?? {}) as Record<string, unknown>);
-  const { state, bid, ask, imbalance, age } = book;
+  const { state, bid, ask, imbalance, age, history, cumulativePressure, averageImbalance, historySamples } = book;
   const isUsable = book.live;
   const displayImbalance = imbalance ?? 0;
   const side = displayImbalance > 0 ? 'BID HEAVY' : displayImbalance < 0 ? 'ASK HEAVY' : 'BALANCED';
   const pressureColor = displayImbalance > 0 ? T.green : displayImbalance < 0 ? T.red : T.txtSec;
   const stateColor = state === 'LIVE' ? T.green : state === 'STALE' ? T.amber : T.txtMuted;
   const ageLabel = age == null ? '—' : age < 1 ? '<1s' : `${age.toFixed(age < 10 ? 1 : 0)}s`;
+  const hasTimeline = history.length > 1;
+  const average = averageImbalance ?? 0;
+  const cumulative = cumulativePressure ?? 0;
+  const historyPath = history.map((point, index) => {
+    const x = history.length === 1 ? 160 : (index / (history.length - 1)) * 320;
+    const y = 28 - (Math.max(-1, Math.min(1, point.imbalance)) * 24);
+    return `${index === 0 ? 'M' : 'L'}${x.toFixed(1)} ${y.toFixed(1)}`;
+  }).join(' ');
+  const historyColor = average > 0.04 ? T.green : average < -0.04 ? T.red : T.txtSec;
+  const historySide = average > 0.04 ? 'BID PRESSURE' : average < -0.04 ? 'ASK PRESSURE' : 'BALANCED';
 
   return (
     <Panel
@@ -482,8 +492,47 @@ const TopOfBookPressurePanel: React.FC<{ p: Record<string, unknown>; ticker: str
           </div>
         </>
       )}
+      <div style={{ marginTop:12, paddingTop:10, borderTop:`1px solid ${T.border}` }}>
+        <div style={{ display:'flex', justifyContent:'space-between', alignItems:'center', gap:8, marginBottom:7 }}>
+          <span style={{ color:T.txtSec, fontSize:9, fontWeight:800, letterSpacing:'0.08em' }}>5-MINUTE BOOK PRESSURE</span>
+          <span style={{ color:T.txtMuted, fontSize:9 }}>{historySamples || history.length} samples · 1s intervals</span>
+        </div>
+        {hasTimeline ? (
+          <>
+            <svg viewBox="0 0 320 56" preserveAspectRatio="none" width="100%" height="62" role="img" aria-label={`Five-minute displayed-liquidity imbalance history: ${historySide.toLowerCase()}`}>
+              <defs>
+                <linearGradient id={`book-pressure-fill-${ticker}`} x1="0" x2="0" y1="0" y2="1">
+                  <stop offset="0%" stopColor={historyColor} stopOpacity="0.34" />
+                  <stop offset="100%" stopColor={historyColor} stopOpacity="0.02" />
+                </linearGradient>
+              </defs>
+              <line x1="0" y1="28" x2="320" y2="28" stroke={T.borderMid} strokeDasharray="3 3" />
+              <path d={`${historyPath} L320 28 L0 28 Z`} fill={`url(#book-pressure-fill-${ticker})`} />
+              <path d={historyPath} fill="none" stroke={historyColor} strokeWidth="2" vectorEffect="non-scaling-stroke" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+            <div style={{ marginTop:3, display:'grid', gridTemplateColumns:'1fr 1fr', gap:8 }}>
+              <div>
+                <div style={{ color:T.txtMuted, fontSize:9, letterSpacing:'0.06em' }}>CUMULATIVE</div>
+                <div style={{ marginTop:2, color:historyColor, fontFamily:T.mono, fontWeight:800, fontSize:13 }}>
+                  {cumulative > 0 ? '+' : ''}{cumulative.toFixed(2)}
+                </div>
+              </div>
+              <div style={{ textAlign:'right' }}>
+                <div style={{ color:T.txtMuted, fontSize:9, letterSpacing:'0.06em' }}>AVERAGE</div>
+                <div style={{ marginTop:2, color:historyColor, fontFamily:T.mono, fontWeight:800, fontSize:13 }}>
+                  {average > 0 ? '+' : ''}{(average * 100).toFixed(1)}% · {historySide}
+                </div>
+              </div>
+            </div>
+          </>
+        ) : (
+          <div style={{ color:T.txtMuted, fontSize:10, lineHeight:1.5 }}>
+            {state === 'LIVE' ? 'History is building from fresh quotes.' : 'A fresh MBP-1 quote is needed before the timeline can build.'}
+          </div>
+        )}
+      </div>
       <div style={{ marginTop:10, color:T.txtMuted, fontSize:9.5, lineHeight:1.45 }}>
-        Advisory market-depth data only · never changes a trade decision or execution.
+        Displayed resting liquidity, not executed trade flow · advisory only and never changes a trade decision or execution.
       </div>
     </Panel>
   );

@@ -28947,7 +28947,9 @@ def build_main_brain_payload(result, instrument=None):
     top_of_book = {
         "available": False, "state": "UNAVAILABLE", "instrument": inst,
         "bid_size": None, "ask_size": None, "imbalance": None,
-        "updated_at": None, "age_s": None,
+        "updated_at": None, "age_s": None, "history": [],
+        "cumulative_pressure": None, "average_imbalance": None,
+        "history_samples": 0,
     }
     try:
         from databento_brain import get_top_of_book_display  # noqa: PLC0415

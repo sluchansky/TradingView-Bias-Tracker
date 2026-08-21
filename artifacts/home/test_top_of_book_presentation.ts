@@ -28,5 +28,20 @@ const malformed = getTopOfBookPresentation({
 });
 check('malformed live quote is not rendered as live', !malformed.live && malformed.state === 'UNAVAILABLE');
 
+const withHistory = getTopOfBookPresentation({
+  state: 'LIVE', available: true, bid_size: 80, ask_size: 20, imbalance: 0.6,
+  history: [
+    { t: '2026-08-20T14:30:00Z', imbalance: -0.4 },
+    { t: '2026-08-20T14:30:01Z', imbalance: 0.6 },
+    { t: 'not-a-date', imbalance: 4 },
+  ],
+  cumulative_pressure: 0.2,
+  average_imbalance: 0.1,
+  history_samples: 2,
+});
+check('valid historical imbalance samples are retained', withHistory.history.length === 2);
+check('malformed historical imbalance samples are hidden', withHistory.history.every((point) => point.imbalance >= -1 && point.imbalance <= 1));
+check('cumulative book pressure is retained', withHistory.cumulativePressure === 0.2 && withHistory.averageImbalance === 0.1);
+
 if (failed) process.exit(1);
-console.log('PASS: top-of-book presentation states');
+console.log('PASS: top-of-book presentation states and history');

@@ -94,16 +94,16 @@ def test_display_view_hides_expired_sizes_and_labels_state():
 
     now = time.time()
     live = dbb.get_top_of_book_display("MNQ", now_epoch=now)
-    assert live == {
-        "available": True,
-        "state": "LIVE",
-        "instrument": "MNQ",
-        "bid_size": 80,
-        "ask_size": 20,
-        "imbalance": 0.6,
-        "updated_at": live["updated_at"],
-        "age_s": live["age_s"],
-    }
+    assert live["available"] is True
+    assert live["state"] == "LIVE"
+    assert live["instrument"] == "MNQ"
+    assert live["bid_size"] == 80
+    assert live["ask_size"] == 20
+    assert live["imbalance"] == 0.6
+    assert live["history_samples"] == 1
+    assert live["history"][0]["imbalance"] == 0.6
+    assert live["cumulative_pressure"] == 0.6
+    assert live["average_imbalance"] == 0.6
 
     stale = dbb.get_top_of_book_display(
         "MNQ", now_epoch=now + dbb.TOP_OF_BOOK_STALE_S + 1,
@@ -114,6 +114,7 @@ def test_display_view_hides_expired_sizes_and_labels_state():
     assert stale["ask_size"] is None
     assert stale["imbalance"] is None
     assert stale["age_s"] > dbb.TOP_OF_BOOK_STALE_S
+    assert stale["history"][0]["imbalance"] == 0.6
 
     unavailable = dbb.get_top_of_book_display("MGC", now_epoch=now)
     assert unavailable["available"] is False
@@ -132,6 +133,27 @@ def test_display_view_hides_expired_sizes_and_labels_state():
     assert malformed["state"] == "UNAVAILABLE"
     assert malformed["bid_size"] is None
     assert malformed["ask_size"] is None
+
+
+def test_history_is_sampled_per_instrument_and_cleared_on_reconnect():
+    brain = _brain()
+    brain._id_to_inst[101] = "MNQ"
+    brain._on_mbp1(_mbp1(101, 20000.0, 20000.25, 90, 10))
+
+    with dbb._TOP_OF_BOOK_LOCK:
+        dbb._TOP_OF_BOOK_LAST_HISTORY_AT["MNQ"] -= dbb.TOP_OF_BOOK_HISTORY_SAMPLE_S
+    brain._on_mbp1(_mbp1(101, 20000.0, 20000.25, 20, 80))
+
+    display = dbb.get_top_of_book_display("MNQ")
+    assert display["history_samples"] == 2
+    assert [p["imbalance"] for p in display["history"]] == [0.8, -0.6]
+    assert display["cumulative_pressure"] == 0.2
+    assert display["average_imbalance"] == 0.1
+
+    dbb.clear_top_of_book_snapshots()
+    cleared = dbb.get_top_of_book_display("MNQ")
+    assert cleared["history"] == []
+    assert cleared["history_samples"] == 0
 
 
 def test_mixed_live_session_subscribes_to_trades_and_mbp1(monkeypatch):
