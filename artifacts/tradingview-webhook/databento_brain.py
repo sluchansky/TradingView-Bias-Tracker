@@ -56,6 +56,8 @@ DB_DATASET = "GLBX.MDP3"
 # subscription that powers price, CVD, bars, and VWAP.
 DATABENTO_MBP1_ENABLED = os.environ.get("DATABENTO_MBP1_ENABLED", "1") == "1"
 TOP_OF_BOOK_STALE_S = max(1.0, float(os.environ.get("TOP_OF_BOOK_STALE_S", "5")))
+TOP_OF_BOOK_HISTORY_S = max(60.0, float(os.environ.get("TOP_OF_BOOK_HISTORY_S", "300")))
+TOP_OF_BOOK_HISTORY_SAMPLE_S = max(0.25, float(os.environ.get("TOP_OF_BOOK_HISTORY_SAMPLE_S", "1")))
 
 # ── Public stores (read by Flask routes and the dashboard chart) ──────────────
 # Each bar entry: {ts, open, high, low, close, volume, vwap?, atr?}
@@ -79,6 +81,11 @@ DATABENTO_PARTIAL_BY_INST: dict[str, Any] = {
 DATABENTO_TOP_OF_BOOK_BY_INST: dict[str, dict[str, Any] | None] = {
     inst: None for inst in DB_SYMBOLS
 }
+_TOP_OF_BOOK_HISTORY_BY_INST: dict[str, deque] = {
+    inst: deque(maxlen=int(TOP_OF_BOOK_HISTORY_S / TOP_OF_BOOK_HISTORY_SAMPLE_S) + 10)
+    for inst in DB_SYMBOLS
+}
+_TOP_OF_BOOK_LAST_HISTORY_AT: dict[str, float] = {inst: 0.0 for inst in DB_SYMBOLS}
 _TOP_OF_BOOK_LOCK = threading.RLock()
 
 
@@ -87,6 +94,8 @@ def clear_top_of_book_snapshots() -> None:
     with _TOP_OF_BOOK_LOCK:
         for inst in DATABENTO_TOP_OF_BOOK_BY_INST:
             DATABENTO_TOP_OF_BOOK_BY_INST[inst] = None
+            _TOP_OF_BOOK_HISTORY_BY_INST[inst].clear()
+            _TOP_OF_BOOK_LAST_HISTORY_AT[inst] = 0.0
 
 
 def get_top_of_book_snapshot(
@@ -137,6 +146,10 @@ def get_top_of_book_display(inst: str, *, now_epoch: float | None = None) -> dic
         "imbalance": None,
         "updated_at": None,
         "age_s": None,
+        "history": [],
+        "cumulative_pressure": None,
+        "average_imbalance": None,
+        "history_samples": 0,
     }
     if not inst:
         return empty
@@ -157,18 +170,38 @@ def get_top_of_book_display(inst: str, *, now_epoch: float | None = None) -> dic
             return empty
 
         if age_s > TOP_OF_BOOK_STALE_S:
-            return {
+            state = {
                 **empty,
                 "state": "STALE",
                 "age_s": round(age_s, 3),
                 "updated_at": snapshot.get("updated_at"),
             }
+            # Historical imbalance is explicitly timestamped and never pretends
+            # to be the current quote. Keep it available so a brief feed pause
+            # shows what pressure was doing immediately beforehand.
+            history = [
+                dict(point) for point in _TOP_OF_BOOK_HISTORY_BY_INST.get(inst, ())
+                if now_epoch - float(point.get("epoch", 0)) <= TOP_OF_BOOK_HISTORY_S
+            ]
+            state["history"] = [{key: value for key, value in p.items() if key != "epoch"} for p in history]
+            state["history_samples"] = len(history)
+            if history:
+                values = [float(p["imbalance"]) for p in history]
+                state["cumulative_pressure"] = round(sum(values), 4)
+                state["average_imbalance"] = round(sum(values) / len(values), 4)
+            return state
         if bid_size <= 0 or ask_size <= 0 or bid_price <= 0 or ask_price <= bid_price:
             return empty
 
         total = bid_size + ask_size
         if total <= 0:
             return empty
+        history = [
+            dict(point) for point in _TOP_OF_BOOK_HISTORY_BY_INST.get(inst, ())
+            if now_epoch - float(point.get("epoch", 0)) <= TOP_OF_BOOK_HISTORY_S
+        ]
+        history_wire = [{key: value for key, value in p.items() if key != "epoch"} for p in history]
+        values = [float(p["imbalance"]) for p in history]
         return {
             "available": True,
             "state": "LIVE",
@@ -178,6 +211,10 @@ def get_top_of_book_display(inst: str, *, now_epoch: float | None = None) -> dic
             "imbalance": round((bid_size - ask_size) / total, 4),
             "updated_at": snapshot.get("updated_at"),
             "age_s": round(age_s, 3),
+            "history": history_wire,
+            "cumulative_pressure": round(sum(values), 4) if values else None,
+            "average_imbalance": round(sum(values) / len(values), 4) if values else None,
+            "history_samples": len(history),
         }
 
 
@@ -634,6 +671,15 @@ class DatabentoBrain:
             }
             with _TOP_OF_BOOK_LOCK:
                 DATABENTO_TOP_OF_BOOK_BY_INST[inst] = snapshot
+                last_history_at = _TOP_OF_BOOK_LAST_HISTORY_AT.get(inst, 0.0)
+                if received_at - last_history_at >= TOP_OF_BOOK_HISTORY_SAMPLE_S:
+                    total = bid_sz + ask_sz
+                    _TOP_OF_BOOK_HISTORY_BY_INST[inst].append({
+                        "t": snapshot["updated_at"],
+                        "imbalance": round((bid_sz - ask_sz) / total, 4),
+                        "epoch": received_at,
+                    })
+                    _TOP_OF_BOOK_LAST_HISTORY_AT[inst] = received_at
             book_status = DATABENTO_STATUS["order_book"]
             book_status["last_update"] = snapshot["updated_at"]
             book_status["updates"] = int(book_status.get("updates") or 0) + 1
