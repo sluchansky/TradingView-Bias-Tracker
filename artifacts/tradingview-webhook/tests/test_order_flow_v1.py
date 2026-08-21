@@ -523,3 +523,47 @@ class TestFlagOffRegressionSmoke:
             assert "order_flow_score" not in r
         finally:
             _m.ORDER_FLOW_V1_ENABLED = orig
+
+
+class TestMbp1BookImbalance:
+    @staticmethod
+    def _book(bid_size=80, ask_size=20, bid_price=100.0, ask_price=100.25):
+        return {
+            "available": True,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "bid_price": bid_price,
+            "ask_price": ask_price,
+        }
+
+    def test_bid_and_ask_heavy_books_are_symmetric(self):
+        assert ofe.compute_book_imbalance(self._book()) == pytest.approx(0.6)
+        assert ofe.compute_book_imbalance(self._book(20, 80)) == pytest.approx(-0.6)
+
+    def test_missing_or_invalid_book_is_a_noop(self):
+        assert ofe.compute_book_imbalance(None) is None
+        assert ofe.compute_book_imbalance({"available": False}) is None
+        assert ofe.compute_book_imbalance(self._book(bid_size=0)) is None
+        assert ofe.compute_book_imbalance(self._book(ask_price=99.0)) is None
+
+    def test_book_pressure_updates_only_the_existing_composite(self):
+        common = dict(
+            cvd_state=None, cvd_slope=None, bar_delta=None, delta_ratio=None,
+            delta_accel=None, absorption_side=None, cvd_divergence=None,
+        )
+        assert ofe.compute_order_flow_score(**common, book_imbalance=0.60) == (
+            50 + ofe._WEIGHTS["book_imbalance"]
+        )
+        assert ofe.compute_order_flow_score(**common, book_imbalance=-0.60) == (
+            50 - ofe._WEIGHTS["book_imbalance"]
+        )
+
+    def test_fresh_mbp1_snapshot_populates_order_flow_result(self):
+        original_flag = ofe.ORDER_FLOW_V1_ENABLED
+        ofe.ORDER_FLOW_V1_ENABLED = True
+        try:
+            bars = [_bar(buy=60, sell=40, volume=100, cvd_snap=float(i)) for i in range(8)]
+            result = ofe.compute_order_flow("MNQ", bars, book_snapshot=self._book())
+            assert result["book_imbalance"] == pytest.approx(0.6)
+        finally:
+            ofe.ORDER_FLOW_V1_ENABLED = original_flag

@@ -1,9 +1,9 @@
 """
 Order Flow Engine V1 — live directional Edge Score confluence.
 
-Computes order-flow metrics from Databento 1-minute bars and CVD state. The parent
-analysis optionally maps the composite result to a bounded, direction-aware Edge
-Score adjustment.
+Computes order-flow metrics from Databento 1-minute bars, CVD state, and a fresh
+MBP-1 top-of-book snapshot. The parent analysis optionally maps the composite
+result to a bounded, direction-aware Edge Score adjustment.
 
 SAFETY CONTRACT
 ───────────────
@@ -27,8 +27,8 @@ Computable from existing Databento trades schema (side A/B per tick):
   absorption_side      large opposing delta but price held/reversed
   absorption_strength  STRONG / MODERATE
 
-NOT computable (no order-book subscription):
-  book_imbalance       always None; requires MBP-1 / MBP-10 subscription
+MBP-1 metric:
+  book_imbalance       (best_bid_size − best_ask_size) / total displayed size
 
 OUTPUTS (per compute_order_flow() call)
 ───────
@@ -55,6 +55,7 @@ _WEIGHTS: dict[str, int] = {
     "delta_acceleration":  8,   # delta accelerating in same direction
     "absorption":         12,   # price held vs large opposing delta
     "cvd_divergence":     10,   # price/CVD divergence (hidden strength/weakness)
+    "book_imbalance":      8,   # current best-bid / best-ask displayed pressure
 }
 
 # ── Thresholds ────────────────────────────────────────────────────────────────
@@ -66,6 +67,7 @@ _CVD_SLOPE_BARS:       int   = 5      # look-back bars for CVD slope
 _DIVERGENCE_BARS:      int   = 3      # look-back bars for divergence check
 _SWEEP_WICK_RATIO:     float = 1.5    # wick / body ratio threshold for sweep detection
 _SWEEP_VOL_MULT:       float = 1.2    # sweep bar volume must be ≥ this × avg vol
+_BOOK_IMBALANCE_MIN:   float = 0.10   # ignore near-balanced top-of-book noise
 
 
 # ── Utilities ─────────────────────────────────────────────────────────────────
@@ -201,6 +203,30 @@ def compute_absorption(bars: list) -> tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def compute_book_imbalance(book_snapshot: Optional[dict]) -> Optional[float]:
+    """Return normalized MBP-1 bid/ask pressure or None for unusable data.
+
+    databento_brain only returns fresh snapshots. This remains defensive because
+    Order Flow can also be called by tests, routes, or future consumers without
+    that source helper.
+    """
+    if not isinstance(book_snapshot, dict) or book_snapshot.get("available") is not True:
+        return None
+    try:
+        bid_size = int(book_snapshot.get("bid_size"))
+        ask_size = int(book_snapshot.get("ask_size"))
+        bid_price = float(book_snapshot.get("bid_price"))
+        ask_price = float(book_snapshot.get("ask_price"))
+    except (TypeError, ValueError):
+        return None
+    if bid_size <= 0 or ask_size <= 0 or bid_price <= 0 or ask_price <= bid_price:
+        return None
+    total = bid_size + ask_size
+    if total <= 0:
+        return None
+    return round((bid_size - ask_size) / total, 4)
+
+
 # ── Composite score and state ─────────────────────────────────────────────────
 
 def compute_order_flow_score(
@@ -212,6 +238,7 @@ def compute_order_flow_score(
     delta_accel:      Optional[float],
     absorption_side:  Optional[str],
     cvd_divergence:   Optional[str],
+    book_imbalance:   Optional[float] = None,
 ) -> int:
     """Composite 0–100 order-flow score.
 
@@ -263,6 +290,14 @@ def compute_order_flow_score(
         score += _WEIGHTS["cvd_divergence"]
     elif cvd_divergence == "BEARISH":
         score -= _WEIGHTS["cvd_divergence"]
+
+    # This changes only the existing Order Flow composite. app.py still maps the
+    # composite to its pre-existing bounded ±15 Edge Score adjustment.
+    if book_imbalance is not None:
+        if book_imbalance >= _BOOK_IMBALANCE_MIN:
+            score += _WEIGHTS["book_imbalance"]
+        elif book_imbalance <= -_BOOK_IMBALANCE_MIN:
+            score -= _WEIGHTS["book_imbalance"]
 
     return max(0, min(100, score))
 
@@ -346,6 +381,7 @@ def compute_order_flow(
     inst:       str,
     bars_deque: Any,
     cvd_record: Optional[dict] = None,
+    book_snapshot: Optional[dict] = None,
 ) -> dict:
     """Compute all order-flow metrics for one instrument.
 
@@ -355,8 +391,9 @@ def compute_order_flow(
         cvd_record: CVD_BY_TICKER[inst] — {state, value, direction, ts, source}
 
     Returns:
-        dict with all order-flow fields.  book_imbalance is always None
-        (no order-book subscription available).  All fields are nullable.
+        dict with all order-flow fields. book_snapshot is a fresh MBP-1
+        best-bid/best-ask snapshot supplied by databento_brain; it is optional
+        so unavailable market depth remains a no-op. All fields are nullable.
 
     FAIL-OPEN: always returns a dict, never raises.
     This function is pure/fail-open. app.py owns any bounded Edge Score integration.
@@ -394,6 +431,7 @@ def compute_order_flow(
         cvd_slope_v  = compute_cvd_slope(bars)
         cvd_div_v    = compute_cvd_divergence(bars)
         abs_side, abs_strength = compute_absorption(bars)
+        book_imbalance_v = compute_book_imbalance(book_snapshot)
 
         # ── CVD from shared authoritative store ───────────────────────────────
         cvd_val   = None
@@ -411,6 +449,7 @@ def compute_order_flow(
             delta_accel=delta_accel_v,
             absorption_side=abs_side,
             cvd_divergence=cvd_div_v,
+            book_imbalance=book_imbalance_v,
         )
         state = _score_to_state(score)
 
@@ -428,7 +467,7 @@ def compute_order_flow(
             #              bid_volume = sell aggressor (hit the bid)
             "ask_volume":              buy_vol,
             "bid_volume":              sell_vol,
-            "book_imbalance":          None,   # no order-book subscription
+            "book_imbalance":          book_imbalance_v,
             # Series
             "cvd":                     cvd_val,
             "cvd_slope":               round(cvd_slope_v, 2) if cvd_slope_v is not None else None,

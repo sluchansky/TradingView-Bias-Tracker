@@ -29037,11 +29037,15 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         import order_flow_engine as _ofe_pre  # noqa: PLC0415
         order_flow_enabled = bool(_ofe_pre.ORDER_FLOW_V1_ENABLED)
         if order_flow_enabled:
-            from databento_brain import DATABENTO_BARS_BY_INST as _dbi_of_pre  # noqa: PLC0415
+            from databento_brain import (  # noqa: PLC0415
+                DATABENTO_BARS_BY_INST as _dbi_of_pre,
+                get_top_of_book_snapshot as _top_book_of_pre,
+            )
             order_flow_snapshot = _ofe_pre.compute_order_flow(
                 active_ticker,
                 _dbi_of_pre.get(active_ticker) or [],
                 CVD_BY_TICKER.get(active_ticker),
+                _top_book_of_pre(active_ticker),
             )
     except Exception as _of_pre_exc:
         logger.debug("order_flow_engine pre-gate (%s): %s", active_ticker, _of_pre_exc)
@@ -83377,12 +83381,17 @@ def route_order_flow_status():
                 "reason":      "flag_off",
                 "instruments": {},
             })
-        from databento_brain import DATABENTO_BARS_BY_INST as _dbi_route  # noqa: PLC0415
+        from databento_brain import (  # noqa: PLC0415
+            DATABENTO_BARS_BY_INST as _dbi_route,
+            get_top_of_book_snapshot as _top_book_route,
+        )
         out = {}
         for _inst in list(INSTRUMENT_SPECS):
             _bars = _dbi_route.get(_inst) or []
             _cvd  = CVD_BY_TICKER.get(_inst)
-            out[_inst] = _ofe.compute_order_flow(_inst, _bars, _cvd)
+            out[_inst] = _ofe.compute_order_flow(
+                _inst, _bars, _cvd, _top_book_route(_inst)
+            )
         return jsonify({"enabled": True, "instruments": out})
     except Exception as exc:
         logger.warning("route_order_flow_status: %s", exc)

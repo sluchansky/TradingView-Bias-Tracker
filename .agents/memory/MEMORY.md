@@ -71,6 +71,7 @@
 - [Decision Contract boot flags](decision-contract-boot-flags.md) — TWO separate DC_DB_READY flags; registry.boot() must be called or persistence silently skips; get_all_states() returns Dict not list.
 - [Signal source ownership](signal-source-ownership.md) — CVD/RVOL now Databento-only via _databento_is_canonical guard; FVG already clean; BOS/sweep/VWAP/zones still dual or legacy.
 - [Order Flow Engine V1](order-flow-v1.md) — Databento buy/sell flow maps directionally to bounded ±15 Edge Score points; missing flow is a no-op and hard-zero setups stay zero.
+- [MBP-1 top-of-book Order Flow](mbp1-top-of-book-order-flow.md) — additive Databento best-bid/ask snapshots are fresh-only and fail-open; stale/reconnect state never influences scoring.
 - [Ghost Research Engine Phase 2](ghost-research-engine-phase2.md) — 10-variant shadow experiment platform; OrbEngine BREAKOUT_DETECTED hook; bootstrap CI + Monte Carlo; evidence state machine; 118 tests; GRE_DB_READY flag; 7 Flask routes + proxy whitelist; RESEARCH_READY_FOR_REVIEW dock alert.
 - [GRE Phase 4 — FVG_REVISIT Research Family](gre-phase4-fvg-revisit.md) — FVG_REVISIT as Research Family #2; strategy_family/strategy SEPARATE fields; deterministic rfid/revisit_id; 10 variants; 86 tests; prod DB apply still needed.
 - [DC Phase 3 Closure](dc-phase3-closure.md) — 6 execution hooks wired; GRE DC enrichment; 13 ghost_opportunities DC columns; 6 new legal transitions (scalp path); get_record() + observe_order_accepted/rejected added; 45 tests.

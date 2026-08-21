@@ -23,6 +23,7 @@ the system is byte-identical to the original.
 Public surface (imported by app.py):
     DatabentoBrain          — main class; call .start() once at boot
     DATABENTO_BARS_BY_INST  — {inst: deque[bar_dict]}  for dashboard chart
+    get_top_of_book_snapshot — fresh MBP-1 best-bid/best-ask snapshot per instrument
     DATABENTO_STATUS        — health / telemetry dict for /databento-status
 """
 from __future__ import annotations
@@ -50,6 +51,11 @@ DB_SYMBOLS: dict[str, str] = {
     "MYM": "MYM.c.0",
 }
 DB_DATASET = "GLBX.MDP3"
+# MBP-1 supplies the best bid/ask and displayed size at each side of the book.
+# Leave a kill switch for an exchange/feed incident without disrupting the trades
+# subscription that powers price, CVD, bars, and VWAP.
+DATABENTO_MBP1_ENABLED = os.environ.get("DATABENTO_MBP1_ENABLED", "1") == "1"
+TOP_OF_BOOK_STALE_S = max(1.0, float(os.environ.get("TOP_OF_BOOK_STALE_S", "5")))
 
 # ── Public stores (read by Flask routes and the dashboard chart) ──────────────
 # Each bar entry: {ts, open, high, low, close, volume, vwap?, atr?}
@@ -66,12 +72,67 @@ DATABENTO_PARTIAL_BY_INST: dict[str, Any] = {
     inst: None for inst in DB_SYMBOLS
 }
 
+# The mutable snapshots stay behind this lock. Readers must use
+# get_top_of_book_snapshot(), which returns a copy only while the snapshot is
+# fresh. This prevents an old book from quietly affecting Order Flow after a
+# disconnect, reconnect, or quiet period.
+DATABENTO_TOP_OF_BOOK_BY_INST: dict[str, dict[str, Any] | None] = {
+    inst: None for inst in DB_SYMBOLS
+}
+_TOP_OF_BOOK_LOCK = threading.RLock()
+
+
+def clear_top_of_book_snapshots() -> None:
+    """Discard all MBP-1 state, including on a live-feed reconnect."""
+    with _TOP_OF_BOOK_LOCK:
+        for inst in DATABENTO_TOP_OF_BOOK_BY_INST:
+            DATABENTO_TOP_OF_BOOK_BY_INST[inst] = None
+
+
+def get_top_of_book_snapshot(
+    inst: str,
+    *,
+    now_epoch: float | None = None,
+    max_age_s: float | None = None,
+) -> dict[str, Any] | None:
+    """Return a copied, fresh top-of-book snapshot or None.
+
+    The book is informational/fail-open: an absent or stale quote must look the
+    same as unavailable data to the Order Flow engine.
+    """
+    if not inst:
+        return None
+    now_epoch = time.time() if now_epoch is None else float(now_epoch)
+    max_age_s = TOP_OF_BOOK_STALE_S if max_age_s is None else float(max_age_s)
+    with _TOP_OF_BOOK_LOCK:
+        snapshot = DATABENTO_TOP_OF_BOOK_BY_INST.get(inst)
+        if not isinstance(snapshot, dict):
+            return None
+        received_at = snapshot.get("_received_at")
+        try:
+            age_s = max(0.0, now_epoch - float(received_at))
+        except (TypeError, ValueError):
+            return None
+        if age_s > max_age_s:
+            return None
+        out = {key: value for key, value in snapshot.items() if key != "_received_at"}
+    out["age_s"] = round(age_s, 3)
+    return out
+
+
 DATABENTO_STATUS: dict[str, Any] = {
     "connected":   False,
     "reconnects":  0,
     "last_ts":     None,
     "error":       None,
     "instruments": {},
+    "order_book": {
+        "schema":      "mbp-1",
+        "enabled":     DATABENTO_MBP1_ENABLED,
+        "subscription": "pending" if DATABENTO_MBP1_ENABLED else "disabled",
+        "last_update": None,
+        "updates":     0,
+    },
 }
 
 
@@ -316,9 +377,16 @@ class DatabentoBrain:
             return
 
         # Reset per-session state so reconnects don't carry stale instrument_ids
-        # (exchange IDs change on contract rollover).
+        # (exchange IDs change on contract rollover). A prior connection's book
+        # must also never be reused after a reconnect.
         self._id_to_inst = {}
         self._unknown_ids_warned = set()   # re-warn after each reconnect/re-prefetch
+        clear_top_of_book_snapshots()
+        DATABENTO_STATUS["order_book"].update({
+            "enabled":      DATABENTO_MBP1_ENABLED,
+            "subscription": "pending" if DATABENTO_MBP1_ENABLED else "disabled",
+            "last_update":  None,
+        })
 
         logger.info("DatabentoBrain: connecting to %s …", DB_DATASET)
         DATABENTO_STATUS["error"] = None
@@ -330,6 +398,31 @@ class DatabentoBrain:
             symbols=list(DB_SYMBOLS.values()),
             stype_in="continuous",
         )
+        if DATABENTO_MBP1_ENABLED:
+            try:
+                # Databento allows multiple schema subscriptions on one Live
+                # session. Keep the trade tape intact; MBP-1 is an additive
+                # top-of-book stream used only by Order Flow.
+                client.subscribe(
+                    dataset=DB_DATASET,
+                    schema="mbp-1",
+                    symbols=list(DB_SYMBOLS.values()),
+                    stype_in="continuous",
+                )
+                DATABENTO_STATUS["order_book"]["subscription"] = "active"
+                logger.info(
+                    "DatabentoBrain: MBP-1 top-of-book subscription active for %s",
+                    list(DB_SYMBOLS.values()),
+                )
+            except Exception as exc:
+                # Fail open: a depth entitlement/feed problem must not take down
+                # the established trades subscription or any existing indicators.
+                DATABENTO_STATUS["order_book"]["subscription"] = "unavailable"
+                logger.warning(
+                    "DatabentoBrain: MBP-1 subscription unavailable; "
+                    "continuing with trades only (%s)",
+                    exc,
+                )
         DATABENTO_STATUS["connected"] = True
         logger.info(
             "DatabentoBrain: connected ✓  streaming %s", list(DB_SYMBOLS.values())
@@ -373,11 +466,14 @@ class DatabentoBrain:
         _flush_stop = threading.Event()
         self._start_partial_flush_timer(_flush_stop)
 
-        # Iterator yields only TradeMsg; id→inst map is built concurrently above
-        # and will be ready long before the first trade is processed.
+        # The session carries both TradeMsg and MBP1Msg records. The instrument
+        # map is built concurrently above and will be ready before either is used.
         try:
             for record in client:
-                self._on_trade(record)
+                if self._is_mbp1_record(record):
+                    self._on_mbp1(record)
+                elif self._is_trade_record(record):
+                    self._on_trade(record)
         finally:
             # Stop the flush timer whether the feed exits cleanly or on error.
             _flush_stop.set()
@@ -385,43 +481,117 @@ class DatabentoBrain:
         DATABENTO_STATUS["connected"] = False
         logger.warning("DatabentoBrain: feed closed by server — reconnecting …")
 
+    # ── Shared record/instrument helpers ───────────────────────────────────────
+
+    @staticmethod
+    def _is_mbp1_record(rec: Any) -> bool:
+        """True for Databento MBP-1 records without importing DBN types eagerly."""
+        return (
+            rec.__class__.__name__ in ("MBP1Msg", "CMBP1Msg")
+            or (hasattr(rec, "bid_sz_00") and hasattr(rec, "ask_sz_00"))
+        )
+
+    @staticmethod
+    def _is_trade_record(rec: Any) -> bool:
+        """True for the trade tape records consumed by _on_trade()."""
+        return hasattr(rec, "price") and hasattr(rec, "size") and not (
+            hasattr(rec, "bid_sz_00") or hasattr(rec, "ask_sz_00")
+        )
+
+    def _instrument_for_record(self, rec: Any) -> str | None:
+        """Resolve a live Databento record to MGC/MNQ/MES/MYM, fail-open."""
+        iid = getattr(rec, "instrument_id", None)
+        inst = self._id_to_inst.get(iid) if iid is not None else None
+        if inst is None:
+            sym = getattr(rec, "symbol", None) or ""
+            inst = self._sym_to_inst.get(sym)
+        if inst is None:
+            sym = getattr(rec, "symbol", None) or ""
+            for root in DB_SYMBOLS:
+                if sym.startswith(root):
+                    inst = root
+                    break
+        if inst is None and iid is not None and iid != 0 and iid not in self._unknown_ids_warned:
+            self._unknown_ids_warned.add(iid)
+            logger.warning(
+                "DatabentoBrain: unrecognized instrument_id=%s (sym=%r) — "
+                "record dropped. Known ids: %s. This may indicate a contract "
+                "rollover where the id changed mid-session.",
+                iid, getattr(rec, "symbol", None) or "", list(self._id_to_inst.keys()),
+            )
+        return inst
+
+    # ── MBP-1 top-of-book handler ─────────────────────────────────────────────
+
+    @staticmethod
+    def _mbp1_level_zero(rec: Any) -> tuple[Any, Any, Any, Any]:
+        """Read level zero across supported DBN Python representations."""
+        bid_px = getattr(rec, "bid_px_00", None)
+        ask_px = getattr(rec, "ask_px_00", None)
+        bid_sz = getattr(rec, "bid_sz_00", None)
+        ask_sz = getattr(rec, "ask_sz_00", None)
+        if None not in (bid_px, ask_px, bid_sz, ask_sz):
+            return bid_px, ask_px, bid_sz, ask_sz
+        levels = getattr(rec, "levels", None) or []
+        if levels:
+            level = levels[0]
+            return (
+                getattr(level, "bid_px", getattr(level, "bid_px_00", None)),
+                getattr(level, "ask_px", getattr(level, "ask_px_00", None)),
+                getattr(level, "bid_sz", getattr(level, "bid_sz_00", None)),
+                getattr(level, "ask_sz", getattr(level, "ask_sz_00", None)),
+            )
+        return bid_px, ask_px, bid_sz, ask_sz
+
+    def _on_mbp1(self, rec: Any) -> None:
+        """Store a valid, current MBP-1 best bid/ask quote for one instrument."""
+        try:
+            inst = self._instrument_for_record(rec)
+            if inst is None:
+                return
+            bid_px_raw, ask_px_raw, bid_sz_raw, ask_sz_raw = self._mbp1_level_zero(rec)
+            bid_px = float(bid_px_raw) / 1_000_000_000
+            ask_px = float(ask_px_raw) / 1_000_000_000
+            bid_sz = int(bid_sz_raw)
+            ask_sz = int(ask_sz_raw)
+            # Ignore crossed, empty, or malformed levels. The prior valid quote
+            # remains available only until its regular stale timeout elapses.
+            if bid_px <= 0 or ask_px <= bid_px or bid_sz <= 0 or ask_sz <= 0:
+                return
+            received_at = time.time()
+            event_ts = getattr(rec, "ts_event", None)
+            snapshot = {
+                "available": True,
+                "instrument": inst,
+                "bid_price": round(bid_px, 8),
+                "ask_price": round(ask_px, 8),
+                "bid_size": bid_sz,
+                "ask_size": ask_sz,
+                "ts_event": event_ts,
+                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "_received_at": received_at,
+            }
+            with _TOP_OF_BOOK_LOCK:
+                DATABENTO_TOP_OF_BOOK_BY_INST[inst] = snapshot
+            book_status = DATABENTO_STATUS["order_book"]
+            book_status["last_update"] = snapshot["updated_at"]
+            book_status["updates"] = int(book_status.get("updates") or 0) + 1
+            DATABENTO_STATUS["instruments"].setdefault(inst, {})["order_book"] = {
+                "bid_size": bid_sz,
+                "ask_size": ask_sz,
+                "updated_at": snapshot["updated_at"],
+            }
+        except Exception as exc:
+            logger.debug("DatabentoBrain _on_mbp1 error: %s", exc)
+
     # ── Trade record handler ──────────────────────────────────────────────────
 
     def _on_trade(self, rec) -> None:
         try:
-            # ── Instrument resolution ─────────────────────────────────────────
-            # Primary: instrument_id → inst via the map pre-fetched by HTTP API
-            # (_prefetch_id_map_http) and kept current by add_callback rollover handler.
-            iid  = getattr(rec, "instrument_id", None)
-            inst = self._id_to_inst.get(iid) if iid is not None else None
-
-            # Fallback 1: continuous-contract symbol string ("MGC.c.0" → "MGC")
+            # Shared resolution also maps the companion MBP-1 stream to the
+            # exact same canonical instrument keys.
+            inst = self._instrument_for_record(rec)
             if inst is None:
-                sym  = getattr(rec, "symbol", None) or ""
-                inst = self._sym_to_inst.get(sym)
-
-            # Fallback 2: prefix-match native symbol (e.g. "MGCQ6") → root
-            if inst is None:
-                sym = getattr(rec, "symbol", None) or ""
-                for root in DB_SYMBOLS:
-                    if sym.startswith(root):
-                        inst = root
-                        break
-
-            if inst is None:
-                # Unknown instrument_id — could be a post-rollover id not in the
-                # prefetch map.  Log once per unique id so we can diagnose silently
-                # dropped ticks without flooding the log.
-                # id=0 is a Databento system/heartbeat record, not a real trade — skip silently.
-                if iid is not None and iid != 0 and iid not in self._unknown_ids_warned:
-                    self._unknown_ids_warned.add(iid)
-                    sym_hint = getattr(rec, "symbol", None) or ""
-                    logger.warning(
-                        "DatabentoBrain: unrecognized instrument_id=%s (sym=%r) — "
-                        "tick dropped. Known ids: %s. This may indicate a contract "
-                        "rollover where the id changed mid-session.",
-                        iid, sym_hint, list(self._id_to_inst.keys()),
-                    )
                 return
 
             # Databento uses nanosecond epoch integers for timestamps and
@@ -718,14 +888,16 @@ class DatabentoBrain:
             }
 
         # ── Telemetry ─────────────────────────────────────────────────────────
-        DATABENTO_STATUS["instruments"][inst] = {
+        telemetry = dict(DATABENTO_STATUS["instruments"].get(inst) or {})
+        telemetry.update({
             "bars":  len(bars),
             "vwap":  round(vwap, 4) if vwap  is not None else None,
             "atr":   round(atr,  4) if atr   is not None else None,
             "cvd":   round(cvd_val, 1),
             "rvol":  round(rvol, 2)  if rvol  is not None else None,
             "price": bar["close"],
-        }
+        })
+        DATABENTO_STATUS["instruments"][inst] = telemetry
 
         # ── Structure detection (BOS / CHOCH → ALERT_HISTORY) ────────────────
         self._detect_structure(inst, bars)
