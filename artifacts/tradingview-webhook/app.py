@@ -50297,6 +50297,18 @@ def _restore_ghost_coordinator():
             and CENTRAL_GHOST_COORDINATOR_DB_READY
             and _ghost_coordinator is not None):
         return 0
+    # Reassert the app-owned persistence boundary immediately before restoring.
+    # This makes boot ordering harmless: restore and future intake use the same
+    # shadow-only callback, never a legacy writer, gate, or execution path.
+    _ghost_coordinator.configure(
+        enabled=CENTRAL_GHOST_COORDINATOR_ENABLED,
+        persistence_enabled=True,
+        persist_fn=_coordinator_persist,
+    )
+    logger.info(
+        "Central Ghost Coordinator persistence configured=%s",
+        bool((_ghost_coordinator.get_report() or {}).get("persistence_enabled")),
+    )
     conn = _learning_conn()
     if conn is None:
         return 0

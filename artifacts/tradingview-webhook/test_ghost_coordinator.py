@@ -108,6 +108,23 @@ def test_opt_in_persistence_and_restore_keep_shadow_evidence():
     assert report["restored_observations"] == 1
 
 
+def test_intake_only_reconfigure_does_not_disable_existing_persistence():
+    persisted = []
+    coordinator = gc.CentralGhostCoordinator(enabled=False)
+    coordinator.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda kind, row: persisted.append((kind, row)) or True,
+    )
+    coordinator.configure(enabled=True)
+
+    result = coordinator.submit(_request())
+
+    assert result.accepted is True
+    assert coordinator.report()["persistence_enabled"] is True
+    assert [kind for kind, _ in persisted] == ["observation"]
+
+
 def test_route_fans_out_once_per_destination_and_filters_sources():
     delivered = []
     coordinator = gc.CentralGhostCoordinator(enabled=True)

@@ -125,13 +125,22 @@ class CentralGhostCoordinator:
         self._delivery_errors: Counter[str] = Counter()
         self._delivery_last_error: Dict[str, str] = {}
 
-    def configure(self, *, enabled: bool, persistence_enabled: bool = False,
+    def configure(self, *, enabled: bool, persistence_enabled: Optional[bool] = None,
                   persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None) -> None:
-        """Enable or disable shadow intake without clearing observed evidence."""
+        """Enable shadow intake without clearing its optional storage boundary.
+
+        Callers that omit ``persistence_enabled`` are changing intake only. This
+        matters when an application module is imported a second time: an
+        incidental ``configure(enabled=...)`` must not silently detach a
+        coordinator persistence callback already installed at boot.
+        """
         with self._lock:
             self._enabled = bool(enabled)
-            self._persistence_enabled = bool(persistence_enabled)
-            self._persist_fn = persist_fn
+            if persistence_enabled is not None:
+                self._persistence_enabled = bool(persistence_enabled)
+                self._persist_fn = persist_fn
+            elif persist_fn is not None:
+                self._persist_fn = persist_fn
 
     @property
     def enabled(self) -> bool:
@@ -525,7 +534,7 @@ class CentralGhostCoordinator:
 _DEFAULT_COORDINATOR = CentralGhostCoordinator(enabled=False)
 
 
-def configure(*, enabled: bool, persistence_enabled: bool = False,
+def configure(*, enabled: bool, persistence_enabled: Optional[bool] = None,
               persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None) -> None:
     """Configure the module-level coordinator used by legacy shadow adapters."""
     _DEFAULT_COORDINATOR.configure(
