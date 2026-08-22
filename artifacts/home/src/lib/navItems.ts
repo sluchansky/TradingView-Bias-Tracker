@@ -23,7 +23,12 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { id: 'execution',  label: 'Execution',     path: '/main-brain/execution', icon: '⊙' },
   { id: 'journal',    label: 'Journal',       path: '/main-brain/journal',   icon: '≡' },
   { id: 'coach',      label: 'Coach',         path: '/main-brain/coach',     icon: '◆' },
-  { id: 'research',   label: 'Research',      path: '/main-brain/research',  icon: '⬡' },
+  // Training/research navigation is deliberately split into three clear,
+  // display-only lanes. Operational SWING remains in its existing workspace.
+  { id: 'scalp',      label: 'SCALP',         path: '/main-brain/scalp',     icon: '◒' },
+  { id: 'intraday',   label: 'INTRADAY',      path: '/main-brain/intraday',  icon: '◫' },
+  { id: 'strategy-lab', label: 'Strategy Lab', path: '/main-brain/strategy-lab', icon: '◇' },
+  { id: 'research-health', label: 'Research Health', path: '/main-brain/research-health', icon: '◌' },
   { id: 'alerts',     label: 'Alerts',        path: '/main-brain/alerts',    icon: '◉' },
 ] as const;
 

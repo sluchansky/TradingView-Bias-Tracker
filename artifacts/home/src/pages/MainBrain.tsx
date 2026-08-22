@@ -12,6 +12,7 @@ import { Link, useLocation, useParams } from 'wouter';
 import { LiveMarketChart } from '../components/LiveMarketChart';
 import { normalizeMainBrainPayload } from '../lib/mainBrainNormalizer';
 import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
+import { TRAINING_LANES, normalizeTrainingSection } from '../lib/trainingLanes';
 import { audioManager, SoundEvent } from '../lib/audioManager';
 import { loadQueue, saveQueue, upsertAlert } from '../lib/globalAlerts';
 import {
@@ -4370,6 +4371,434 @@ const ResearchOpsPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
         )}
       </div>
     </section>
+  );
+};
+
+// ── Training lanes ────────────────────────────────────────────────────────────
+// All three lane views are GET-only presentation layers. They reuse the legacy
+// research writers, outcome resolvers, and coordinator reports as their source
+// of truth; no lane can promote a strategy or change an execution setting.
+type JsonRecord = Record<string, unknown>;
+
+async function getReadOnlyJson(path: string, authHeader: string): Promise<JsonRecord | null> {
+  try {
+    const response = await fetch(path, {
+      credentials: 'include',
+      headers: authHeader ? { Authorization: authHeader } : {},
+    });
+    if (!response.ok) return null;
+    const body = await response.json();
+    return body && typeof body === 'object' ? body as JsonRecord : null;
+  } catch {
+    return null;
+  }
+}
+
+const TrainingReadOnlyBanner: React.FC<{ children: React.ReactNode }> = ({ children }) => (
+  <div style={{
+    marginBottom: 12, padding: '9px 12px', borderRadius: 8,
+    background: `${T.cyan}0d`, border: `1px solid ${T.cyan}2c`,
+    color: T.txtSec, fontSize: 10.5, lineHeight: 1.45,
+  }}>
+    <strong style={{ color: T.cyan, letterSpacing: '0.06em', fontSize: 9.5 }}>DISPLAY-ONLY RESEARCH</strong>
+    <span> · {children}</span>
+  </div>
+);
+
+const TrainingStat: React.FC<{ label: string; value: React.ReactNode; color?: string }> = ({ label, value, color = T.txtPri }) => (
+  <div style={{ padding: '8px 9px', borderRadius: 7, background: `${T.border}20`, minWidth: 0 }}>
+    <div style={{ fontSize: 8.5, color: T.txtMuted, letterSpacing: '0.06em', textTransform: 'uppercase' }}>{label}</div>
+    <div style={{ marginTop: 3, fontSize: 15, color, fontFamily: T.mono, fontWeight: 750, overflow: 'hidden', textOverflow: 'ellipsis' }}>{value}</div>
+  </div>
+);
+
+const TrainingLanePanel: React.FC<{
+  lane: 'scalp' | 'intraday';
+  authHeader: string;
+}> = ({ lane, authHeader }) => {
+  const config = TRAINING_LANES[lane];
+  const mode = config.apiMode;
+  const [data, setData] = React.useState<{
+    modeReport: JsonRecord | null;
+    strategyReport: JsonRecord | null;
+    opportunities: JsonRecord | null;
+    settlement: JsonRecord | null;
+    coordinator: JsonRecord | null;
+    researchHealth: JsonRecord | null;
+    loadedAt: number | null;
+  }>({ modeReport: null, strategyReport: null, opportunities: null, settlement: null, coordinator: null, researchHealth: null, loadedAt: null });
+
+  const load = React.useCallback(async () => {
+    const [modeReportRaw, strategyReportRaw, opportunities, settlement, coordinator, researchHealth] = await Promise.all([
+      getReadOnlyJson(`/api/gate-effectiveness/mode-report?mode=${encodeURIComponent(mode)}`, authHeader),
+      getReadOnlyJson(`/api/gate-effectiveness/strategy-report?mode=${encodeURIComponent(mode)}`, authHeader),
+      getReadOnlyJson(`/api/gate-effectiveness/opportunities?mode=${encodeURIComponent(mode)}&days=7`, authHeader),
+      getReadOnlyJson('/api/gate-effectiveness/settlement-health', authHeader),
+      getReadOnlyJson('/api/research-coordinator-report?limit=25', authHeader),
+      getReadOnlyJson('/api/research-health', authHeader),
+    ]);
+    setData({
+      modeReport: (modeReportRaw?.report as JsonRecord | undefined) ?? null,
+      strategyReport: (strategyReportRaw?.report as JsonRecord | undefined) ?? null,
+      opportunities,
+      settlement,
+      coordinator,
+      researchHealth,
+      loadedAt: Date.now(),
+    });
+  }, [authHeader, mode]);
+
+  React.useEffect(() => {
+    load();
+    const id = window.setInterval(load, 30_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  const report = data.modeReport;
+  const health = (report?.health ?? {}) as JsonRecord;
+  const strategyReport = data.strategyReport;
+  const strategies = Object.values((strategyReport?.strategies ?? {}) as Record<string, JsonRecord>)
+    .sort((a, b) => (safeNum(b.raw_evaluations) ?? 0) - (safeNum(a.raw_evaluations) ?? 0))
+    .slice(0, 6);
+  const opportunities = Array.isArray(data.opportunities?.opportunities)
+    ? data.opportunities?.opportunities as JsonRecord[] : [];
+  const coordinator = data.coordinator ?? {};
+  const researchHealth = data.researchHealth ?? {};
+  const ghostHealth = (researchHealth.ghost_engine ?? {}) as JsonRecord;
+  const edgeHealth = (researchHealth.edge_ledger ?? {}) as JsonRecord;
+  const pending = safeNum(health.pending_outcomes) ?? 0;
+  const collector = safeStr(health.collector_status, 'NO DATA');
+  const collectorColor = collector === 'ACTIVE' ? T.green : collector === 'SILENT' ? T.amber : T.txtMuted;
+  const coordinatorFanout = coordinator.fanout_enabled === true ? 'ON' : 'OFF';
+
+  return (
+    <div>
+      <TrainingReadOnlyBanner>
+        {config.description} Legacy writers and outcome resolvers remain authoritative; coordinator fan-out is not controlled here.
+      </TrainingReadOnlyBanner>
+
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, margin: '2px 0 12px' }}>
+        <h1 style={{ margin: 0, fontSize: 20, letterSpacing: '0.06em' }}>{config.label}</h1>
+        <span style={{ fontSize: 10, color: T.txtMuted }}>Training evidence lane · refreshed {data.loadedAt ? fmtAge(new Date(data.loadedAt).toISOString()) : 'loading…'}</span>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 8, marginBottom: 12 }} className="mb-training-stats">
+        <TrainingStat label="Observations" value={report ? (safeNum(report.total_blocked) ?? 0) + (safeNum(report.total_allowed) ?? 0) : '—'} />
+        <TrainingStat label="Open / pending" value={report ? pending : '—'} color={pending > 0 ? T.amber : T.txtPri} />
+        <TrainingStat label="Resolved" value={report ? safeNum(health.resolved_outcomes) ?? 0 : '—'} color={T.green} />
+        <TrainingStat label="Strategies" value={(safeNum(strategyReport?.strategy_count) ?? strategies.length) || '—'} />
+        <TrainingStat label="Geometry" value={report ? `${safeNum(report.geometry_rate) ?? 0}%` : '—'} color={(safeNum(report?.geometry_rate) ?? 0) > 30 ? T.green : T.amber} />
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 0.9fr', gap: 10 }} className="mb-grid-2">
+        <Panel title={`${config.label} outcome & gate evidence`} badge={<Badge label={collector} color={collectorColor} />}>
+          {!report ? (
+            <div style={{ color: T.txtMuted, fontSize: 11, padding: 12 }}>Loading mode report…</div>
+          ) : (
+            <div style={{ padding: 12 }}>
+              <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: 7, marginBottom: 12 }}>
+                <TrainingStat label="Allowed" value={safeNum(report.total_allowed) ?? 0} color={T.green} />
+                <TrainingStat label="Blocked" value={safeNum(report.total_blocked) ?? 0} color={T.amber} />
+                <TrainingStat label="Gate value" value={report.gate_improvement == null ? '—' : `${safeNum(report.gate_improvement) ?? 0}R`} color={(safeNum(report.gate_improvement) ?? 0) >= 0 ? T.green : T.red} />
+              </div>
+              <div style={{ fontSize: 9, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 5 }}>OUTCOME RESOLVER HEALTH</div>
+              <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, fontSize: 10, color: T.txtSec }}>
+                <span>Last observation: <strong>{fmtAge(health.last_observation_ts)}</strong></span>
+                <span>Last resolved: <strong>{fmtAge(health.last_resolved_ts)}</strong></span>
+                <span>24h unique setups: <strong>{safeStr(health.unique_opps_24h)}</strong></span>
+                <span>Evidence: <strong>{safeStr(report.evidence_status)}</strong></span>
+              </div>
+              {pending > 0 && (
+                <div role="status" style={{ marginTop: 10, padding: '7px 9px', borderRadius: 6, background: `${T.amber}12`, color: T.amber, fontSize: 10 }}>
+                  {pending} unresolved observation{pending === 1 ? '' : 's'} awaiting the established outcome resolver.
+                </div>
+              )}
+            </div>
+          )}
+        </Panel>
+
+        <Panel title="Shadow coverage & stale-evidence watch" badge={<Badge label={`FAN-OUT ${coordinatorFanout}`} color={coordinatorFanout === 'OFF' ? T.txtMuted : T.red} />}>
+          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 9, fontSize: 10 }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <span style={{ color: T.txtMuted }}>Coordinator intake</span>
+              <span style={{ color: coordinator.enabled === false ? T.txtMuted : T.cyan }}>{safeStr(coordinator.enabled === true ? 'ENABLED' : coordinator.enabled === false ? 'OFF' : 'PENDING')}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <span style={{ color: T.txtMuted }}>Persistence</span>
+              <span style={{ color: T.txtSec }}>{safeStr(coordinator.persistence, 'shadow only')}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <span style={{ color: T.txtMuted }}>Ghost ledger</span>
+              <span style={{ color: ghostHealth.table_ready === true ? T.green : T.amber }}>{ghostHealth.table_ready === true ? 'READY' : 'PENDING'}</span>
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
+              <span style={{ color: T.txtMuted }}>Edge ledger</span>
+              <span style={{ color: edgeHealth.table_ready === true ? T.green : T.amber }}>{edgeHealth.table_ready === true ? 'READY' : 'PENDING'}</span>
+            </div>
+            <div style={{ paddingTop: 8, borderTop: `1px solid ${T.border}`, color: pending > 0 || collector === 'SILENT' ? T.amber : T.txtMuted }}>
+              {collector === 'SILENT' ? 'Collector is silent — verify upstream market data before interpreting empty results.' :
+                pending > 0 ? 'Pending outcomes are visible here; they are not re-routed or resolved by this dashboard.' :
+                'No overdue-evidence warning reported by the current mode health snapshot.'}
+            </div>
+          </div>
+        </Panel>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 0.9fr', gap: 10, marginTop: 10 }} className="mb-grid-2">
+        <Panel title={`${config.label} strategy breakdown`} badge={<Badge label={`${strategies.length} shown`} color={T.cyan} />}>
+          <div style={{ padding: 12, overflowX: 'auto' }}>
+            {strategies.length === 0 ? <div style={{ fontSize: 10, color: T.txtMuted }}>No resolved strategy evidence yet.</div> : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+                <thead><tr style={{ color: T.txtMuted, textAlign: 'left' }}>
+                  {['Strategy', 'Evaluations', 'Resolved', 'Win %', 'Net R'].map(label => <th key={label} style={{ padding: '0 5px 6px', fontWeight: 700, fontSize: 8.5, letterSpacing: '0.05em' }}>{label}</th>)}
+                </tr></thead>
+                <tbody>{strategies.map((strategy, index) => {
+                  const winRate = safeNum(strategy.win_rate);
+                  const netR = safeNum(strategy.net_r);
+                  return <tr key={`${safeStr(strategy.strategy)}-${index}`} style={{ borderTop: `1px solid ${T.border}` }}>
+                    <td style={{ padding: '7px 5px', color: T.txtPri, fontWeight: 700 }}>{safeStr(strategy.strategy)}</td>
+                    <td style={{ padding: '7px 5px', color: T.txtSec }}>{safeStr(strategy.raw_evaluations)}</td>
+                    <td style={{ padding: '7px 5px', color: T.txtSec }}>{safeStr(strategy.resolved_count)}</td>
+                    <td style={{ padding: '7px 5px', color: winRate == null ? T.txtMuted : winRate >= 50 ? T.green : T.red }}>{winRate == null ? '—' : `${winRate}%`}</td>
+                    <td style={{ padding: '7px 5px', color: netR == null ? T.txtMuted : netR >= 0 ? T.green : T.red }}>{netR == null ? '—' : `${netR.toFixed(2)}R`}</td>
+                  </tr>;
+                })}</tbody>
+              </table>
+            )}
+          </div>
+        </Panel>
+
+        <Panel title="Recent mode observations" badge={<Badge label={`${opportunities.length}`} color={T.txtMuted} />}>
+          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {opportunities.slice(0, 6).map((opportunity, index) => (
+              <div key={`${safeStr(opportunity.id ?? opportunity.obs_key ?? opportunity.created_at)}-${index}`} style={{ paddingBottom: 6, borderBottom: `1px solid ${T.border}` }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 10 }}>
+                  <span style={{ color: dirColor(opportunity.direction), fontWeight: 700 }}>{safeStr(opportunity.direction, 'OBSERVATION')}</span>
+                  <span style={{ color: T.txtMuted }}>{fmtAge(opportunity.created_at ?? opportunity.timestamp ?? opportunity.signal_timestamp)}</span>
+                </div>
+                <div style={{ fontSize: 9.5, color: T.txtSec, marginTop: 2 }}>{safeStr(opportunity.strategy ?? opportunity.strategy_key ?? opportunity.primary_blocker)}</div>
+              </div>
+            ))}
+            {opportunities.length === 0 && <div style={{ fontSize: 10, color: T.txtMuted }}>No recent observations returned for this lane.</div>}
+          </div>
+        </Panel>
+      </div>
+    </div>
+  );
+};
+
+const StrategyLabPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
+  const [data, setData] = React.useState<{
+    health: JsonRecord | null; experiments: JsonRecord[]; candidates: JsonRecord[];
+    ready: JsonRecord[]; operations: JsonRecord | null; loadedAt: number | null;
+  }>({ health: null, experiments: [], candidates: [], ready: [], operations: null, loadedAt: null });
+
+  const load = React.useCallback(async () => {
+    const [health, experimentResponse, candidateResponse, readyResponse, operations] = await Promise.all([
+      getReadOnlyJson('/api/ghost-research/health', authHeader),
+      getReadOnlyJson('/api/ghost-research/experiments?limit=30', authHeader),
+      getReadOnlyJson('/api/ghost-research/candidates?min_samples=10', authHeader),
+      getReadOnlyJson('/api/ghost-research/ready-for-review', authHeader),
+      getReadOnlyJson('/api/research-ops', authHeader),
+    ]);
+    setData({
+      health,
+      experiments: Array.isArray(experimentResponse?.experiments) ? experimentResponse?.experiments as JsonRecord[] : [],
+      candidates: Array.isArray(candidateResponse?.candidates) ? candidateResponse?.candidates as JsonRecord[] : [],
+      ready: Array.isArray(readyResponse?.experiments) ? readyResponse?.experiments as JsonRecord[] : [],
+      operations,
+      loadedAt: Date.now(),
+    });
+  }, [authHeader]);
+
+  React.useEffect(() => {
+    load();
+    const id = window.setInterval(load, 30_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  const familyBreakdown = (data.health?.family_breakdown ?? {}) as Record<string, JsonRecord>;
+  const evidence = (data.operations?.evidence_states ?? {}) as Record<string, unknown>;
+  const completed = safeNum(data.health?.completed) ?? 0;
+
+  return (
+    <div>
+      <TrainingReadOnlyBanner>
+        Shadow experiments are reviewed here only. A strategy can move to SCALP or INTRADAY only through an explicit human decision outside this dashboard; no automatic promotion exists.
+      </TrainingReadOnlyBanner>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, margin: '2px 0 12px' }}>
+        <h1 style={{ margin: 0, fontSize: 20, letterSpacing: '0.06em' }}>STRATEGY LAB</h1>
+        <span style={{ fontSize: 10, color: T.txtMuted }}>Experiment evidence · refreshed {data.loadedAt ? fmtAge(new Date(data.loadedAt).toISOString()) : 'loading…'}</span>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0, 1fr))', gap: 8, marginBottom: 12 }} className="mb-training-stats">
+        <TrainingStat label="Experiments" value={safeNum(data.health?.total_experiments) ?? '—'} />
+        <TrainingStat label="Active ghosts" value={safeNum(data.health?.active_ghost_trades) ?? '—'} color={T.cyan} />
+        <TrainingStat label="Completed" value={completed || '—'} color={T.green} />
+        <TrainingStat label="Candidates" value={data.candidates.length} />
+        <TrainingStat label="Ready for review" value={data.ready.length} color={data.ready.length ? T.green : T.txtPri} />
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '0.8fr 1.2fr', gap: 10 }} className="mb-grid-2">
+        <Panel title="Manual promotion path" badge={<Badge label="HUMAN DECISION" color={T.amber} />}>
+          <div style={{ padding: 12, fontSize: 10.5, color: T.txtSec, lineHeight: 1.55 }}>
+            <ol style={{ margin: 0, paddingLeft: 18 }}>
+              <li>Observe a family and its variants through completed shadow outcomes.</li>
+              <li>Review sample size, performance, evidence state, and risk context.</li>
+              <li>Make an explicit operator decision to evaluate it for <strong style={{ color: T.cyan }}>SCALP</strong> or <strong style={{ color: T.cyan }}>INTRADAY</strong>.</li>
+            </ol>
+            <div style={{ marginTop: 10, padding: '7px 9px', borderRadius: 6, background: `${T.amber}10`, color: T.amber }}>
+              This panel has no promotion button, strategy selector, execution control, or write request.
+            </div>
+          </div>
+        </Panel>
+        <Panel title="Research families & evidence states" badge={<Badge label={data.health?.db_ready === true ? 'ENGINE READY' : 'PENDING'} color={data.health?.db_ready === true ? T.green : T.amber} />}>
+          <div style={{ padding: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 9 }}>
+            <div>
+              <div style={{ fontSize: 8.5, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 }}>FAMILIES</div>
+              {Object.entries(familyBreakdown).map(([family, metrics]) => (
+                <div key={family} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: `1px solid ${T.border}`, fontSize: 10 }}>
+                  <span style={{ color: T.txtSec }}>{family.replace(/_/g, ' ')}</span>
+                  <span style={{ color: T.txtPri }}>{safeStr(metrics.total_opps, '0')} total</span>
+                </div>
+              ))}
+              {Object.keys(familyBreakdown).length === 0 && <div style={{ fontSize: 10, color: T.txtMuted }}>No family evidence yet.</div>}
+            </div>
+            <div>
+              <div style={{ fontSize: 8.5, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.08em', marginBottom: 6 }}>EVIDENCE PIPELINE</div>
+              {Object.entries(evidence).map(([state, count]) => (
+                <div key={state} style={{ display: 'flex', justifyContent: 'space-between', padding: '5px 0', borderBottom: `1px solid ${T.border}`, fontSize: 10 }}>
+                  <span style={{ color: state === 'READY_FOR_REVIEW' ? T.green : T.txtSec }}>{state.replace(/_/g, ' ')}</span>
+                  <span style={{ color: T.txtPri }}>{safeStr(count)}</span>
+                </div>
+              ))}
+              {Object.keys(evidence).length === 0 && <div style={{ fontSize: 10, color: T.txtMuted }}>Evidence aggregation is warming up.</div>}
+            </div>
+          </div>
+        </Panel>
+      </div>
+
+      <div style={{ display: 'grid', gridTemplateColumns: '1.1fr 0.9fr', gap: 10, marginTop: 10 }} className="mb-grid-2">
+        <Panel title="Top reviewed candidates" badge={<Badge label={`${data.candidates.length} ≥ minimum sample`} color={T.cyan} />}>
+          <div style={{ padding: 12, overflowX: 'auto' }}>
+            {data.candidates.length === 0 ? <div style={{ fontSize: 10, color: T.txtMuted }}>No experiment has reached the current minimum sample count.</div> : (
+              <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 10 }}>
+                <thead><tr style={{ color: T.txtMuted, textAlign: 'left' }}>
+                  {['Variant', 'Family', 'Closed', 'Avg net R', 'State'].map(label => <th key={label} style={{ padding: '0 5px 6px', fontWeight: 700, fontSize: 8.5 }}>{label}</th>)}
+                </tr></thead>
+                <tbody>{data.candidates.slice(0, 8).map((candidate, index) => {
+                  const avg = safeNum(candidate.avg_net_r);
+                  return <tr key={`${safeStr(candidate.experiment_id)}-${index}`} style={{ borderTop: `1px solid ${T.border}` }}>
+                    <td style={{ padding: '7px 5px', color: T.txtPri, fontWeight: 700 }}>{safeStr(candidate.variant_name)}</td>
+                    <td style={{ padding: '7px 5px', color: T.txtSec }}>{safeStr(candidate.strategy_family).replace(/_/g, ' ')}</td>
+                    <td style={{ padding: '7px 5px', color: T.txtSec }}>{safeStr(candidate.closed)}</td>
+                    <td style={{ padding: '7px 5px', color: avg == null ? T.txtMuted : avg >= 0 ? T.green : T.red }}>{avg == null ? '—' : `${avg.toFixed(2)}R`}</td>
+                    <td style={{ padding: '7px 5px', color: candidate.evidence_state === 'READY_FOR_REVIEW' ? T.green : T.txtSec }}>{safeStr(candidate.evidence_state).replace(/_/g, ' ')}</td>
+                  </tr>;
+                })}</tbody>
+              </table>
+            )}
+          </div>
+        </Panel>
+
+        <Panel title="Recent variant outcomes" badge={<Badge label={`${data.experiments.length} recent`} color={T.txtMuted} />}>
+          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {data.experiments.slice(0, 7).map((experiment, index) => {
+              const netR = safeNum(experiment.net_r);
+              return <div key={`${safeStr(experiment.experiment_id)}-${index}`} style={{ paddingBottom: 6, borderBottom: `1px solid ${T.border}` }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', gap: 8, fontSize: 10 }}>
+                  <span style={{ color: T.txtPri, fontWeight: 700 }}>{safeStr(experiment.variant_name)}</span>
+                  <span style={{ color: netR == null ? T.txtMuted : netR >= 0 ? T.green : T.red }}>{netR == null ? safeStr(experiment.status) : `${netR.toFixed(2)}R`}</span>
+                </div>
+                <div style={{ marginTop: 2, fontSize: 9.5, color: T.txtMuted }}>
+                  {safeStr(experiment.instrument)} · {safeStr(experiment.direction)} · {safeStr(experiment.evidence_state).replace(/_/g, ' ')}
+                </div>
+              </div>;
+            })}
+            {data.experiments.length === 0 && <div style={{ fontSize: 10, color: T.txtMuted }}>No experiments returned yet.</div>}
+          </div>
+        </Panel>
+      </div>
+    </div>
+  );
+};
+
+const TrainingInfrastructurePanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
+  const [data, setData] = React.useState<{ health: JsonRecord | null; operations: JsonRecord | null; coordinator: JsonRecord | null; events: JsonRecord[] }>({
+    health: null, operations: null, coordinator: null, events: [],
+  });
+  const [advancedOpen, setAdvancedOpen] = React.useState(false);
+
+  const load = React.useCallback(async () => {
+    const [health, operations, coordinator, eventsResponse] = await Promise.all([
+      getReadOnlyJson('/api/research-health', authHeader),
+      getReadOnlyJson('/api/research-ops', authHeader),
+      getReadOnlyJson('/api/research-coordinator-report?limit=10', authHeader),
+      getReadOnlyJson('/api/research-events?limit=10', authHeader),
+    ]);
+    setData({ health, operations, coordinator, events: Array.isArray(eventsResponse?.events) ? eventsResponse?.events as JsonRecord[] : [] });
+  }, [authHeader]);
+
+  React.useEffect(() => {
+    load();
+    const id = window.setInterval(load, 30_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  const ghost = (data.health?.ghost_engine ?? {}) as JsonRecord;
+  const edge = (data.health?.edge_ledger ?? {}) as JsonRecord;
+  const coordinator = data.coordinator ?? {};
+
+  return (
+    <div>
+      <TrainingReadOnlyBanner>
+        Supporting health is separated from the three training lanes. It observes infrastructure only and cannot change a scheduler, database, coordinator fan-out, or execution setting.
+      </TrainingReadOnlyBanner>
+      <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, margin: '2px 0 12px' }}>
+        <h1 style={{ margin: 0, fontSize: 20, letterSpacing: '0.06em' }}>RESEARCH HEALTH</h1>
+        <span style={{ fontSize: 10, color: T.txtMuted }}>Supporting infrastructure</span>
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8, marginBottom: 12 }} className="mb-training-stats">
+        <TrainingStat label="Ghost ledger" value={ghost.table_ready === true ? 'READY' : 'PENDING'} color={ghost.table_ready === true ? T.green : T.amber} />
+        <TrainingStat label="Edge ledger" value={edge.table_ready === true ? 'READY' : 'PENDING'} color={edge.table_ready === true ? T.green : T.amber} />
+        <TrainingStat label="Coordinator" value={coordinator.enabled === true ? 'INTAKE ON' : 'OFF'} color={coordinator.enabled === true ? T.cyan : T.txtMuted} />
+        <TrainingStat label="Fan-out" value={coordinator.fanout_enabled === true ? 'ON' : 'OFF'} color={coordinator.fanout_enabled === true ? T.red : T.green} />
+      </div>
+      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }} className="mb-grid-2">
+        <Panel title="Research pipeline health" badge={<Badge label={data.operations?.healthy === true ? 'HEALTHY' : data.operations?.needs_attention === true ? 'ATTENTION' : 'PENDING'} color={data.operations?.healthy === true ? T.green : T.amber} />}>
+          <div style={{ padding: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 10 }}>
+            <TrainingStat label="Engine errors" value={safeNum(data.operations?.error_count) ?? '—'} color={(safeNum(data.operations?.error_count) ?? 0) > 0 ? T.amber : T.green} />
+            <TrainingStat label="Duplicate evidence" value={safeNum(data.health?.duplicate_event_count) ?? '—'} color={(safeNum(data.health?.duplicate_event_count) ?? 0) > 0 ? T.amber : T.green} />
+            <TrainingStat label="Ghost open" value={safeNum((ghost.counts as JsonRecord | undefined)?.open) ?? '—'} />
+            <TrainingStat label="Edge rows" value={safeNum(edge.total_rows) ?? '—'} />
+          </div>
+        </Panel>
+        <Panel title="Coordinator & scheduler boundary" badge={<Badge label="SHADOW ONLY" color={T.cyan} />}>
+          <div style={{ padding: 12, display: 'flex', flexDirection: 'column', gap: 8, fontSize: 10 }}>
+            <div><span style={{ color: T.txtMuted }}>Persistence:</span> <span style={{ color: T.txtSec }}>{safeStr(coordinator.persistence, 'in-memory shadow only')}</span></div>
+            <div><span style={{ color: T.txtMuted }}>DB readiness:</span> <span style={{ color: coordinator.persistence_db_ready === true ? T.green : T.amber }}>{coordinator.persistence_db_ready === true ? 'READY' : 'PENDING'}</span></div>
+            <div><span style={{ color: T.txtMuted }}>Fan-out state:</span> <strong style={{ color: coordinator.fanout_enabled === true ? T.red : T.green }}>{coordinator.fanout_enabled === true ? 'ENABLED' : 'DISABLED'}</strong></div>
+            <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8, color: T.txtMuted }}>The dashboard reports this boundary; it does not reconfigure it.</div>
+          </div>
+        </Panel>
+      </div>
+      <Panel title="Recent research events" badge={<Badge label={`${data.events.length} buffered`} color={T.txtMuted} />} style={{ marginTop: 10 }}>
+        <div style={{ padding: 12 }}>
+          {data.events.length === 0 ? <div style={{ fontSize: 10, color: T.txtMuted }}>No event records returned.</div> : data.events.map((event, index) => (
+            <div key={`${safeStr(event.event_id ?? event.timestamp)}-${index}`} style={{ display: 'flex', justifyContent: 'space-between', gap: 10, padding: '6px 0', borderBottom: `1px solid ${T.border}`, fontSize: 10 }}>
+              <span style={{ color: T.txtSec }}>{safeStr(event.event_type, 'EVENT').replace(/_/g, ' ')} · {safeStr(event.instrument, 'SYSTEM')}</span>
+              <span style={{ color: T.txtMuted }}>{fmtAge(event.timestamp ?? event.ts)}</span>
+            </div>
+          ))}
+        </div>
+      </Panel>
+      <div style={{ marginTop: 10 }}>
+        <button onClick={() => setAdvancedOpen(open => !open)} style={{ width: '100%', padding: '9px 12px', borderRadius: 8, border: `1px solid ${T.border}`, background: T.panel, color: T.txtSec, cursor: 'pointer', fontSize: 10, fontWeight: 700, letterSpacing: '0.07em', textAlign: 'left' }}>
+          {advancedOpen ? '▾' : '▸'} ADVANCED OBSERVATIONAL SYSTEMS · Visual Brain, market evidence, and history
+        </button>
+        {advancedOpen && <div style={{ marginTop: 10 }}><VisualBrainPanel authHeader={authHeader} /></div>}
+      </div>
+    </div>
   );
 };
 
@@ -14178,7 +14607,8 @@ const BellToast: React.FC<{ data: BellToastData; onDismiss: () => void }> = ({ d
 export default function MainBrain() {
   // Section param — present when route is /main-brain/:section, absent at /main-brain
   const params = useParams<{ section?: string }>();
-  const section = (params as Record<string, string | undefined>).section ?? '';
+  const requestedSection = (params as Record<string, string | undefined>).section ?? '';
+  const section = normalizeTrainingSection(requestedSection);
 
   const [ticker, setTicker] = useState<string>(() => {
     try { return localStorage.getItem('mb_ticker') || 'MGC'; } catch { return 'MGC'; }
@@ -14201,10 +14631,14 @@ export default function MainBrain() {
   // URL is removed from browser history rather than pushed as a new entry).
   const [, navigate] = useLocation();
   useEffect(() => {
+    if (requestedSection === 'research') {
+      navigate('/main-brain/strategy-lab', { replace: true });
+      return;
+    }
     if (section !== '' && !KNOWN_SECTIONS.includes(section)) {
       navigate('/main-brain', { replace: true });
     }
-  }, [section]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [requestedSection, section]); // eslint-disable-line react-hooks/exhaustive-deps
 
   const { payload, fetchState, lastOk, error, isAuthFail, refresh } = useMainBrain(ticker);
   const [showLogin, setShowLogin] = useState<boolean>(() => {
@@ -14584,9 +15018,21 @@ export default function MainBrain() {
         return <JournalFullPage />;
       case 'coach':
         return <CoachPanel p={p} />;
-      case 'research':
+      case 'scalp':
         return (
-          <ResearchOpsPanel authHeader={getAuthHeader()['Authorization'] ?? ''} />
+          <TrainingLanePanel lane="scalp" authHeader={getAuthHeader()['Authorization'] ?? ''} />
+        );
+      case 'intraday':
+        return (
+          <TrainingLanePanel lane="intraday" authHeader={getAuthHeader()['Authorization'] ?? ''} />
+        );
+      case 'strategy-lab':
+        return (
+          <StrategyLabPanel authHeader={getAuthHeader()['Authorization'] ?? ''} />
+        );
+      case 'research-health':
+        return (
+          <TrainingInfrastructurePanel authHeader={getAuthHeader()['Authorization'] ?? ''} />
         );
       case 'execution':
         return (
@@ -14707,8 +15153,8 @@ export default function MainBrain() {
         />
 
         <main id="main-content" className="mb-main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
-          {/* Execution and Research render immediately — they have own data sources, no brain poll needed */}
-          {(section === 'execution' || section === 'research') ? renderSectionPanels() :
+          {/* Execution and training lanes render immediately — they have their own read-only data sources. */}
+          {(section === 'execution' || section === 'scalp' || section === 'intraday' || section === 'strategy-lab' || section === 'research-health') ? renderSectionPanels() :
           isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
             <>
               {/* Stale banner */}
@@ -14852,9 +15298,10 @@ export default function MainBrain() {
         @keyframes mbNavIn { from { opacity:0; transform:translateX(-18px); } to { opacity:1; transform:translateX(0); } }
         @media (max-width: 1024px) {
           .mb-grid-3 { grid-template-columns: 1fr 1fr !important; }
+          .mb-training-stats { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
         }
         @media (max-width: 768px) {
-          .mb-grid-3, .mb-grid-2 { grid-template-columns: 1fr !important; }
+          .mb-grid-3, .mb-grid-2, .mb-training-stats { grid-template-columns: 1fr !important; }
           .mb-desktop-sidenav { display: none !important; }
           .mb-mobile-menu-toggle { width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; border-radius:8px; border:1px solid ${T.borderMid}; color:${T.cyan}; background:${T.cyan}12; cursor:pointer; font-size:20px; line-height:1; }
           .mb-main-header { min-height:58px !important; height:auto !important; padding:8px 12px !important; gap:8px !important; flex-wrap:wrap; }
