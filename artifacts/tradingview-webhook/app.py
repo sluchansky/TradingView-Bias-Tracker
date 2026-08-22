@@ -4100,6 +4100,23 @@ def _intraday_bucket(ts, tz: str = "America/New_York"):
         return None
 
 
+def _strftime_compatible(value, fmt):
+    """Render strftime formats containing the POSIX ``%-d``/``%-I`` forms.
+
+    Windows' CRT does not support the ``-`` flag. Mark only those fields,
+    render them with the portable zero-padded directives, then remove their
+    padding so existing display strings remain unchanged.
+    """
+    day_marker = "__FMT_DAY__"
+    hour_marker = "__FMT_HOUR__"
+    fmt = fmt.replace("%-d", day_marker + "%d" + day_marker)
+    fmt = fmt.replace("%-I", hour_marker + "%I" + hour_marker)
+    rendered = value.strftime(fmt)
+    rendered = rendered.replace(day_marker + "0", day_marker)
+    rendered = rendered.replace(hour_marker + "0", hour_marker)
+    return rendered.replace(day_marker, "").replace(hour_marker, "")
+
+
 def fmt_et(value, fmt="%Y-%m-%d %H:%M ET"):
     """Format a UTC datetime or ISO-8601 string in US Eastern time for display.
 
@@ -4115,7 +4132,7 @@ def fmt_et(value, fmt="%Y-%m-%d %H:%M ET"):
             return value
     if value.tzinfo is None:
         value = value.replace(tzinfo=timezone.utc)
-    return value.astimezone(ET_TZ).strftime(fmt)
+    return _strftime_compatible(value.astimezone(ET_TZ), fmt)
 
 
 # ── Preferred trading-session windows (Eastern Time) ─────────────────────────
