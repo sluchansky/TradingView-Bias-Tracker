@@ -32,6 +32,7 @@ import hashlib
 import json
 import logging
 import math
+import os
 import random
 import threading
 import time
@@ -242,6 +243,23 @@ def _tick(inst: str) -> float:
 
 def _now_utc() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def _submit_coordinator_observation(request: Any) -> None:
+    """Send a GRE research copy through the optional central intake.
+
+    GRE remains the owner of its opportunity, experiment, and outcome writes.
+    The router is an isolated observer/fan-out boundary only.
+    """
+    try:
+        import ghost_coordinator as _gc  # noqa: PLC0415
+        fanout = os.getenv("CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED", "0").strip().lower()
+        if fanout in ("1", "true", "yes", "on"):
+            _gc.route_research(request)
+        else:
+            _gc.submit_shadow(request)
+    except Exception:
+        pass
 
 def _sn(v: Any) -> Optional[float]:
     """Safe numeric cast."""
@@ -960,7 +978,7 @@ class GhostResearchEngine:
             # No coordinator result is read back by GRE or any money path.
             try:
                 import ghost_coordinator as _gc  # noqa: PLC0415
-                _gc.submit_shadow(_gc.ObservationRequest(
+                _submit_coordinator_observation(_gc.ObservationRequest(
                     source_system="gre_orb", source_event_id=opp_id,
                     instrument=inst, timeframe="1m", setup_family="ORB",
                     strategy_name=STRATEGY_NAME, strategy_version=STRATEGY_VERSION,
@@ -2203,7 +2221,7 @@ class GhostResearchEngine:
             target = float(price) + (_FVG_BASELINE_TARGET_R * risk if direction == "Long"
                                      else -_FVG_BASELINE_TARGET_R * risk)
             import ghost_coordinator as _gc  # noqa: PLC0415
-            _gc.submit_shadow(_gc.ObservationRequest(
+            _submit_coordinator_observation(_gc.ObservationRequest(
                 source_system="gre_fvg_revisit", source_event_id=opp_id,
                 instrument=inst, timeframe="1m", setup_family="FVG_REVISIT",
                 strategy_name="FVG_REVISIT", strategy_version=STRATEGY_VERSION,

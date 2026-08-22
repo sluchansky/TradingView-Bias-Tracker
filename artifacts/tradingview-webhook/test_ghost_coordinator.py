@@ -108,6 +108,74 @@ def test_opt_in_persistence_and_restore_keep_shadow_evidence():
     assert report["restored_observations"] == 1
 
 
+def test_route_fans_out_once_per_destination_and_filters_sources():
+    delivered = []
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.register_delivery("generic-ledger", lambda row: delivered.append(("generic", row)),
+                                  sources=("generic_ghost",))
+    coordinator.register_delivery("all-research", lambda row: delivered.append(("all", row)))
+
+    first, deliveries = coordinator.route(_request())
+    second, duplicate_deliveries = coordinator.route(_request())
+
+    assert first.accepted is True
+    assert [item.destination for item in deliveries] == ["generic-ledger", "all-research"]
+    assert all(item.delivered for item in deliveries)
+    assert second.duplicate is True
+    assert duplicate_deliveries == ()
+    assert [name for name, _ in delivered] == ["generic", "all"]
+    report = coordinator.report()
+    assert report["delivery_attempts"] == 2
+    assert report["delivery_successes"] == 2
+    assert report["delivery_failures"] == 0
+
+
+def test_route_isolates_delivery_failure_and_does_not_reject_intake():
+    delivered = []
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.register_delivery("broken", lambda _: (_ for _ in ()).throw(RuntimeError("sink down")))
+    coordinator.register_delivery("healthy", lambda row: delivered.append(row["observation_id"]))
+
+    result, deliveries = coordinator.route(_request())
+
+    assert result.accepted is True
+    assert [item.destination for item in deliveries] == ["broken", "healthy"]
+    assert deliveries[0].error == "sink down"
+    assert deliveries[1].delivered is True
+    assert len(delivered) == 1
+    report = coordinator.report()
+    assert report["unique_observations"] == 1
+    assert report["delivery_failures"] == 1
+    assert report["delivery_successes"] == 1
+
+
+def test_telemetry_route_fans_out_without_creating_trade_geometry():
+    delivered = []
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.register_delivery("visual-receipt", lambda row: delivered.append(row),
+                                  sources=("visual_brain",))
+
+    result, deliveries = coordinator.route_observational_event("visual_brain", "MNQ|image-1")
+
+    assert result.accepted is True
+    assert deliveries[0].delivered is True
+    assert delivered[0]["kind"] == "telemetry"
+    assert coordinator.report()["unique_market_opportunities"] == 0
+
+
+def test_disabled_router_never_delivers():
+    delivered = []
+    coordinator = gc.CentralGhostCoordinator(enabled=False)
+    coordinator.register_delivery("should-not-run", lambda row: delivered.append(row))
+
+    result, deliveries = coordinator.route(_request())
+
+    assert result.ignored is True
+    assert deliveries == ()
+    assert delivered == []
+    assert coordinator.report()["delivery_attempts"] == 0
+
+
 def test_coordinator_cannot_reach_execution_code():
     tree = ast.parse(Path(gc.__file__).read_text(encoding="utf-8"))
     imported = set()
@@ -117,4 +185,4 @@ def test_coordinator_cannot_reach_execution_code():
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.add(node.module.split(".")[0])
     assert "app" not in imported
-    assert not ({"traderspost", "pickmytrade", "broker"} & imported)
+    assert not ({"traderspost", "pickmytrade", "broker", "execution", "gateway", "psycopg2"} & imported)

@@ -1,13 +1,12 @@
-"""Central Ghost Coordinator — Phase 1 shadow intake only.
+"""Central Ghost Coordinator — research-only canonical intake and fan-out.
 
 This module creates a canonical identity for research observations so existing
 ghost/research producers can be compared without changing their writes,
 watchers, outcomes, scores, promotion, or execution behavior.
 
 It deliberately imports neither ``app`` nor any execution, broker, gateway, or
-database module.  Phase 1 keeps the report process-local and observational; a
-future phase may add explicit additive persistence after the comparison data has
-been reviewed.
+database module.  Callers inject research-only delivery callbacks; the
+coordinator can never discover or invoke a trading/execution path by itself.
 """
 
 from __future__ import annotations
@@ -85,6 +84,16 @@ class SubmissionResult:
     error: Optional[str] = None
 
 
+@dataclass(frozen=True)
+class DeliveryResult:
+    """Result of one research-only fan-out attempt."""
+
+    destination: str
+    delivered: bool
+    duplicate: bool = False
+    error: Optional[str] = None
+
+
 class CentralGhostCoordinator:
     """Thread-safe, fail-open, in-memory canonical observation registry."""
 
@@ -107,6 +116,14 @@ class CentralGhostCoordinator:
         self._persistence_writes = 0
         self._persistence_errors = 0
         self._restored_observations = 0
+        self._deliveries: Dict[str, Callable[[Mapping[str, Any]], Any]] = {}
+        self._delivery_sources: Dict[str, Optional[frozenset[str]]] = {}
+        self._delivered: set[Tuple[str, str]] = set()
+        self._delivery_attempts: Counter[str] = Counter()
+        self._delivery_successes: Counter[str] = Counter()
+        self._delivery_duplicates: Counter[str] = Counter()
+        self._delivery_errors: Counter[str] = Counter()
+        self._delivery_last_error: Dict[str, str] = {}
 
     def configure(self, *, enabled: bool, persistence_enabled: bool = False,
                   persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None) -> None:
@@ -195,6 +212,87 @@ class CentralGhostCoordinator:
                 self._last_error = str(exc)[:180]
             return SubmissionResult(accepted=False, ignored=False, error=str(exc)[:180])
 
+    def register_delivery(self, destination: str,
+                          callback: Callable[[Mapping[str, Any]], Any],
+                          *, sources: Optional[Sequence[str]] = None) -> None:
+        """Register one injected research delivery callback.
+
+        Destination callbacks are intentionally generic data callbacks. They run
+        outside the coordinator lock and must be registered by the hosting
+        research application; this module never imports an execution subsystem.
+        Re-registering a destination deliberately replaces its callback without
+        clearing prior delivery idempotency.
+        """
+        name = str(destination or "").strip()
+        if not name:
+            raise ValueError("destination is required")
+        if not callable(callback):
+            raise ValueError("delivery callback must be callable")
+        source_filter = None
+        if sources is not None:
+            source_filter = frozenset(str(item).strip() for item in sources if str(item).strip())
+        with self._lock:
+            self._deliveries[name] = callback
+            self._delivery_sources[name] = source_filter
+
+    def unregister_delivery(self, destination: str) -> None:
+        """Remove a callback; delivery history remains for report consistency."""
+        name = str(destination or "").strip()
+        with self._lock:
+            self._deliveries.pop(name, None)
+            self._delivery_sources.pop(name, None)
+
+    def route(self, request: ObservationRequest) -> Tuple[SubmissionResult, Tuple[DeliveryResult, ...]]:
+        """Canonical intake followed by best-effort research-only fan-out.
+
+        A duplicate or rejected intake is never delivered. Each destination sees
+        an isolated JSON-safe copy and a failure in one destination never blocks
+        another destination or changes the accepted intake result.
+        """
+        result = self.submit(request)
+        if not result.accepted or result.duplicate or not result.observation_id:
+            return result, ()
+        with self._lock:
+            record = self._observations.get(result.observation_id)
+            callbacks = [
+                (name, callback)
+                for name, callback in self._deliveries.items()
+                if self._delivery_sources.get(name) is None
+                or record.get("source_system") in self._delivery_sources[name]
+            ] if record else []
+        return result, tuple(self._deliver_one(name, callback, record) for name, callback in callbacks)
+
+    def _deliver_one(self, destination: str, callback: Callable[[Mapping[str, Any]], Any],
+                     record: Optional[Mapping[str, Any]]) -> DeliveryResult:
+        if not record:
+            return DeliveryResult(destination=destination, delivered=False, error="missing observation")
+        record_id = str(record.get("observation_id") or record.get("telemetry_id") or "")
+        if not record_id:
+            return DeliveryResult(destination=destination, delivered=False, error="missing delivery identity")
+        key = (destination, record_id)
+        with self._lock:
+            self._delivery_attempts[destination] += 1
+            if key in self._delivered:
+                self._delivery_duplicates[destination] += 1
+                return DeliveryResult(destination=destination, delivered=False, duplicate=True)
+            # Reserve before invoking the callback to prevent concurrent duplicate
+            # fan-out. A failure removes its reservation so a future explicit
+            # re-route can try again; retries are never scheduled implicitly.
+            self._delivered.add(key)
+        payload = _json_scalar(dict(record))
+        try:
+            callback(payload)
+            with self._lock:
+                self._delivery_successes[destination] += 1
+            return DeliveryResult(destination=destination, delivered=True)
+        except Exception as exc:
+            message = str(exc)[:180]
+            with self._lock:
+                self._delivered.discard(key)
+                self._delivery_errors[destination] += 1
+                self._delivery_last_error[destination] = message
+            return DeliveryResult(destination=destination, delivered=False, error=message)
+
     def report(self, limit: int = 100) -> Dict[str, Any]:
         """Return a JSON-safe read-only comparison report."""
         safe_limit = max(1, min(int(limit), 500))
@@ -228,7 +326,8 @@ class CentralGhostCoordinator:
                 row["errors"] = int(self._source_errors[row["source_system"]])
             return {
                 "ok": True,
-                "phase": 1,
+                "phase": 2,
+                "routing_mode": ("research_fanout" if self._deliveries else "shadow_intake"),
                 "enabled": self._enabled,
                 "persistence": ("postgres_shadow_only" if self._persistence_enabled
                                 else "in_memory_shadow_only"),
@@ -247,6 +346,19 @@ class CentralGhostCoordinator:
                 "source_systems": rows,
                 "cross_system_match_count": len(cross),
                 "cross_system_opportunities": cross[:safe_limit],
+                "delivery_attempts": int(sum(self._delivery_attempts.values())),
+                "delivery_successes": int(sum(self._delivery_successes.values())),
+                "delivery_failures": int(sum(self._delivery_errors.values())),
+                "delivery_destinations": [{
+                    "destination": destination,
+                    "source_filter": sorted(self._delivery_sources.get(destination) or ()),
+                    "attempted": int(self._delivery_attempts[destination]),
+                    "delivered": int(self._delivery_successes[destination]),
+                    "duplicates": int(self._delivery_duplicates[destination]),
+                    "errors": int(self._delivery_errors[destination]),
+                    "last_error": self._delivery_last_error.get(destination),
+                } for destination in sorted(set(self._deliveries) | set(self._delivery_attempts)
+                                              | set(self._delivery_errors))],
             }
 
     @staticmethod
@@ -318,6 +430,27 @@ class CentralGhostCoordinator:
             "telemetry_id": telemetry_id,
         })
         return SubmissionResult(accepted=True, ignored=False)
+
+    def route_observational_event(self, source_system: str, event_id: str) -> Tuple[SubmissionResult, Tuple[DeliveryResult, ...]]:
+        """Record non-trade telemetry and fan it out without inventing geometry."""
+        result = self.record_observational_event(source_system, event_id)
+        if not result.accepted or result.duplicate:
+            return result, ()
+        source = str(source_system or "").strip()
+        record = {
+            "telemetry_id": "%s|%s" % (source, str(event_id or "").strip()),
+            "source_system": source,
+            "event_id": str(event_id or "").strip(),
+            "kind": "telemetry",
+        }
+        with self._lock:
+            callbacks = [
+                (name, callback)
+                for name, callback in self._deliveries.items()
+                if self._delivery_sources.get(name) is None
+                or source in self._delivery_sources[name]
+            ]
+        return result, tuple(self._deliver_one(name, callback, record) for name, callback in callbacks)
 
     def restore(self, records: Iterable[Mapping[str, Any]]) -> int:
         """Rehydrate prior shadow evidence without re-writing it or running rules."""
@@ -407,6 +540,20 @@ def submit_shadow(request: ObservationRequest) -> SubmissionResult:
         return SubmissionResult(accepted=False, ignored=False, error=str(exc)[:180])
 
 
+def route_research(request: ObservationRequest) -> Tuple[SubmissionResult, Tuple[DeliveryResult, ...]]:
+    """Use canonical intake plus registered research-only fan-out callbacks."""
+    try:
+        return _DEFAULT_COORDINATOR.route(request)
+    except Exception as exc:  # defensive boundary — legacy producers must continue
+        return SubmissionResult(accepted=False, ignored=False, error=str(exc)[:180]), ()
+
+
+def register_delivery(destination: str, callback: Callable[[Mapping[str, Any]], Any],
+                      *, sources: Optional[Sequence[str]] = None) -> None:
+    """Register an injected research sink for the module-level coordinator."""
+    _DEFAULT_COORDINATOR.register_delivery(destination, callback, sources=sources)
+
+
 def get_report(limit: int = 100) -> Dict[str, Any]:
     """Read-only report for the coordinator diagnostic endpoint."""
     return _DEFAULT_COORDINATOR.report(limit=limit)
@@ -418,6 +565,14 @@ def record_observational_event(source_system: str, event_id: str) -> SubmissionR
         return _DEFAULT_COORDINATOR.record_observational_event(source_system, event_id)
     except Exception as exc:
         return SubmissionResult(accepted=False, ignored=False, error=str(exc)[:180])
+
+
+def route_observational_event(source_system: str, event_id: str) -> Tuple[SubmissionResult, Tuple[DeliveryResult, ...]]:
+    """Use canonical telemetry intake plus registered research-only fan-out."""
+    try:
+        return _DEFAULT_COORDINATOR.route_observational_event(source_system, event_id)
+    except Exception as exc:
+        return SubmissionResult(accepted=False, ignored=False, error=str(exc)[:180]), ()
 
 
 def restore(records: Iterable[Mapping[str, Any]]) -> int:

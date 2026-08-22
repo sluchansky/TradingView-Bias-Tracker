@@ -887,10 +887,11 @@ def analyze_visual_market(
             # never a direction/entry/stop/target observation.
             try:
                 import ghost_coordinator as _gc  # noqa: PLC0415
-                _gc.record_observational_event(
-                    "visual_brain",
-                    "%s|%s|%s" % (instrument, now_utc, obs.get("market_state", "UNKNOWN")),
-                )
+                event_id = "%s|%s|%s" % (instrument, now_utc, obs.get("market_state", "UNKNOWN"))
+                if os.getenv("CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED", "0").lower() in ("true", "1", "yes", "on"):
+                    _gc.route_observational_event("visual_brain", event_id)
+                else:
+                    _gc.record_observational_event("visual_brain", event_id)
             except Exception:
                 pass
             return obs

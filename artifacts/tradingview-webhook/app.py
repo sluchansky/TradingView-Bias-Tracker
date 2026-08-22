@@ -47658,6 +47658,7 @@ _SCALP_SIM_WATCH_HEALTH = {
     "last_skip_reason": None, "cycles_started": 0, "cycles_completed": 0,
     "cycles_skipped": 0, "cycles_failed": 0, "last_open_rows": 0,
     "last_closed_rows": 0, "last_missing_bar_count": 0,
+    "oldest_unresolved_age_hours": None,
 }
 
 # Central Ghost Coordinator is shadow-only and disabled by default.  It observes
@@ -47665,6 +47666,8 @@ _SCALP_SIM_WATCH_HEALTH = {
 # promotion input, or execution dependency.
 CENTRAL_GHOST_COORDINATOR_ENABLED = os.environ.get(
     "CENTRAL_GHOST_COORDINATOR_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED = os.environ.get(
+    "CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED = os.environ.get(
     "CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 CENTRAL_GHOST_COORDINATOR_DB_READY = False
@@ -49078,10 +49081,12 @@ def _watch_scalp_sim_trades():
     scalp_strategy_sim_trades — never MANAGED_TRADES, strategy_trades,
     _record_strategy_trade, or the money path. FAIL-OPEN."""
     if not SCALP_SIM_DB_READY:
-        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0}
+        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0,
+                "oldest_unresolved_age_hours": None}
     conn = _learning_conn()
     if conn is None:
-        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0}
+        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0,
+                "oldest_unresolved_age_hours": None}
     open_rows = []
     try:
         with conn.cursor() as cur:
@@ -49106,7 +49111,19 @@ def _watch_scalp_sim_trades():
         except Exception:
             pass
     if not open_rows:
-        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0}
+        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0,
+                "oldest_unresolved_age_hours": None}
+    oldest_age_hours = None
+    for row in open_rows:
+        opened_at = row.get("opened_at")
+        if opened_at is None:
+            continue
+        try:
+            opened_at = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=timezone.utc)
+            age_hours = max(0.0, (now_utc() - opened_at).total_seconds() / 3600.0)
+            oldest_age_hours = age_hours if oldest_age_hours is None else max(oldest_age_hours, age_hours)
+        except Exception:
+            continue
     bars = {}
     for inst in {r["symbol"] for r in open_rows}:
         try:
@@ -49142,7 +49159,14 @@ def _watch_scalp_sim_trades():
             continue
         if _scalp_sim_close(row["id"], outcome[0], outcome[1], outcome[2]):
             closed_rows += 1
-    return {"open_rows": len(open_rows), "closed_rows": closed_rows, "missing_bars": missing_bars}
+    return {
+        "open_rows": len(open_rows),
+        "closed_rows": closed_rows,
+        "missing_bars": missing_bars,
+        "oldest_unresolved_age_hours": (
+            round(oldest_age_hours, 3) if oldest_age_hours is not None else None
+        ),
+    }
 
 
 def _scalp_sim_watch_loop():
@@ -49173,6 +49197,9 @@ def _scalp_sim_watch_loop():
                     _SCALP_SIM_WATCH_HEALTH["last_open_rows"] = int(cycle.get("open_rows", 0))
                     _SCALP_SIM_WATCH_HEALTH["last_closed_rows"] = int(cycle.get("closed_rows", 0))
                     _SCALP_SIM_WATCH_HEALTH["last_missing_bar_count"] = int(cycle.get("missing_bars", 0))
+                    _SCALP_SIM_WATCH_HEALTH["oldest_unresolved_age_hours"] = cycle.get(
+                        "oldest_unresolved_age_hours"
+                    )
             finally:
                 SCALP_SIM_WATCH_LOCK.release()
         if reason:
@@ -50157,8 +50184,10 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
                                  source_event_id=None, variant=None, context=None):
     """Thin fail-open adapter from legacy producers into the Phase-1 coordinator.
 
-    The coordinator receives a copy after a legacy observation was accepted. It
-    cannot change the existing observation, its lifecycle, or execution access.
+    The coordinator receives a normalized research-only copy after a legacy
+    observation was accepted. When the separate fan-out migration flag is on,
+    its registered research sinks receive isolated copies; it cannot change the
+    existing observation, lifecycle, qualification, or execution access.
     """
     if not CENTRAL_GHOST_COORDINATOR_ENABLED or _ghost_coordinator is None:
         return None
@@ -50172,7 +50201,7 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
         )
         event_id = source_event_id or "%s|%s|%s|%s" % (
             inst, setup_family, direction, source_bar)
-        return _ghost_coordinator.submit_shadow(_ghost_coordinator.ObservationRequest(
+        observation = _ghost_coordinator.ObservationRequest(
             source_system=source_system, source_event_id=str(event_id),
             instrument=inst, timeframe="1m", setup_family=setup_family,
             strategy_name=str(strategy_name or "UNKNOWN"),
@@ -50180,7 +50209,10 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
             signal_time=now_utc(), source_bar_time=source_bar,
             entry=entry, stop=stop, targets=tuple(t for t in targets if t is not None),
             experiment_variant=variant, context=context or {},
-        ))
+        )
+        if CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED:
+            return _ghost_coordinator.route_research(observation)[0]
+        return _ghost_coordinator.submit_shadow(observation)
     except Exception as exc:
         logger.debug("ghost coordinator adapter (%s): %s", source_system, exc)
         return None
@@ -50323,6 +50355,50 @@ def _configure_ghost_coordinator_persistence():
         persistence_enabled=enabled,
         persist_fn=_coordinator_persist if enabled else None,
     )
+    if CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED:
+        _register_coordinator_research_sinks()
+
+
+def _coordinator_research_delivery(record):
+    """Read-only fan-out receipt on the existing research event stream.
+
+    This is deliberately an observability sink, not an order, gate, scorer, or
+    legacy outcome writer. Legacy systems remain authoritative while source
+    migrations are enabled incrementally.
+    """
+    _re_event(
+        "coordinator_routed",
+        inst=record.get("instrument"),
+        strategy=record.get("strategy_name"),
+        verdict="OBSERVED",
+        obs_key=record.get("observation_id"),
+        extra={
+            "source_system": record.get("source_system"),
+            "market_opportunity_id": record.get("market_opportunity_id"),
+            "setup_family": record.get("setup_family"),
+            "variant": record.get("experiment_variant"),
+        },
+    )
+
+
+def _register_coordinator_research_sinks():
+    """Register one explicit, source-filtered research receipt per known producer."""
+    if _ghost_coordinator is None:
+        return
+    sources = (
+        "generic_ghost", "scalp_live_sim", "dual_mode_sim",
+        "micro_scalp_ghost", "bot_training", "gate_effectiveness",
+        "gre_orb", "gre_fvg_revisit", "visual_brain",
+    )
+    for source in sources:
+        try:
+            _ghost_coordinator.register_delivery(
+                "research_receipt:%s" % source,
+                _coordinator_research_delivery,
+                sources=(source,),
+            )
+        except Exception as exc:
+            logger.debug("ghost coordinator sink registration (%s): %s", source, exc)
 
 
 def _ghost_obs_watcher_cycle():
@@ -83105,6 +83181,9 @@ def route_research_health():
             and CENTRAL_GHOST_COORDINATOR_DB_READY else "in_memory_shadow_only"
         )
         out["central_ghost_coordinator"]["persistence_db_ready"] = CENTRAL_GHOST_COORDINATOR_DB_READY
+        out["central_ghost_coordinator"]["fanout_enabled"] = (
+            CENTRAL_GHOST_COORDINATOR_ENABLED and CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED
+        )
     except Exception as exc:
         out["central_ghost_coordinator"] = {"ok": False, "error": str(exc)[:180]}
     with _SCALP_SIM_WATCH_HEALTH_LOCK:
