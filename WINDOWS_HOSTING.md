@@ -16,8 +16,9 @@ The production bot source is primarily:
 - `artifacts/api-server/` — Replit-oriented Express proxy and artifact API
   service; it is not required to run the Flask bot directly on Windows.
 
-The current branch is `polish-v1`. Verify the commit shown by `git log -1`
-matches the reviewed production baseline before starting the bot.
+The current stable branch is `polish-v1`. Backup and recovery tooling is
+developed on `replit-dev`; verify the commit shown by `git log -1` matches the
+reviewed source you intentionally want to restore before starting the bot.
 
 ## 1. Install prerequisites
 
@@ -94,10 +95,12 @@ never commit it. At minimum, set:
 Keep these safety values for the first boot:
 
 ```text
-EXECUTION_MODE=manual_only
+EXECUTION_MODE=disabled
 DATABENTO_ENABLED=0
 DISCORD_LIVE=0
 TRAINING_MODE_ENABLED=1
+MANUAL_ORDER_ENABLED=0
+LIVE_RUNNER_ENABLED=0
 ```
 
 Before enabling market data or any execution route, verify the corresponding
@@ -228,3 +231,91 @@ Replit-specific or require replacement services:
 
 Database migration and replacement of Replit object storage are deliberately
 out of scope for this preparation pass.
+
+## 10. PostgreSQL evidence backup and restore validation
+
+The repository includes logical-backup tooling in `scripts\backup`. It creates
+PostgreSQL custom-format dumps that can be restored on Windows or another
+PostgreSQL host. It does not start the application, change a source database,
+or invoke an execution route.
+
+### Safety rules
+
+- Run the backup command with the correct source database URL available only in
+  the process environment. Never paste a connection string into a command,
+  script, manifest, terminal transcript, or Git file.
+- Use an encrypted destination outside the repository and outside Replit's
+  filesystem. The tool refuses output paths within the repository and requires
+  an explicit destination acknowledgement. It also refuses to create a final
+  backup when launched inside a detected Replit runtime.
+- Back up development and production separately. Each has its own schema and
+  evidence history.
+- The scripts discover the actual schema/table catalog, including
+  `public`, `analysis_bot`, and coordinator tables if present. They do not
+  assume production and development are identical.
+
+### Exact development backup command
+
+With `DATABASE_URL` already supplied securely to the current process for the
+development database:
+
+```powershell
+py -3.11 scripts\backup\pg_backup.py --environment development --database-url-env DATABASE_URL --output-dir E:\BiasTrackerBackups\development --confirm-external-destination
+```
+
+### Exact production backup command
+
+Run this only in an environment where `DATABASE_URL` has been securely supplied
+for the production database:
+
+```powershell
+py -3.11 scripts\backup\pg_backup.py --environment production --database-url-env DATABASE_URL --output-dir E:\BiasTrackerBackups\production --confirm-external-destination
+```
+
+Each command writes two files outside the repository:
+
+- `bias-tracker-<environment>-<UTC timestamp>.pgdump` — a PostgreSQL custom
+  logical backup containing every accessible schema except PostgreSQL catalog,
+  temporary, and toast schemas.
+- `bias-tracker-<environment>-<UTC timestamp>.manifest.json` — environment,
+  UTC timestamp, PostgreSQL version, schema/table catalog, critical evidence
+  counts/newest timestamps, backup bytes, and SHA-256 checksum. It never
+  contains a connection string or credential.
+
+The critical evidence checks include thesis evaluations, decision transitions,
+GRE opportunities/experiments/results, SCALP simulations, Visual Brain, gate
+audit, dual sim, strategy/backtest data in both schemas, journals, and
+operator/safety state.
+
+### Exact test restore and read-only validation commands
+
+Restore only into a newly created **test** database. Do not restore over a
+running production or development database:
+
+```powershell
+createdb bias_tracker_restore
+pg_restore --no-owner --no-acl --dbname=bias_tracker_restore E:\BiasTrackerBackups\production\bias-tracker-production-YYYYMMDDTHHMMSSZ.pgdump
+```
+
+With `DATABASE_URL` securely supplied for `bias_tracker_restore`, validate
+without writing to it:
+
+```powershell
+py -3.11 scripts\backup\restore_validate.py --environment production --database-url-env DATABASE_URL --backup E:\BiasTrackerBackups\production\bias-tracker-production-YYYYMMDDTHHMMSSZ.pgdump --manifest E:\BiasTrackerBackups\production\bias-tracker-production-YYYYMMDDTHHMMSSZ.manifest.json
+```
+
+Validation checks the dump SHA-256, schema/table presence, each critical table's
+row count, and newest timestamp where the source table exposes one. A mismatch
+returns a non-zero exit code. It uses only read-only `SELECT` queries.
+
+### Disaster-recovery sequence
+
+1. Restore the intended GitHub revision.
+2. Restore PostgreSQL into a non-production test database.
+3. Run manifest validation and resolve every mismatch.
+4. Restore secrets from the approved secret store; never from Git.
+5. Start with `EXECUTION_MODE=disabled`, `MANUAL_ORDER_ENABLED=0`, and
+   `LIVE_RUNNER_ENABLED=0`.
+6. Verify evidence health and market-data connectivity.
+7. Reconcile broker positions and account state manually.
+8. Obtain explicit operator approval before enabling any execution capability.

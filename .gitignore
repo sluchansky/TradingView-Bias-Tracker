@@ -60,6 +60,8 @@ market_data/
 .env
 .env.*
 !.env.example
+*.pgdump
+bias-tracker-*.manifest.json
 *.db
 *.sqlite
 *.sqlite3
