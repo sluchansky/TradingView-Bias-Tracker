@@ -150,3 +150,15 @@ VISUAL_BRAIN_ENABLED = "true"
 [userenv.development]
 LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED = "1"
 VISUAL_BRAIN_ENABLED = "true"
+
+[[ports]]
+localPort = 8080
+externalPort = 8080
+
+[[ports]]
+localPort = 8081
+externalPort = 8081
+
+[[ports]]
+localPort = 24319
+externalPort = 80
