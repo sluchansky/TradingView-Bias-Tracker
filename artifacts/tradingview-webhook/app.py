@@ -62659,14 +62659,17 @@ def _apply_opposite_side_buffer(instrument, mode, payload):
     never delayed and never touches the tracker; a same-direction repeat is never
     delayed (gap 0). No-op when the knob is 0 (default) or mode != "traderspost" ->
     byte-identical to today. Fail-OPEN: any error skips the buffer entirely (a buffer
-    hiccup must never block or delay a live order)."""
+    hiccup must never block or delay a live order). Returns a provisional
+    reservation token when it touched the side tracker; the broker sink rolls this
+    token back on a local final-boundary block or definite 4xx so an order that
+    never reached the broker cannot poison future reversal spacing."""
     try:
         buf = BROKER_OPPOSITE_SIDE_BUFFER_SEC
         if buf <= 0 or mode != "traderspost":
-            return
+            return None
         side = _broker_payload_side(mode, payload)
         if side is None:
-            return
+            return None
         now = time.time()
         with _BROKER_SIDE_LOCK:
             prev = _BROKER_LAST_SIDE.get(instrument)
@@ -62676,17 +62679,307 @@ def _apply_opposite_side_buffer(instrument, mode, payload):
             else:
                 send_at = now
             _BROKER_LAST_SIDE[instrument] = (side, send_at)
+        reservation = {"side": side, "send_at": send_at, "previous": prev}
         wait = send_at - time.time()
         if wait > 0:
             logger.info("Opposite-side buffer: holding %s %s order %.1fs (TradersPost "
                         "reversal spacing).", instrument, side, wait)
             time.sleep(wait)
+        return reservation
+    except Exception:
+        return None
+
+
+def _rollback_opposite_side_buffer(instrument, reservation):
+    """Undo a provisional reversal-spacing reservation after a proven no-send.
+
+    The exact-token compare prevents an older failed request from erasing a newer
+    concurrent reservation. Ambiguous send outcomes intentionally do NOT call this:
+    the provider may already have received the order, so retaining spacing is safer.
+    """
+    if not isinstance(reservation, dict):
+        return
+    try:
+        token = (reservation.get("side"), reservation.get("send_at"))
+        with _BROKER_SIDE_LOCK:
+            if _BROKER_LAST_SIDE.get(instrument) != token:
+                return
+            previous = reservation.get("previous")
+            if previous is None:
+                _BROKER_LAST_SIDE.pop(instrument, None)
+            else:
+                _BROKER_LAST_SIDE[instrument] = previous
     except Exception:
         pass
 
 
+_FINAL_ORDER_ENTRY_SOURCES = frozenset({
+    "manual", "manual_desk", "user_approved_preview",
+    "auto", "dual_tf", "fast_entry", "micro_scalp",
+})
+_FINAL_ORDER_EXIT_SOURCES = frozenset({
+    "quick_exit", "auto_exit", "runner_reduce",
+})
+_FINAL_ORDER_CONTEXT_MAX_AGE_SEC = 30.0
+
+
+def _final_payload_action(mode, payload):
+    """Return the provider-normalized action for the final safety boundary."""
+    try:
+        if mode == "traderspost":
+            return str((payload or {}).get("action") or "").strip().lower()
+        if mode == "pickmytrade":
+            return str((payload or {}).get("data") or "").strip().lower()
+    except Exception:
+        pass
+    return ""
+
+
+def _final_payload_symbol(mode, payload):
+    """Return the exact provider symbol/ticker being transmitted."""
+    try:
+        key = "ticker" if mode == "traderspost" else "symbol" if mode == "pickmytrade" else None
+        return str((payload or {}).get(key) or "").strip() if key else ""
+    except Exception:
+        return ""
+
+
+def _final_payload_bracket(mode, payload):
+    """Read the protective bracket from an already-adapted provider payload."""
+    try:
+        if mode == "traderspost":
+            stop = ((payload or {}).get("stopLoss") or {}).get("stopPrice")
+            target = ((payload or {}).get("takeProfit") or {}).get("limitPrice")
+        elif mode == "pickmytrade":
+            stop = (payload or {}).get("sl")
+            target = (payload or {}).get("tp")
+        else:
+            return None, None
+        return (float(stop) if stop is not None else None,
+                float(target) if target is not None else None)
+    except (TypeError, ValueError, AttributeError):
+        return None, None
+
+
+def _final_payload_quantity(payload):
+    """Read a positive integer provider quantity without trusting the caller."""
+    try:
+        quantity = int((payload or {}).get("quantity"))
+        return quantity if quantity > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _final_candidate_is_fresh(candidate):
+    """Final, fail-closed timestamp check for a server-built entry snapshot.
+
+    The gateway already validates the same optional candidate timestamps while it
+    resolves a setup. This compact second check deliberately runs at the broker
+    boundary so a future direct caller cannot claim an old snapshot. Fields remain
+    optional for legacy analysis producers that do not publish them yet.
+    """
+    if not isinstance(candidate, dict):
+        return False, "missing server analysis snapshot"
+    now = now_utc()
+    boundary_anchor = candidate.get("_final_boundary_at")
+    if not boundary_anchor:
+        return False, "missing server freshness anchor"
+    try:
+        boundary_age = (now - datetime.fromisoformat(str(boundary_anchor))).total_seconds()
+    except (TypeError, ValueError):
+        return False, "malformed server freshness anchor"
+    if boundary_age < -_DB_EXEC_THRESHOLDS["future_skew_max_sec"]:
+        return False, "future server freshness anchor"
+    if boundary_age > _FINAL_ORDER_CONTEXT_MAX_AGE_SEC:
+        return False, "stale server freshness anchor"
+    checks = (
+        ("generated_at", _DB_EXEC_THRESHOLDS["candidate_age_max_sec"]),
+        ("ts", _DB_EXEC_THRESHOLDS["candidate_age_max_sec"]),
+        ("market_data_ts", _DB_EXEC_THRESHOLDS["market_data_ts_age_max_sec"]),
+        ("strategy_eval_ts", _DB_EXEC_THRESHOLDS["strategy_eval_ts_age_max_sec"]),
+    )
+    for key, max_age in checks:
+        raw = candidate.get(key)
+        if not raw:
+            continue
+        try:
+            age = (now - datetime.fromisoformat(str(raw))).total_seconds()
+        except (TypeError, ValueError):
+            return False, "malformed candidate %s" % key
+        if age < -_DB_EXEC_THRESHOLDS["future_skew_max_sec"]:
+            return False, "future candidate %s" % key
+        if age > max_age:
+            return False, "stale candidate %s" % key
+    raw_expiry = candidate.get("expires_at")
+    if raw_expiry:
+        try:
+            if (now - datetime.fromisoformat(str(raw_expiry))).total_seconds() > 0:
+                return False, "expired candidate"
+        except (TypeError, ValueError):
+            return False, "malformed candidate expiry"
+    return True, ""
+
+
+def _final_order_safety_check(mode, instrument, payload, safety_context, order_kind,
+                              *, freshness_prevalidated=False):
+    """One mandatory, immediately-pre-transmission broker safety boundary.
+
+    Every production broker send supplies a typed context. Entries prove their
+    server-built source, current analysis snapshot, exact bracket, current session,
+    arm policy, and dedupe reservation. Non-reversing exits instead prove the exact
+    tracked position/runner they are allowed to flatten. This function never mutates
+    a provider payload and never retries; it only allows or locally rejects a send.
+    """
+    def _block(reason, code=409):
+        logger.warning("FINAL ORDER BOUNDARY blocked %s %s (%s): %s",
+                       instrument, order_kind, mode, reason)
+        return {"status": "error", "reason": "Final order safety boundary: " + reason,
+                "outcome": "rejected", "final_boundary": "blocked"}, code
+
+    if not isinstance(safety_context, dict):
+        return _block("missing typed safety context", 400)
+    if safety_context.get("schema") != "final_order_v1":
+        return _block("unknown safety-context schema", 400)
+    if safety_context.get("mode") != mode or safety_context.get("instrument") != instrument:
+        return _block("context does not match final provider intent", 400)
+    expected_symbol = TRADERSPOST_TICKER.get(instrument, instrument)
+    if _final_payload_symbol(mode, payload) != expected_symbol:
+        return _block("provider symbol differs from server intent", 400)
+    source = safety_context.get("source")
+    intent_kind = safety_context.get("intent_kind")
+    if intent_kind == "entry":
+        if source not in _FINAL_ORDER_ENTRY_SOURCES:
+            return _block("unrecognized entry provenance %r" % (source,), 400)
+        expected_provenance = ("operator" if source in
+                               ("manual", "manual_desk", "user_approved_preview")
+                               else "autonomous")
+        if safety_context.get("provenance") != expected_provenance:
+            return _block("ambiguous entry provenance", 400)
+        if order_kind not in ("entry", "entry_primary", "entry_runner"):
+            return _block("entry context used for non-entry send", 400)
+        if instrument not in ASSETS:
+            return _block("unknown instrument", 400)
+        if safety_context.get("market_open") is not True:
+            return _block("market session is not explicitly open")
+        if not freshness_prevalidated:
+            ok, freshness_reason = _final_candidate_is_fresh(
+                safety_context.get("analysis_snapshot"))
+            if not ok:
+                return _block(freshness_reason)
+        try:
+            quantity = int(safety_context.get("quantity"))
+            entry = float((safety_context.get("bracket") or {}).get("entry"))
+            stop = float((safety_context.get("bracket") or {}).get("stop"))
+            target = (safety_context.get("bracket") or {}).get("target1")
+        except (TypeError, ValueError):
+            return _block("incomplete server-built entry bracket", 400)
+        if quantity < 1 or quantity != int((safety_context.get("quantity"))):
+            return _block("invalid final contract quantity", 400)
+        direction = str(safety_context.get("direction") or "").strip().lower()
+        action = _final_payload_action(mode, payload)
+        expected_action = "buy" if direction == "long" else "sell" if direction == "short" else ""
+        if not expected_action or action != expected_action:
+            return _block("payload direction conflicts with server intent", 400)
+        if _final_payload_quantity(payload) != quantity:
+            return _block("provider payload quantity differs from server intent", 400)
+        bracket_kind = safety_context.get("bracket_kind", "full")
+        if not (entry > 0 and stop > 0):
+            return _block("invalid protective stop", 400)
+        if direction == "long" and not stop < entry:
+            return _block("long protective stop is not below entry", 400)
+        if direction == "short" and not stop > entry:
+            return _block("short protective stop is not above entry", 400)
+        payload_stop, payload_target = _final_payload_bracket(mode, payload)
+        if payload_stop is None or round(payload_stop, 8) != round(stop, 8):
+            return _block("provider payload stop differs from server bracket", 400)
+        if bracket_kind == "full":
+            try:
+                target = float(target)
+            except (TypeError, ValueError):
+                return _block("missing server-built profit target", 400)
+            if ((direction == "long" and not target > entry)
+                    or (direction == "short" and not target < entry)):
+                return _block("profit target is directionally invalid", 400)
+            if payload_target is None or round(payload_target, 8) != round(target, 8):
+                return _block("provider payload target differs from server bracket", 400)
+        elif bracket_kind != "runner_stop_only":
+            return _block("unknown entry bracket policy", 400)
+
+        # The duplicate reservation is made by the shared gateway before any runner
+        # leg. Requiring its exact token here makes a new direct entry caller fail
+        # closed rather than bypassing idempotency.
+        reservation = safety_context.get("dedupe_reservation") or {}
+        if not reservation.get("fingerprint") or reservation.get("epoch") is None:
+            return _block("missing idempotency reservation", 400)
+        with _TRADERSPOST_LOCK:
+            if _TRADERSPOST_LAST.get(instrument) != (
+                    reservation.get("fingerprint"), reservation.get("epoch")):
+                return _block("idempotency reservation is no longer current")
+
+        # Re-check limits at the final seam. These guards already run earlier in the
+        # gateway; repeating them here closes races without changing default settings.
+        if emergency_disabled(instrument):
+            return _block("instrument execution is emergency-disabled")
+        loss_cap = max_losses_per_day(instrument)
+        if loss_cap is not None and _losses_today(instrument) >= loss_cap:
+            return _block("daily loss-count limit reached")
+        daily_loss_cap = max_daily_loss(instrument)
+        if daily_loss_cap is not None and _realized_pnl_today(instrument) <= -daily_loss_cap:
+            return _block("daily loss limit reached")
+        max_open = max_open_trades(instrument)
+        if max_open is not None and (max_open < 1 or active_trade_for(instrument)):
+            return _block("open-position limit reached")
+
+        # Preserve the explicit policy: dashboard/manual-desk clicks require the
+        # durable enable switch; all autonomous and preview entries require a live arm.
+        if source in ("manual", "manual_desk"):
+            with _ARM_STATE_LOCK:
+                if not _ARM_STATE.get("execution_enabled", False):
+                    return _block("execution is disabled")
+        else:
+            arm_ok, arm_reason, arm_diag = _check_arm_for_transmission(
+                instrument, quantity, strategy=safety_context.get("strategy"),
+                direction=safety_context.get("direction"))
+            if not arm_ok:
+                return ({"status": "error",
+                         "reason": ("Final order safety boundary: system disarmed "
+                                    "before transmission — %s. No order was sent." % arm_reason),
+                         "reason_code": arm_reason, "arm_diagnostics": arm_diag,
+                         "outcome": "rejected", "final_boundary": "blocked"}, 409)
+        return None, None
+
+    if intent_kind == "exit":
+        if source not in _FINAL_ORDER_EXIT_SOURCES:
+            return _block("unrecognized exit provenance %r" % (source,), 400)
+        if safety_context.get("provenance") not in ("operator", "protective"):
+            return _block("ambiguous exit provenance", 400)
+        if order_kind not in ("quick_exit", "auto_exit", "runner_reduce"):
+            return _block("exit context used for non-exit send", 400)
+        _expected_exit_action = "exit" if mode == "traderspost" else "close" if mode == "pickmytrade" else ""
+        if not _expected_exit_action or _final_payload_action(mode, payload) != _expected_exit_action:
+            return _block("exit payload is not non-reversing", 400)
+        identity = safety_context.get("position_identity") or {}
+        identity_kind = identity.get("kind")
+        if identity_kind == "active_trade":
+            current = active_trade_for(instrument)
+            if not current or current.get("opened_at") != identity.get("opened_at"):
+                return _block("tracked position changed before exit")
+        elif identity_kind == "runner":
+            current = _live_runner_get(instrument)
+            if not current or current.get("runner_id") != identity.get("runner_id"):
+                return _block("tracked runner changed before exit")
+            if current.get("broker_symbol") and current.get("broker_symbol") != expected_symbol:
+                return _block("runner broker symbol does not match server instrument")
+        else:
+            return _block("missing exact exit position identity", 400)
+        return None, None
+
+    return _block("unknown order intent kind", 400)
+
+
 def _send_broker_order(mode, provider_label, instrument, payload, send_url,
-                       *, release_slot=None, order_kind="entry", broker_out=None):
+                       *, release_slot=None, order_kind="entry", broker_out=None,
+                       safety_context=None):
     """Audited broker-send sink shared by the single-order gateway AND the LIVE
     2-contract runner (entry legs + runner reduce). Owns ONLY the money-path SEND
     discipline: the redacted pre-send audit log (the destination URL is NEVER
@@ -62743,12 +63036,45 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
         return {"status": "error", "reason": _reason,
                 "blocked_fields": [f for f, _ in _bad_fields], "outcome": "invalid_payload"}, 400
 
+    # A source snapshot must be fresh before a potentially long reversal-spacing
+    # wait. Never mint or renew this evidence at the sink: a stale direct caller
+    # must fail locally even when it supplies an otherwise well-formed context.
+    # The final call below receives this local (not context-controlled) result and
+    # still re-checks all current state after the wait.
+    _freshness_prevalidated = False
+    if isinstance(safety_context, dict) and safety_context.get("intent_kind") == "entry":
+        _freshness_ok, _freshness_reason = _final_candidate_is_fresh(
+            safety_context.get("analysis_snapshot"))
+        if not _freshness_ok:
+            _reason = "Final order safety boundary: " + _freshness_reason
+            logger.warning("FINAL ORDER BOUNDARY blocked %s %s (%s): %s",
+                           instrument, order_kind, mode, _freshness_reason)
+            _release()
+            _record_exec_rejection(instrument, _reason)
+            _record_diagnostic("%s | EXECUTION blocked — final safety boundary" % instrument)
+            return {"status": "error", "reason": _reason, "outcome": "rejected",
+                    "final_boundary": "blocked"}, 409
+        _freshness_prevalidated = True
+
     # Opposite-side reversal spacing (TradersPost): if enabled, hold an opposing
     # buy/sell just long enough after the previous opposite send for THIS instrument
     # so the broker accepts the reversal. No-op when BROKER_OPPOSITE_SIDE_BUFFER_SEC
     # is 0 (default) or for a flatten/exit (never delayed). Runs AFTER validation (we
     # never sleep for an order we're about to block) and BEFORE the POST.
-    _apply_opposite_side_buffer(instrument, mode, payload)
+    _side_reservation = _apply_opposite_side_buffer(instrument, mode, payload)
+
+    # Mandatory final boundary. It runs after an optional reversal-spacing wait so
+    # the arm/session/identity check is the last application decision before the
+    # one broker HTTP POST. It verifies the exact adapted payload without mutating it.
+    _final_res, _final_code = _final_order_safety_check(
+        mode, instrument, payload, safety_context, order_kind,
+        freshness_prevalidated=_freshness_prevalidated)
+    if _final_res is not None:
+        _rollback_opposite_side_buffer(instrument, _side_reservation)
+        _release()
+        _record_exec_rejection(instrument, _final_res.get("reason"))
+        _record_diagnostic("%s | EXECUTION blocked — final safety boundary" % instrument)
+        return _final_res, _final_code
 
     # Send. Broker-bound failure handling fails CLOSED: ONLY a definite rejection (4xx —
     # the order was not accepted) releases the duplicate-guard slot for retry. EVERY
@@ -62781,6 +63107,7 @@ def _send_broker_order(mode, provider_label, instrument, payload, send_url,
                 pass
         return None, None  # success -- caller continues to its own confirmation path
     elif 400 <= resp.status_code < 500:
+        _rollback_opposite_side_buffer(instrument, _side_reservation)
         _release()
         _record_broker_send(instrument, order_kind, payload, resp.status_code, resp.text[:200])
         # ── DC Phase 3: observe ORDER_REJECTED on broker 4xx — SHADOW / FAIL-OPEN ──
@@ -62897,6 +63224,25 @@ def adapt_traderspost_reduce(broker_symbol):
     }
 
 
+def adapt_pickmytrade_reduce(broker_symbol):
+    """Canonical intent -> PickMyTrade's documented non-reversing full close.
+
+    PickMyTrade uses ``data: "close"`` (not a sell/buy reversal) to close the
+    current position for ``symbol``. Keep this provider shape isolated just like
+    the entry adapter so the shared final boundary can verify the exact wire intent.
+    """
+    payload = {
+        "symbol":     broker_symbol,
+        "data":       "close",
+        "order_type": "MKT",
+    }
+    if EXECUTION_TOKEN:
+        payload["token"] = EXECUTION_TOKEN
+    if EXECUTION_ACCOUNT_ID:
+        payload["account_id"] = EXECUTION_ACCOUNT_ID
+    return payload
+
+
 def _live_runner_be_2r_levels(entry, stop, direction):
     """Derive (break-even arm price, 2R target) for a be_2r runner leg from the LIVE
     entry/stop — independent of the displayed plan target so the sanctioned ORB 1:4
@@ -62919,7 +63265,8 @@ def _live_runner_be_2r_levels(entry, stop, direction):
 
 def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_public,
                                 tp, direction, action, tp_symbol, entry, stop, t1, t2,
-                                contracts, source, release_slot, fingerprint, now):
+                                 contracts, source, release_slot, fingerprint, now,
+                                 safety_context):
     """LIVE 2-contract runner entry (Option A; traderspost-only; gated by
     _live_runner_eligible). Splits the order into a PRIMARY leg (qty = contracts -
     runner_qty, stop + 1R TP — the existing bracket) and a RUNNER leg (qty =
@@ -62981,9 +63328,16 @@ def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_p
             pass
 
     # ── PRIMARY leg ────────────────────────────────────────────────────────────
+    primary_safety_context = dict(safety_context)
+    primary_safety_context.update({
+        "quantity": primary_qty,
+        "bracket": {"entry": entry, "stop": stop, "target1": t1},
+        "bracket_kind": "full",
+    })
     p_res, p_code = _send_broker_order(mode, provider_label, instrument, primary_payload,
                                        send_url, release_slot=release_slot,
-                                       order_kind="entry_primary")
+                                       order_kind="entry_primary",
+                                       safety_context=primary_safety_context)
     if p_res is not None:
         # Nothing usable was placed (local block / 4xx released the slot, ambiguous
         # held it). No runner. Return the primary failure exactly as the single-order
@@ -62993,9 +63347,16 @@ def _execute_live_two_leg_entry(mode, provider_label, instrument, intent, plan_p
     # ── RUNNER leg (primary confirmed live) ────────────────────────────────────
     # release_slot=None: a real primary fill exists, so the dedupe cooldown must
     # NEVER be freed by the runner outcome.
+    runner_safety_context = dict(safety_context)
+    runner_safety_context.update({
+        "quantity": runner_qty,
+        "bracket": {"entry": entry, "stop": stop, "target1": runner_target},
+        "bracket_kind": "runner_stop_only" if runner_target is None else "full",
+    })
     r_res, r_code = _send_broker_order(mode, provider_label, instrument, runner_payload,
                                        send_url, release_slot=None,
-                                       order_kind="entry_runner")
+                                       order_kind="entry_runner",
+                                       safety_context=runner_safety_context)
 
     if r_res is None:
         # Both legs live. Track the runner; the existing lifecycle tracks the primary.
@@ -63146,7 +63507,13 @@ def _execute_live_runner_reduce(instrument, runner_id=None, reason=""):
     payload = adapt_traderspost_reduce(rec.get("broker_symbol"))
     res, _code = _send_broker_order(mode, provider_label, instrument, payload,
                                     TRADERSPOST_WEBHOOK_URL, release_slot=None,
-                                    order_kind="runner_reduce")
+                                    order_kind="runner_reduce",
+                                    safety_context={
+                                        "schema": "final_order_v1", "mode": mode,
+                                        "instrument": instrument, "source": "runner_reduce",
+                                        "provenance": "protective", "intent_kind": "exit",
+                                        "position_identity": {"kind": "runner", "runner_id": rid},
+                                    })
     if res is None:
         _live_runner_update(instrument, rid, reduce_state="done", reduce_reason=reason)
         _live_runner_clear(instrument, rid)
@@ -63488,7 +63855,15 @@ def _auto_exit_fire(inst, at, mgmt, mode, live_send):
         provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
         res, _code = _send_broker_order(mode, provider_label, inst, payload,
                                         TRADERSPOST_WEBHOOK_URL, release_slot=None,
-                                        order_kind="auto_exit")
+                                        order_kind="auto_exit",
+                                        safety_context={
+                                            "schema": "final_order_v1", "mode": mode,
+                                            "instrument": inst, "source": "auto_exit",
+                                            "provenance": "protective", "intent_kind": "exit",
+                                            "position_identity": {
+                                                "kind": "active_trade", "opened_at": opened,
+                                            },
+                                        })
         if res is not None:
             with AUTO_EXIT_LOCK:
                 globals()["AUTO_EXIT_ARMED"] = False
@@ -65428,6 +65803,41 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
             if _TRADERSPOST_LAST.get(instrument) == (fingerprint, now):
                 _TRADERSPOST_LAST.pop(instrument, None)
 
+    # Typed final-safety contract carried into the sole broker HTTP sink. This is
+    # built only after the server has resolved the exact entry, risk-sized it, and
+    # reserved idempotency. The sink independently checks this context against the
+    # final provider payload immediately before it can transmit.
+    _entry_provenance = ("operator" if source in
+                         ("manual", "manual_desk", "user_approved_preview")
+                         else "autonomous")
+    _entry_strategy = ((a.get("strategy_engine") or {}).get("active_key")
+                       or ((a.get("learning_score_influence") or {}).get("meta") or {}).get("active_key"))
+    _final_entry_safety_context = {
+        "schema": "final_order_v1",
+        "mode": mode,
+        "instrument": instrument,
+        "source": source,
+        "provenance": _entry_provenance,
+        "intent_kind": "entry",
+        "direction": direction,
+        "quantity": contracts,
+        "strategy": _entry_strategy,
+        "market_open": a.get("market_open"),
+        # Copy only the current candidate metadata; no caller can hand a browser
+        # candidate to the boundary. Legacy analyses legitimately publish an empty
+        # object, whose optional timestamps remain backward-compatible.
+        "analysis_snapshot": {
+            **dict(a.get("candidate_preview") or {}),
+            # A server-created anchor is mandatory even for legacy analysis
+            # producers that do not expose a candidate timestamp yet. It proves this
+            # exact full_analysis result was resolved immediately before the send.
+            "_final_boundary_at": now_utc().isoformat(),
+        },
+        "bracket": {"entry": entry, "stop": stop, "target1": t1},
+        "bracket_kind": "full",
+        "dedupe_reservation": {"fingerprint": fingerprint, "epoch": now},
+    }
+
     # Provider-specific payload + destination via isolated adapters. The TradersPost
     # adapter is byte-equivalent to the legacy payload when mode == "traderspost".
     if mode == "traderspost":
@@ -65446,7 +65856,8 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
         _runner_res, _runner_code = _execute_live_two_leg_entry(
             mode, provider_label, instrument, intent, plan_public, tp,
             direction, action, tp_symbol, entry, stop, t1, t2,
-            contracts, source, _release_slot, fingerprint, now)
+            contracts, source, _release_slot, fingerprint, now,
+            _final_entry_safety_context)
         # Capture an immutable send-time snapshot when the primary was confirmed
         # (status="sent"). The runner leg's metadata is stored in broker_metadata.
         # Fail-open: never alters the returned result or code.
@@ -65463,53 +65874,14 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
                                         broker_out=_runner_broker_meta)
         return _runner_res, _runner_code
 
-    # ── Final arm check (immediately before transmission) ────────────────────────
-    # This is the third and final arm gate (§6 spec): checked at candidate evaluation,
-    # before candidate claim, and NOW — immediately before the outbound wire.
-    # Guards against a disarm that races with the send after all prior checks passed.
-    # Paper/manual_only are exempt (arm control is live-execution only).
-    #
-    # Manual source (dashboard two-click ENTER or manual_desk LONG/SHORT click):
-    # the operator is literally at the keyboard confirming each trade — the
-    # explicit click IS the session gate.  We still require execution_enabled
-    # (DB-persistent, must be explicitly set) but skip the armed/session-expiry
-    # checks that exist to prevent autonomous bot fires.
-    # Every other live source keeps the full ARM check.
-    if execution_is_live(mode):
-        if source in ("manual", "manual_desk"):
-            # Execution-enabled check only — skip armed / session-expiry for operator clicks.
-            with _ARM_STATE_LOCK:
-                _manual_exec_enabled = _ARM_STATE.get("execution_enabled", False)
-            if not _manual_exec_enabled:
-                logger.warning(
-                    "Manual ENTER blocked for %s — execution not enabled", instrument)
-                return {"status": "error",
-                        "reason": ("Execution is not enabled. "
-                                   "Go to the Execution panel and click Enable Execution first."),
-                        "reason_code": RC_EXECUTION_DISABLED}, 409
-        else:
-            _fa_arm_ok, _fa_arm_reason, _fa_arm_diag = _check_arm_for_transmission(
-                instrument, contracts, strategy=None, direction=direction)
-            if not _fa_arm_ok:
-                logger.warning(
-                    "Execution blocked at final arm gate for %s — %s",
-                    instrument, _fa_arm_reason)
-                return {"status": "error",
-                        "reason": (f"System disarmed before transmission — {_fa_arm_reason}. "
-                                   "No order was sent."),
-                        "reason_code": _fa_arm_reason,
-                        "arm_diagnostics": _fa_arm_diag}, 409
-
-    # Audited send sink (shared with the LIVE 2-contract runner legs / reduce in
-    # Phase 3b). Byte-identical for the single-order path: it logs the redacted
-    # payload, validates required fields (local 400 block), POSTs, and maps the
-    # result fail-closed. (None, None) => 2xx landed -- fall through to the Discord
-    # confirmation + success response below. _release_slot frees the duplicate-guard
-    # cooldown ONLY on a local validation block or a definite broker 4xx.
+    # Audited send sink: the mandatory final boundary runs inside this function,
+    # immediately before the one broker HTTP POST. _release_slot frees the
+    # duplicate reservation only on a local validation block or a definite 4xx.
     _broker_out = {}
     _send_res, _send_code = _send_broker_order(
         mode, provider_label, instrument, payload, send_url,
-        release_slot=_release_slot, order_kind="entry", broker_out=_broker_out)
+        release_slot=_release_slot, order_kind="entry", broker_out=_broker_out,
+        safety_context=_final_entry_safety_context)
     if _send_res is not None:
         return _send_res, _send_code
 
@@ -66225,9 +66597,9 @@ def close_trade():
 def quick_exit():
     """Owner-only. Send an immediate EXIT (full flatten) to the configured broker
     gateway for the active tracked position on an instrument, then clear local
-    tracking. Uses TradersPost action='exit' — a NON-REVERSING flatten that can
-    never open a reverse position — through the SAME audited _send_broker_order
-    sink as all other live orders.
+    tracking. Uses the configured provider's documented non-reversing flatten
+    (`action='exit'` for TradersPost / `data='close'` for PickMyTrade) through
+    the SAME audited _send_broker_order sink as all other live orders.
 
     On paper / manual_only mode: skips the broker POST and clears tracking only
     (paper simulate). On execution_mode='disabled': rejects with 409.
@@ -66250,7 +66622,8 @@ def quick_exit():
 
     provider_label = _EXECUTION_PROVIDER_LABELS.get(mode, mode)
     tp_symbol      = TRADERSPOST_TICKER.get(_inst, _inst)
-    payload        = adapt_traderspost_reduce(tp_symbol)   # {ticker, action:"exit", signal}
+    payload        = (adapt_traderspost_reduce(tp_symbol) if mode == "traderspost"
+                      else adapt_pickmytrade_reduce(tp_symbol))
 
     exec_status = "simulated"
     exec_msg    = f"Paper/manual mode — no broker order sent ({mode})."
@@ -66261,7 +66634,16 @@ def quick_exit():
             return jsonify({"status": "error",
                             "reason": f"No webhook URL configured for {mode}."}), 409
         err_res, err_code = _send_broker_order(mode, provider_label, _inst, payload,
-                                               send_url, order_kind="quick_exit")
+                                               send_url, order_kind="quick_exit",
+                                               safety_context={
+                                                   "schema": "final_order_v1", "mode": mode,
+                                                   "instrument": _inst, "source": "quick_exit",
+                                                   "provenance": "operator", "intent_kind": "exit",
+                                                   "position_identity": {
+                                                       "kind": "active_trade",
+                                                       "opened_at": _at.get("opened_at"),
+                                                   },
+                                               })
         if err_res is not None:
             return jsonify(err_res), err_code
         exec_status = "sent"
