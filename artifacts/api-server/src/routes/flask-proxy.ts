@@ -425,6 +425,10 @@ export const BOT1_ROUTES = [
   "/research-health",
   "/research-events",
   "/research-coordinator-report",
+  // Canonical Ghost Phase 1 — append-only reconciliation telemetry for the
+  // existing coordinator + generic ghost lifecycle. Read-only, shadow-only,
+  // owner-only, and never a gate, outcome resolver, or execution surface.
+  "/canonical-ghost-report",
   // Research Operations panel — lightweight aggregated status for GRE/FVG/SCALP/IT
   // engines: observation counts, evidence-state breakdown, READY_FOR_REVIEW queue.
   // DISPLAY-ONLY; owner-only; NOT in OPEN_PATHS. Never touches gate or execution.

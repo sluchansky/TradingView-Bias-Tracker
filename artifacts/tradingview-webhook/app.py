@@ -9043,7 +9043,7 @@ def _it_force_close_watchdog():
                        AND status       = 'OPEN'
                        AND (opened_at AT TIME ZONE 'America/New_York')::date
                            = (NOW() AT TIME ZONE 'America/New_York')::date
-                    RETURNING id, entry_price, direction, risk_pts,
+                     RETURNING id, obs_key, entry_price, direction, risk_pts,
                               mfe_price, mae_price, mfe_r, mae_r, gross_r
                     """,
                 )
@@ -9053,6 +9053,11 @@ def _it_force_close_watchdog():
                 logger.info(
                     "IT EOD force-close: closed %d ghost observation(s)", len(closed_rows))
                 for row in closed_rows:
+                    _canonical_ghost_record_outcome(
+                        obs_key=row["obs_key"], status="CLOSED",
+                        close_reason="IT_EOD_FORCE_CLOSE", gross_r=row.get("gross_r"),
+                        event_at=now_utc(), extra={"legacy_ghost_id": row["id"]},
+                    )
                     _it_ghost_write_extended_fields(
                         conn,
                         obs_id      = row["id"],
@@ -47702,6 +47707,20 @@ try:
 except Exception:
     _ghost_coordinator = None
 
+# Canonical Ghost Phase 1 is a reporting-only sidecar over the existing
+# coordinator + generic ghost lifecycle.  Its output is never read by a gate,
+# resolver, scorer, scheduler, broker, or execution path.
+CANONICAL_GHOST_SHADOW_ENABLED = os.environ.get(
+    "CANONICAL_GHOST_SHADOW_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+CANONICAL_GHOST_SHADOW_PERSIST_ENABLED = os.environ.get(
+    "CANONICAL_GHOST_SHADOW_PERSIST_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+CANONICAL_GHOST_DB_READY = False
+try:
+    import canonical_ghost_authority as _canonical_ghost_authority  # noqa: PLC0415
+    _canonical_ghost_authority.configure(enabled=CANONICAL_GHOST_SHADOW_ENABLED)
+except Exception:
+    _canonical_ghost_authority = None
+
 # ════════════════════════════════════════════════════════════════════════════
 # SCALP-STRATEGY ADVISORY (Main Brain "potential trades") — DISPLAY/ADVISORY ONLY
 # ════════════════════════════════════════════════════════════════════════════
@@ -50226,6 +50245,17 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
         )
         event_id = source_event_id or "%s|%s|%s|%s" % (
             inst, setup_family, direction, source_bar)
+        shadow_context = dict(context or {})
+        # The existing coordinator identity intentionally remains unchanged.
+        # Phase-1's sidecar receives the explicit lane only in copied context,
+        # so SCALP and INTRADAY can never collapse in its shadow projection.
+        if source_system == "generic_ghost":
+            shadow_context.setdefault("trading_mode", TRADING_MODE)
+            shadow_context.setdefault("legacy_table", "ghost_observations")
+        elif "trading_mode" not in shadow_context and "mode" in shadow_context:
+            # Cross-system comparisons must opt into a real lane explicitly;
+            # never borrow the current global mode for a legacy simulator.
+            shadow_context["trading_mode"] = shadow_context["mode"]
         observation = _ghost_coordinator.ObservationRequest(
             source_system=source_system, source_event_id=str(event_id),
             instrument=inst, timeframe="1m", setup_family=setup_family,
@@ -50233,14 +50263,264 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
             strategy_version=str(STRATEGY_VERSION), direction=direction,
             signal_time=now_utc(), source_bar_time=source_bar,
             entry=entry, stop=stop, targets=tuple(t for t in targets if t is not None),
-            experiment_variant=variant, context=context or {},
+            experiment_variant=variant, context=shadow_context,
         )
         if CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED:
-            return _ghost_coordinator.route_research(observation)[0]
-        return _ghost_coordinator.submit_shadow(observation)
+            submission = _ghost_coordinator.route_research(observation)[0]
+        else:
+            submission = _ghost_coordinator.submit_shadow(observation)
+        if (submission is not None and submission.accepted
+                and submission.market_opportunity_id and submission.observation_id):
+            _canonical_ghost_observe_submission({
+                "observation_id": submission.observation_id,
+                "market_opportunity_id": submission.market_opportunity_id,
+                "source_system": source_system,
+                "source_event_id": str(event_id),
+                "instrument": inst,
+                "timeframe": "1m",
+                "setup_family": setup_family,
+                "strategy_name": str(strategy_name or "UNKNOWN"),
+                "strategy_version": str(STRATEGY_VERSION),
+                "direction": direction,
+                "signal_time": observation.signal_time,
+                "source_bar_time": source_bar,
+                "entry": entry,
+                "stop": stop,
+                "targets": tuple(t for t in targets if t is not None),
+                "experiment_variant": variant,
+                "context": shadow_context,
+            })
+        return submission
     except Exception as exc:
         logger.debug("ghost coordinator adapter (%s): %s", source_system, exc)
         return None
+
+
+def _canonical_ghost_observe_submission(record):
+    """Copy a coordinator submission into the Phase-1 shadow authority."""
+    if not CANONICAL_GHOST_SHADOW_ENABLED or _canonical_ghost_authority is None:
+        return None
+    try:
+        return _canonical_ghost_authority.observe_coordinator_submission(record)
+    except Exception as exc:
+        logger.debug("canonical ghost observation (%s): %s", record.get("source_system"), exc)
+        return None
+
+
+def _canonical_ghost_record_outcome(*, obs_key, status, close_reason,
+                                    gross_r=None, cost_r=None, net_r=None,
+                                    exit_price=None, mfe_r=None, mae_r=None,
+                                    bars_held=None, event_at=None, extra=None):
+    """Copy an already-resolved generic ghost outcome; never resolve or mutate it."""
+    if not CANONICAL_GHOST_SHADOW_ENABLED or _canonical_ghost_authority is None:
+        return None
+    try:
+        return _canonical_ghost_authority.observe_legacy_outcome(
+            source_system="generic_ghost", source_record_id=obs_key,
+            raw_status=status, close_reason=close_reason,
+            gross_r=gross_r, cost_r=cost_r, net_r=net_r, result_r=net_r,
+            exit_price=exit_price, mfe_r=mfe_r, mae_r=mae_r,
+            bars_held=bars_held, event_at=event_at,
+            payload=extra or {},
+        )
+    except Exception as exc:
+        logger.debug("canonical ghost outcome (%s): %s", obs_key, exc)
+        return None
+
+
+def _check_canonical_ghost_db_ready():
+    """No-DDL probe for the additive Phase-1 reconciliation sidecar."""
+    global CANONICAL_GHOST_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM canonical_ghost_reconciliation_events LIMIT 1")
+            cur.fetchone()
+        CANONICAL_GHOST_DB_READY = True
+        logger.info("Canonical Ghost Phase 1 reconciliation table ready")
+    except Exception as exc:
+        logger.info("Canonical Ghost Phase 1 persistence unavailable (shadow stays in-memory): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _canonical_ghost_persist_event(event):
+    """Append one copied canonical-shadow event; never touches a legacy ledger."""
+    if not CANONICAL_GHOST_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO canonical_ghost_reconciliation_events
+                   (event_id, canonical_opportunity_id, canonical_observation_id,
+                    coordinator_market_opportunity_id, trading_mode, source_system,
+                    source_record_id, event_type, legacy_table, raw_status,
+                    raw_close_reason, normalized_outcome, gross_r, cost_r, net_r,
+                    result_r, exit_price, mfe_r, mae_r, bars_held, event_at, payload)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           %s,%s,%s,%s,%s,%s::jsonb)
+                   ON CONFLICT (event_id) DO NOTHING""",
+                (event["event_id"], event["canonical_opportunity_id"],
+                 event["canonical_observation_id"], event["coordinator_market_opportunity_id"],
+                 event["trading_mode"], event["source_system"], event["source_record_id"],
+                 event["event_type"], event["legacy_table"], event.get("raw_status"),
+                 event.get("raw_close_reason"), event["normalized_outcome"],
+                 event.get("gross_r"), event.get("cost_r"), event.get("net_r"),
+                 event.get("result_r"), event.get("exit_price"), event.get("mfe_r"),
+                 event.get("mae_r"), event.get("bars_held"), event.get("event_at"),
+                 json.dumps(event.get("payload") or {})))
+            wrote = cur.rowcount == 1
+        conn.commit()
+        return wrote
+    except Exception as exc:
+        logger.debug("canonical ghost persistence: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _configure_canonical_ghost_persistence():
+    """Attach an app-owned append-only storage callback after the no-DDL probe."""
+    if _canonical_ghost_authority is None:
+        return
+    enabled = bool(CANONICAL_GHOST_SHADOW_PERSIST_ENABLED and CANONICAL_GHOST_DB_READY)
+    _canonical_ghost_authority.configure(
+        enabled=CANONICAL_GHOST_SHADOW_ENABLED,
+        persistence_enabled=enabled,
+        persist_fn=_canonical_ghost_persist_event if enabled else None,
+    )
+
+
+def _restore_canonical_ghost_authority():
+    """Rehydrate copied reconciliation events without replaying or rewriting them."""
+    if not (CANONICAL_GHOST_SHADOW_PERSIST_ENABLED and CANONICAL_GHOST_DB_READY
+            and _canonical_ghost_authority is not None):
+        return 0
+    conn = _learning_conn()
+    if conn is None:
+        return 0
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT event_id, canonical_opportunity_id, canonical_observation_id,
+                          coordinator_market_opportunity_id, trading_mode, source_system,
+                          source_record_id, event_type, legacy_table, raw_status,
+                          raw_close_reason, normalized_outcome, gross_r, cost_r, net_r,
+                          result_r, exit_price, mfe_r, mae_r, bars_held, event_at, payload
+                   FROM canonical_ghost_reconciliation_events
+                   ORDER BY canonical_opportunity_id ASC,
+                            CASE event_type WHEN 'OBSERVED' THEN 0 ELSE 1 END ASC,
+                            created_at ASC""")
+            rows = [dict(row) for row in cur.fetchall()]
+    except Exception as exc:
+        logger.info("Canonical Ghost Phase 1 restore skipped: %s", exc)
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    restored = _canonical_ghost_authority.restore(rows)
+    logger.info("Canonical Ghost Phase 1 restored %d reconciliation event(s)", restored)
+    return restored
+
+
+def _reconcile_canonical_ghost_from_legacy():
+    """Recover missing sidecar copies by exact durable-ledger correlation only.
+
+    This runs after a restart if a transient sidecar insert failed.  It reads
+    the already-persisted coordinator observation and joins it to the legacy
+    ghost record on `source_event_id = obs_key`; it never time/price matches,
+    changes either source ledger, or invokes an outcome resolver.
+    """
+    if not (CANONICAL_GHOST_SHADOW_ENABLED and CANONICAL_GHOST_DB_READY
+            and CENTRAL_GHOST_COORDINATOR_DB_READY
+            and _canonical_ghost_authority is not None):
+        return 0
+    conn = _learning_conn()
+    if conn is None:
+        return 0
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT c.observation_id, c.market_opportunity_id, c.source_system,
+                          c.source_event_id, c.instrument, c.timeframe, c.setup_family,
+                          c.strategy_name, c.strategy_version, c.direction, c.signal_time,
+                          c.source_bar_time, c.entry_price, c.stop_price, c.targets,
+                          c.context, c.experiment_variant,
+                          g.obs_key, g.trading_mode AS legacy_trading_mode,
+                          g.status AS legacy_status, g.close_reason,
+                          g.gross_r, g.cost_r, g.net_r, g.exit_price, g.mfe_r, g.mae_r,
+                          g.bars_held, g.closed_at
+                   FROM ghost_coordinator_observations c
+                   JOIN ghost_observations g
+                     ON c.source_system = 'generic_ghost'
+                    AND c.source_event_id = g.obs_key
+                   WHERE g.trading_mode IN ('SCALP', 'INTRADAY_TREND')
+                   ORDER BY c.created_at ASC""")
+            rows = [dict(row) for row in cur.fetchall()]
+    except Exception as exc:
+        logger.info("Canonical Ghost Phase 1 legacy recovery skipped: %s", exc)
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    recovered = 0
+    for row in rows:
+        context = row.get("context") if isinstance(row.get("context"), dict) else {}
+        context = dict(context)
+        context["trading_mode"] = row.get("legacy_trading_mode") or context.get("trading_mode")
+        # The generic coordinator record should already carry this field.  The
+        # joined legacy mode is authoritative for a recovery fallback only.
+        if context.get("trading_mode") not in ("SCALP", "INTRADAY_TREND"):
+            continue
+        record = {
+            "observation_id": row["observation_id"],
+            "market_opportunity_id": row["market_opportunity_id"],
+            "source_system": row["source_system"],
+            "source_event_id": row["source_event_id"],
+            "instrument": row["instrument"], "timeframe": row["timeframe"],
+            "setup_family": row["setup_family"], "strategy_name": row["strategy_name"],
+            "strategy_version": row["strategy_version"], "direction": row["direction"],
+            "signal_time": row["signal_time"], "source_bar_time": row["source_bar_time"],
+            "entry": row["entry_price"], "stop": row["stop_price"], "targets": row["targets"],
+            "experiment_variant": row["experiment_variant"], "context": context,
+        }
+        event = _canonical_ghost_authority.observe_coordinator_submission(record)
+        if event is not None:
+            recovered += 1
+        status = str(row.get("legacy_status") or "").upper()
+        if status not in ("", "OPEN", "PENDING", "ACTIVE"):
+            _canonical_ghost_record_outcome(
+                obs_key=row["obs_key"], status=status,
+                close_reason=row.get("close_reason"), gross_r=row.get("gross_r"),
+                cost_r=row.get("cost_r"), net_r=row.get("net_r"),
+                exit_price=row.get("exit_price"), mfe_r=row.get("mfe_r"),
+                mae_r=row.get("mae_r"), bars_held=row.get("bars_held"),
+                event_at=row.get("closed_at"), extra={"recovered_on_boot": True},
+            )
+    if recovered:
+        logger.info("Canonical Ghost Phase 1 recovered %d legacy-linked event(s)", recovered)
+    return recovered
 
 
 def _check_ghost_coordinator_db_ready():
@@ -50614,6 +50894,13 @@ def _ghost_obs_watcher_cycle():
                              (round(mfe_r,   4) if mfe_r   is not None else None),
                              (round(mae_r,   4) if mae_r   is not None else None),
                              mfe_price, mae_price, bars_held, row["id"]))
+                    _canonical_ghost_record_outcome(
+                        obs_key=row["obs_key"], status=status, close_reason=close_reason,
+                        gross_r=gross_r, cost_r=cost_r, net_r=net_r,
+                        exit_price=exit_px, mfe_r=mfe_r, mae_r=mae_r,
+                        bars_held=bars_held, event_at=now_ts,
+                        extra={"legacy_ghost_id": row["id"]},
+                    )
                     logger.info(
                         "ghost_obs %s: id=%d %s %s → %s (%s) gross_r=%s net_r=%s",
                         status, row["id"], inst, row["direction"],
@@ -83223,6 +83510,19 @@ def route_research_health():
         )
     except Exception as exc:
         out["central_ghost_coordinator"] = {"ok": False, "error": str(exc)[:180]}
+    try:
+        out["canonical_ghost_authority"] = (
+            _canonical_ghost_authority.get_report(limit=25)
+            if _canonical_ghost_authority is not None
+            else {"ok": True, "enabled": False, "reason": "module unavailable"}
+        )
+        out["canonical_ghost_authority"]["persistence"] = (
+            "postgres_shadow_only" if CANONICAL_GHOST_SHADOW_PERSIST_ENABLED
+            and CANONICAL_GHOST_DB_READY else "in_memory_shadow_only"
+        )
+        out["canonical_ghost_authority"]["persistence_db_ready"] = CANONICAL_GHOST_DB_READY
+    except Exception as exc:
+        out["canonical_ghost_authority"] = {"ok": False, "error": str(exc)[:180]}
     with _SCALP_SIM_WATCH_HEALTH_LOCK:
         out["scalp_live_sim_watcher"] = {
             **_SCALP_SIM_WATCH_HEALTH,
@@ -83246,6 +83546,27 @@ def route_research_coordinator_report():
         if _ghost_coordinator is None:
             return jsonify({"ok": True, "enabled": False, "reason": "module unavailable"})
         return jsonify(_ghost_coordinator.get_report(limit=limit))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)[:180]}), 500
+
+
+@app.route("/canonical-ghost-report", methods=["GET"])
+def route_canonical_ghost_report():
+    """Phase-1 canonical shadow reconciliation report (GET-only; never a gate)."""
+    try:
+        limit = min(500, max(1, int(request.args.get("limit", 100))))
+    except (TypeError, ValueError):
+        limit = 100
+    try:
+        if _canonical_ghost_authority is None:
+            return jsonify({"ok": True, "enabled": False, "reason": "module unavailable"})
+        report = _canonical_ghost_authority.get_report(limit=limit)
+        report["persistence"] = (
+            "postgres_shadow_only" if CANONICAL_GHOST_SHADOW_PERSIST_ENABLED
+            and CANONICAL_GHOST_DB_READY else "in_memory_shadow_only"
+        )
+        report["persistence_db_ready"] = CANONICAL_GHOST_DB_READY
+        return jsonify(report)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)[:180]}), 500
 
@@ -86610,6 +86931,10 @@ if __name__ == "__main__":
         _check_ghost_coordinator_db_ready()        # probe additive coordinator tables (no DDL; apply db_ghost_coordinator_schema.sql)
         _configure_ghost_coordinator_persistence() # optional shadow-only storage boundary; default OFF
         _restore_ghost_coordinator()               # restores coordinator evidence only when persistence is explicitly enabled
+        _check_canonical_ghost_db_ready()          # probe append-only canonical reconciliation sidecar (no DDL)
+        _configure_canonical_ghost_persistence()   # optional shadow-only storage boundary; default OFF
+        _restore_canonical_ghost_authority()       # restores copied evidence only; never replays outcomes
+        _reconcile_canonical_ghost_from_legacy()   # exact obs_key recovery for transient sidecar persistence failures
         _check_gre_db_ready()                      # probe ghost_opportunities/experiments/results (no DDL; created via DB tool/publish diff) — PHASE 2 GHOST RESEARCH ENGINE, RESEARCH/DISPLAY-ONLY
         _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
         _check_gate_audit_db_ready()               # probe gate_audit_log (no DDL; apply db_gate_effectiveness_schema.sql) — PHASE 8C Gate Effectiveness Audit, DISPLAY/MEASUREMENT-ONLY
