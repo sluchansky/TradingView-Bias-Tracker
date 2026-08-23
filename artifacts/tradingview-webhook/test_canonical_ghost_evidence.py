@@ -127,6 +127,59 @@ def test_terminal_without_submission_becomes_one_durable_unmatched_record():
     assert restarted.report()["unmatched_records"] == 1
 
 
+def test_explicit_canonical_unmatched_persists_as_a_classified_shadow_fact():
+    writes = []
+    evidence = CanonicalGhostEvidence(enabled=True)
+    evidence.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda row: writes.append(dict(row)) or True,
+    )
+    record = _submission()
+    unmatched = evidence.observe_unmatched(
+        record,
+        reason="canonical_authority_observation_unmatched",
+    )
+    duplicate = evidence.observe_unmatched(
+        record,
+        reason="canonical_authority_observation_unmatched",
+    )
+
+    assert unmatched["trading_mode"] == "SCALP"
+    assert duplicate["evidence_id"] == unmatched["evidence_id"]
+    assert evidence.report()["unmatched_by_reason"] == {
+        "canonical_authority_observation_unmatched": 1,
+    }
+    assert evidence.report()["errors"] == 0
+    assert evidence.report()["unsupported_mode_rejections"] == 0
+    assert len(writes) == 1
+
+    restarted = CanonicalGhostEvidence(enabled=True)
+    assert restarted.restore(writes) == 1
+    assert restarted.report()["by_mode"]["SCALP"]["unresolved_unmatched_records"] == 1
+    assert restarted.report()["errors"] == 0
+
+
+def test_unsupported_mode_unmatched_is_rejected_without_projection_error():
+    evidence = CanonicalGhostEvidence(enabled=True)
+    rejected = evidence.observe_unmatched(
+        {
+            "source_system": "scalp_live_sim",
+            "source_event_id": "noncanonical-no-lane",
+            "context": {"trading_mode": "SWING"},
+        },
+        reason="canonical_authority_observation_unmatched",
+    )
+
+    report = evidence.report()
+    assert rejected is None
+    assert report["records"] == 0
+    assert report["unmatched_records"] == 0
+    assert report["errors"] == 0
+    assert report["unsupported_mode_rejections"] == 1
+    assert report["ignored"] == 1
+
+
 def test_unmatched_then_exact_replay_has_one_exact_link_after_restart():
     writes = []
     evidence = CanonicalGhostEvidence(enabled=True)

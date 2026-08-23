@@ -123,6 +123,7 @@ class CanonicalGhostEvidence:
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._duplicates = 0
         self._ignored = 0
+        self._unsupported_mode_rejections = 0
         self._errors = 0
         self._persistence_errors = 0
         self._persistence_writes = 0
@@ -315,7 +316,15 @@ class CanonicalGhostEvidence:
                 self._ignored += 1
             return None
         if mode not in CANONICAL_MODES:
-            return self._fail("unmatched result has unsupported trading mode")
+            # Evidence is limited to explicitly declared SCALP/INTRADAY lanes.
+            # A noncanonical coordinator submission is neither a durable
+            # unmatched fact nor a projection failure: retaining it here would
+            # create false SCALP/INTRADAY health noise.  Do not infer a lane
+            # from source, strategy, or the current app mode.
+            with self._lock:
+                self._ignored += 1
+                self._unsupported_mode_rejections += 1
+            return None
         source_result_id = str(
             event.get("source_record_id")
             or context.get("legacy_obs_key")
@@ -448,6 +457,7 @@ class CanonicalGhostEvidence:
                 "by_mode": by_mode,
                 "duplicates": self._duplicates,
                 "ignored": self._ignored,
+                "unsupported_mode_rejections": self._unsupported_mode_rejections,
                 "errors": self._errors,
                 "last_error": self._last_error,
                 "persistence_writes": self._persistence_writes,
