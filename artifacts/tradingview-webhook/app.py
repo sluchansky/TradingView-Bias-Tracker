@@ -50310,6 +50310,11 @@ def _canonical_ghost_observe_submission(record):
         event = _canonical_ghost_authority.observe_coordinator_submission(record)
         if event is not None:
             _canonical_evidence_observe_submission(record, event)
+        else:
+            _canonical_evidence_record_unmatched(
+                record,
+                reason="canonical_authority_observation_unmatched",
+            )
         return event
     except Exception as exc:
         logger.debug("canonical ghost observation (%s): %s", record.get("source_system"), exc)
@@ -50338,6 +50343,21 @@ def _canonical_evidence_record_outcome(canonical_event):
         return None
 
 
+def _canonical_evidence_record_unmatched(record, *, reason, canonical_event=None):
+    """Store a shadow-only explicit unmatched representation; never resolve it."""
+    if not CANONICAL_GHOST_SHADOW_ENABLED or _canonical_ghost_evidence is None:
+        return None
+    try:
+        return _canonical_ghost_evidence.observe_unmatched(
+            record,
+            canonical_event,
+            reason=reason,
+        )
+    except Exception as exc:
+        logger.debug("canonical evidence unmatched (%s): %s", record.get("source_system"), exc)
+        return None
+
+
 def _canonical_ghost_record_outcome(*, obs_key, status, close_reason,
                                     gross_r=None, cost_r=None, net_r=None,
                                     exit_price=None, mfe_r=None, mae_r=None,
@@ -50356,6 +50376,37 @@ def _canonical_ghost_record_outcome(*, obs_key, status, close_reason,
         )
         if event is not None:
             _canonical_evidence_record_outcome(event)
+        else:
+            _canonical_evidence_record_unmatched(
+                {
+                    "source_system": "generic_ghost",
+                    "source_event_id": obs_key,
+                    "context": {
+                        "trading_mode": TRADING_MODE,
+                        "legacy_obs_key": obs_key,
+                        "legacy_table": "ghost_observations",
+                    },
+                },
+                canonical_event={
+                    "trading_mode": TRADING_MODE,
+                    "source_system": "generic_ghost",
+                    "source_record_id": obs_key,
+                    "event_type": "OUTCOME_RESOLVED",
+                    "raw_status": status,
+                    "raw_close_reason": close_reason,
+                    "gross_r": gross_r,
+                    "cost_r": cost_r,
+                    "net_r": net_r,
+                    "result_r": net_r,
+                    "exit_price": exit_price,
+                    "mfe_r": mfe_r,
+                    "mae_r": mae_r,
+                    "bars_held": bars_held,
+                    "event_at": event_at,
+                    "payload": extra or {},
+                },
+                reason="terminal_outcome_without_canonical_observation",
+            )
         return event
     except Exception as exc:
         logger.debug("canonical ghost outcome (%s): %s", obs_key, exc)
@@ -50395,10 +50446,25 @@ def _check_canonical_evidence_db_ready():
         return
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1 FROM canonical_ghost_evidence_records LIMIT 1")
+            cur.execute(
+                """SELECT evidence_schema_version, provenance_version,
+                          provenance_fingerprint, resolver_name, resolver_version,
+                          outcome_schema_version
+                   FROM canonical_ghost_evidence_records LIMIT 1"""
+            )
             cur.fetchone()
+            cur.execute("SELECT 1 FROM canonical_ghost_unmatched_evidence_records LIMIT 1")
+            cur.fetchone()
+            cur.execute(
+                """SELECT 1
+                   FROM pg_constraint
+                   WHERE conname = 'fk_cgu_matched_evidence'
+                     AND conrelid = 'canonical_ghost_unmatched_evidence_records'::regclass"""
+            )
+            if not cur.fetchone():
+                raise RuntimeError("strict unmatched-evidence foreign key is missing")
         CANONICAL_EVIDENCE_DB_READY = True
-        logger.info("Canonical Ghost durable evidence table ready")
+        logger.info("Canonical Ghost strict durable evidence tables ready")
     except Exception as exc:
         logger.info("Canonical Ghost durable evidence unavailable (shadow stays in-memory): %s", exc)
     finally:
@@ -50474,9 +50540,114 @@ def _canonical_evidence_persist_record(record):
         return False
     try:
         with conn.cursor() as cur:
+            if record.get("record_kind") == "UNMATCHED":
+                matched_evidence_id = str(record.get("matched_evidence_id") or "").strip()
+                if matched_evidence_id:
+                    cur.execute(
+                        """SELECT 1
+                           FROM canonical_ghost_evidence_records
+                           WHERE evidence_id = %s
+                             AND trading_mode = %s
+                             AND source_system = %s
+                             AND source_result_id = %s""",
+                        (matched_evidence_id, record["trading_mode"],
+                         record["source_system"], record["result_identity"]))
+                    if not cur.fetchone():
+                        conn.rollback()
+                        return False
+                cur.execute(
+                    """INSERT INTO canonical_ghost_unmatched_evidence_records
+                       (unmatched_id, record_kind, evidence_schema_version,
+                        provenance_version, provenance_fingerprint, resolver_name,
+                        resolver_version, outcome_schema_version, trading_mode,
+                        source_system, source_result_id, result_identity,
+                        canonical_opportunity_id, canonical_observation_id,
+                        coordinator_market_opportunity_id, coordinator_observation_id,
+                        legacy_table, strategy_name, strategy_version, setup_family,
+                        instrument, timeframe, direction, signal_time, source_bar_time,
+                        entry_price, stop_price, targets, result_state, unmatched_reason,
+                        matched_evidence_id, raw_status, raw_close_reason,
+                        normalized_outcome, gross_r, cost_r, net_r, result_r, exit_price,
+                        mfe_r, mae_r, bars_held, outcome_at, context, outcome_payload)
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,NULLIF(%s,''),%s,
+                               NULLIF(%s,''),NULLIF(%s,''),NULLIF(%s,''),NULLIF(%s,''),
+                               %s,%s,%s,%s,%s,%s,%s,NULLIF(%s,'')::timestamptz,
+                               NULLIF(%s,''),%s,%s,%s::jsonb,%s,%s,NULLIF(%s,''),
+                               %s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                               NULLIF(%s,'')::timestamptz,%s::jsonb,%s::jsonb)
+                       ON CONFLICT (trading_mode, source_system, result_identity) DO UPDATE SET
+                           matched_evidence_id = CASE
+                               WHEN canonical_ghost_unmatched_evidence_records.matched_evidence_id
+                                    IS NULL
+                                    OR canonical_ghost_unmatched_evidence_records.matched_evidence_id = ''
+                               THEN EXCLUDED.matched_evidence_id
+                               ELSE canonical_ghost_unmatched_evidence_records.matched_evidence_id
+                           END,
+                           updated_at = NOW()
+                       WHERE canonical_ghost_unmatched_evidence_records.provenance_fingerprint
+                             = EXCLUDED.provenance_fingerprint
+                         AND (
+                             canonical_ghost_unmatched_evidence_records.matched_evidence_id IS NULL
+                             OR canonical_ghost_unmatched_evidence_records.matched_evidence_id = ''
+                             OR EXCLUDED.matched_evidence_id IS NULL
+                             OR EXCLUDED.matched_evidence_id = ''
+                             OR canonical_ghost_unmatched_evidence_records.matched_evidence_id
+                                = EXCLUDED.matched_evidence_id
+                         )""",
+                    (record["evidence_id"], record.get("record_kind") or "UNMATCHED",
+                     record.get("evidence_schema_version") or "2",
+                     record.get("provenance_version") or "canonical-evidence-provenance-v1",
+                     record["provenance_fingerprint"], record["resolver_name"],
+                     record["resolver_version"], record["outcome_schema_version"],
+                     record["trading_mode"], record["source_system"],
+                     record.get("source_result_id") or "", record["result_identity"],
+                     record.get("canonical_opportunity_id") or "",
+                     record.get("canonical_observation_id") or "",
+                     record.get("coordinator_market_opportunity_id") or "",
+                     record.get("coordinator_observation_id") or "",
+                     record["legacy_table"], record["strategy_name"],
+                     record["strategy_version"], record["setup_family"],
+                     record.get("instrument"), record.get("timeframe"), record.get("direction"),
+                     record.get("signal_time") or "", record.get("source_bar_time") or "",
+                     record.get("entry_price"), record.get("stop_price"),
+                     json.dumps(record.get("targets") or []), record["result_state"],
+                     record["unmatched_reason"], record.get("matched_evidence_id") or "",
+                     record.get("raw_status"), record.get("raw_close_reason"),
+                     record["normalized_outcome"], record.get("gross_r"), record.get("cost_r"),
+                     record.get("net_r"), record.get("result_r"), record.get("exit_price"),
+                     record.get("mfe_r"), record.get("mae_r"), record.get("bars_held"),
+                     record.get("outcome_at") or "", json.dumps(record.get("context") or {}),
+                     json.dumps(record.get("outcome_payload") or {})))
+                if cur.rowcount == 0:
+                    cur.execute(
+                        """SELECT provenance_fingerprint, matched_evidence_id
+                           FROM canonical_ghost_unmatched_evidence_records
+                           WHERE trading_mode = %s
+                             AND source_system = %s
+                             AND result_identity = %s""",
+                        (record["trading_mode"], record["source_system"],
+                         record["result_identity"]))
+                    existing = cur.fetchone()
+                    existing_link = str(existing[1] or "").strip() if existing else ""
+                    if (
+                        not existing
+                        or str(existing[0] or "") != str(record["provenance_fingerprint"])
+                        or (
+                            matched_evidence_id
+                            and existing_link
+                            and existing_link != matched_evidence_id
+                        )
+                    ):
+                        conn.rollback()
+                        return False
+                conn.commit()
+                return True
             cur.execute(
                 """INSERT INTO canonical_ghost_evidence_records
-                   (evidence_id, canonical_opportunity_id, canonical_observation_id,
+                   (evidence_id, record_kind, evidence_schema_version,
+                    provenance_version, provenance_fingerprint, resolver_name,
+                    resolver_version, outcome_schema_version,
+                    canonical_opportunity_id, canonical_observation_id,
                     coordinator_market_opportunity_id, coordinator_observation_id,
                     trading_mode, source_system, source_result_id, legacy_table,
                     strategy_name, strategy_version, setup_family, instrument, timeframe,
@@ -50484,7 +50655,8 @@ def _canonical_evidence_persist_record(record):
                     targets, result_state, outcome_version, outcome_order_key, raw_status,
                     raw_close_reason, normalized_outcome, gross_r, cost_r, net_r, result_r,
                     exit_price, mfe_r, mae_r, bars_held, outcome_at, context, outcome_payload)
-                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           %s,%s,%s,%s,%s,
                            NULLIF(%s,'')::timestamptz, NULLIF(%s,''),%s,%s,
                            %s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
                            NULLIF(%s,'')::timestamptz,%s::jsonb,%s::jsonb)
@@ -50507,8 +50679,18 @@ def _canonical_evidence_persist_record(record):
                        outcome_payload = EXCLUDED.outcome_payload,
                        updated_at = NOW()
                    WHERE EXCLUDED.outcome_order_key <> ''
-                     AND canonical_ghost_evidence_records.outcome_order_key < EXCLUDED.outcome_order_key""",
-                (record["evidence_id"], record["canonical_opportunity_id"],
+                      AND canonical_ghost_evidence_records.outcome_order_key < EXCLUDED.outcome_order_key
+                      AND (
+                          canonical_ghost_evidence_records.provenance_fingerprint = ''
+                          OR canonical_ghost_evidence_records.provenance_fingerprint
+                             = EXCLUDED.provenance_fingerprint
+                      )""",
+                 (record["evidence_id"], record.get("record_kind") or "MATCHED",
+                  record.get("evidence_schema_version") or "2",
+                  record.get("provenance_version") or "canonical-evidence-provenance-v1",
+                  record["provenance_fingerprint"], record["resolver_name"],
+                  record["resolver_version"], record["outcome_schema_version"],
+                  record["canonical_opportunity_id"],
                  record["canonical_observation_id"], record["coordinator_market_opportunity_id"],
                  record["coordinator_observation_id"], record["trading_mode"],
                  record["source_system"], record["source_result_id"], record["legacy_table"],
@@ -50524,8 +50706,22 @@ def _canonical_evidence_persist_record(record):
                  record.get("mfe_r"), record.get("mae_r"), record.get("bars_held"),
                  record.get("outcome_at") or "", json.dumps(record.get("context") or {}),
                  json.dumps(record.get("outcome_payload") or {})))
+            if cur.rowcount == 0:
+                cur.execute(
+                    """SELECT provenance_fingerprint
+                       FROM canonical_ghost_evidence_records
+                       WHERE trading_mode = %s
+                         AND source_system = %s
+                         AND source_result_id = %s""",
+                    (record["trading_mode"], record["source_system"],
+                     record["source_result_id"]))
+                existing = cur.fetchone()
+                if not existing or str(existing[0] or "") != str(
+                        record["provenance_fingerprint"]):
+                    conn.rollback()
+                    return False
         conn.commit()
-        # A no-op conflict is already durable and therefore a successful replay.
+        # A no-op is accepted only when it is an identical-provenance replay.
         return True
     except Exception as exc:
         logger.debug("canonical evidence persistence: %s", exc)
@@ -50598,7 +50794,10 @@ def _restore_canonical_evidence():
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
             cur.execute(
-                """SELECT evidence_id, canonical_opportunity_id, canonical_observation_id,
+                """SELECT evidence_id, record_kind, evidence_schema_version,
+                          provenance_version, provenance_fingerprint, resolver_name,
+                          resolver_version, outcome_schema_version,
+                          canonical_opportunity_id, canonical_observation_id,
                           coordinator_market_opportunity_id, coordinator_observation_id,
                           trading_mode, source_system, source_result_id, legacy_table,
                           strategy_name, strategy_version, setup_family, instrument, timeframe,
@@ -50609,6 +50808,23 @@ def _restore_canonical_evidence():
                    FROM canonical_ghost_evidence_records
                    ORDER BY created_at ASC""")
             rows = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                """SELECT unmatched_id AS evidence_id, record_kind,
+                          evidence_schema_version, provenance_version,
+                          provenance_fingerprint, resolver_name, resolver_version,
+                          outcome_schema_version, canonical_opportunity_id,
+                          canonical_observation_id, coordinator_market_opportunity_id,
+                          coordinator_observation_id, trading_mode, source_system,
+                          source_result_id, result_identity, legacy_table, strategy_name,
+                          strategy_version, setup_family, instrument, timeframe, direction,
+                          signal_time, source_bar_time, entry_price, stop_price, targets,
+                          result_state, unmatched_reason, matched_evidence_id, raw_status,
+                          raw_close_reason, normalized_outcome, gross_r, cost_r, net_r,
+                          result_r, exit_price, mfe_r, mae_r, bars_held, outcome_at,
+                          context, outcome_payload
+                   FROM canonical_ghost_unmatched_evidence_records
+                   ORDER BY created_at ASC""")
+            rows.extend(dict(row) for row in cur.fetchall())
     except Exception as exc:
         logger.info("Canonical Ghost durable evidence restore skipped: %s", exc)
         return 0
@@ -84229,6 +84445,26 @@ def _canonical_evidence_durable_health():
                     for key, value in dict(row).items()
                     if key != "trading_mode"
                 }
+            cur.execute(
+                """SELECT trading_mode,
+                          COUNT(*) AS durable_unmatched_evidence_records,
+                          COUNT(*) FILTER (WHERE matched_evidence_id IS NULL)
+                              AS unresolved_unmatched_evidence_records,
+                          MAX(updated_at) AS last_unmatched_evidence_update_at
+                   FROM canonical_ghost_unmatched_evidence_records
+                   WHERE trading_mode IN ('SCALP', 'INTRADAY_TREND')
+                   GROUP BY trading_mode"""
+            )
+            for row in cur.fetchall():
+                mode = str(row.get("trading_mode") or "").upper()
+                if mode not in empty["by_mode"]:
+                    continue
+                evidence = empty["by_mode"][mode].setdefault("evidence", {})
+                evidence.update({
+                    key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                    for key, value in dict(row).items()
+                    if key != "trading_mode"
+                })
     except Exception as exc:
         empty["db_ready"] = False
         empty["error"] = str(exc)[:180]
