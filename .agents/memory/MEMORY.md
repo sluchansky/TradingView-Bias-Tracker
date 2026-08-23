@@ -155,3 +155,4 @@
 - [Observability / eval-metrics heartbeat](observability-eval-metrics.md) — COUNTERS_LOCK never inside EVAL_METRICS_LOCK; WAIT reason is strict_reason not reason.
 - [Per-instrument structure isolation](instrument-structure-isolation.md) — suspected cross-instrument BOS/CHOCH leak DISPROVEN; all 3 structure readers share a_inst!=inst filter.
 - [Dashboard potential-plan preview](dashboard-potential-plan-preview.md) — forming-setup entry/stop/TP preview is display-only in directions[*].potential_plan; money path keys ONLY off actionable verdict + top-level trade_plan.
+- [Canonical Ghost durable evidence](canonical-ghost-durable-evidence.md) — each eligible generic SCALP/IT ghost result has one exact-ID shadow record; terminal copies are deterministic snapshots, never a new authority.

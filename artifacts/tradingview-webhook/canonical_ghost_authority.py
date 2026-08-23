@@ -884,3 +884,8 @@ def restore(records: Iterable[Mapping[str, Any]]) -> int:
 
 def get_report(limit: int = 100) -> Dict[str, Any]:
     return _DEFAULT_AUTHORITY.report(limit=limit)
+
+
+def health_report(**kwargs: Any) -> Dict[str, Any]:
+    """Return the default shadow authority's read-only health contract."""
+    return _DEFAULT_AUTHORITY.health_report(**kwargs)

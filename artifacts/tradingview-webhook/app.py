@@ -47715,11 +47715,17 @@ CANONICAL_GHOST_SHADOW_ENABLED = os.environ.get(
 CANONICAL_GHOST_SHADOW_PERSIST_ENABLED = os.environ.get(
     "CANONICAL_GHOST_SHADOW_PERSIST_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
 CANONICAL_GHOST_DB_READY = False
+CANONICAL_EVIDENCE_DB_READY = False
 try:
     import canonical_ghost_authority as _canonical_ghost_authority  # noqa: PLC0415
     _canonical_ghost_authority.configure(enabled=CANONICAL_GHOST_SHADOW_ENABLED)
 except Exception:
     _canonical_ghost_authority = None
+try:
+    from canonical_ghost_evidence import CanonicalGhostEvidence  # noqa: PLC0415
+    _canonical_ghost_evidence = CanonicalGhostEvidence(enabled=CANONICAL_GHOST_SHADOW_ENABLED)
+except Exception:
+    _canonical_ghost_evidence = None
 
 # ════════════════════════════════════════════════════════════════════════════
 # SCALP-STRATEGY ADVISORY (Main Brain "potential trades") — DISPLAY/ADVISORY ONLY
@@ -50301,9 +50307,34 @@ def _canonical_ghost_observe_submission(record):
     if not CANONICAL_GHOST_SHADOW_ENABLED or _canonical_ghost_authority is None:
         return None
     try:
-        return _canonical_ghost_authority.observe_coordinator_submission(record)
+        event = _canonical_ghost_authority.observe_coordinator_submission(record)
+        if event is not None:
+            _canonical_evidence_observe_submission(record, event)
+        return event
     except Exception as exc:
         logger.debug("canonical ghost observation (%s): %s", record.get("source_system"), exc)
+        return None
+
+
+def _canonical_evidence_observe_submission(record, canonical_event):
+    """Project an already-admitted authority observation into one shadow evidence row."""
+    if not CANONICAL_GHOST_SHADOW_ENABLED or _canonical_ghost_evidence is None:
+        return None
+    try:
+        return _canonical_ghost_evidence.observe_submission(record, canonical_event)
+    except Exception as exc:
+        logger.debug("canonical evidence observation (%s): %s", record.get("source_system"), exc)
+        return None
+
+
+def _canonical_evidence_record_outcome(canonical_event):
+    """Copy an already-copied authority terminal outcome into its evidence row."""
+    if not CANONICAL_GHOST_SHADOW_ENABLED or _canonical_ghost_evidence is None:
+        return None
+    try:
+        return _canonical_ghost_evidence.observe_outcome(canonical_event)
+    except Exception as exc:
+        logger.debug("canonical evidence outcome (%s): %s", canonical_event.get("source_record_id"), exc)
         return None
 
 
@@ -50315,7 +50346,7 @@ def _canonical_ghost_record_outcome(*, obs_key, status, close_reason,
     if not CANONICAL_GHOST_SHADOW_ENABLED or _canonical_ghost_authority is None:
         return None
     try:
-        return _canonical_ghost_authority.observe_legacy_outcome(
+        event = _canonical_ghost_authority.observe_legacy_outcome(
             source_system="generic_ghost", source_record_id=obs_key,
             raw_status=status, close_reason=close_reason,
             gross_r=gross_r, cost_r=cost_r, net_r=net_r, result_r=net_r,
@@ -50323,6 +50354,9 @@ def _canonical_ghost_record_outcome(*, obs_key, status, close_reason,
             bars_held=bars_held, event_at=event_at,
             payload=extra or {},
         )
+        if event is not None:
+            _canonical_evidence_record_outcome(event)
+        return event
     except Exception as exc:
         logger.debug("canonical ghost outcome (%s): %s", obs_key, exc)
         return None
@@ -50344,6 +50378,29 @@ def _check_canonical_ghost_db_ready():
         logger.info("Canonical Ghost Phase 1 reconciliation table ready")
     except Exception as exc:
         logger.info("Canonical Ghost Phase 1 persistence unavailable (shadow stays in-memory): %s", exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _check_canonical_evidence_db_ready():
+    """No-DDL probe for the one-record canonical evidence projection."""
+    global CANONICAL_EVIDENCE_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    conn = _learning_conn()
+    if conn is None:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM canonical_ghost_evidence_records LIMIT 1")
+            cur.fetchone()
+        CANONICAL_EVIDENCE_DB_READY = True
+        logger.info("Canonical Ghost durable evidence table ready")
+    except Exception as exc:
+        logger.info("Canonical Ghost durable evidence unavailable (shadow stays in-memory): %s", exc)
     finally:
         try:
             conn.close()
@@ -50408,6 +50465,94 @@ def _configure_canonical_ghost_persistence():
     )
 
 
+def _canonical_evidence_persist_record(record):
+    """Upsert only the shadow evidence projection; legacy ledgers are never touched."""
+    if not CANONICAL_EVIDENCE_DB_READY:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """INSERT INTO canonical_ghost_evidence_records
+                   (evidence_id, canonical_opportunity_id, canonical_observation_id,
+                    coordinator_market_opportunity_id, coordinator_observation_id,
+                    trading_mode, source_system, source_result_id, legacy_table,
+                    strategy_name, strategy_version, setup_family, instrument, timeframe,
+                    direction, signal_time, source_bar_time, entry_price, stop_price,
+                    targets, result_state, outcome_version, outcome_order_key, raw_status,
+                    raw_close_reason, normalized_outcome, gross_r, cost_r, net_r, result_r,
+                    exit_price, mfe_r, mae_r, bars_held, outcome_at, context, outcome_payload)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           NULLIF(%s,'')::timestamptz, NULLIF(%s,''),%s,%s,
+                           %s::jsonb,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,
+                           NULLIF(%s,'')::timestamptz,%s::jsonb,%s::jsonb)
+                   ON CONFLICT (trading_mode, source_system, source_result_id) DO UPDATE SET
+                       result_state = EXCLUDED.result_state,
+                       outcome_version = EXCLUDED.outcome_version,
+                       outcome_order_key = EXCLUDED.outcome_order_key,
+                       raw_status = EXCLUDED.raw_status,
+                       raw_close_reason = EXCLUDED.raw_close_reason,
+                       normalized_outcome = EXCLUDED.normalized_outcome,
+                       gross_r = EXCLUDED.gross_r,
+                       cost_r = EXCLUDED.cost_r,
+                       net_r = EXCLUDED.net_r,
+                       result_r = EXCLUDED.result_r,
+                       exit_price = EXCLUDED.exit_price,
+                       mfe_r = EXCLUDED.mfe_r,
+                       mae_r = EXCLUDED.mae_r,
+                       bars_held = EXCLUDED.bars_held,
+                       outcome_at = EXCLUDED.outcome_at,
+                       outcome_payload = EXCLUDED.outcome_payload,
+                       updated_at = NOW()
+                   WHERE EXCLUDED.outcome_order_key <> ''
+                     AND canonical_ghost_evidence_records.outcome_order_key < EXCLUDED.outcome_order_key""",
+                (record["evidence_id"], record["canonical_opportunity_id"],
+                 record["canonical_observation_id"], record["coordinator_market_opportunity_id"],
+                 record["coordinator_observation_id"], record["trading_mode"],
+                 record["source_system"], record["source_result_id"], record["legacy_table"],
+                 record["strategy_name"], record["strategy_version"], record["setup_family"],
+                 record.get("instrument"), record.get("timeframe"), record.get("direction"),
+                 record.get("signal_time") or "", record.get("source_bar_time") or "",
+                 record.get("entry_price"), record.get("stop_price"),
+                 json.dumps(record.get("targets") or []), record["result_state"],
+                 record.get("outcome_version"), record.get("outcome_order_key") or "",
+                 record.get("raw_status"), record.get("raw_close_reason"),
+                 record["normalized_outcome"], record.get("gross_r"), record.get("cost_r"),
+                 record.get("net_r"), record.get("result_r"), record.get("exit_price"),
+                 record.get("mfe_r"), record.get("mae_r"), record.get("bars_held"),
+                 record.get("outcome_at") or "", json.dumps(record.get("context") or {}),
+                 json.dumps(record.get("outcome_payload") or {})))
+        conn.commit()
+        # A no-op conflict is already durable and therefore a successful replay.
+        return True
+    except Exception as exc:
+        logger.debug("canonical evidence persistence: %s", exc)
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _configure_canonical_evidence_persistence():
+    """Attach the app-owned evidence writer only after the no-DDL probe."""
+    if _canonical_ghost_evidence is None:
+        return
+    enabled = bool(CANONICAL_GHOST_SHADOW_PERSIST_ENABLED and CANONICAL_EVIDENCE_DB_READY)
+    _canonical_ghost_evidence.configure(
+        enabled=CANONICAL_GHOST_SHADOW_ENABLED,
+        persistence_enabled=enabled,
+        persist_fn=_canonical_evidence_persist_record if enabled else None,
+    )
+
+
 def _restore_canonical_ghost_authority():
     """Rehydrate copied reconciliation events without replaying or rewriting them."""
     if not (CANONICAL_GHOST_SHADOW_PERSIST_ENABLED and CANONICAL_GHOST_DB_READY
@@ -50439,6 +50584,41 @@ def _restore_canonical_ghost_authority():
             pass
     restored = _canonical_ghost_authority.restore(rows)
     logger.info("Canonical Ghost Phase 1 restored %d reconciliation event(s)", restored)
+    return restored
+
+
+def _restore_canonical_evidence():
+    """Rehydrate only durable evidence snapshots; never replay a legacy outcome."""
+    if not (CANONICAL_GHOST_SHADOW_PERSIST_ENABLED and CANONICAL_EVIDENCE_DB_READY
+            and _canonical_ghost_evidence is not None):
+        return 0
+    conn = _learning_conn()
+    if conn is None:
+        return 0
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT evidence_id, canonical_opportunity_id, canonical_observation_id,
+                          coordinator_market_opportunity_id, coordinator_observation_id,
+                          trading_mode, source_system, source_result_id, legacy_table,
+                          strategy_name, strategy_version, setup_family, instrument, timeframe,
+                          direction, signal_time, source_bar_time, entry_price, stop_price,
+                          targets, result_state, outcome_version, outcome_order_key, raw_status,
+                          raw_close_reason, normalized_outcome, gross_r, cost_r, net_r, result_r,
+                          exit_price, mfe_r, mae_r, bars_held, outcome_at, context, outcome_payload
+                   FROM canonical_ghost_evidence_records
+                   ORDER BY created_at ASC""")
+            rows = [dict(row) for row in cur.fetchall()]
+    except Exception as exc:
+        logger.info("Canonical Ghost durable evidence restore skipped: %s", exc)
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    restored = _canonical_ghost_evidence.restore(rows)
+    logger.info("Canonical Ghost restored %d durable evidence record(s)", restored)
     return restored
 
 
@@ -50505,7 +50685,7 @@ def _reconcile_canonical_ghost_from_legacy():
             "entry": row["entry_price"], "stop": row["stop_price"], "targets": row["targets"],
             "experiment_variant": row["experiment_variant"], "context": context,
         }
-        event = _canonical_ghost_authority.observe_coordinator_submission(record)
+        event = _canonical_ghost_observe_submission(record)
         if event is not None:
             recovered += 1
         status = str(row.get("legacy_status") or "").upper()
@@ -83523,6 +83703,15 @@ def route_research_health():
         out["canonical_ghost_authority"]["persistence_db_ready"] = CANONICAL_GHOST_DB_READY
     except Exception as exc:
         out["canonical_ghost_authority"] = {"ok": False, "error": str(exc)[:180]}
+    try:
+        out["canonical_ghost_evidence"] = (
+            _canonical_ghost_evidence.report()
+            if _canonical_ghost_evidence is not None
+            else {"ok": True, "enabled": False, "reason": "module unavailable"}
+        )
+        out["canonical_ghost_evidence"]["persistence_db_ready"] = CANONICAL_EVIDENCE_DB_READY
+    except Exception as exc:
+        out["canonical_ghost_evidence"] = {"ok": False, "error": str(exc)[:180]}
     with _SCALP_SIM_WATCH_HEALTH_LOCK:
         out["scalp_live_sim_watcher"] = {
             **_SCALP_SIM_WATCH_HEALTH,
@@ -83578,14 +83767,16 @@ def _canonical_evidence_durable_health():
     reconcile, resolve, or otherwise mutate any evidence state.
     """
     empty = {
-        "db_ready": bool(CANONICAL_GHOST_DB_READY),
+        "db_ready": bool(CANONICAL_GHOST_DB_READY and CANONICAL_EVIDENCE_DB_READY),
+        "event_db_ready": bool(CANONICAL_GHOST_DB_READY),
+        "evidence_db_ready": bool(CANONICAL_EVIDENCE_DB_READY),
         "error": None,
         "by_mode": {
             "SCALP": {},
             "INTRADAY_TREND": {},
         },
     }
-    if not (CANONICAL_GHOST_DB_READY and LEARNING_DB_ENABLED):
+    if not (CANONICAL_GHOST_DB_READY and CANONICAL_EVIDENCE_DB_READY and LEARNING_DB_ENABLED):
         return empty
     conn = _learning_conn()
     if conn is None:
@@ -83635,6 +83826,27 @@ def _canonical_evidence_durable_health():
                     for key, value in dict(row).items()
                 }
                 empty["by_mode"][mode]["legacy"] = legacy
+            cur.execute(
+                """SELECT trading_mode,
+                          COUNT(*) AS durable_evidence_records,
+                          COUNT(*) FILTER (WHERE result_state = 'TERMINAL')
+                              AS terminal_evidence_records,
+                          COUNT(*) FILTER (WHERE result_state <> 'TERMINAL')
+                              AS open_evidence_records,
+                          MAX(updated_at) AS last_evidence_update_at
+                   FROM canonical_ghost_evidence_records
+                   WHERE trading_mode IN ('SCALP', 'INTRADAY_TREND')
+                   GROUP BY trading_mode"""
+            )
+            for row in cur.fetchall():
+                mode = str(row.get("trading_mode") or "").upper()
+                if mode not in empty["by_mode"]:
+                    continue
+                empty["by_mode"][mode]["evidence"] = {
+                    key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                    for key, value in dict(row).items()
+                    if key != "trading_mode"
+                }
     except Exception as exc:
         empty["db_ready"] = False
         empty["error"] = str(exc)[:180]
@@ -83690,6 +83902,11 @@ def route_canonical_evidence_health():
         )
         report["persistence_error"] = durable.get("error")
         report["persistence_db_ready"] = bool(durable.get("db_ready"))
+        report["evidence_projection"] = (
+            _canonical_ghost_evidence.report()
+            if _canonical_ghost_evidence is not None
+            else {"ok": True, "enabled": False, "reason": "module unavailable"}
+        )
         return jsonify(report)
     except Exception as exc:
         return jsonify({
@@ -87061,8 +87278,11 @@ if __name__ == "__main__":
         _configure_ghost_coordinator_persistence() # optional shadow-only storage boundary; default OFF
         _restore_ghost_coordinator()               # restores coordinator evidence only when persistence is explicitly enabled
         _check_canonical_ghost_db_ready()          # probe append-only canonical reconciliation sidecar (no DDL)
+        _check_canonical_evidence_db_ready()       # probe one-record canonical evidence projection (no DDL)
         _configure_canonical_ghost_persistence()   # optional shadow-only storage boundary; default OFF
+        _configure_canonical_evidence_persistence() # optional exact evidence storage boundary; default OFF
         _restore_canonical_ghost_authority()       # restores copied evidence only; never replays outcomes
+        _restore_canonical_evidence()              # restores evidence snapshots only; never replays outcomes
         _reconcile_canonical_ghost_from_legacy()   # exact obs_key recovery for transient sidecar persistence failures
         _check_gre_db_ready()                      # probe ghost_opportunities/experiments/results (no DDL; created via DB tool/publish diff) — PHASE 2 GHOST RESEARCH ENGINE, RESEARCH/DISPLAY-ONLY
         _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
