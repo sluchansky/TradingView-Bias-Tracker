@@ -3291,15 +3291,21 @@ _EXECUTION_PROVIDER_LABELS = {
     "pickmytrade": "PickMyTrade",
 }
 
-# Runtime override — set via POST /execution/set-mode; takes precedence over env.
-# Resets to None on server restart (fail-closed: env var wins on cold boot).
+# Runtime override — set via POST /execution/set-mode; normally takes precedence
+# over env.  An explicit EXECUTION_MODE=disabled deployment pin always wins, so a
+# persisted live override cannot reactivate routing during a safety republish.
 _EXECUTION_MODE_RUNTIME_OVERRIDE = None  # type: str | None
 _EXECUTION_MODE_OVERRIDE_LOCK = threading.Lock()
+
+def _execution_mode_is_pinned_disabled():
+    """True only for an explicit deployment-wide disabled execution boundary."""
+    return _EXECUTION_MODE_RAW == "disabled"
 
 def resolve_execution_mode():
     """Resolve the active execution mode (fail-closed).
 
-    Priority: runtime override → env var → 'disabled'.
+    Priority: explicit disabled deployment pin → runtime override → env var →
+    'disabled'.
     FAIL-CLOSED invariant: if EXECUTION_MODE is missing, blank, or unrecognised,
     the resolved mode is 'disabled' — no execution is authorised at all.
     The presence of a webhook URL NEVER enables live execution; only an explicit
@@ -3307,6 +3313,8 @@ def resolve_execution_mode():
     'paper' simulates execution; 'disabled' blocks all execution (gateway 409).
     Mode comparisons are case-insensitive (raw value is lowercased at load time).
     """
+    if _execution_mode_is_pinned_disabled():
+        return "disabled"
     with _EXECUTION_MODE_OVERRIDE_LOCK:
         override = _EXECUTION_MODE_RUNTIME_OVERRIDE
     if override in _VALID_EXECUTION_MODES:
@@ -3320,6 +3328,8 @@ def _configured_execution_mode():
     """Return the explicitly configured raw value, or None if unset / invalid.
     Used for audit/status reporting; callers must use resolve_execution_mode() for
     actual execution decisions."""
+    if _execution_mode_is_pinned_disabled():
+        return "disabled"
     with _EXECUTION_MODE_OVERRIDE_LOCK:
         override = _EXECUTION_MODE_RUNTIME_OVERRIDE
     if override in _VALID_EXECUTION_MODES:
@@ -12661,6 +12671,19 @@ def _restore_execution_enabled_from_db():
     Called at boot AFTER _probe_execution_arm_audit_table() succeeds.
     Fail-open: any error leaves execution_enabled=False (safe default).
     """
+    # A disabled deployment is an explicit execution boundary, not merely a
+    # presentation mode.  Never let a historical audit "enable" re-arm the
+    # software switch during this boot.  The audit record remains untouched, so
+    # the normal operator-controlled restore behavior is still available after
+    # a later, explicit change to a live-capable execution mode.
+    if resolve_execution_mode() == "disabled":
+        with _ARM_STATE_LOCK:
+            _ARM_STATE["execution_enabled"] = False
+        logger.info(
+            "execution_enabled boot default: False "
+            "(EXECUTION_MODE=disabled; audit restore suppressed)"
+        )
+        return
     if not EXECUTION_ARM_AUDIT_DB_READY:
         return
     try:
@@ -41748,6 +41771,7 @@ def _restore_market_state_from_db():
     - Restored READY state is intentionally NOT restored — only new post-restart
       market evidence can create an actionable READY event.
     FAIL-OPEN throughout."""
+    global _EXECUTION_MODE_RUNTIME_OVERRIDE, TRADING_MODE
     if not MARKET_STATE_CACHE_DB_READY:
         return
     restored_cvd = restored_vol = restored_tp = restored_auto = restored_alerts = 0
@@ -41828,13 +41852,20 @@ def _restore_market_state_from_db():
 
     # ── Execution gateway mode override (PERSIST ACROSS RESTARTS) ────────────
     try:
-        global _EXECUTION_MODE_RUNTIME_OVERRIDE, TRADING_MODE
-        data = _load_market_state("exec_mode_override")
-        saved_mode = (data or {}).get("mode", "")
-        if saved_mode in _VALID_EXECUTION_MODES:
+        if _execution_mode_is_pinned_disabled():
             with _EXECUTION_MODE_OVERRIDE_LOCK:
-                _EXECUTION_MODE_RUNTIME_OVERRIDE = saved_mode
-            logger.info("Market-state restore: execution mode=%s (from cache)", saved_mode)
+                _EXECUTION_MODE_RUNTIME_OVERRIDE = None
+            logger.info(
+                "Market-state restore: execution mode override suppressed "
+                "(EXECUTION_MODE=disabled)"
+            )
+        else:
+            data = _load_market_state("exec_mode_override")
+            saved_mode = (data or {}).get("mode", "")
+            if saved_mode in _VALID_EXECUTION_MODES:
+                with _EXECUTION_MODE_OVERRIDE_LOCK:
+                    _EXECUTION_MODE_RUNTIME_OVERRIDE = saved_mode
+                logger.info("Market-state restore: execution mode=%s (from cache)", saved_mode)
     except Exception as exc:
         logger.debug("Exec mode restore fail-open: %s", exc)
 
@@ -61743,7 +61774,8 @@ def execution_set_mode_route():
     Accepts: { "mode": "paper" | "traderspost" | "pickmytrade" | "manual_only" | "disabled" }
 
     The runtime override takes precedence over the EXECUTION_MODE env var until
-    the server restarts (fail-closed: env var wins on cold boot).
+    the server restarts, except an explicit disabled deployment pin which cannot
+    be overridden at runtime.
 
     Returns:
       200  { status: "ok", effective_mode: "<mode>", runtime_override: true }
@@ -61757,6 +61789,11 @@ def execution_set_mode_route():
             "status": "error",
             "reason": f"Unknown mode {mode!r}. Valid: {sorted(_VALID_EXECUTION_MODES)}",
         }), 400
+    if _execution_mode_is_pinned_disabled() and mode != "disabled":
+        return jsonify({
+            "status": "error",
+            "reason": "Execution mode is pinned disabled by this deployment.",
+        }), 409
     by = str(data.get("by") or "operator")[:100]
     with _EXECUTION_MODE_OVERRIDE_LOCK:
         prev = _EXECUTION_MODE_RUNTIME_OVERRIDE
@@ -61767,7 +61804,7 @@ def execution_set_mode_route():
     )
     return jsonify({
         "status":           "ok",
-        "effective_mode":   mode,
+        "effective_mode":   resolve_execution_mode(),
         "previous_mode":    prev,
         "runtime_override": True,
         "note":             "Override persisted to DB — survives restarts.",

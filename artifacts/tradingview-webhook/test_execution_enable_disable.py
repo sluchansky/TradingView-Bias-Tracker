@@ -733,7 +733,7 @@ class TestEnableDisableHelpers(unittest.TestCase):
 
 
 class TestRestoreExecutionEnabled(unittest.TestCase):
-    """_restore_execution_enabled_from_db: correct behavior when DB is unavailable."""
+    """_restore_execution_enabled_from_db: only restores when execution is active."""
 
     def setUp(self):
         _reset()
@@ -748,6 +748,123 @@ class TestRestoreExecutionEnabled(unittest.TestCase):
                 self.assertFalse(APP._ARM_STATE["execution_enabled"])
         finally:
             APP.EXECUTION_ARM_AUDIT_DB_READY = orig
+
+    def test_disabled_mode_suppresses_historical_enable_without_reading_db(self):
+        """A disabled republish must ignore an older persisted enable action."""
+        orig_ready = APP.EXECUTION_ARM_AUDIT_DB_READY
+        try:
+            APP.EXECUTION_ARM_AUDIT_DB_READY = True
+            with APP._ARM_STATE_LOCK:
+                APP._ARM_STATE["execution_enabled"] = True
+            with unittest.mock.patch.object(APP, "_EXECUTION_MODE_RAW", "disabled"), \
+                 unittest.mock.patch.object(APP, "_EXECUTION_MODE_RUNTIME_OVERRIDE", None), \
+                 unittest.mock.patch.object(
+                     APP,
+                     "get_db_connection",
+                     side_effect=AssertionError("disabled boot must not read arm audit"),
+                 ):
+                APP._restore_execution_enabled_from_db()
+            with APP._ARM_STATE_LOCK:
+                self.assertFalse(APP._ARM_STATE["execution_enabled"])
+        finally:
+            APP.EXECUTION_ARM_AUDIT_DB_READY = orig_ready
+
+    def test_live_mode_still_restores_a_persisted_enable(self):
+        """The safety suppression is limited to disabled deployments."""
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def execute(self, *_args):
+                return None
+
+            @staticmethod
+            def fetchone():
+                return ("enable",)
+
+        class Connection:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            @staticmethod
+            def cursor():
+                return Cursor()
+
+            @staticmethod
+            def close():
+                return None
+
+        orig_ready = APP.EXECUTION_ARM_AUDIT_DB_READY
+        try:
+            APP.EXECUTION_ARM_AUDIT_DB_READY = True
+            with unittest.mock.patch.object(APP, "_EXECUTION_MODE_RAW", "traderspost"), \
+                 unittest.mock.patch.object(APP, "_EXECUTION_MODE_RUNTIME_OVERRIDE", None), \
+                 unittest.mock.patch.object(APP, "get_db_connection", return_value=Connection()):
+                APP._restore_execution_enabled_from_db()
+            with APP._ARM_STATE_LOCK:
+                self.assertTrue(APP._ARM_STATE["execution_enabled"])
+        finally:
+            APP.EXECUTION_ARM_AUDIT_DB_READY = orig_ready
+
+    def test_disabled_boot_blocks_persisted_live_override_after_arm_restore(self):
+        """Boot order cannot re-enable routing from an older mode override."""
+        orig_arm_ready = APP.EXECUTION_ARM_AUDIT_DB_READY
+        orig_cache_ready = APP.MARKET_STATE_CACHE_DB_READY
+        try:
+            APP.EXECUTION_ARM_AUDIT_DB_READY = True
+            APP.MARKET_STATE_CACHE_DB_READY = True
+            with unittest.mock.patch.object(APP, "_EXECUTION_MODE_RAW", "disabled"), \
+                 unittest.mock.patch.object(APP, "_EXECUTION_MODE_RUNTIME_OVERRIDE", None), \
+                 unittest.mock.patch.object(
+                     APP,
+                     "get_db_connection",
+                     side_effect=AssertionError("disabled boot must not restore arm audit"),
+                 ), \
+                 unittest.mock.patch.object(
+                     APP,
+                     "_load_market_state",
+                     return_value={"mode": "traderspost"},
+                 ) as load_state:
+                # These calls occur in production boot order.  An old audit
+                # enable and an old live mode override must both remain inert.
+                with APP._ARM_STATE_LOCK:
+                    APP._ARM_STATE["execution_enabled"] = True
+                APP._restore_execution_enabled_from_db()
+                APP._restore_market_state_from_db()
+
+                with APP._ARM_STATE_LOCK:
+                    self.assertFalse(APP._ARM_STATE["execution_enabled"])
+                with APP._EXECUTION_MODE_OVERRIDE_LOCK:
+                    self.assertIsNone(APP._EXECUTION_MODE_RUNTIME_OVERRIDE)
+                self.assertEqual(APP.resolve_execution_mode(), "disabled")
+                self.assertEqual(APP._configured_execution_mode(), "disabled")
+                self.assertNotIn(
+                    "exec_mode_override",
+                    [call.args[0] for call in load_state.call_args_list],
+                )
+        finally:
+            APP.EXECUTION_ARM_AUDIT_DB_READY = orig_arm_ready
+            APP.MARKET_STATE_CACHE_DB_READY = orig_cache_ready
+
+    def test_disabled_deployment_rejects_live_runtime_mode_change(self):
+        """A deployment pin cannot be bypassed through the owner runtime route."""
+        with unittest.mock.patch.object(APP, "_EXECUTION_MODE_RAW", "disabled"), \
+             unittest.mock.patch.object(APP, "_EXECUTION_MODE_RUNTIME_OVERRIDE", None), \
+             unittest.mock.patch.object(APP, "_save_market_state") as save_state:
+            response = _client().post(
+                "/execution/set-mode",
+                json={"mode": "traderspost", "by": "test"},
+                headers={"Content-Type": "application/json"},
+            )
+        self.assertEqual(response.status_code, 409)
+        self.assertIn("pinned disabled", response.get_json()["reason"])
+        save_state.assert_not_called()
 
 
 # Allow running as a script as well as via pytest

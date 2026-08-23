@@ -62,3 +62,11 @@ ARM returns 409 RC_EXECUTION_DISABLED if `execution_enabled=False` (checked befo
 **Why:** Security-first ordering. The preflight check (mode, contracts, etc.) shouldn't run until the basic software switch is on.
 
 **How to apply:** Any test that calls the `/execution/arm` route must call `/execution/enable` first (or mock `_ARM_STATE["execution_enabled"] = True`). Rate limiter (`_ARM_RATE_LIMIT`) must be cleared in setUp when tests call /execution/arm in rapid succession.
+
+## Explicit disabled deployment pin
+
+When `EXECUTION_MODE=disabled` is explicitly configured for a deployment, it is authoritative over both the persisted arm-audit enable state and any persisted runtime execution-mode override. Boot must leave the software switch off, clear the in-memory override, and reject an attempted live runtime-mode change without saving it.
+
+**Why:** Market-state restore runs after arm-audit restore. Without this priority rule, an older `traderspost` or `pickmytrade` override can reappear late in boot and silently re-open a live-capable route during a safety republish.
+
+**How to apply:** Treat a disabled deployment as a durable operational boundary, not a UI state. Verify cold boot logs show both restore suppressions and verify `/execution/state` reports `effective_mode=disabled`, `execution_enabled=false`, `armed=false`, and no runtime mode override.

@@ -31,7 +31,15 @@ echo "[prod-start] launching Flask webhook server on :8000"
 # workspace, which shares the same Discord webhook secrets (avoids double alerts).
 # ANALYSIS_BOT_FORWARD_URL mirrors every inbound /webhook to the analysis bot on
 # :8001 (fire-and-forget; default-OFF when unset). It is set ONLY here in prod.
-PORT=8000 DISCORD_LIVE=1 ANALYSIS_BOT_FORWARD_URL=http://localhost:8001/webhook PYTHONUNBUFFERED=1 .pythonlibs/bin/python3 artifacts/tradingview-webhook/app.py &
+# Republish posture: execution stays disabled even if the deployment environment
+# or persisted arm audit still has an older enabled value.  Canonical Ghost
+# remains a shadow-only intake/persistence lane; coordinator fan-out stays off.
+PORT=8000 DISCORD_LIVE=1 ANALYSIS_BOT_FORWARD_URL=http://localhost:8001/webhook \
+  EXECUTION_MODE=disabled MANUAL_ORDER_ENABLED=0 LIVE_RUNNER_ENABLED=0 \
+  CENTRAL_GHOST_COORDINATOR_ENABLED=1 CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED=0 \
+  CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED=1 \
+  CANONICAL_GHOST_SHADOW_ENABLED=1 CANONICAL_GHOST_SHADOW_PERSIST_ENABLED=1 \
+  PYTHONUNBUFFERED=1 .pythonlibs/bin/python3 artifacts/tradingview-webhook/app.py &
 FLASK_PID=$!
 
 echo "[prod-start] launching Express /api proxy on :8080"
