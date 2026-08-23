@@ -429,6 +429,10 @@ export const BOT1_ROUTES = [
   // existing coordinator + generic ghost lifecycle. Read-only, shadow-only,
   // owner-only, and never a gate, outcome resolver, or execution surface.
   "/canonical-ghost-report",
+  // Canonical Evidence Health — aggregate SELECT-only operational telemetry for
+  // SCALP and INTRADAY_TREND. Read-only, shadow-only, owner-only, and never a
+  // gate, outcome resolver, strategy, risk, broker, or execution surface.
+  "/canonical-evidence-health",
   // Research Operations panel — lightweight aggregated status for GRE/FVG/SCALP/IT
   // engines: observation counts, evidence-state breakdown, READY_FOR_REVIEW queue.
   // DISPLAY-ONLY; owner-only; NOT in OPEN_PATHS. Never touches gate or execution.

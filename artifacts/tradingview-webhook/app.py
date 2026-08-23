@@ -83571,6 +83571,135 @@ def route_canonical_ghost_report():
         return jsonify({"ok": False, "error": str(exc)[:180]}), 500
 
 
+def _canonical_evidence_durable_health():
+    """Read-only durable health supplement for Canonical Ghost reporting.
+
+    This intentionally uses aggregate SELECTs only.  It does not restore,
+    reconcile, resolve, or otherwise mutate any evidence state.
+    """
+    empty = {
+        "db_ready": bool(CANONICAL_GHOST_DB_READY),
+        "error": None,
+        "by_mode": {
+            "SCALP": {},
+            "INTRADAY_TREND": {},
+        },
+    }
+    if not (CANONICAL_GHOST_DB_READY and LEARNING_DB_ENABLED):
+        return empty
+    conn = _learning_conn()
+    if conn is None:
+        empty["error"] = "database connection unavailable"
+        return empty
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT trading_mode,
+                          COUNT(*) AS durable_event_count,
+                          MAX(created_at) AS last_successful_write_at,
+                          MAX(created_at) FILTER (
+                              WHERE event_type IN ('OBSERVED', 'OUTCOME_RESOLVED')
+                          ) AS last_reconciliation_at,
+                          COUNT(*) FILTER (WHERE event_type = 'OBSERVED')
+                              AS persisted_observations,
+                          COUNT(*) FILTER (WHERE event_type = 'OUTCOME_RESOLVED')
+                              AS persisted_outcomes
+                   FROM canonical_ghost_reconciliation_events
+                   WHERE trading_mode IN ('SCALP', 'INTRADAY_TREND')
+                   GROUP BY trading_mode"""
+            )
+            for row in cur.fetchall():
+                mode = str(row.get("trading_mode") or "").upper()
+                if mode not in empty["by_mode"]:
+                    continue
+                empty["by_mode"][mode] = {
+                    key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                    for key, value in dict(row).items()
+                }
+            cur.execute(
+                """SELECT trading_mode,
+                          COUNT(*) AS records,
+                          COUNT(*) FILTER (WHERE closed_at IS NULL) AS open_records,
+                          MAX(created_at) AS last_created_at,
+                          MAX(closed_at) AS last_closed_at
+                   FROM ghost_observations
+                   WHERE trading_mode IN ('SCALP', 'INTRADAY_TREND')
+                   GROUP BY trading_mode"""
+            )
+            for row in cur.fetchall():
+                mode = str(row.get("trading_mode") or "").upper()
+                if mode not in empty["by_mode"]:
+                    continue
+                legacy = {
+                    key: (value.isoformat() if hasattr(value, "isoformat") else value)
+                    for key, value in dict(row).items()
+                }
+                empty["by_mode"][mode]["legacy"] = legacy
+    except Exception as exc:
+        empty["db_ready"] = False
+        empty["error"] = str(exc)[:180]
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return empty
+
+
+@app.route("/canonical-evidence-health", methods=["GET"])
+def route_canonical_evidence_health():
+    """Canonical Ghost operational health (GET-only, shadow-only).
+
+    This is an observability contract, not a qualification or execution
+    contract.  All database access below is aggregate SELECT-only telemetry.
+    """
+    try:
+        if _canonical_ghost_authority is None:
+            return jsonify({
+                "ok": True,
+                "contract_version": 1,
+                "read_only": True,
+                "shadow_only": True,
+                "health_status": "UNAVAILABLE",
+                "canonical_modes": ["SCALP", "INTRADAY_TREND"],
+                "strat_lab_included": False,
+                "reason": "module unavailable",
+            })
+        coordinator_report = {}
+        if _ghost_coordinator is not None:
+            try:
+                coordinator_report = _ghost_coordinator.get_report(limit=1)
+            except Exception:
+                coordinator_report = {}
+        durable = _canonical_evidence_durable_health()
+        legacy_report = {
+            "by_mode": {
+                mode: (values.get("legacy") or {})
+                for mode, values in durable.get("by_mode", {}).items()
+            }
+        }
+        report = _canonical_ghost_authority.health_report(
+            coordinator_report=coordinator_report,
+            durable_report=durable,
+            legacy_report=legacy_report,
+            overdue_after_minutes=240,
+        )
+        report["persistence_state"] = (
+            "READY" if durable.get("db_ready") and not durable.get("error")
+            else "UNAVAILABLE"
+        )
+        report["persistence_error"] = durable.get("error")
+        report["persistence_db_ready"] = bool(durable.get("db_ready"))
+        return jsonify(report)
+    except Exception as exc:
+        return jsonify({
+            "ok": False,
+            "read_only": True,
+            "shadow_only": True,
+            "error": str(exc)[:180],
+        }), 500
+
+
 @app.route("/ghost-research/health", methods=["GET"])
 def route_ghost_research_health():
     """Ghost Research Engine operational health — Phase 2 (DISPLAY-ONLY).

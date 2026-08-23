@@ -134,3 +134,185 @@ def test_failed_persistence_is_visible_and_retried():
     assert authority.report()["pending_persistence_events"] == 0
     assert authority.report()["persistence_errors"] >= 1
     assert len(persisted) == 1
+
+
+def test_health_report_has_honest_empty_per_mode_state():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    health = authority.health_report(now="2026-08-23T16:00:00+00:00")
+
+    assert health["read_only"] is True
+    assert health["shadow_only"] is True
+    assert health["strat_lab_included"] is False
+    assert health["health_status"] == "NO_DATA"
+    assert health["by_mode"]["SCALP"]["status"] == "NO_DATA"
+    assert health["by_mode"]["INTRADAY_TREND"]["status"] == "NO_DATA"
+    assert health["reconciliation"]["exact_id_match_coverage"] is None
+
+
+def test_health_report_counts_duplicates_unresolved_and_overdue_without_resolving():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    authority.observe_coordinator_submission(_record())
+    authority.observe_coordinator_submission(_record())
+
+    health = authority.health_report(
+        now="2026-08-23T20:00:00+00:00",
+        overdue_after_minutes=60,
+    )
+    scalp = health["by_mode"]["SCALP"]
+    assert scalp["intake_volume"] == 1
+    assert scalp["duplicate_count"] == 1
+    assert scalp["deduplication_rate"] == 50.0
+    assert scalp["unresolved_observations"] == 1
+    assert scalp["stale_observations"] == 1
+    assert scalp["overdue_observations"] == 1
+    assert scalp["status"] == "ATTENTION"
+
+
+def test_health_report_measures_exact_id_agreement_and_disagreement():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    authority.observe_coordinator_submission(_record())
+    authority.observe_coordinator_submission(
+        _record(
+            source_system="scalp_live_sim",
+            source_event_id="sim-1",
+            context={"trading_mode": "SCALP", "legacy_record_id": "sim-1"},
+        )
+    )
+    authority.observe_legacy_outcome(
+        source_system="generic_ghost",
+        source_record_id="ghost|MNQ|Long|STRAT|20260823|1",
+        raw_status="win",
+        result_r=1.0,
+    )
+    authority.observe_legacy_outcome(
+        source_system="scalp_live_sim",
+        source_record_id="sim-1",
+        raw_status="loss",
+        result_r=-1.0,
+    )
+
+    health = authority.health_report(now="2026-08-23T16:00:00+00:00")
+    scalp = health["by_mode"]["SCALP"]
+    assert scalp["exact_id_match_count"] == 1
+    assert scalp["exact_id_unmatched_count"] == 0
+    assert scalp["exact_id_match_coverage"] == 100.0
+    assert scalp["outcome_comparison_count"] == 1
+    assert scalp["outcome_disagreement_count"] == 1
+    assert health["outcomes"]["disagreement_count"] == 1
+
+
+def test_health_report_exposes_persistence_failure_without_mutating_evidence():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    authority.configure(enabled=True, persistence_enabled=True, persist_fn=lambda _row: False)
+    authority.observe_coordinator_submission(_record())
+
+    health = authority.health_report(now="2026-08-23T16:00:00+00:00")
+    scalp = health["by_mode"]["SCALP"]
+    assert scalp["persistence_errors"] >= 1
+    assert scalp["pending_persistence_events"] == 1
+    assert health["persistence"]["pending_events"] == 1
+    assert health["health_status"] == "ATTENTION"
+    assert authority.report()["unique_canonical_observations"] == 1
+
+
+def test_health_report_keeps_strategy_lab_out_of_canonical_outcome_authority():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    assert authority.observe_coordinator_submission(
+        _record(context={"trading_mode": "STRATEGY_LAB", "legacy_obs_key": "lab-only"})
+    ) is None
+
+    health = authority.health_report(now="2026-08-23T16:00:00+00:00")
+    assert health["strat_lab_included"] is False
+    assert health["intake_volume"] == 0
+    assert health["ignored_noncanonical_events"] == 1
+
+
+def test_health_report_restores_durable_exact_id_matches_after_restart():
+    persisted = []
+    first = cga.CanonicalGhostAuthority(enabled=True)
+    first.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda row: persisted.append(dict(row)) or True,
+    )
+    first.observe_coordinator_submission(_record())
+    first.observe_coordinator_submission(
+        _record(
+            source_system="scalp_live_sim",
+            source_event_id="sim-restore",
+            context={"trading_mode": "SCALP", "legacy_record_id": "sim-restore"},
+        )
+    )
+    first.observe_legacy_outcome(
+        source_system="generic_ghost",
+        source_record_id="ghost|MNQ|Long|STRAT|20260823|1",
+        raw_status="win",
+        result_r=1.0,
+    )
+    first.observe_legacy_outcome(
+        source_system="scalp_live_sim",
+        source_record_id="sim-restore",
+        raw_status="win",
+        result_r=1.0,
+    )
+
+    restarted = cga.CanonicalGhostAuthority(enabled=True)
+    assert restarted.restore(persisted) == 4
+    health = restarted.health_report(
+        now="2026-08-23T16:00:00+00:00",
+        durable_report={
+            "db_ready": True,
+            "by_mode": {
+                "SCALP": {
+                    "durable_event_count": 4,
+                    "last_successful_write_at": "2026-08-23T15:00:00+00:00",
+                    "last_reconciliation_at": "2026-08-23T15:00:00+00:00",
+                },
+                "INTRADAY_TREND": {},
+            },
+        },
+    )
+    scalp = health["by_mode"]["SCALP"]
+    assert scalp["exact_id_match_count"] == 1
+    assert scalp["exact_id_match_coverage"] == 100.0
+    assert scalp["outcome_agreement_count"] == 1
+    assert scalp["persistence_writes"] == 4
+    assert health["persistence"]["durable_persisted_events"] == 4
+
+
+def test_health_report_restores_durable_unmatched_exact_id_reference_after_restart():
+    persisted = []
+    first = cga.CanonicalGhostAuthority(enabled=True)
+    first.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda row: persisted.append(dict(row)) or True,
+    )
+    assert first.observe_coordinator_submission(
+        _record(
+            source_system="scalp_live_sim",
+            source_event_id="sim-unmatched-restore",
+            context={
+                "trading_mode": "SCALP",
+                "legacy_record_id": "sim-unmatched-restore",
+            },
+        )
+    ) is None
+    assert persisted[0]["event_type"] == "REFERENCE_UNMATCHED"
+
+    restarted = cga.CanonicalGhostAuthority(enabled=True)
+    assert restarted.restore(persisted) == 1
+    health = restarted.health_report(
+        durable_report={
+            "db_ready": True,
+            "by_mode": {
+                "SCALP": {"durable_event_count": 1},
+                "INTRADAY_TREND": {},
+            },
+        }
+    )
+    scalp = health["by_mode"]["SCALP"]
+    assert scalp["exact_id_match_count"] == 0
+    assert scalp["exact_id_unmatched_count"] == 1
+    assert scalp["exact_id_match_coverage"] == 0.0
+    assert scalp["exact_id_coverage_scope"] == "append_only_exact_id_reference_events"

@@ -4412,6 +4412,65 @@ const TrainingStat: React.FC<{ label: string; value: React.ReactNode; color?: st
   </div>
 );
 
+const CanonicalEvidenceHealthPanel: React.FC<{
+  mode: string;
+  health: JsonRecord | null;
+}> = ({ mode, health }) => {
+  const byMode = (health?.by_mode ?? {}) as Record<string, JsonRecord>;
+  const lane = byMode[mode] ?? null;
+  const persistence = (health?.persistence ?? {}) as JsonRecord;
+  const reconciliation = (health?.reconciliation ?? {}) as JsonRecord;
+  const outcomes = (health?.outcomes ?? {}) as JsonRecord;
+  const staleAfter = safeNum(health?.stale_after_minutes);
+  const status = safeStr(lane?.status ?? health?.health_status, 'UNAVAILABLE');
+  const statusColor = status === 'HEALTHY' ? T.green
+    : status === 'ATTENTION' ? T.amber : T.txtMuted;
+  const exactCoverage = safeNum(lane?.exact_id_match_coverage);
+  const lastWrite = fmtAge(lane?.last_successful_write_at ?? persistence.last_successful_write_at) || '—';
+  const lastReconciliation = fmtAge(lane?.last_reconciliation_at ?? reconciliation.last_reconciliation_at) || '—';
+
+  return (
+    <Panel
+      title="Canonical Evidence Health"
+      badge={<Badge label={`${status} · SHADOW ONLY`} color={statusColor} />}
+      style={{ marginBottom: 12 }}
+    >
+      {!health || !lane ? (
+        <UnavailableNote msg="Canonical evidence health is unavailable. This never changes qualification, outcomes, or execution." />
+      ) : (
+        <>
+          <div style={{ marginBottom: 10, color: T.txtSec, fontSize: 10, lineHeight: 1.45 }}>
+            Exact-ID reconciliation for <strong style={{ color: T.cyan }}>{mode}</strong>. Generic ghost remains the outcome authority; Strategy Lab is excluded.
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(6, minmax(0, 1fr))', gap: 7 }} className="mb-training-stats">
+            <TrainingStat label="Intake" value={safeNum(lane.intake_volume) ?? 0} />
+            <TrainingStat label="Unique" value={safeNum(lane.unique_canonical_opportunities) ?? 0} color={T.cyan} />
+            <TrainingStat label="Duplicates" value={safeNum(lane.duplicate_count) ?? 0} color={safeNum(lane.duplicate_count) ? T.amber : T.txtPri} />
+            <TrainingStat label="Unresolved" value={safeNum(lane.unresolved_observations) ?? 0} color={safeNum(lane.unresolved_observations) ? T.amber : T.green} />
+            <TrainingStat label="Overdue" value={safeNum(lane.overdue_observations) ?? 0} color={safeNum(lane.overdue_observations) ? T.red : T.green} />
+            <TrainingStat label="Disagrees" value={safeNum(lane.outcome_disagreement_count) ?? 0} color={safeNum(lane.outcome_disagreement_count) ? T.red : T.green} />
+          </div>
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 14, marginTop: 11 }} className="mb-grid-2">
+            <div>
+              <KV label="Exact-ID match coverage" value={exactCoverage == null ? 'No comparison references' : `${exactCoverage}%`} valueColor={exactCoverage == null || exactCoverage === 100 ? T.green : T.amber} />
+              <KV label="Matched / unmatched" value={`${safeNum(lane.exact_id_match_count) ?? 0} / ${safeNum(lane.exact_id_unmatched_count) ?? 0}`} mono />
+              <KV label="Agreement / compared" value={`${safeNum(lane.outcome_agreement_count) ?? 0} / ${safeNum(lane.outcome_comparison_count) ?? 0}`} mono />
+            </div>
+            <div>
+              <KV label="Persistence" value={safeStr(health.persistence_state, 'IN-MEMORY')} valueColor={health.persistence_state === 'READY' ? T.green : T.amber} />
+              <KV label="Pending writes / errors" value={`${safeNum(lane.pending_persistence_events) ?? 0} / ${safeNum(lane.persistence_errors) ?? 0}`} valueColor={safeNum(lane.persistence_errors) ? T.red : T.txtPri} mono />
+              <KV label="Last write / reconcile" value={`${lastWrite} / ${lastReconciliation}`} />
+            </div>
+          </div>
+          <div style={{ marginTop: 10, fontSize: 9.5, color: T.txtMuted }}>
+            Overdue means unresolved for more than {staleAfter ?? '—'} minutes. This panel reads evidence only; it cannot route, resolve, size, gate, or execute.
+          </div>
+        </>
+      )}
+    </Panel>
+  );
+};
+
 const TrainingLanePanel: React.FC<{
   lane: 'scalp' | 'intraday';
   authHeader: string;
@@ -4425,17 +4484,19 @@ const TrainingLanePanel: React.FC<{
     settlement: JsonRecord | null;
     coordinator: JsonRecord | null;
     researchHealth: JsonRecord | null;
+    canonicalHealth: JsonRecord | null;
     loadedAt: number | null;
-  }>({ modeReport: null, strategyReport: null, opportunities: null, settlement: null, coordinator: null, researchHealth: null, loadedAt: null });
+  }>({ modeReport: null, strategyReport: null, opportunities: null, settlement: null, coordinator: null, researchHealth: null, canonicalHealth: null, loadedAt: null });
 
   const load = React.useCallback(async () => {
-    const [modeReportRaw, strategyReportRaw, opportunities, settlement, coordinator, researchHealth] = await Promise.all([
+    const [modeReportRaw, strategyReportRaw, opportunities, settlement, coordinator, researchHealth, canonicalHealth] = await Promise.all([
       getReadOnlyJson(`/api/gate-effectiveness/mode-report?mode=${encodeURIComponent(mode)}`, authHeader),
       getReadOnlyJson(`/api/gate-effectiveness/strategy-report?mode=${encodeURIComponent(mode)}`, authHeader),
       getReadOnlyJson(`/api/gate-effectiveness/opportunities?mode=${encodeURIComponent(mode)}&days=7`, authHeader),
       getReadOnlyJson('/api/gate-effectiveness/settlement-health', authHeader),
       getReadOnlyJson('/api/research-coordinator-report?limit=25', authHeader),
       getReadOnlyJson('/api/research-health', authHeader),
+      getReadOnlyJson('/api/canonical-evidence-health', authHeader),
     ]);
     setData({
       modeReport: (modeReportRaw?.report as JsonRecord | undefined) ?? null,
@@ -4444,6 +4505,7 @@ const TrainingLanePanel: React.FC<{
       settlement,
       coordinator,
       researchHealth,
+      canonicalHealth,
       loadedAt: Date.now(),
     });
   }, [authHeader, mode]);
@@ -4476,6 +4538,7 @@ const TrainingLanePanel: React.FC<{
       <TrainingReadOnlyBanner>
         {config.description} Legacy writers and outcome resolvers remain authoritative; coordinator fan-out is not controlled here.
       </TrainingReadOnlyBanner>
+      <CanonicalEvidenceHealthPanel mode={mode} health={data.canonicalHealth} />
 
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, margin: '2px 0 12px' }}>
         <h1 style={{ margin: 0, fontSize: 20, letterSpacing: '0.06em' }}>{config.label}</h1>
