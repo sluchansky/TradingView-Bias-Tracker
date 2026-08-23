@@ -239,6 +239,44 @@ PostgreSQL custom-format dumps that can be restored on Windows or another
 PostgreSQL host. It does not start the application, change a source database,
 or invoke an execution route.
 
+## 11. Republish and restart durability guard
+
+PostgreSQL is the persistent external state boundary. The trading database
+contains the durable trading, research, ghost/coordinator, journal, strategy,
+and operator-state evidence. The Git checkout, process memory, runtime caches,
+logs, and temporary files are ephemeral; a republish may replace those without
+replacing PostgreSQL.
+
+Before starting a Windows copy or publishing the Replit app, run the
+source-only policy check from the repository root:
+
+```powershell
+py -3.11 scripts\persistence_guard.py --source-only --source-root .
+```
+
+The Replit development workflow and production supervisor also run the full
+guard before startup. Its database portion uses SELECT-only access to confirm
+the configured `DATABASE_URL` reconnects to an existing non-template
+PostgreSQL database with a populated `public` catalog. It does not create a
+database, apply a migration, alter a schema, write a row, or expose the
+connection string. The source check rejects destructive/non-idempotent boot
+schema SQL and data-writing automatic migrations; it intentionally leaves
+normal event-driven research observation persistence available after startup.
+
+For every Replit Publish:
+
+1. Confirm the deployment still references the existing PostgreSQL database.
+2. Review the proposed Publish schema diff.
+3. Approve only additive, reviewed schema changes.
+4. Do not select any overwrite-data option.
+5. After startup, confirm the persistence guard and evidence-health checks.
+
+The guard protects normal startup/deploy schema code and automatic migrations.
+It cannot prevent normal event-driven application persistence, an operator
+from explicitly running destructive SQL, the `push-force` command, or
+restoring over a live database. Those destructive operations are outside the
+safe republish process and must never target the live evidence database.
+
 ### Safety rules
 
 - Run the backup command with the correct source database URL available only in

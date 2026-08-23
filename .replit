@@ -45,7 +45,7 @@ outputType = "console"
 
 [[workflows.workflow.tasks]]
 task = "shell.exec"
-args = "EXECUTION_MODE=disabled MANUAL_ORDER_ENABLED=0 LIVE_RUNNER_ENABLED=0 /home/runner/workspace/.pythonlibs/bin/python3 artifacts/tradingview-webhook/app.py"
+args = "EXECUTION_MODE=disabled MANUAL_ORDER_ENABLED=0 LIVE_RUNNER_ENABLED=0 /home/runner/workspace/.pythonlibs/bin/python3 scripts/persistence_guard.py --source-root /home/runner/workspace --database-url-env DATABASE_URL && EXECUTION_MODE=disabled MANUAL_ORDER_ENABLED=0 LIVE_RUNNER_ENABLED=0 /home/runner/workspace/.pythonlibs/bin/python3 artifacts/tradingview-webhook/app.py"
 
 [[workflows.workflow]]
 name = "parity"

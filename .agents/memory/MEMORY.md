@@ -18,6 +18,7 @@
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.
 - [Production deployment topology](deployment-topology.md) — deploy as one Reserved VM; api-server prod build/run supervises Flask+Express; static `home` artifact serves `/`; target chosen in Publish UI.
 - [App-side DB convention: INSERT/SELECT only](db-app-insert-select-only.md) — app.py runs NO DDL; boot does no-DDL readiness probe + `*_DB_READY` flag; new tables via database tool (dev) + Publish schema-diff (prod).
+- [PostgreSQL startup durability guard](postgres-startup-durability-guard.md) — automatic SQL migrations are allowlisted to idempotent table/index creation; guard probes the existing DB read-only before service start.
 - [Market State Cache persistence](market-state-cache-persistence.md) — market_state_cache table persists CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY; freshness windows guard restores; READY intentionally NOT restored.
 - [Edge Score, grades & session bonus](edge-score-card-block.md) — EDGE_COMPONENTS BOS20/CHOCH20/VWAP15/Sweep15/Volume15/CVD15/Session10 = max110; grade ≥85A+/≥70A/≥50B/<50 WAIT; zone scores 0 so CHOCH-absent edge caps ~50.
 - [CVD hard filter + RVOL→Volume component](cvd-rvol-filter.md) — CVD = HARD fail-open directional veto; RVOL feeds Volume +15 (≥~1.5), NOT a standalone modifier; ceiling 110; display via alert_diagnostics.

@@ -29,6 +29,42 @@ All four must pass before any change is considered complete.
 ### Database
 Managed via Replit's built-in PostgreSQL. App boots with a no-DDL readiness probe; new tables must be created via the database tool (dev) or a re-publish schema diff (prod). The app never runs DDL at boot.
 
+### PostgreSQL durability and republish safety
+PostgreSQL is persistent external state. Trading history, research evidence,
+ghost/coordinator observations, journals, strategy records, and persisted
+operator state live in PostgreSQL and must survive a process restart,
+republish, or redeploy. The checkout, Python process memory, runtime caches,
+logs, and temporary files are ephemeral and must never be treated as the
+database.
+
+The development webhook workflow and `scripts/prod-start.sh` run the
+read-only `scripts/persistence_guard.py` before starting services. It checks
+that boot schema SQL is non-destructive/idempotent and that automatic SQL
+migrations contain no data-writing statements, then reconnects to the
+configured non-template PostgreSQL database using SELECT-only access. The
+guard itself never creates a database, changes a schema, writes rows, or
+prints a connection string. It deliberately does not block normal,
+event-driven application persistence such as live research observations.
+Run the source-only portion before publishing:
+
+```bash
+python scripts/persistence_guard.py --source-only --source-root .
+```
+
+Before clicking Publish, confirm the deployment still points at the existing
+PostgreSQL database, review the Publish schema diff, and do **not** choose any
+overwrite-data option. A normal republish reconnects to the existing database;
+it does not restore from the checkout or recreate PostgreSQL. Schema changes
+must be additive and reviewed through the Publish flow.
+
+The guard does not disable normal event-driven research persistence,
+intentional operator CRUD routes, test-fixture cleanup, or an explicitly run
+backup restore against a separately created test database. Those are separate
+application or operator actions, not destructive migration/startup
+initialization.
+Never run `push-force`, `pg_restore`, or a destructive SQL command against the
+live development or production database as part of publishing.
+
 ### Deployment
 Single Reserved VM deployment. The `api-server` prod build supervises Flask + Express. The `home` artifact serves the operator dashboard at `/`. Deploy via Replit Publish UI (not `pnpm run build` alone).
 

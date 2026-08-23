@@ -48,6 +48,77 @@ export const MIGRATIONS_DIR: string = findMigrationsDir(
   dirname(fileURLToPath(import.meta.url)),
 );
 
+/**
+ * Migrations run automatically on every API-server boot. Keep this policy
+ * narrower than a general-purpose migration framework: schema creation must be
+ * idempotent and migrations may not mutate or destroy persistent data.
+ */
+export function assertMigrationIsNonDestructive(sql: string, file: string): void {
+  const normalized = sql
+    .replace(/\/\*[\s\S]*?\*\//g, " ")
+    .replace(/--[^\r\n]*/g, " ");
+  const violations: string[] = [];
+  if (
+    /\bDROP\s+(?:DATABASE|SCHEMA|TABLE|INDEX|VIEW|MATERIALIZED\s+VIEW|SEQUENCE|TYPE|FUNCTION|PROCEDURE|TRIGGER|RULE|DOMAIN)\b/i.test(
+      normalized,
+    )
+  ) {
+    violations.push("DROP");
+  }
+  if (/\bTRUNCATE\b/i.test(normalized)) {
+    violations.push("TRUNCATE");
+  }
+  if (/\bCREATE\s+DATABASE\b/i.test(normalized)) {
+    violations.push("CREATE DATABASE");
+  }
+  if (
+    /\b(?:INSERT\s+INTO|UPDATE\s+\w+|DELETE\s+FROM|MERGE\s+INTO|COPY\s+\w+\s+FROM)\b/i.test(
+      normalized,
+    )
+  ) {
+    violations.push("data-writing SQL");
+  }
+  if (/\bALTER\s+(?:TABLE|SCHEMA|TYPE|DOMAIN|FUNCTION|PROCEDURE)\b/i.test(normalized)) {
+    violations.push("ALTER requires an explicit idempotency review");
+  }
+  if (/\bDO\s+(?:\$|\bBEGIN\b)/i.test(normalized)) {
+    violations.push("procedural DO block");
+  }
+  if (/\bCREATE\s+TABLE\b(?!\s+IF\s+NOT\s+EXISTS\b)/i.test(normalized)) {
+    violations.push("CREATE TABLE without IF NOT EXISTS");
+  }
+  if (/\bCREATE\s+(?:UNIQUE\s+)?INDEX\b(?!\s+IF\s+NOT\s+EXISTS\b)/i.test(normalized)) {
+    violations.push("CREATE INDEX without IF NOT EXISTS");
+  }
+  if (/\bCREATE\s+SCHEMA\b(?!\s+IF\s+NOT\s+EXISTS\b)/i.test(normalized)) {
+    violations.push("CREATE SCHEMA without IF NOT EXISTS");
+  }
+  if (
+    /\bCREATE\s+(?:OR\s+REPLACE\s+)?(?:MATERIALIZED\s+VIEW|SEQUENCE|TYPE|VIEW|EXTENSION|FUNCTION|PROCEDURE|TRIGGER|RULE|DOMAIN|AGGREGATE|COLLATION|CAST|OPERATOR)\b/i.test(
+      normalized,
+    )
+  ) {
+    violations.push("unapproved CREATE");
+  }
+  for (const statement of normalized.split(";")) {
+    if (
+      statement.trim() &&
+      !/^\s*CREATE\s+(?:TABLE|(?:UNIQUE\s+)?INDEX)\s+IF\s+NOT\s+EXISTS\b/i.test(
+        statement,
+      )
+    ) {
+      violations.push("unapproved automatic migration statement");
+    }
+  }
+  if (violations.length > 0) {
+    throw new Error(
+      `Migration ${file} violates the non-destructive persistence policy: ${[
+        ...new Set(violations),
+      ].join(", ")}`,
+    );
+  }
+}
+
 export async function runMigrations(): Promise<void> {
   let files: string[];
   try {
@@ -63,10 +134,20 @@ export async function runMigrations(): Promise<void> {
     return;
   }
 
+  const migrations: Array<{ file: string; sql: string }> = [];
+  for (const file of files) {
+    const sql = await readFile(join(MIGRATIONS_DIR, file), "utf-8");
+    assertMigrationIsNonDestructive(sql, file);
+    migrations.push({ file, sql });
+  }
+  logger.info(
+    { count: migrations.length },
+    "migrate: all migrations passed non-destructive policy",
+  );
+
   const client = await pool.connect();
   try {
-    for (const file of files) {
-      const sql = await readFile(join(MIGRATIONS_DIR, file), "utf-8");
+    for (const { file, sql } of migrations) {
       logger.info({ file }, "migrate: applying");
       await client.query(sql);
       logger.info({ file }, "migrate: applied");

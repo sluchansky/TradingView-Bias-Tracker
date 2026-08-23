@@ -24,7 +24,12 @@ vi.mock("../logger", () => ({
 }));
 
 // Import AFTER mocking so the module picks up the stubs
-import { findMigrationsDir, MIGRATIONS_DIR, runMigrations } from "../migrate";
+import {
+  assertMigrationIsNonDestructive,
+  findMigrationsDir,
+  MIGRATIONS_DIR,
+  runMigrations,
+} from "../migrate";
 import { pool as mockPool } from "@workspace/db";
 
 // Compute stable path anchors from this test file's location.
@@ -120,5 +125,43 @@ describe("runMigrations", () => {
     mockClient.query.mockRejectedValue(new Error("DB error"));
     await expect(runMigrations()).rejects.toThrow("DB error");
     expect(mockClient.release).toHaveBeenCalledOnce();
+  });
+});
+
+describe("assertMigrationIsNonDestructive", () => {
+  it("accepts idempotent schema creation", () => {
+    expect(() =>
+      assertMigrationIsNonDestructive(
+        "CREATE TABLE IF NOT EXISTS evidence (id SERIAL PRIMARY KEY); " +
+          "CREATE INDEX IF NOT EXISTS evidence_id_idx ON evidence (id);",
+        "safe.sql",
+      ),
+    ).not.toThrow();
+  });
+
+  it.each([
+    "DROP TABLE evidence;",
+    "TRUNCATE evidence;",
+    "DELETE FROM evidence;",
+    "UPDATE evidence SET value = 1;",
+    "CREATE TABLE evidence (id INT);",
+    "CREATE INDEX evidence_idx ON evidence (id);",
+    "ALTER TABLE evidence DROP COLUMN value;",
+    "DROP VIEW evidence_view;",
+    "DROP TYPE evidence_type;",
+    "DROP SEQUENCE evidence_seq;",
+    "CREATE FUNCTION refresh() RETURNS void AS $$ BEGIN END; $$ LANGUAGE plpgsql;",
+    "CREATE MATERIALIZED VIEW evidence_mv AS SELECT 1;",
+    "DO $$ BEGIN RAISE NOTICE 'unsafe'; END $$;",
+    'UPDATE "evidence" SET value = 1;',
+    'COPY "evidence" FROM \'/tmp/evidence.csv\';',
+    "DROP EXTENSION hstore;",
+    "DROP FOREIGN TABLE remote_evidence;",
+    "DROP OWNED BY app_user;",
+    "SELECT 1;",
+  ])("rejects unsafe migration SQL: %s", (sql) => {
+    expect(() => assertMigrationIsNonDestructive(sql, "unsafe.sql")).toThrow(
+      /non-destructive persistence policy/,
+    );
   });
 });

@@ -18,6 +18,13 @@ set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
+echo "[prod-start] verifying PostgreSQL persistence and startup safety"
+if ! PYTHONUNBUFFERED=1 .pythonlibs/bin/python3 scripts/persistence_guard.py \
+  --source-root "$ROOT" --database-url-env DATABASE_URL; then
+  echo "[prod-start] persistence guard blocked startup; no child process launched" >&2
+  exit 1
+fi
+
 echo "[prod-start] launching Flask webhook server on :8000"
 # DISCORD_LIVE=1 marks this as the single live sender so the time-based Discord
 # schedulers (heartbeat / EOD / weekly / trade-ready) run here and NOT in the dev

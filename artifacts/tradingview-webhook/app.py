@@ -16953,7 +16953,7 @@ def _check_learning_eligibility(instrument, mode=None):
     return (elig.get("status") or "NO_RESEARCH_OPINION"), elig.get("rule_triggered")
 
 
-def _recompute_learning_eligibility(conn):
+def _recompute_learning_eligibility(conn, persist=True):
     """Compute per-instrument live-eligibility from strategy_trades and persist to
     learning_eligibility. Swaps LEARNING_ELIGIBILITY cache atomically. Called from
     _recompute_learning (same connection reused for reads; FAIL-OPEN)."""
@@ -17086,42 +17086,44 @@ def _recompute_learning_eligibility(conn):
             if r.get("trade_label"):
                 today_labels[r["trade_label"]] = int(r.get("cnt") or 0)
 
-        # Persist to learning_eligibility
-        try:
-            wconn = _learning_conn()
-            if wconn is not None:
-                with wconn.cursor() as wc:
-                    for inst, e in new_elig.items():
-                        wc.execute(
-                            """INSERT INTO learning_eligibility
-                                   (instrument, status, rule_triggered, sample_size,
-                                    expectancy, last_20_avg_r, win_rate, tp1_hit_rate, last_updated)
-                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                               ON CONFLICT (instrument) DO UPDATE SET
-                                   status=EXCLUDED.status, rule_triggered=EXCLUDED.rule_triggered,
-                                   sample_size=EXCLUDED.sample_size, expectancy=EXCLUDED.expectancy,
-                                   last_20_avg_r=EXCLUDED.last_20_avg_r, win_rate=EXCLUDED.win_rate,
-                                   tp1_hit_rate=EXCLUDED.tp1_hit_rate, last_updated=NOW()""",
-                            (inst, e["status"], e["rule_triggered"], e["sample_size"],
-                             e["expectancy"], e["last_20_avg_r"], e["win_rate"], e["tp1_hit_rate"]))
-                    for inst, setups in disabled_by_inst.items():
-                        for s in setups:
+        # Persist derived eligibility only after a real post-trade recompute.
+        # Startup rebuilds the same in-memory state without rewriting records.
+        if persist:
+            try:
+                wconn = _learning_conn()
+                if wconn is not None:
+                    with wconn.cursor() as wc:
+                        for inst, e in new_elig.items():
                             wc.execute(
-                                """INSERT INTO learning_setup_rules
-                                       (instrument, setup_key, status, rule_reason,
-                                        sample_size, win_rate, expectancy, last_updated)
-                                   VALUES (%s,%s,'DISABLED',%s,%s,%s,%s,NOW())
-                                   ON CONFLICT (instrument, setup_key) DO UPDATE SET
-                                       status='DISABLED', rule_reason=EXCLUDED.rule_reason,
-                                       sample_size=EXCLUDED.sample_size, win_rate=EXCLUDED.win_rate,
-                                       expectancy=EXCLUDED.expectancy, last_updated=NOW()""",
-                                (inst, s["setup_key"],
-                                 "WR=%.0f%% Exp=%+.2fR n=%d" % (s["win_rate"]*100, s["expectancy"], s["sample_size"]),
-                                 s["sample_size"], s["win_rate"], s["expectancy"]))
-                wconn.commit()
-                wconn.close()
-        except Exception as exc:
-            logger.debug("learning_eligibility persist skip: %s", exc)
+                                """INSERT INTO learning_eligibility
+                                       (instrument, status, rule_triggered, sample_size,
+                                        expectancy, last_20_avg_r, win_rate, tp1_hit_rate, last_updated)
+                                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                                   ON CONFLICT (instrument) DO UPDATE SET
+                                       status=EXCLUDED.status, rule_triggered=EXCLUDED.rule_triggered,
+                                       sample_size=EXCLUDED.sample_size, expectancy=EXCLUDED.expectancy,
+                                       last_20_avg_r=EXCLUDED.last_20_avg_r, win_rate=EXCLUDED.win_rate,
+                                       tp1_hit_rate=EXCLUDED.tp1_hit_rate, last_updated=NOW()""",
+                                (inst, e["status"], e["rule_triggered"], e["sample_size"],
+                                 e["expectancy"], e["last_20_avg_r"], e["win_rate"], e["tp1_hit_rate"]))
+                        for inst, setups in disabled_by_inst.items():
+                            for s in setups:
+                                wc.execute(
+                                    """INSERT INTO learning_setup_rules
+                                           (instrument, setup_key, status, rule_reason,
+                                            sample_size, win_rate, expectancy, last_updated)
+                                       VALUES (%s,%s,'DISABLED',%s,%s,%s,%s,NOW())
+                                       ON CONFLICT (instrument, setup_key) DO UPDATE SET
+                                           status='DISABLED', rule_reason=EXCLUDED.rule_reason,
+                                           sample_size=EXCLUDED.sample_size, win_rate=EXCLUDED.win_rate,
+                                           expectancy=EXCLUDED.expectancy, last_updated=NOW()""",
+                                    (inst, s["setup_key"],
+                                     "WR=%.0f%% Exp=%+.2fR n=%d" % (s["win_rate"]*100, s["expectancy"], s["sample_size"]),
+                                     s["sample_size"], s["win_rate"], s["expectancy"]))
+                    wconn.commit()
+                    wconn.close()
+            except Exception as exc:
+                logger.debug("learning_eligibility persist skip: %s", exc)
 
         with LEARNING_ELIGIBILITY_LOCK:
             LEARNING_ELIGIBILITY.clear()
@@ -17166,10 +17168,15 @@ def _boot_purge_test_trades():
             except Exception: pass
 
 
-def _recompute_learning():
+def _recompute_learning(persist_derived_state=True, normalize_historical_symbols=True):
     """Recompute per-strategy analytics + bounded weights from strategy_trades and
-    swap the in-memory caches atomically. Also persists strategy_weights for
-    continuity/inspection. FAIL-OPEN; runs at startup and every Nth close."""
+    swap the in-memory caches atomically.
+
+    Post-trade recomputes persist derived learning state for continuity and
+    inspection. Startup warmup passes persist_derived_state=False so a restart
+    only reads durable evidence and rebuilds in-memory caches; it never rewrites
+    historical symbols or derived rows merely because the process restarted.
+    """
     global LEARNING_ANALYTICS, GOVERNOR_STATS, PER_MODE_STATS
     if not LEARNING_DB_ENABLED:
         return
@@ -17181,40 +17188,40 @@ def _recompute_learning():
         conn = _learning_conn()
         if conn is None:
             return
-        # ── One-shot boot migration: normalize any raw TV continuous-contract
-        # symbols (e.g. MGC1!, MNQ1!) to canonical names (MGC, MNQ) so the
-        # per-instrument eligibility lookup keys always match. Idempotent:
-        # after the first run no rows satisfy the WHERE clause.
-        try:
-            mig_cur = conn.cursor()
-            mig_cur.execute("""
-                UPDATE strategy_trades
-                SET symbol = CASE symbol
-                    WHEN 'MGC1!' THEN 'MGC'
-                    WHEN 'MGC2!' THEN 'MGC'
-                    WHEN 'MNQ1!' THEN 'MNQ'
-                    WHEN 'MNQ2!' THEN 'MNQ'
-                    WHEN 'MES1!' THEN 'MES'
-                    WHEN 'MES2!' THEN 'MES'
-                    WHEN 'MYM1!' THEN 'MYM'
-                    WHEN 'MYM2!' THEN 'MYM'
-                    WHEN 'GC1!'  THEN 'MGC'
-                    WHEN 'NQ1!'  THEN 'MNQ'
-                    ELSE symbol
-                END
-                WHERE symbol LIKE '%!'
-            """)
-            if mig_cur.rowcount:
-                logger.info("symbol migration: normalized %d strategy_trades rows",
-                            mig_cur.rowcount)
-            conn.commit()
-            mig_cur.close()
-        except Exception as _mig_exc:
-            logger.warning("symbol migration skipped: %s", _mig_exc)
+        # Historical symbol normalization is an explicit maintenance operation,
+        # never an automatic restart side effect. Normal read paths already
+        # canonicalize continuous-contract symbols for eligibility lookups.
+        if normalize_historical_symbols:
             try:
-                conn.rollback()
-            except Exception:
-                pass
+                mig_cur = conn.cursor()
+                mig_cur.execute("""
+                    UPDATE strategy_trades
+                    SET symbol = CASE symbol
+                        WHEN 'MGC1!' THEN 'MGC'
+                        WHEN 'MGC2!' THEN 'MGC'
+                        WHEN 'MNQ1!' THEN 'MNQ'
+                        WHEN 'MNQ2!' THEN 'MNQ'
+                        WHEN 'MES1!' THEN 'MES'
+                        WHEN 'MES2!' THEN 'MES'
+                        WHEN 'MYM1!' THEN 'MYM'
+                        WHEN 'MYM2!' THEN 'MYM'
+                        WHEN 'GC1!'  THEN 'MGC'
+                        WHEN 'NQ1!'  THEN 'MNQ'
+                        ELSE symbol
+                    END
+                    WHERE symbol LIKE '%!'
+                """)
+                if mig_cur.rowcount:
+                    logger.info("symbol normalization: updated %d strategy_trades rows",
+                                mig_cur.rowcount)
+                conn.commit()
+                mig_cur.close()
+            except Exception as _mig_exc:
+                logger.warning("symbol normalization skipped: %s", _mig_exc)
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT COALESCE(trading_mode, 'UNKNOWN') AS trading_mode,
@@ -17387,29 +17394,30 @@ def _recompute_learning():
             "updated_at": now_utc().isoformat(),
         }
 
-        try:
-            wconn = _learning_conn()
-            if wconn is not None:
-                bh = best_hours[0]["hour_et"] if best_hours else None
-                br = best_conditions[0]["regime"] if best_conditions else None
-                with wconn.cursor() as wc:
-                    for r in ranking:
-                        wc.execute("""
-                            INSERT INTO strategy_weights
-                                (strategy_key, weight, sample_size, win_rate, profit_factor,
-                                 avg_r, best_hour_et, best_regime, trend, updated_at)
-                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                            ON CONFLICT (strategy_key) DO UPDATE SET
-                                weight=EXCLUDED.weight, sample_size=EXCLUDED.sample_size,
-                                win_rate=EXCLUDED.win_rate, profit_factor=EXCLUDED.profit_factor,
-                                avg_r=EXCLUDED.avg_r, best_hour_et=EXCLUDED.best_hour_et,
-                                best_regime=EXCLUDED.best_regime, trend=EXCLUDED.trend,
-                                updated_at=NOW()
-                        """, (r["strategy_key"], r["weight"], r["n"], r["win_rate"] / 100.0,
-                              r["profit_factor"], r["avg_r"], bh, br, trend["label"]))
-                wconn.close()
-        except Exception as exc:
-            logger.debug("strategy_weights upsert skip: %s", exc)
+        if persist_derived_state:
+            try:
+                wconn = _learning_conn()
+                if wconn is not None:
+                    bh = best_hours[0]["hour_et"] if best_hours else None
+                    br = best_conditions[0]["regime"] if best_conditions else None
+                    with wconn.cursor() as wc:
+                        for r in ranking:
+                            wc.execute("""
+                                INSERT INTO strategy_weights
+                                    (strategy_key, weight, sample_size, win_rate, profit_factor,
+                                     avg_r, best_hour_et, best_regime, trend, updated_at)
+                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                                ON CONFLICT (strategy_key) DO UPDATE SET
+                                    weight=EXCLUDED.weight, sample_size=EXCLUDED.sample_size,
+                                    win_rate=EXCLUDED.win_rate, profit_factor=EXCLUDED.profit_factor,
+                                    avg_r=EXCLUDED.avg_r, best_hour_et=EXCLUDED.best_hour_et,
+                                    best_regime=EXCLUDED.best_regime, trend=EXCLUDED.trend,
+                                    updated_at=NOW()
+                            """, (r["strategy_key"], r["weight"], r["n"], r["win_rate"] / 100.0,
+                                   r["profit_factor"], r["avg_r"], bh, br, trend["label"]))
+                    wconn.close()
+            except Exception as exc:
+                logger.debug("strategy_weights upsert skip: %s", exc)
 
         # ── Learning Engine v2 (display-only) caches: governor aggregates + memory ──
         gov_by_strategy = {r["strategy_key"]: {"n": int(r["n"] or 0), "win_rate": _f(r["win_rate"])}
@@ -17473,7 +17481,7 @@ def _recompute_learning():
 
         # ── Rule Engine: per-instrument live-eligibility (reads same conn; fail-open) ──
         try:
-            _recompute_learning_eligibility(conn)
+            _recompute_learning_eligibility(conn, persist=persist_derived_state)
         except Exception as _le_exc:
             logger.warning("learning_eligibility recompute skip: %s", _le_exc)
 
@@ -86593,7 +86601,8 @@ if __name__ == "__main__":
         _check_trade_mgmt_db_ready()               # probe trade_management_metrics (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
         _check_session_quality_db_ready()          # probe session_quality_grades (no DDL; created via DB tool/publish diff) — DISPLAY/ANALYTICS
         _check_scalp_research_db_ready()           # probe scalp_strategy_library/research (no DDL; created via DB tool/publish diff) — RESEARCH/DISPLAY-ONLY
-        _seed_scalp_library()                      # idempotent catalog seed (INSERT ON CONFLICT; refreshes descriptions, NEVER live_status)
+        # Catalog seeding is an explicit maintenance action, never a republish
+        # side effect. The persisted catalog remains readable for research UI.
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
         _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
@@ -86832,7 +86841,13 @@ if __name__ == "__main__":
         threading.Timer(0, _heartbeat_eval_loop).start()  # periodic market re-eval (diagnostics-only; no Discord) — runs on dev + prod
     if LEARNING_DB_ENABLED:
         # (test_p6_* rows are kept in strategy_trades and excluded from LRE counts via SQL filter)
-        threading.Thread(target=_recompute_learning, daemon=True).start()  # warm the learning cache from Postgres at boot (display-only)
+        threading.Thread(
+            target=lambda: _recompute_learning(
+                persist_derived_state=False,
+                normalize_historical_symbols=False,
+            ),
+            daemon=True,
+        ).start()  # warm the learning cache from Postgres without rewriting evidence
         threading.Thread(target=_load_last_report, daemon=True).start()    # warm the last performance report from Postgres at boot (display-only)
         threading.Thread(target=_recompute_main_brain_review, daemon=True).start()  # warm the Main Brain review cache from Postgres at boot (display-only)
         threading.Thread(target=_main_brain_resolver_loop, name="main-brain-resolver", daemon=True).start()  # resolve pending WAIT hypotheses (display-only)
