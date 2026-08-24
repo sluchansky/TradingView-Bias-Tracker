@@ -16,6 +16,7 @@ from urllib.parse import urlparse
 from flask import Flask, request, jsonify, Response, send_file
 import requests
 from structure_dedup import STRUCTURE_DEDUP, STRUCTURE_TYPES as _SD_STRUCTURE_TYPES
+from structure_state import resolve_structure_cycle
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -9776,10 +9777,10 @@ def _active_ticker():
 # gate (evaluate_strict_setup) and the displayed Edge Score (compute_edge_breakdown)
 # can never diverge.
 # ── Weighted Edge Score components (single source of truth for gate AND display).
-#    Each component is a boolean confluence keyed by EDGE_COMPONENTS[*][0]; the score
-#    is the pure additive sum of the points for every component present, clamped to
-#    EDGE_SCORE_MAX. Structure is split into two independent components (BOS +20 and
-#    CHOCH +20) so a setup carrying BOTH is scored higher than one with only one.
+#    Each component is keyed by EDGE_COMPONENTS[*][0]; the score is the pure additive
+#    sum of its points, clamped to EDGE_SCORE_MAX. Market structure is ONE capped
+#    allocation per active BOS/CHOCH cycle: a CHOCH candidate contributes +20 and a
+#    same-direction BOS confirms the cycle at its capped +40 allocation.
 #    Volume is a first-class +15 component (a recent volume-spike alert OR RVOL >=
 #    the mode's RVOL_CONFIRM_THRESHOLD). Zone mitigation and confirmation candle no
 #    longer SCORE (zone stays a SWING hard gate + a location input; the confirmation
@@ -9787,8 +9788,7 @@ def _active_ticker():
 #    +/-5/+10 modifier no longer feed the score — volatility is informational + a
 #    SWING hard gate only. ──
 EDGE_COMPONENTS = (
-    ("bos_confirmed",     "BOS Confirmed",       20),
-    ("choch_confirmed",   "CHOCH Confirmed",     20),
+    ("structure_allocation", "Market Structure", 40),
     ("vwap_confirmed",    "VWAP Confirmation",   15),
     ("liquidity_sweep",   "Liquidity Sweep",     15),
     ("volume_confirmed",  "Volume Confirmation", 15),
@@ -9799,7 +9799,7 @@ EDGE_COMPONENTS = (
     ("preferred_session", "Session Bonus",       10),
 )
 # Maximum possible Edge Score = the sum of every component above
-# (20+20+15+15+15+15+10 = 110). The score is the pure additive sum of the
+# (40+15+15+15+15+10 = 110). The score is the pure additive sum of the
 # confluences present, clamped to this ceiling; no soft modifiers raise it.
 EDGE_SCORE_MAX = 110
 EDGE_READY_THRESHOLD = 70   # default minimum Edge Score for a READY setup (mode-tunable)
@@ -9854,9 +9854,11 @@ def order_flow_edge_adjustment(order_flow, direction):
 
 def compute_trade_edge_components(signals, modifiers=None):
     """THE Edge Score — additive sum of the weighted confluence components
-    (BOS+20, CHOCH+20, VWAP+15, Sweep+15, Volume+15, CVD+15, Session+10 = max 110),
+    (one state-aware structure cycle at +20/+40, VWAP+15, Sweep+15, Volume+15,
+    CVD+15, Session+10 = max 110),
     optionally reduced by SOFT negative `modifiers`, then clamped to [0, EDGE_SCORE_MAX].
-    `signals` is a dict of booleans keyed by EDGE_COMPONENTS[*][0]. `modifiers` is an
+    `signals` is a dict keyed by EDGE_COMPONENTS[*][0]. All are booleans except
+    structure_allocation, which is a bounded 0/20/40 value. `modifiers` is an
     optional list of signed {"label", "points"} dicts. SCALP soft penalties remain
     negative; a live order-flow read can add a bounded direction-aware adjustment in
     either direction. Volatility and RVOL do not feed the score (volume is a
@@ -9866,8 +9868,16 @@ def compute_trade_edge_components(signals, modifiers=None):
     gate and display layer so the gate score and the shown Edge Score are identical."""
     breakdown = []
     for key, label, pts in EDGE_COMPONENTS:
-        if signals.get(key):
-            breakdown.append({"label": label, "points": pts})
+        value = signals.get(key)
+        if key == "structure_allocation":
+            try:
+                earned = max(0, min(pts, int(value or 0)))
+            except (TypeError, ValueError):
+                earned = 0
+        else:
+            earned = pts if value else 0
+        if earned:
+            breakdown.append({"label": label, "points": earned})
     base    = sum(item["points"] for item in breakdown)
     mod_sum = sum(int(m.get("points") or 0) for m in (modifiers or []) if m)
     score   = max(0, min(EDGE_SCORE_MAX, base + mod_sum))
@@ -9981,6 +9991,23 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     has_bos_supply   = bos_sup_ts is not None
     has_choch_demand = choch_dem_ts is not None
     has_choch_supply = choch_sup_ts is not None
+    # Resolve BOS / CHOCH as one ordered, per-instrument state machine instead of
+    # four independent booleans. The conventional detector semantics stay intact:
+    # CHOCH begins a reversal candidate; BOS confirms it (or continues a standing
+    # trend). Only a confirmed ACTIVE cycle may satisfy the strict structure gate
+    # or receive the single +20 Edge allocation. This is mode-agnostic, so SCALP
+    # and INTRADAY_TREND consume the identical contract.
+    structure_state = resolve_structure_cycle(
+        recent, inst, now=now_utc(), window_minutes=int(stage_window or 20)
+    )
+    _structure_state_direction = structure_state.get("direction")
+    _structure_state_confirmed = bool(structure_state.get("confirmed"))
+    structure_cycle_long = bool(
+        _structure_state_confirmed and _structure_state_direction == "Long"
+    )
+    structure_cycle_short = bool(
+        _structure_state_confirmed and _structure_state_direction == "Short"
+    )
     # The "Confirmation Candle" indicator marks a shape on EVERY 5m bar, so a plain
     # presence check is almost always true and makes the confirmation gate
     # meaningless. Require the confirmation to have closed AFTER the same-direction
@@ -10002,9 +10029,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     price_above = bool(vwap_ok and current_price > vwap)
     price_below = bool(vwap_ok and current_price < vwap)
 
-    # ── Swing-structure alerts (HH/HL bullish, LH/LL bearish) — shared & ticker-
-    #    scoped at ingestion like CHOCH/BOS. ANY ONE structure signal in the trade
-    #    direction now satisfies the structure gate (no longer BOS *and* CHOCH). ──
+    # ── Swing-structure alerts (HH/HL bullish, LH/LL bearish) — retained as
+    #    observability evidence only. They do not replace a confirmed BOS/CHOCH
+    #    cycle at the score/gate seam: a pivot sequence is not a broken level. ──
     hh_ts = _latest_ts("HH"); hl_ts = _latest_ts("HL")
     lh_ts = _latest_ts("LH"); ll_ts = _latest_ts("LL")
     # ── Structure-reversal demote (SCALP-only, flag-gated, MONEY PATH) ──────────
@@ -10063,8 +10090,8 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                         _STRUCTURE_DEMOTE_COUNTS["short"] += 1
                 except Exception:
                     pass
-    structure_long  = bool(has_bos_demand or has_choch_demand or hh_ts or hl_ts)
-    structure_short = bool(has_bos_supply or has_choch_supply or lh_ts or ll_ts)
+    structure_long  = structure_cycle_long
+    structure_short = structure_cycle_short
 
     # ── Market Intelligence structure fallback (T003; flag-gated, FAIL-CLOSED) ──
     # A STRONG, persistent, multi-confirmation one-sided directional confidence MAY
@@ -10149,9 +10176,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             logger.warning("MI structure fallback error (fail-closed): %s", _mi_exc)
             structure_fallback_long = structure_fallback_short = False
     # Gate-side structure boolean (native OR confidence fallback) + a per-side source
-    # tag for /status + the trade card. The native structure_long/short vars stay
-    # UNTOUCHED so the Edge Score, conflict timestamps, trend-memory scoring and the
-    # MI component display all keep reading real structure only.
+    # tag for /status + the trade card. The native structure_long/short vars are
+    # state-machine confirmed cycles only, so no provisional CHOCH can accidentally
+    # score or satisfy one mode's gate while being merely display evidence elsewhere.
     structure_gate_long  = bool(structure_long  or structure_fallback_long)
     structure_gate_short = bool(structure_short or structure_fallback_short)
     structure_source_long  = ("confidence_fallback"
@@ -10353,14 +10380,18 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     # ── Unified additive Edge Score per direction (single source of truth shared
     #    with the display layer via compute_trade_edge_components). ──
     def _signals(direction):
-        # Keys MUST match EDGE_COMPONENTS[*][0]. Structure is split into independent
-        # BOS (+20) and CHOCH (+20) components; volume_confirmed is directionless.
+        # Keys MUST match EDGE_COMPONENTS[*][0]. Structure is one capped active-cycle
+        # 0/20/40 allocation; BOS/CHOCH raw flags remain diagnostic-only below.
         if direction == "Long":
-            return {"bos_confirmed": has_bos_demand, "choch_confirmed": has_choch_demand,
+            return {"structure_allocation": (
+                        int(structure_state.get("allocation_points") or 0)
+                        if _structure_state_direction == "Long" else 0),
                     "vwap_confirmed": price_above, "liquidity_sweep": has_bull_sweep,
                     "volume_confirmed": volume_confirmed, "cvd_confirmed": cvd_confirmed_long,
                     "preferred_session": session_pref}
-        return {"bos_confirmed": has_bos_supply, "choch_confirmed": has_choch_supply,
+        return {"structure_allocation": (
+                    int(structure_state.get("allocation_points") or 0)
+                    if _structure_state_direction == "Short" else 0),
                 "vwap_confirmed": price_below, "liquidity_sweep": has_bear_sweep,
                 "volume_confirmed": volume_confirmed, "cvd_confirmed": cvd_confirmed_short,
                 "preferred_session": session_pref}
@@ -10701,15 +10732,13 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     def _confirmations(direction):
         """Count the REAL confirmations present for `direction`. Display/diagnostic
         only now — both modes set MIN_CONFIRMATIONS=0, so the gate is structure +
-        location + volume + edge, not a raw confirmation count. Structure contributes
-        per-signal (BOS / CHOCH / swing) and volume_confirmed counts when present."""
+        location + volume + edge, not a raw confirmation count. A confirmed active
+        BOS/CHOCH cycle contributes at most once, regardless of how many events built it."""
         if direction == "Long":
-            flags = [price_above, has_bos_demand, has_choch_demand,
-                     bool(hh_ts or hl_ts), has_bull_sweep, has_bull_confirm, trend_long,
+            flags = [price_above, structure_cycle_long, has_bull_sweep, has_bull_confirm, trend_long,
                      volume_confirmed]
         else:
-            flags = [price_below, has_bos_supply, has_choch_supply,
-                     bool(lh_ts or ll_ts), has_bear_sweep, has_bear_confirm, trend_short,
+            flags = [price_below, structure_cycle_short, has_bear_sweep, has_bear_confirm, trend_short,
                      volume_confirmed]
         return sum(1 for f in flags if f)
 
@@ -10752,10 +10781,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "direction":             direction,
             "bos":                   bool(_bos),
             "choch":                 bool(_choch),
-            # Mirror the scored component keys (identical to bos/choch) so the
-            # per-setup score breakdown can render every EDGE_COMPONENTS key uniformly.
-            "bos_confirmed":         bool(sig["bos_confirmed"]),
-            "choch_confirmed":       bool(sig["choch_confirmed"]),
+            # Raw detector flags remain diagnostic; only structure_confirmed below
+            # can earn Edge or satisfy the gate.
+            "bos_confirmed":         bool(_bos),
+            "choch_confirmed":       bool(_choch),
             "swing":                 bool(_swing),
             "zone_present":          bool(_zone_pres),
             "zone_mitigated":        bool(_zone_mit),
@@ -10773,6 +10802,10 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "edgeScore":             int(score),
             "vwap_confirmed":        bool(sig["vwap_confirmed"]),
             "structure_confirmed":   bool(_structure),
+            "structure_state":       dict(structure_state),
+            "structure_cycle_confirmed": bool(_structure),
+            "structure_allocation_points": int(sig["structure_allocation"] or 0),
+            "next_structure_event":  structure_state.get("next_event"),
             # T003: when the confidence fallback satisfied structure (vs a real
             # BOS/CHOCH/swing alert), tag the source. Flag-gated so the OFF gate_debug
             # is byte-identical to legacy.
@@ -10927,6 +10960,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
                 "bos":                 bool(has_bos_supply),
                 "choch":               bool(has_choch_supply),
                 "structure_confirmed": structure_gate_short,
+                "structure_state":     dict(structure_state),
+                "structure_cycle_confirmed": structure_cycle_short,
+                "structure_allocation_points": (
+                    int(structure_state.get("allocation_points") or 0)
+                    if _structure_state_direction == "Short" else 0),
                 "confirmation":        bool(has_bear_confirm or zone_valid_short),
                 "confirmation_candle": bool(has_bear_confirm),
                 "vwap":                price_below,
@@ -10945,6 +10983,11 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "bos":                 bool(has_bos_demand),
             "choch":               bool(has_choch_demand),
             "structure_confirmed": structure_gate_long,
+            "structure_state":     dict(structure_state),
+            "structure_cycle_confirmed": structure_cycle_long,
+            "structure_allocation_points": (
+                int(structure_state.get("allocation_points") or 0)
+                if _structure_state_direction == "Long" else 0),
             "confirmation":        bool(has_bull_confirm or zone_valid_long),
             "confirmation_candle": bool(has_bull_confirm),
             "vwap":                price_above,
@@ -11039,6 +11082,7 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
         payload.setdefault("volume_confirmed", volume_confirmed)
         payload.setdefault("volume_data_present", volume_data_present)
         payload.setdefault("volume_state", volume_state)
+        payload.setdefault("structure_state", dict(structure_state))
         # Opposing-structure diagnostic (display-only, never gates).
         payload.setdefault("opposing_structure", _opp_struct)
         return payload
@@ -27399,7 +27443,7 @@ def build_legacy_decision_trace(result, instrument, generated_at=None):
             _5c_vol = result.get("volatility") or {}
             _5c_comps = _5c_eb.get("components") or []
             _5c_key_map = {
-                "bos_confirmed": "bos", "choch_confirmed": "choch",
+                "structure_allocation": "structure",
                 "vwap_confirmed": "vwap", "liquidity_sweep": "sweep",
                 "volume_confirmed": "volume", "cvd_confirmed": "cvd",
                 "preferred_session": "session",
@@ -28309,7 +28353,7 @@ def _mb_verdict(result, errors):
             "direction":           r.get("strict_direction"),
             "readiness":           label,
             "edge_score":          r.get("edge_score"),
-            "edge_max":            110,
+            "edge_max":            EDGE_SCORE_MAX,
             "grade":               eb.get("grade"),
             "is_actionable":       ("READY" in label),
             "confidence_score":    r.get("edge_score"),
@@ -28326,19 +28370,20 @@ def _mb_verdict(result, errors):
             # Exposes exactly the evidence the conflict gate used: event type, age,
             # remaining block window, effect classification. Never feeds the gate.
             "opposing_structure":  r.get("opposing_structure"),
+            "structure_state":     r.get("structure_state"),
         }
     except Exception as _exc:
         logger.debug("_mb_verdict: %s", _exc)
         _mb_err(errors, "verdict", "verdict_unavailable")
         return {
-            "direction": None, "readiness": "WAIT", "edge_score": 0, "edge_max": 110,
+            "direction": None, "readiness": "WAIT", "edge_score": 0, "edge_max": EDGE_SCORE_MAX,
             "grade": None, "is_actionable": False, "confidence_score": 0,
             "strict_reason": None, "failed_conditions": [], "risk_reward": None,
             "components": {},
             # Phase 7C.2 transparency fields — must mirror the success path schema
             "edge_components": [], "score_breakdown": [],
             "failed_confirmations": [], "risks": [],
-            "opposing_structure": None,
+            "opposing_structure": None, "structure_state": None,
         }
 
 
@@ -29694,6 +29739,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # Edge Score and the Session block on /status, /why and the trade card. Reuses
     # the SAME instant threaded into the gate so the bonus stays consistent.
     result["session"] = session_state
+    # The pure BOS/CHOCH cycle contract is a first-class dashboard diagnostic. It
+    # mirrors the strict gate's state; it never recomputes or changes a verdict.
+    result["structure_state"] = strict.get("structure_state")
     # Thesis hysteresis snapshot — attached here so every downstream surface
     # (status, diagnostics, journal, Discord card) reads the same snapshot.
     # The thesis was already applied above to adjust `verdict`; this is display-only.
@@ -36156,9 +36204,10 @@ def compute_edge_breakdown(a, entry):
 
     Computed from the SAME pure additive helper (compute_trade_edge_components)
     the READY gate uses, reading the confluences full_analysis() already produced,
-    so the displayed Edge Score and the gate score can never diverge. Seven additive
-    components (max 110): BOS (+20), CHOCH (+20), VWAP (+15), liquidity sweep (+15),
-    volume (+15), CVD agreement (+15), preferred session (+10). Risk lines are
+    so the displayed Edge Score and the gate score can never diverge. Six additive
+    components (max 110): one active market-structure cycle (+20 candidate / +40
+    confirmed), VWAP (+15), liquidity sweep (+15), volume (+15), CVD agreement
+    (+15), preferred session (+10). Risk lines are
     INFORMATIONAL warnings only — they do NOT reduce the score. Hard blockers (zone
     broken / consumed) force the score to 0.
 
@@ -36177,13 +36226,12 @@ def compute_edge_breakdown(a, entry):
     sess      = a.get("session") or get_session_state()
 
     has_sweep = bool(conf.get("liquidity_sweep") or conf.get("sweep") or a.get("liquidity_sweep"))
-    # The seven additive components — same keys the READY gate scores in _signals,
-    # so the displayed Edge Score equals the gate score. Structure is split into BOS
-    # and CHOCH; volume is a first-class component (spike OR RVOL >= threshold,
-    # resolved by the gate and stamped on the confluences / `a`).
+    # The six additive components — same keys the READY gate scores in _signals,
+    # so the displayed Edge Score equals the gate score. Structure is the single
+    # 0/20/40 active-cycle allocation; raw BOS/CHOCH detector flags are not score
+    # inputs. Volume is a first-class component (spike OR RVOL >= threshold).
     signals = {
-        "bos_confirmed":     bool(conf.get("bos")),
-        "choch_confirmed":   bool(conf.get("choch")),
+        "structure_allocation": int(conf.get("structure_allocation_points") or 0),
         "vwap_confirmed":    bool(conf.get("vwap")),
         "liquidity_sweep":   has_sweep,
         "volume_confirmed":  bool(conf.get("volume_confirmed") or a.get("volume_confirmed")),
@@ -36205,8 +36253,7 @@ def compute_edge_breakdown(a, entry):
 
     # Direction-aware display labels for the generic component names.
     relabel = {
-        "BOS Confirmed":     "Bullish BOS"        if is_long else "Bearish BOS",
-        "CHOCH Confirmed":   "Bullish CHOCH"      if is_long else "Bearish CHOCH",
+        "Market Structure":  "Bullish Structure"  if is_long else "Bearish Structure",
         "VWAP Confirmation": "VWAP Reclaim"       if is_long else "VWAP Rejection",
         "CVD Agreement":     "CVD Confirms Long"  if is_long else "CVD Confirms Short",
     }
@@ -36220,8 +36267,10 @@ def compute_edge_breakdown(a, entry):
     # Per-setup diagnostics: EVERY component with its present/points, plus the list
     # of confirmations that did NOT fire. Lets the card / dashboard render the full
     # 7-component checklist uniformly (present and absent alike).
+    _earned_points = {item["label"]: item["points"] for item in raw_breakdown}
     components = [{"key": key, "label": relabel.get(label, label),
-                  "points": pts, "present": bool(signals.get(key))}
+                  "points": _earned_points.get(label, pts),
+                  "present": bool(signals.get(key))}
                  for key, label, pts in EDGE_COMPONENTS]
     failed_confirmations = [relabel.get(label, label)
                             for key, label, pts in EDGE_COMPONENTS
@@ -36309,7 +36358,7 @@ def compute_edge_breakdown(a, entry):
         "risk_adjustments": risk_adj,
         # Per-setup diagnostics: full component list + which confirmations failed,
         # and the honest raw-vs-clamped accounting (cap_applied is True only if the
-        # additive sum actually exceeded EDGE_SCORE_MAX — with max 110 it never does).
+        # additive sum actually exceeded EDGE_SCORE_MAX).
         "components": components,
         "failed_confirmations": failed_confirmations,
         "raw_score": raw_score,
@@ -60903,6 +60952,7 @@ def _build_status_payload(_tk):
         "strict_reason":       a.get("strict_reason"),
         "strict_missing":      a.get("strict_missing"),
         "gate_debug":          a.get("gate_debug"),
+        "structure_state":     a.get("structure_state"),
         "learning_score_influence": a.get("learning_score_influence"),
         "source_attribution":  a.get("source_attribution"),
         "source_audit":        a.get("source_audit"),
