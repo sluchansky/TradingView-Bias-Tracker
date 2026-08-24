@@ -50960,6 +50960,7 @@ def _restore_canonical_ghost_authority():
 
 def _restore_canonical_evidence():
     """Rehydrate only durable evidence snapshots; never replay a legacy outcome."""
+    global CANONICAL_EVIDENCE_DB_READY
     if not (CANONICAL_GHOST_SHADOW_PERSIST_ENABLED and CANONICAL_EVIDENCE_DB_READY
             and _canonical_ghost_evidence is not None):
         return 0
@@ -51001,7 +51002,15 @@ def _restore_canonical_evidence():
                    ORDER BY created_at ASC""")
             rows.extend(dict(row) for row in cur.fetchall())
     except Exception as exc:
-        logger.info("Canonical Ghost durable evidence restore skipped: %s", exc)
+        # A successful table probe does not prove the historical evidence chain
+        # was actually recovered. Do not continue accepting new writes under a
+        # durable-ready health state when a restart cannot load that chain.
+        CANONICAL_EVIDENCE_DB_READY = False
+        _configure_canonical_evidence_persistence()
+        logger.info(
+            "Canonical Ghost durable evidence restore failed; persistence disabled: %s",
+            exc,
+        )
         return 0
     finally:
         try:

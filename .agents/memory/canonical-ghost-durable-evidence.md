@@ -23,6 +23,19 @@ snapshot. Persist and deduplicate on the exact natural source identity, restore
 all records before recovery, and make any database failure visible/retryable
 without changing the legacy lifecycle.
 
+At boot, a table-readiness probe alone is insufficient evidence of durable
+continuity. If the historical evidence restore fails, disable the evidence
+persistence writer and expose the unavailable state rather than accepting new
+in-memory snapshots as durable.
+
+**Why:** A process can otherwise report healthy persistence after a restart
+while it has lost the exact chain needed to link new observations and outcomes
+to its prior evidence.
+
+**How to apply:** Restore matched records before unmatched records, and only
+keep the writer attached after that read succeeds. The legacy lifecycle remains
+unchanged; this protection affects the shadow projection only.
+
 For cross-table unmatched-to-matched links, persist the matched snapshot first
 and create the link only after that write succeeds. A database no-op is a safe
 replay only when the stored provenance fingerprint matches; a conflicting

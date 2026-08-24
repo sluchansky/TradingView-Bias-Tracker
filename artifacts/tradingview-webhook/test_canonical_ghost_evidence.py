@@ -2,6 +2,7 @@
 
 import ast
 import json
+import types
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -74,6 +75,18 @@ def _outcome(**changes):
     }
     event.update(changes)
     return event
+
+
+def _app_function(function_name):
+    source = Path(__file__).with_name("app.py").read_text()
+    tree = ast.parse(source)
+    node = next(
+        node for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == function_name
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[node], type_ignores=[]), "app.py", "exec"), namespace)
+    return namespace
 
 
 def test_exact_submission_creates_one_durable_evidence_record():
@@ -476,6 +489,125 @@ def test_restart_restore_and_failed_write_retry_preserve_exact_record():
     assert restarted.observe_submission(_submission(), _observed_event())["evidence_id"] == writes[0]["evidence_id"]
     assert restarted.report()["records"] == 1
     assert restarted.report()["by_mode"]["SCALP"]["terminal_records"] == 1
+
+
+def test_app_restart_restores_durable_rows_before_appending_next_evidence_snapshot():
+    """The app's ordered DB restore must rehydrate an exact chain before new writes."""
+    seed = CanonicalGhostEvidence(enabled=True)
+    partial_event = dict(_observed_event(), canonical_observation_id="")
+    unmatched = seed.observe_submission(_submission(), partial_event)
+    matched = seed.observe_submission(_submission(), _observed_event())
+    assert unmatched["record_kind"] == "UNMATCHED"
+
+    writes = []
+    restarted = CanonicalGhostEvidence(enabled=True)
+    restarted.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda row: writes.append(dict(row)) or True,
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.queries = []
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, query):
+            self.queries.append(query)
+
+        def fetchall(self):
+            return [matched] if len(self.queries) == 1 else [unmatched]
+
+    class Connection:
+        def __init__(self):
+            self.cursor_instance = Cursor()
+            self.closed = False
+
+        def cursor(self, **_kwargs):
+            return self.cursor_instance
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    namespace = _app_function("_restore_canonical_evidence")
+    namespace.update({
+        "CANONICAL_GHOST_SHADOW_PERSIST_ENABLED": True,
+        "CANONICAL_EVIDENCE_DB_READY": True,
+        "_canonical_ghost_evidence": restarted,
+        "_learning_conn": lambda: connection,
+        "psycopg2": types.SimpleNamespace(
+            extras=types.SimpleNamespace(RealDictCursor=object)
+        ),
+        "logger": type("Logger", (), {"info": staticmethod(lambda *_args: None)})(),
+    })
+
+    assert namespace["_restore_canonical_evidence"]() == 2
+    assert connection.closed is True
+    assert "canonical_ghost_evidence_records" in connection.cursor_instance.queries[0]
+    assert "canonical_ghost_unmatched_evidence_records" in connection.cursor_instance.queries[1]
+    assert restarted.report()["records"] == 1
+    assert restarted.report()["unmatched_records"] == 1
+
+    continued = restarted.observe_outcome(_outcome(event_at="2026-08-23T14:37:00+00:00"))
+    assert continued["evidence_id"] == matched["evidence_id"]
+    assert continued["result_state"] == "TERMINAL"
+    assert writes[-1]["evidence_id"] == matched["evidence_id"]
+    assert writes[-1]["result_state"] == "TERMINAL"
+
+
+def test_app_restart_restore_failure_disables_evidence_persistence():
+    """A failed historical restore must not leave a false durable-ready state."""
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def execute(_query):
+            pass
+
+        @staticmethod
+        def fetchall():
+            raise RuntimeError("database read interrupted")
+
+    class Connection:
+        def __init__(self):
+            self.closed = False
+
+        @staticmethod
+        def cursor(**_kwargs):
+            return Cursor()
+
+        def close(self):
+            self.closed = True
+
+    connection = Connection()
+    reconfigured = []
+    namespace = _app_function("_restore_canonical_evidence")
+    namespace.update({
+        "CANONICAL_GHOST_SHADOW_PERSIST_ENABLED": True,
+        "CANONICAL_EVIDENCE_DB_READY": True,
+        "_canonical_ghost_evidence": object(),
+        "_learning_conn": lambda: connection,
+        "_configure_canonical_evidence_persistence": lambda: reconfigured.append(True),
+        "psycopg2": types.SimpleNamespace(
+            extras=types.SimpleNamespace(RealDictCursor=object)
+        ),
+        "logger": type("Logger", (), {"info": staticmethod(lambda *_args: None)})(),
+    })
+
+    assert namespace["_restore_canonical_evidence"]() == 0
+    assert namespace["CANONICAL_EVIDENCE_DB_READY"] is False
+    assert reconfigured == [True]
+    assert connection.closed is True
 
 
 def test_only_explicit_canonical_generic_authority_is_eligible():
