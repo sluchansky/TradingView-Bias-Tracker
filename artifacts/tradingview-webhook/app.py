@@ -8292,7 +8292,7 @@ def _it_daily_trade_count(instrument="MNQ"):
     """Count today's INTRADAY_TREND ghost observations that actually entered.
 
     Excludes EXPIRED_NO_ENTRY (setup never triggered) and PENDING rows.
-    Returns (count, cap) where cap = MAX_INTRADAY_TREND_TRADES_PER_DAY (default 2).
+    Returns (count, cap) where cap = MAX_INTRADAY_TREND_TRADES_PER_DAY (default 3).
     ``signal_time`` is the authoritative entry-observation timestamp: the
     ghost writer persists it for every row, while ``opened_at`` is not a
     column in this ledger.  ``obs_key`` is the durable idempotency identity,
@@ -8327,7 +8327,9 @@ def _it_daily_trade_count(instrument="MNQ"):
                     (inst, today_et),
                 )
                 row = cur.fetchone()
-                if not row or len(row) < 1 or isinstance(row[0], bool):
+                if (not row or len(row) < 1
+                        or isinstance(row[0], bool)
+                        or not isinstance(row[0], int)):
                     return (-1, cap)
                 count = int(row[0])
                 if count < 0:

@@ -691,6 +691,113 @@ class TestITDailyCap(unittest.TestCase):
 
 
 # ══════════════════════════════════════════════════════════════════════════════
+# 16b. Durable daily-count authority — ghost_observations readback
+# ══════════════════════════════════════════════════════════════════════════════
+
+class _ITCountCursor:
+    def __init__(self, row=(0,), error=None):
+        self.row = row
+        self.error = error
+        self.sql = None
+        self.params = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def execute(self, sql, params):
+        self.sql = sql
+        self.params = params
+        if self.error:
+            raise self.error
+
+    def fetchone(self):
+        return self.row
+
+
+class _ITCountConnection:
+    def __init__(self, cursor):
+        self.cursor_obj = cursor
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_args):
+        return False
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+class TestITDailyCountAuthority(unittest.TestCase):
+    """The IT cap reconstructs from durable ghost-observation readback only."""
+
+    def setUp(self):
+        self._saved_ready = A.GHOST_OBS_DB_READY
+        A.GHOST_OBS_DB_READY = True
+        self._env_patch = patch.dict(os.environ, {"IT_DAILY_CAP": "3"}, clear=False)
+        self._env_patch.start()
+
+    def tearDown(self):
+        self._env_patch.stop()
+        A.GHOST_OBS_DB_READY = self._saved_ready
+
+    @staticmethod
+    def _count_with(cursor, instrument="MNQ1!"):
+        conn = _ITCountConnection(cursor)
+        with patch.object(A, "get_db_connection", return_value=conn):
+            with patch.object(A, "now_utc",
+                              return_value=datetime(2026, 1, 16, 2, 30,
+                                                    tzinfo=timezone.utc)):
+                return A._it_daily_trade_count(instrument)
+
+    def test_valid_empty_readback_is_zero_with_et_day(self):
+        """A reachable empty ledger is a valid zero, not an unavailable count."""
+        cur = _ITCountCursor(row=(0,))
+        count, cap = self._count_with(cur)
+        self.assertEqual((count, cap), (0, 3))
+        self.assertEqual(cur.params, ("MNQ", "2026-01-15"),
+                         "02:30 UTC is still the prior ET trading date")
+        self.assertIn("signal_time AT TIME ZONE 'America/New_York'", cur.sql)
+        self.assertNotIn("opened_at", cur.sql,
+                         "opened_at is not a ghost_observations ledger column")
+
+    def test_distinct_obs_key_counts_a_retry_once(self):
+        """The durable ghost identity remains one count after a retry/readback."""
+        cur = _ITCountCursor(row=(1,))
+        self.assertEqual(self._count_with(cur)[0], 1)
+        self.assertIn("COUNT(DISTINCT obs_key)", cur.sql)
+
+    def test_restart_style_readback_reconstructs_cap_boundaries(self):
+        """No process-local count is needed for cap-1, cap, or above-cap state."""
+        for returned_count in (2, 3, 4):
+            with self.subTest(returned_count=returned_count):
+                count, cap = self._count_with(_ITCountCursor(row=(returned_count,)))
+                self.assertEqual(cap, 3)
+                self.assertEqual(count, returned_count)
+                self.assertEqual(count >= cap, returned_count >= cap)
+
+    def test_unreadable_or_malformed_readback_remains_fail_closed(self):
+        for cursor in (
+            _ITCountCursor(error=RuntimeError("missing table")),
+            _ITCountCursor(row=None),
+            _ITCountCursor(row=(None,)),
+            _ITCountCursor(row=(True,)),
+            _ITCountCursor(row=("0",)),
+            _ITCountCursor(row=(0.0,)),
+            _ITCountCursor(row=(-1,)),
+        ):
+            with self.subTest(cursor=cursor):
+                self.assertEqual(self._count_with(cursor)[0], -1)
+
+    def test_not_ready_source_remains_unavailable(self):
+        A.GHOST_OBS_DB_READY = False
+        self.assertEqual(A._it_daily_trade_count("MNQ"), (-1, 3))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
 # 17. _it_select_intraday_target
 # ══════════════════════════════════════════════════════════════════════════════
 
