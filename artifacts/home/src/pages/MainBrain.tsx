@@ -2453,14 +2453,15 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const [showExplain, setShowExplain] = useState(false);
 
   const v          = (p.verdict ?? {}) as Record<string, unknown>;
+  const op         = (p.operator_presentation ?? {}) as Record<string, unknown>;
   const avail      = v.available !== false;
   const score      = safeNum(v.edge_score) ?? 0;
   const scoreMax   = safeNum(v.edge_max) ?? 110;
   const grade      = safeStr(v.edge_grade, '');
-  const ready      = safeStr(v.readiness, '');
+  const ready      = safeStr(op.verdict ?? v.readiness, '');
   const rCol       = readinessColor(ready);
-  const isReady    = v.is_actionable === true;
-  const direction  = safeStr(v.direction, '');
+  const isReady    = op.is_actionable === true || (op.is_actionable == null && v.is_actionable === true);
+  const direction  = safeStr(op.candidate_direction ?? v.direction, '');
 
   // Rich component list {key, label, points, present} — Phase 7C.2
   const edgeComps  = Array.isArray(v.edge_components)
@@ -2474,7 +2475,14 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
   const missingComps = edgeComps.filter(c => c.present === false);
   const structureGuidance = extractStructureGuidance(p);
-  const waitingFor = structureGuidance?.isPendingConfirmation
+  const opWaiting = Array.isArray(op.waiting_for)
+    ? (op.waiting_for as Record<string, unknown>[]).map(item => ({
+        label: safeStr(item.label ?? item.key, ''),
+        points: 0,
+        structure: item.structure === true,
+      })).filter(item => item.label)
+    : [];
+  const waitingFor = opWaiting.length > 0 ? opWaiting : structureGuidance?.isPendingConfirmation
     ? [{ label: structureWaitingText(structureGuidance), points: 0, structure: true }, ...missingComps.map(c => ({
         label: safeStr(c.label, safeStr(c.key, '').replace(/_/g, ' ')),
         points: safeNum(c.points) ?? 0,

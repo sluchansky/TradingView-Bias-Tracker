@@ -25407,74 +25407,130 @@ def _structure_cycle_operator_guidance(structure_state):
     }
 
 
+def _operator_direction(value):
+    """Normalize a direction label for display; never select a trading side."""
+    text = str(value or "").strip().lower()
+    if text in ("long", "bull", "bullish", "buy"):
+        return "Long"
+    if text in ("short", "bear", "bearish", "sell"):
+        return "Short"
+    return None
+
+
+def _operator_reason_direction(reason):
+    """Read a leading direction token from an already-emitted strict reason."""
+    first = str(reason or "").strip().split(None, 1)
+    return _operator_direction(first[0].rstrip(":—-")) if first else None
+
+
+def _build_operator_presentation(result):
+    """Build one display-only contract from the completed authoritative analysis.
+
+    This projection is downstream of strict evaluation and all display vetoes.
+    It never feeds a value back into scoring, gates, risk, or execution. A WAIT
+    candidate is explicitly separate from an actionable direction.
+    """
+    r = result if isinstance(result, dict) else {}
+    verdict = str(r.get("strict_label") or r.get("verdict") or "WAIT").strip() or "WAIT"
+    actionable = bool(is_actionable(verdict))
+    reason = str(r.get("strict_reason") or "").strip()
+    actionable_direction = ready_direction(verdict) if actionable else None
+    candidate_direction = (
+        actionable_direction
+        or _operator_direction(r.get("strict_direction"))
+        or _operator_reason_direction(reason)
+    )
+    if not reason:
+        reason = (
+            f"{candidate_direction} {verdict} — awaiting required confirmations."
+            if candidate_direction else
+            f"{verdict} — no directional candidate is active."
+        )
+
+    def _finite(value):
+        try:
+            number = float(value)
+            return number if math.isfinite(number) else None
+        except (TypeError, ValueError):
+            return None
+
+    price = _finite(r.get("current_price"))
+    vwap = _finite(r.get("vwap_value"))
+    vwap_status = str(r.get("vwap_status") or "unavailable").lower()
+    if vwap_status == "ok" and price is not None and vwap is not None:
+        vwap_side = "ABOVE" if price > vwap else ("BELOW" if price < vwap else "AT")
+    else:
+        vwap_side = "UNAVAILABLE"
+    vwap_wording = {
+        "ABOVE": "Price is above VWAP.",
+        "BELOW": "Price is below VWAP.",
+        "AT": "Price is at VWAP.",
+        "UNAVAILABLE": "VWAP is unavailable or stale.",
+    }[vwap_side]
+
+    structure = _structure_cycle_operator_guidance(r.get("structure_state"))
+    waiting_for = [{"key": str(item), "label": str(item).replace("_", " ")}
+                   for item in list(r.get("strict_missing") or []) if item]
+    if structure and not structure.get("confirmed") and structure.get("next_event_reason"):
+        waiting_for.insert(0, {
+            "key": "structure_cycle",
+            "label": str(structure["next_event_reason"]),
+            "structure": True,
+        })
+
+    candidate_label = (
+        f"{candidate_direction} READY" if actionable_direction
+        else (f"{candidate_direction} candidate — WAIT" if candidate_direction else "WAIT")
+    )
+    return {
+        "version": 1,
+        "instrument": r.get("active_ticker"),
+        "verdict": verdict,
+        "readiness": "READY" if actionable else "WAIT",
+        "is_actionable": actionable,
+        "candidate_direction": candidate_direction,
+        "actionable_direction": actionable_direction,
+        "candidate_label": candidate_label,
+        "reasoning": reason,
+        "waiting_for": waiting_for,
+        "vwap": {
+            "value": vwap,
+            "status": vwap_status,
+            "side": vwap_side,
+            "wording": vwap_wording,
+        },
+        "regime_wording": vwap_wording,
+        "structure_guidance": structure,
+    }
+
+
 def compute_main_brain_voice(result):
-    """One natural, evolving paragraph — what I see / what changed / why / what I'm
-    waiting for / what invalidates it — synthesized from the already-assembled blocks
-    (Main Brain, analyst phase/outlook, edge, confidence trend). Pure + FAIL-OPEN."""
+    """Narrate the backend-owned operator presentation contract.
+
+    This remains display-only. Direction, readiness, reason, VWAP wording, and
+    structure guidance are all read from the same normalized projection.
+    """
     try:
-        mb      = result.get("main_brain") if isinstance(result.get("main_brain"), dict) else {}
-        analyst = result.get("analyst") if isinstance(result.get("analyst"), dict) else {}
+        presentation = (
+            result.get("operator_presentation")
+            if isinstance(result.get("operator_presentation"), dict)
+            else _build_operator_presentation(result)
+        )
         inst    = result.get("active_ticker") or "the market"
-        verdict = str(result.get("verdict") or "")
         if not result.get("market_open", True):
             return {"available": True, "headline": "Market closed",
                     "narration": ("The market's closed for %s right now, so I'm standing down. "
                                   "I'll pick the read back up when it reopens." % inst),
                     "reason": None}
-        phase    = str(((analyst.get("market_phase") or {}).get("phase")) or "—")
-        outlook  = analyst.get("analyst_outlook") if isinstance(analyst.get("analyst_outlook"), dict) else {}
-        control  = str(outlook.get("control") or "")
-        fav      = str(mb.get("favored_direction") or "Neither")
-        edge     = _mb_pi(mb.get("edge_score") or result.get("edge_score"))
-        grade    = str(result.get("edge_grade") or mb.get("edge_grade") or "")
-        what_now = mb.get("what_now") if isinstance(mb.get("what_now"), list) else []
-        inval    = str(mb.get("invalidation") or "")
-        ct       = result.get("confidence_timeline") if isinstance(result.get("confidence_timeline"), dict) else {}
-        trend    = str(ct.get("trend") or "")
-        structure_guidance = _structure_cycle_operator_guidance(result.get("structure_state"))
-        structure_pending = bool(
-            structure_guidance
-            and not structure_guidance.get("confirmed")
-            and structure_guidance.get("state") in ("TREND_INITIAL", "REVERSAL_CANDIDATE")
-        )
-
-        parts = []
-        phase_desc = phase.lower() if phase != "—" else "a developing tape"
-        see = "%s's in %s right now" % (inst, phase_desc)
-        if control:
-            see += " — %s" % control.rstrip(".").lower()
-        parts.append(see + ".")
-
-        if edge:
-            c = "Edge is at %d%s" % (edge, (" — grade %s" % grade if grade else ""))
-            if fav and fav != "Neither":
-                c += ", leaning %s" % fav.lower()
-            if trend in ("rising", "falling"):
-                c += ", and it's been %s" % trend
-            parts.append(c + ".")
-
-        if is_actionable(verdict):
-            parts.append("The pieces are there — this is actionable.")
-        elif structure_pending:
-            # The resolver owns this exact next-event wording. Prefer it over a
-            # generic "what now" item so the operator never sees conflicting
-            # BOS/CHOCH advice.
-            parts.append(str(structure_guidance.get("next_event_reason")))
-        elif what_now:
-            nx = what_now[0] if isinstance(what_now[0], str) else str(what_now[0])
-            parts.append("Still need %s before I'd pull the trigger." % nx.rstrip("."))
-        else:
-            parts.append("No clean trigger yet, so I'm staying patient.")
-
-        if inval and inval != "—":
-            parts.append("Thesis is out if %s." % inval.rstrip(".").lower())
-
-        narration = " ".join(p for p in parts if p)
-        if edge:
-            headline = "%s · edge %d%s" % ((fav if fav != "Neither" else "Neutral"), edge,
-                                           (" %s" % grade if grade else ""))
-        else:
-            headline = (fav if fav and fav != "Neither" else "Watching")
+        vwap = presentation.get("vwap") or {}
+        structure = presentation.get("structure_guidance") or {}
+        parts = [str(presentation.get("reasoning") or "").rstrip(".") + "."]
+        if vwap.get("wording"):
+            parts.append(str(vwap["wording"]))
+        if structure.get("next_event_reason"):
+            parts.append(str(structure["next_event_reason"]))
+        narration = " ".join(part for part in parts if part and part != ".")
+        headline = str(presentation.get("candidate_label") or presentation.get("verdict") or inst)
         return {"available": True, "headline": headline, "narration": narration, "reason": None}
     except Exception:
         return _main_brain_voice_neutral()
@@ -29088,6 +29144,26 @@ def build_main_brain_payload(result, instrument=None):
     market_state     = _mb_market_state(result, errors)
     left_brain       = _mb_left_brain(inst, result, errors)
     verdict          = _mb_verdict(result, errors)
+    operator_presentation = (
+        (result or {}).get("operator_presentation")
+        if isinstance((result or {}).get("operator_presentation"), dict)
+        else _build_operator_presentation(result)
+    )
+    # Preserve diagnostics, but make all operator-facing verdict fields read the
+    # one display contract rather than mixed independent directional sources.
+    verdict = {
+        **verdict,
+        "direction":            operator_presentation.get("candidate_direction"),
+        "candidate_direction":  operator_presentation.get("candidate_direction"),
+        "actionable_direction": operator_presentation.get("actionable_direction"),
+        "candidate_label":      operator_presentation.get("candidate_label"),
+        "readiness":            operator_presentation.get("verdict"),
+        "is_actionable":        operator_presentation.get("is_actionable") is True,
+        "strict_reason":        operator_presentation.get("reasoning"),
+        "waiting_for":          operator_presentation.get("waiting_for"),
+        "vwap":                 operator_presentation.get("vwap"),
+        "structure_guidance":   operator_presentation.get("structure_guidance"),
+    }
     strategy_scanner = _mb_strategy_scanner(inst, result, errors)
     active_trades    = _mb_active_trades(inst, result, errors)
 
@@ -29161,7 +29237,10 @@ def build_main_brain_payload(result, instrument=None):
     try:
         voice = (result or {}).get("main_brain_voice")
         if not voice:
-            voice = ((result or {}).get("main_brain") or {}).get("voice")
+            voice = compute_main_brain_voice({
+                **(result or {}),
+                "operator_presentation": operator_presentation,
+            })
     except Exception:
         pass
 
@@ -29196,6 +29275,7 @@ def build_main_brain_payload(result, instrument=None):
         "_version":          "v1",
         "generated_at":      now_utc().isoformat(),
         "voice":             voice,
+        "operator_presentation": operator_presentation,
         "market":            market,
         "market_state":      market_state,
         "left_brain":        left_brain,
@@ -31002,6 +31082,22 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         result["main_brain_learning_stats"] = compute_main_brain_learning_stats()
     except Exception:
         result["main_brain_learning_stats"] = {"available": False, "reason": "unavailable"}
+    # Assemble after strict evaluation and all display overrides are complete.
+    # This is a read-only presentation projection, never a money-path input.
+    try:
+        result["operator_presentation"] = _build_operator_presentation(result)
+    except Exception:
+        result["operator_presentation"] = {
+            "version": 1, "verdict": "WAIT", "readiness": "WAIT",
+            "is_actionable": False, "candidate_direction": None,
+            "actionable_direction": None, "candidate_label": "WAIT",
+            "reasoning": "WAIT — operator presentation is unavailable.",
+            "waiting_for": [],
+            "vwap": {"value": None, "status": "unavailable", "side": "UNAVAILABLE",
+                     "wording": "VWAP is unavailable or stale."},
+            "regime_wording": "VWAP is unavailable or stale.",
+            "structure_guidance": None,
+        }
     try:
         result["main_brain_voice"] = compute_main_brain_voice(result)
     except Exception:
@@ -61090,6 +61186,97 @@ _STATUS_BUILDING   = {}   # key -> True while a build is running (single-flight 
 _STATUS_CACHE_LOCK = threading.Lock()   # guards the two dicts only — never held during a build
 
 
+def _status_json_safe_payload(payload):
+    """Return a JSON-native copy of a status response without mutating its sources.
+
+    /status contains diagnostic values from independent engines. Unexpected types
+    are normalized only on the outgoing/cache copy and logged with their path so a
+    future producer can be corrected without breaking the dashboard response.
+    """
+    from collections.abc import Mapping
+    from datetime import date
+    from decimal import Decimal
+    from enum import Enum
+
+    normalizations = []
+    active_ids = set()
+
+    def _copy(value, path="$", depth=0):
+        if depth > 48:
+            normalizations.append((path, "max_depth"))
+            return None
+        if value is None or isinstance(value, (str, bool, int)):
+            return value
+        if isinstance(value, float):
+            if math.isfinite(value):
+                return value
+            normalizations.append((path, type(value).__name__))
+            return None
+        if isinstance(value, Decimal):
+            try:
+                number = float(value)
+                if math.isfinite(number):
+                    return number
+            except (TypeError, ValueError):
+                pass
+            normalizations.append((path, "Decimal"))
+            return None
+        if isinstance(value, (datetime, date)):
+            normalizations.append((path, type(value).__name__))
+            return value.isoformat()
+        if isinstance(value, Enum):
+            normalizations.append((path, type(value).__name__))
+            return _copy(value.value, path, depth + 1)
+        if isinstance(value, bytes):
+            normalizations.append((path, "bytes"))
+            return value.decode("utf-8", errors="replace")
+        if isinstance(value, Mapping):
+            identity = id(value)
+            if identity in active_ids:
+                normalizations.append((path, "cycle"))
+                return None
+            active_ids.add(identity)
+            try:
+                return {
+                    str(key): _copy(item, f"{path}.{key}", depth + 1)
+                    for key, item in value.items()
+                }
+            finally:
+                active_ids.discard(identity)
+        if isinstance(value, (list, tuple, set, frozenset)):
+            identity = id(value)
+            if identity in active_ids:
+                normalizations.append((path, "cycle"))
+                return None
+            active_ids.add(identity)
+            try:
+                items = list(value)
+                if isinstance(value, (set, frozenset)):
+                    items.sort(key=repr)
+                    normalizations.append((path, type(value).__name__))
+                return [_copy(item, f"{path}[{index}]", depth + 1)
+                        for index, item in enumerate(items)]
+            finally:
+                active_ids.discard(identity)
+        item = getattr(value, "item", None)
+        if callable(item):
+            try:
+                scalar = item()
+                if scalar is not value:
+                    normalizations.append((path, type(value).__name__))
+                    return _copy(scalar, path, depth + 1)
+            except Exception:
+                pass
+        normalizations.append((path, type(value).__name__))
+        return str(value)
+
+    copied = _copy(payload)
+    if normalizations:
+        detail = ", ".join(f"{path}<{kind}>" for path, kind in normalizations[:8])
+        logger.warning("/status normalized non-JSON response value(s): %s", detail)
+    return copied
+
+
 def _build_brain_contract(a, generated_at):
     """Assemble the canonical Brain Output Contract from an already-computed
     full_analysis result `a`.
@@ -61239,6 +61426,11 @@ def _build_status_payload(_tk):
     # Compute once and share between edge_score_generated_at and brain.generated_at
     # so the two timestamps are identical — both represent payload generation time.
     _now_ts = datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+    operator_presentation = (
+        a.get("operator_presentation")
+        if isinstance(a.get("operator_presentation"), dict)
+        else _build_operator_presentation(a)
+    )
     return {
         "status":              "running",
         "version":             "11.0",
@@ -61246,8 +61438,8 @@ def _build_status_payload(_tk):
         "verdict":             a["verdict"],
         "strict_label":        a.get("strict_label"),
         "strict_score":        a.get("strict_score"),
-        "strict_direction":    a.get("strict_direction"),
-        "strict_reason":       a.get("strict_reason"),
+        "strict_direction":    operator_presentation.get("candidate_direction"),
+        "strict_reason":       operator_presentation.get("reasoning"),
         "strict_missing":      a.get("strict_missing"),
         "gate_debug":          a.get("gate_debug"),
         "structure_state":     a.get("structure_state"),
@@ -61259,6 +61451,9 @@ def _build_status_payload(_tk):
         "vwap_value":          a.get("vwap_value"),
         "vwap_status":         a.get("vwap_status"),
         "vwap_source":         (VWAP_BY_TICKER.get(a.get("active_ticker")) or {}).get("source"),
+        "vwap_presentation":   operator_presentation.get("vwap"),
+        "regime_wording":      operator_presentation.get("regime_wording"),
+        "operator_presentation": operator_presentation,
         "active_ticker":       a.get("active_ticker"),
         "volatility":          a.get("volatility"),
         "recommendation":      a["recommendation"],
@@ -61493,7 +61688,7 @@ def status():
         # Cache disabled — legacy inline build, byte-identical behavior.
         _MODE_TLS.override = _mode_ov
         try:
-            return jsonify(_build_status_payload(_tk)), 200
+            return jsonify(_status_json_safe_payload(_build_status_payload(_tk))), 200
         finally:
             _MODE_TLS.override = None
     # Mode-scoped cache key: SCALP and SWING results are stored separately.
@@ -61514,7 +61709,7 @@ def status():
         _STATUS_BUILDING[key] = True                       # this request becomes the builder
     _MODE_TLS.override = _mode_ov
     try:
-        payload = _build_status_payload(_tk)
+        payload = _status_json_safe_payload(_build_status_payload(_tk))
         with _STATUS_CACHE_LOCK:
             _STATUS_CACHE[key] = (time.time(), payload)
     finally:

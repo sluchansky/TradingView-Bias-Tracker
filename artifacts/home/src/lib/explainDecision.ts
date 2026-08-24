@@ -104,6 +104,7 @@ export interface ExplainData {
  */
 export function extractExplainData(p: Record<string, unknown>): ExplainData {
   const v    = (p.verdict       ?? {}) as Record<string, unknown>;
+  const op   = (p.operator_presentation ?? {}) as Record<string, unknown>;
   const lb   = (p.left_brain    ?? {}) as Record<string, unknown>;
   const dirs = (p.directions    ?? {}) as Record<string, unknown>;
   const tl   = (p.decision_timeline ?? {}) as Record<string, unknown>;
@@ -111,10 +112,10 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
   const structureGuidance = extractStructureGuidance(p);
 
   // ── Verdict ───────────────────────────────────────────────────────────────
-  const readiness    = safeStr(v.readiness ?? v.readiness_label, 'WAIT');
-  const isActionable = v.is_actionable === true;
+  const readiness    = safeStr(op.verdict ?? v.readiness ?? v.readiness_label, 'WAIT');
+  const isActionable = op.is_actionable === true || (op.is_actionable == null && v.is_actionable === true);
   const score        = safeNum(v.edge_score) ?? 0;
-  const rawDir       = safeStr(v.direction ?? v.candidate_direction, '');
+  const rawDir       = safeStr(op.candidate_direction ?? v.direction ?? v.candidate_direction, '');
   const candidateDir: CandidateDir =
     /^long$/i.test(rawDir) ? 'LONG' :
     /^short$/i.test(rawDir) ? 'SHORT' : 'NONE';
@@ -203,7 +204,10 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
   // ── Blockers ──────────────────────────────────────────────────────────────
   const hardBlockers = Array.isArray(v.hard_blockers)
     ? (v.hard_blockers as unknown[]).map(String).filter(Boolean) : [];
-  const missingConfirmations = Array.isArray(v.missing_confirmations)
+  const presentationWaiting = Array.isArray(op.waiting_for)
+    ? (op.waiting_for as Record<string, unknown>[]).map(item => safeStr(item.label ?? item.key, '')).filter(Boolean)
+    : [];
+  const missingConfirmations = presentationWaiting.length > 0 ? presentationWaiting : Array.isArray(v.missing_confirmations)
     ? (v.missing_confirmations as unknown[]).map(String).filter(Boolean) : [];
 
   // ── Opposing structure ────────────────────────────────────────────────────
@@ -284,7 +288,7 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
     structureGuidance,
     mustChange,
     timelineEvents,
-    brainVoice: safeStr(mb.voice, ''),
+    brainVoice: safeStr(mb.voice ?? op.reasoning, ''),
   };
 }
 

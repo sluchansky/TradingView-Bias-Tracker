@@ -117,10 +117,30 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
     age_seconds:  thesis.age_seconds  ?? null,
   };
 
-  // ── verdict: add edge_grade alias + pass transparency fields ─────────────────
+  // ── backend-owned operator presentation ─────────────────────────────────────
+  // This is the sole display contract for strict verdict, candidate/actionable
+  // distinction, reason, VWAP wording, and structure guidance. Keep fallback
+  // support only for older payloads during a rolling server refresh.
+  const operatorPresentation = (raw.operator_presentation ?? {}) as Record<string, unknown>;
+
+  // ── verdict: add edge_grade alias + presentation-owned fields ─────────────────
   const vrd = (raw.verdict ?? {}) as Record<string, unknown>;
   const verdict: Record<string, unknown> = {
     ...vrd,
+    direction:            operatorPresentation.candidate_direction ?? vrd.direction,
+    candidate_direction:  operatorPresentation.candidate_direction ?? vrd.candidate_direction,
+    // Explicit null means “candidate only, not actionable” and must not fall
+    // through to an older payload's direction.
+    actionable_direction: Object.prototype.hasOwnProperty.call(
+      operatorPresentation, 'actionable_direction'
+    ) ? operatorPresentation.actionable_direction : vrd.actionable_direction,
+    candidate_label:      operatorPresentation.candidate_label ?? vrd.candidate_label,
+    readiness:            operatorPresentation.verdict ?? vrd.readiness,
+    is_actionable:        operatorPresentation.is_actionable ?? vrd.is_actionable,
+    strict_reason:        operatorPresentation.reasoning ?? vrd.strict_reason,
+    waiting_for:          operatorPresentation.waiting_for ?? vrd.waiting_for,
+    vwap:                 operatorPresentation.vwap ?? vrd.vwap,
+    structure_guidance:   operatorPresentation.structure_guidance ?? vrd.structure_guidance,
     edge_grade:           vrd.grade,
     edge_components:      Array.isArray(vrd.edge_components)      ? vrd.edge_components      : [],
     score_breakdown:      Array.isArray(vrd.score_breakdown)      ? vrd.score_breakdown      : [],
@@ -256,7 +276,8 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
           || null)
       : null;
   const structureGuidance = (
-    vrd.structure_guidance
+    operatorPresentation.structure_guidance
+    ?? vrd.structure_guidance
     ?? vrd.structure_state
     ?? raw.structure_guidance
     ?? raw.structure_state
@@ -306,6 +327,7 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
 
   return {
     ...raw,
+    operator_presentation: operatorPresentation,
     market,
     market_state,
     left_brain,

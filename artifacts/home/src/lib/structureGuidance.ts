@@ -33,8 +33,13 @@ function asText(value: unknown): string {
  */
 export function selectStructureCycleDisplay(p: Record<string, unknown>): Record<string, unknown> {
   const verdict = asRecord(p.verdict);
+  const presentation = asRecord(p.operator_presentation);
   const canonical = asRecord(verdict.structure_state ?? p.structure_state);
-  const guidance = asRecord(verdict.structure_guidance ?? p.structure_guidance);
+  const guidance = asRecord(
+    presentation.structure_guidance
+    ?? verdict.structure_guidance
+    ?? p.structure_guidance
+  );
   return { ...canonical, ...guidance };
 }
 
