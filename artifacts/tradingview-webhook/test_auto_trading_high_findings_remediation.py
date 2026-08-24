@@ -294,6 +294,27 @@ class TestDatabentoHealthGate(unittest.TestCase):
         self.assertFalse(healthy)
         self.assertIn("STALE", reason.upper())
 
+    def test_delayed_dispatcher_blocks_before_source_data_is_replayed(self):
+        """A bounded-queue backlog must not be treated as fresh at transmission."""
+        healthy, reason, diag = self._gate(
+            DATABENTO_STATUS={
+                "connected": True,
+                "instruments": {
+                    "MGC": {
+                        "queue": {
+                            "freshness": "DELAYED",
+                            "queue_depth": 12,
+                            "processing_lag_s": 8.5,
+                            "dropped": 0,
+                        }
+                    }
+                },
+            }
+        )
+        self.assertFalse(healthy)
+        self.assertIn("QUEUE_DELAYED", reason.upper())
+        self.assertEqual(diag["queue_health"]["queue_depth"], 12)
+
     def test_stale_completed_bar(self):
         stale_ts = int((datetime.now(timezone.utc) - timedelta(minutes=10)).timestamp())
         healthy, reason, diag = self._gate(

@@ -9,6 +9,7 @@ from __future__ import annotations
 import time
 import math
 import threading
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 import pytest
 
@@ -498,6 +499,25 @@ class TestStaleness:
         e._atr_updated = time.time() - (STALE_THRESHOLD_S + 10)
         snap = e.get_snapshot()
         assert snap["atr"]["health"] == STALE
+
+    def test_external_cvd_and_rvol_use_source_time_not_read_time(self):
+        """Delayed shared records must not look healthy in the shadow snapshot."""
+        from canonical_market_state import _augment_snapshot
+        e = _engine()
+        e.on_bar_close(_bar(time.time(), 100, 105, 95, 100))
+        snap = e.get_snapshot()
+        original_cvd, original_rvol = cms._CVD_BY_TICKER, cms._RVOL_BY_TICKER
+        stale_iso = datetime.fromtimestamp(
+            time.time() - STALE_THRESHOLD_S - 1, timezone.utc
+        ).isoformat()
+        cms._CVD_BY_TICKER = {"MNQ": {"value": 10, "state": "bullish", "ts": stale_iso}}
+        cms._RVOL_BY_TICKER = {"MNQ": {"value": 1.8, "ts": stale_iso}}
+        try:
+            _augment_snapshot("MNQ", snap)
+        finally:
+            cms._CVD_BY_TICKER, cms._RVOL_BY_TICKER = original_cvd, original_rvol
+        assert snap["cvd"]["health"] == STALE
+        assert snap["volume"]["databento_rvol_health"] == STALE
 
 
 # ── 16. Insufficient-history behavior ────────────────────────────────────────
@@ -1040,7 +1060,9 @@ class TestComparisonMetrics:
         """VWAP diff ≤ 2 ticks → MATCH."""
         from canonical_market_state import _augment_snapshot, AGREE_MATCH, TICK_SIZES
         e = CanonicalMarketStateEngine("MNQ")
-        _feed(e, _bars_trend_up(10, start_price=29800.0))
+        _feed(e, _bars_trend_up(
+            10, start_price=29800.0, start_ts=time.time() - 9 * 60
+        ))
         snap = e.get_snapshot()
         tick = TICK_SIZES["MNQ"]
         close_legacy = snap["vwap"]["value"]  # match: same as databento
@@ -1060,7 +1082,9 @@ class TestComparisonMetrics:
         """VWAP diff > 10 ticks → LARGE_DIFF."""
         from canonical_market_state import _augment_snapshot, AGREE_LARGE_DIFF, TICK_SIZES
         e = CanonicalMarketStateEngine("MNQ")
-        _feed(e, _bars_trend_up(10, start_price=29800.0))
+        _feed(e, _bars_trend_up(
+            10, start_price=29800.0, start_ts=time.time() - 9 * 60
+        ))
         snap = e.get_snapshot()
         tick = TICK_SIZES["MNQ"]
         db_vwap = snap["vwap"]["value"]

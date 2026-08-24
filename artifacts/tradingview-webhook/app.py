@@ -45431,11 +45431,11 @@ def get_databento_status():
             "reason":  "Databento feed not enabled",
         }), 200
 
-    from databento_brain import DATABENTO_STATUS   # noqa: PLC0415
+    from databento_brain import get_databento_status_snapshot   # noqa: PLC0415
     return jsonify({
         "ok":      True,
         "enabled": True,
-        "status":  DATABENTO_STATUS,
+        "status":  get_databento_status_snapshot(),
     })
 
 
@@ -45581,9 +45581,18 @@ def _chart_connection_status(inst: str) -> str:
     connected  = DATABENTO_STATUS.get("connected", False)
     reconnects = int(DATABENTO_STATUS.get("reconnects") or 0)
     last_ts_str = DATABENTO_STATUS.get("last_ts")
+    queue_state = ((DATABENTO_STATUS.get("instruments") or {}).get(inst) or {}).get("queue") or {}
 
     if not connected:
         return "RECONNECTING" if reconnects > 0 else "DISCONNECTED"
+
+    queue_freshness = str(queue_state.get("freshness") or "").upper()
+    if queue_freshness == "UNAVAILABLE":
+        return "STALE"
+    if queue_freshness == "STALE":
+        return "STALE"
+    if queue_freshness == "DELAYED":
+        return "DELAYED"
 
     if last_ts_str:
         try:
@@ -66802,6 +66811,23 @@ def _check_databento_execution_health(inst):
     if not connected:
         diag["result"] = "disconnected"
         return False, "databento_disconnected", diag
+
+    # ── 1b. Bounded dispatcher freshness ────────────────────────────────────
+    # Queue health is additive telemetry.  When available, an overloaded or
+    # dropped instrument is not permitted to masquerade as fresh source data.
+    # Older test/compatibility status dictionaries omit this field entirely.
+    inst_queue = ((_DB_STATUS.get("instruments") or {}).get(inst) or {}).get("queue")
+    if isinstance(inst_queue, dict):
+        queue_freshness = str(inst_queue.get("freshness") or "").upper()
+        diag["queue_health"] = {
+            "freshness": queue_freshness or None,
+            "queue_depth": inst_queue.get("queue_depth"),
+            "processing_lag_s": inst_queue.get("processing_lag_s"),
+            "dropped": inst_queue.get("dropped"),
+        }
+        if queue_freshness in ("DELAYED", "STALE", "UNAVAILABLE"):
+            diag["result"] = "queue_" + queue_freshness.lower()
+            return False, "databento_queue_" + queue_freshness.lower(), diag
 
     # ── 2. Instrument subscribed (id→inst map populated) ───────────────────
     try:

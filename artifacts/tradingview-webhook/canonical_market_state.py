@@ -305,6 +305,23 @@ def _freshness(last_update: Optional[float]) -> str:
     return HEALTHY if age < STALE_THRESHOLD_S else STALE
 
 
+def _source_record_freshness(record: dict) -> str:
+    """Evaluate shared-source freshness from its source event timestamp."""
+    if not isinstance(record, dict) or record.get("value") is None:
+        return DATA_UNAVAILABLE
+    raw = record.get("ts")
+    if raw is None:
+        return DATA_UNAVAILABLE
+    try:
+        if isinstance(raw, (int, float)):
+            epoch = float(raw)
+        else:
+            epoch = datetime.fromisoformat(str(raw)).timestamp()
+    except (TypeError, ValueError, OSError):
+        return DATA_UNAVAILABLE
+    return _freshness(epoch)
+
+
 # ── Per-instrument engine ─────────────────────────────────────────────────────
 
 class CanonicalMarketStateEngine:
@@ -366,6 +383,10 @@ class CanonicalMarketStateEngine:
                 self._bars.append(bar)
                 self._bars_received += 1
                 ts = bar.get("ts", time.time())
+                try:
+                    ts = float(ts)
+                except (TypeError, ValueError):
+                    ts = time.time()
                 self._last_bar_ts = ts
                 c = bar.get("close")
                 if c is not None:
@@ -373,7 +394,7 @@ class CanonicalMarketStateEngine:
 
                 self._calc_vwap(bar, ts)
                 self._calc_volume(bar)
-                self._calc_atr(bar)
+                self._calc_atr(bar, ts)
                 self._calc_structure(ts)
                 self._calc_sweeps(bar, ts)
 
@@ -404,7 +425,9 @@ class CanonicalMarketStateEngine:
 
         if self._v_sum > 0:
             self._vwap = self._pv_sum / self._v_sum
-            self._vwap_updated = time.time()
+            # Source-event time prevents a delayed dispatcher replay from
+            # refreshing canonical VWAP merely because it was processed now.
+            self._vwap_updated = ts
 
     def _calc_volume(self, bar: dict) -> None:
         v = bar.get("volume") or 0
@@ -423,7 +446,7 @@ class CanonicalMarketStateEngine:
                     "NORMAL"
                 )
 
-    def _calc_atr(self, bar: dict) -> None:
+    def _calc_atr(self, bar: dict, ts: float) -> None:
         h  = bar.get("high")
         lo = bar.get("low")
         c  = bar.get("close")
@@ -443,7 +466,7 @@ class CanonicalMarketStateEngine:
                 self._atr = sum(list(self._tr_history)[-ATR_PERIOD:]) / ATR_PERIOD
             else:
                 self._atr = (self._atr * (ATR_PERIOD - 1) + tr) / ATR_PERIOD
-            self._atr_updated = time.time()
+            self._atr_updated = ts
 
     def _calc_structure(self, ts: float) -> None:
         """Deterministic swing-pivot structure detection from closed bars.
@@ -485,9 +508,9 @@ class CanonicalMarketStateEngine:
                     evt_type = "HH" if p_h > max(highs) else "LH"
                     self._struct_events.append(
                         StructureEvent(evt_type, "BULLISH" if evt_type == "HH" else "BEARISH",
-                                       p_h, time.time(), p_ts)
+                                       p_h, ts, p_ts)
                     )
-                    self._struct_updated = time.time()
+                    self._struct_updated = ts
 
         # ── Swing LOW pivot ───────────────────────────────────────────────────
         if (p_l < float("inf") and
@@ -502,9 +525,9 @@ class CanonicalMarketStateEngine:
                     evt_type = "HL" if p_l > min(lows) else "LL"
                     self._struct_events.append(
                         StructureEvent(evt_type, "BULLISH" if evt_type == "HL" else "BEARISH",
-                                       p_l, time.time(), p_ts)
+                                       p_l, ts, p_ts)
                     )
-                    self._struct_updated = time.time()
+                    self._struct_updated = ts
 
         # ── BOS / CHoCH from current close ────────────────────────────────────
         curr = bars[-1]
@@ -518,29 +541,29 @@ class CanonicalMarketStateEngine:
         # Bullish BOS: close above last confirmed swing high
         if c > last_sh.price:
             new_dir = "BULLISH"
-            evt = StructureEvent("BOS", "BULLISH", last_sh.price, time.time(), curr.get("ts", ts))
+            evt = StructureEvent("BOS", "BULLISH", last_sh.price, ts, curr.get("ts", ts))
             if self._last_bos is None or abs(self._last_bos.price - last_sh.price) > 0.01:
                 self._last_bos = evt
                 self._struct_events.append(evt)
                 if self._struct_dir == "BEARISH":
-                    choch = StructureEvent("CHOCH", "BULLISH", last_sh.price, time.time(), curr.get("ts", ts))
+                    choch = StructureEvent("CHOCH", "BULLISH", last_sh.price, ts, curr.get("ts", ts))
                     self._last_choch = choch
                     self._struct_events.append(choch)
                 self._struct_dir = new_dir
-                self._struct_updated = time.time()
+                self._struct_updated = ts
 
         # Bearish BOS: close below last confirmed swing low
         elif c < last_sl.price:
-            evt = StructureEvent("BOS", "BEARISH", last_sl.price, time.time(), curr.get("ts", ts))
+            evt = StructureEvent("BOS", "BEARISH", last_sl.price, ts, curr.get("ts", ts))
             if self._last_bos is None or abs(self._last_bos.price - last_sl.price) > 0.01:
                 self._last_bos = evt
                 self._struct_events.append(evt)
                 if self._struct_dir == "BULLISH":
-                    choch = StructureEvent("CHOCH", "BEARISH", last_sl.price, time.time(), curr.get("ts", ts))
+                    choch = StructureEvent("CHOCH", "BEARISH", last_sl.price, ts, curr.get("ts", ts))
                     self._last_choch = choch
                     self._struct_events.append(choch)
                 self._struct_dir = "BEARISH"
-                self._struct_updated = time.time()
+                self._struct_updated = ts
 
     def _calc_sweeps(self, bar: dict, ts: float) -> None:
         """Liquidity sweep: wick beyond a recent swing level, close back inside."""
@@ -556,7 +579,7 @@ class CanonicalMarketStateEngine:
                 self._sweeps.append(SweepEvent(
                     instrument=self.instrument, direction="BEARISH_SWEEP",
                     swept_level=last_sh.price, sweep_price=h,
-                    created_at=time.time(), bar_ts=ts,
+                    created_at=ts, bar_ts=ts,
                 ))
 
         if self._swing_lows:
@@ -565,7 +588,7 @@ class CanonicalMarketStateEngine:
                 self._sweeps.append(SweepEvent(
                     instrument=self.instrument, direction="BULLISH_SWEEP",
                     swept_level=last_sl.price, sweep_price=lo,
-                    created_at=time.time(), bar_ts=ts,
+                    created_at=ts, bar_ts=ts,
                 ))
 
     # ── Snapshot ──────────────────────────────────────────────────────────────
@@ -603,7 +626,10 @@ class CanonicalMarketStateEngine:
             # Structure detection is inherently slow (needs pivot confirmation on both sides).
             # Unknown direction always means INSUFFICIENT_HISTORY — never DATA_UNAVAILABLE —
             # because it's a signal-arrival problem, not a configuration problem.
-            struct_health = HEALTHY if self._struct_dir != "UNKNOWN" else INSUFFICIENT_HISTORY
+            struct_health = (
+                _freshness(self._struct_updated)
+                if self._struct_dir != "UNKNOWN" else INSUFFICIENT_HISTORY
+            )
 
             # Sweeps
             sweep_list = [s.to_dict() for s in list(self._sweeps)[-5:]]
@@ -635,7 +661,10 @@ class CanonicalMarketStateEngine:
                     "relative_volume":    self._rvol,
                     "regime":             self._vol_regime,
                     "source":             "databento",
-                    "health":             HEALTHY if self._rvol is not None else INSUFFICIENT_HISTORY,
+                    "health":             (
+                        _freshness(self._last_bar_ts)
+                        if self._rvol is not None else INSUFFICIENT_HISTORY
+                    ),
                     "promotion_status":   SHADOW,
                 },
                 "atr": {
@@ -850,7 +879,7 @@ def _augment_snapshot(inst: str, snap: dict) -> None:
             "TradingView alerts may also inject (secondary). "
             "Databento is the continuous authoritative source."
         ),
-        "health":           HEALTHY if cvd_rec.get("value") is not None else DATA_UNAVAILABLE,
+        "health":           _source_record_freshness(cvd_rec),
         "promotion_status": SHADOW,
     }
 
@@ -866,6 +895,7 @@ def _augment_snapshot(inst: str, snap: dict) -> None:
     if rvol_rec.get("value") is not None:
         snap["volume"]["databento_rvol"]        = rvol_rec.get("value")
         snap["volume"]["databento_rvol_source"] = "databento_brain"
+        snap["volume"]["databento_rvol_health"] = _source_record_freshness(rvol_rec)
 
     # ── 15m / 4H Trend ────────────────────────────────────────────────────────
     # TRUE SOURCE: DATABENTO — trend_alignment.ingest_1m_bar() consumes

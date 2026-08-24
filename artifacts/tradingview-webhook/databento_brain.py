@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import logging
 import os
+import queue
 import time
 import threading
 import uuid
@@ -59,6 +60,12 @@ DATABENTO_MBP1_ENABLED = os.environ.get("DATABENTO_MBP1_ENABLED", "1") == "1"
 TOP_OF_BOOK_STALE_S = max(1.0, float(os.environ.get("TOP_OF_BOOK_STALE_S", "5")))
 TOP_OF_BOOK_HISTORY_S = max(60.0, float(os.environ.get("TOP_OF_BOOK_HISTORY_S", "300")))
 TOP_OF_BOOK_HISTORY_SAMPLE_S = max(0.25, float(os.environ.get("TOP_OF_BOOK_HISTORY_SAMPLE_S", "1")))
+# The live iterator must never be held hostage by an expensive bar-close callback.
+# Keep intake bounded and preserve stream order with one worker.  A dropped record
+# makes the affected instrument unavailable for fresh-only consumers until reconnect.
+RECORD_QUEUE_MAX = max(64, int(os.environ.get("DATABENTO_RECORD_QUEUE_MAX", "4096")))
+RECORD_QUEUE_DELAY_S = max(1.0, float(os.environ.get("DATABENTO_RECORD_QUEUE_DELAY_S", "5")))
+RECORD_QUEUE_STALE_S = max(RECORD_QUEUE_DELAY_S, float(os.environ.get("DATABENTO_RECORD_QUEUE_STALE_S", "120")))
 
 # ── Public stores (read by Flask routes and the dashboard chart) ──────────────
 # Each bar entry: {ts, open, high, low, close, volume, vwap?, atr?}
@@ -321,7 +328,32 @@ DATABENTO_STATUS: dict[str, Any] = {
         "last_update": None,
         "updates":     0,
     },
+    "queue": {
+        "max_depth":       RECORD_QUEUE_MAX,
+        "depth":           0,
+        "enqueued":        0,
+        "processed":       0,
+        "dropped":         0,
+        "unsupported":     0,
+        "worker":          "stopped",
+        "reset_at":        None,
+    },
 }
+
+
+def get_databento_status_snapshot() -> dict[str, Any]:
+    """Return a JSON-safe copy of live telemetry without exposing mutable stores."""
+    status = dict(DATABENTO_STATUS)
+    status["queue"] = dict(DATABENTO_STATUS.get("queue") or {})
+    status["order_book"] = dict(DATABENTO_STATUS.get("order_book") or {})
+    status["instruments"] = {
+        inst: {
+            **dict(values or {}),
+            "queue": dict((values or {}).get("queue") or {}),
+        }
+        for inst, values in (DATABENTO_STATUS.get("instruments") or {}).items()
+    }
+    return status
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -414,6 +446,7 @@ class DatabentoBrain:
         self._last_bos:     dict[str, Any]         = {i: None for i in DB_SYMBOLS}
         self._last_sweep:   dict[str, Any]         = {i: None for i in DB_SYMBOLS}
         self._last_confirm: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        self._active_bar_source_ts: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._trend:        dict[str, str | None]  = {i: None for i in DB_SYMBOLS}
         # HH/HL/LH/LL: last confirmed swing high/low used for label sequencing
         self._prev_sh:      dict[str, float | None] = {i: None for i in DB_SYMBOLS}
@@ -427,8 +460,29 @@ class DatabentoBrain:
         self._structure_signal_callbacks: list = []
         # Tick callbacks: called for every raw trade record (sub-second cadence).
         # Registered by app.py to forward live ticks to SSE subscribers for the
-        # real-time dashboard chart.  Must return quickly — runs on the feed thread.
+        # real-time dashboard chart.  Must return quickly — runs on the ordered
+        # dispatcher worker and must not recreate feed backpressure.
         self._tick_callbacks: list = []
+        # The feed iterator is producer-only.  One worker preserves the ordering
+        # that the old inline path had while isolating socket intake from detectors,
+        # chart callbacks, and analysis fan-out.
+        self._dispatch_lock = threading.RLock()
+        self._record_process_lock = threading.RLock()
+        self._record_queue: queue.Queue | None = None
+        self._record_worker: threading.Thread | None = None
+        self._record_worker_stop: threading.Event | None = None
+        self._dispatch_generation = 0
+        self._active_dispatch_generation = 0
+        self._queue_depth_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_enqueued_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_processed_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_dropped_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_unsupported_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_unsupported_global = 0
+        self._last_enqueued_at: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
+        self._last_enqueued_event: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
+        self._last_processed_at: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
+        self._last_processed_event: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -445,20 +499,258 @@ class DatabentoBrain:
 
     def register_bar_close_callback(self, fn) -> None:
         """Register a callable(inst: str, price: float) invoked after each bar close.
-        Called from the data-feed thread — fn must be fast or dispatch its own thread."""
+        Called from the ordered record worker — fn must be fast or dispatch its own thread."""
         self._bar_close_callbacks.append(fn)
 
     def register_structure_signal_callback(self, fn) -> None:
         """Register a callable(inst: str, alert_type: str, price: float) invoked
         whenever _inject_alert fires a BOS, CHOCH, or CONFIRMATION alert.
-        Called from the data-feed thread — fn must return quickly."""
+        Called from the ordered record worker — fn must return quickly."""
         self._structure_signal_callbacks.append(fn)
 
     def register_tick_callback(self, fn) -> None:
         """Register a callable(inst, ts_s, price, volume, side) invoked for
-        every individual Databento trade record.  Runs on the feed thread —
+        every individual Databento trade record.  Runs on the ordered worker —
         fn must return immediately (enqueue or discard; never block or sleep)."""
         self._tick_callbacks.append(fn)
+
+    # ── Bounded record dispatch / telemetry ───────────────────────────────────
+
+    @staticmethod
+    def _event_epoch(rec: Any) -> float | None:
+        """Return the source event epoch, not the local processing time."""
+        try:
+            raw = getattr(rec, "ts_event", None)
+            if raw is None:
+                return None
+            value = float(raw)
+            return value / 1_000_000_000 if value > 10_000_000_000 else value
+        except (TypeError, ValueError, OverflowError):
+            return None
+
+    @staticmethod
+    def _iso_epoch(value: float | None) -> str | None:
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+
+    def _queue_state_for(self, inst: str) -> dict[str, Any]:
+        """Build a copied, current queue health view while holding _dispatch_lock."""
+        now = time.time()
+        depth = self._queue_depth_by_inst.get(inst, 0)
+        last_enqueued_event = self._last_enqueued_event.get(inst)
+        last_processed_event = self._last_processed_event.get(inst)
+        processing_lag = None
+        if last_enqueued_event is not None:
+            processing_lag = max(
+                0.0,
+                last_enqueued_event - (last_processed_event if last_processed_event is not None else last_enqueued_event),
+            )
+        event_age = max(0.0, now - last_processed_event) if last_processed_event is not None else None
+        dropped = self._queue_dropped_by_inst.get(inst, 0)
+        worker_alive = bool(self._record_worker and self._record_worker.is_alive())
+        if dropped:
+            freshness = "UNAVAILABLE"
+            reason = "records_dropped"
+        elif last_processed_event is None:
+            freshness = "UNAVAILABLE"
+            reason = "no_processed_records"
+        elif event_age is not None and event_age > RECORD_QUEUE_STALE_S:
+            freshness = "STALE"
+            reason = "source_event_stale"
+        elif depth > 0 or (processing_lag is not None and processing_lag > RECORD_QUEUE_DELAY_S):
+            freshness = "DELAYED"
+            reason = "queue_backlog"
+        else:
+            freshness = "FRESH"
+            reason = None
+        return {
+            "queue_depth": depth,
+            "enqueued": self._queue_enqueued_by_inst.get(inst, 0),
+            "processed": self._queue_processed_by_inst.get(inst, 0),
+            "dropped": dropped,
+            "unsupported": self._queue_unsupported_by_inst.get(inst, 0),
+            "last_enqueued_at": self._iso_epoch(self._last_enqueued_at.get(inst)),
+            "newest_enqueued_timestamp": self._iso_epoch(last_enqueued_event),
+            "last_processed_at": self._iso_epoch(self._last_processed_at.get(inst)),
+            "newest_processed_timestamp": self._iso_epoch(last_processed_event),
+            "processing_lag_s": round(processing_lag, 3) if processing_lag is not None else None,
+            "source_event_age_s": round(event_age, 3) if event_age is not None else None,
+            "freshness": freshness,
+            "unavailable_reason": reason,
+            "worker_alive": worker_alive,
+        }
+
+    def _publish_queue_telemetry(self, inst: str | None = None) -> None:
+        """Publish additive health snapshots; this never affects signal scoring."""
+        with self._dispatch_lock:
+            instruments = (inst,) if inst in DB_SYMBOLS else tuple(DB_SYMBOLS)
+            queue_state = DATABENTO_STATUS["queue"]
+            queue_state.update({
+                "max_depth": RECORD_QUEUE_MAX,
+                "depth": sum(self._queue_depth_by_inst.values()),
+                "enqueued": sum(self._queue_enqueued_by_inst.values()),
+                "processed": sum(self._queue_processed_by_inst.values()),
+                "dropped": sum(self._queue_dropped_by_inst.values()),
+                "unsupported": sum(self._queue_unsupported_by_inst.values()) + self._queue_unsupported_global,
+                "worker": "running" if self._record_worker and self._record_worker.is_alive() else "stopped",
+            })
+            for key in instruments:
+                existing = dict(DATABENTO_STATUS["instruments"].get(key) or {})
+                existing["queue"] = self._queue_state_for(key)
+                DATABENTO_STATUS["instruments"][key] = existing
+
+    def _start_record_dispatcher(self) -> None:
+        """Start a fresh, bounded ordered dispatcher for one feed connection."""
+        with self._dispatch_lock:
+            if self._record_worker is not None and self._record_worker.is_alive():
+                # Never run two state-mutating consumers across reconnects.
+                raise RuntimeError("previous Databento record worker is still running")
+            self._dispatch_generation += 1
+            generation = self._dispatch_generation
+            self._active_dispatch_generation = generation
+            self._record_queue = queue.Queue(maxsize=RECORD_QUEUE_MAX)
+            self._record_worker_stop = threading.Event()
+            self._queue_depth_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_enqueued_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_processed_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_dropped_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_unsupported_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_unsupported_global = 0
+            self._last_enqueued_at = {i: None for i in DB_SYMBOLS}
+            self._last_enqueued_event = {i: None for i in DB_SYMBOLS}
+            self._last_processed_at = {i: None for i in DB_SYMBOLS}
+            self._last_processed_event = {i: None for i in DB_SYMBOLS}
+            DATABENTO_STATUS["queue"]["reset_at"] = datetime.now(timezone.utc).isoformat()
+            worker = threading.Thread(
+                target=self._record_worker_loop,
+                args=(self._record_queue, self._record_worker_stop, generation),
+                daemon=True,
+                name="databento-record-worker",
+            )
+            self._record_worker = worker
+            worker.start()
+        self._publish_queue_telemetry()
+
+    def _stop_record_dispatcher(self) -> None:
+        """Stop one session before reconnecting; never overlap state consumers."""
+        with self._dispatch_lock:
+            worker = self._record_worker
+            stop = self._record_worker_stop
+            record_queue = self._record_queue
+            if stop is not None:
+                stop.set()
+            while record_queue is not None:
+                try:
+                    _, inst, _, _ = record_queue.get_nowait()
+                except queue.Empty:
+                    break
+                if inst in DB_SYMBOLS:
+                    self._queue_depth_by_inst[inst] = max(0, self._queue_depth_by_inst[inst] - 1)
+                    self._queue_dropped_by_inst[inst] += 1
+                record_queue.task_done()
+            DATABENTO_STATUS["queue"]["worker"] = "stopping"
+        # Serialize shutdown against the actual record handler. If a callback is
+        # currently running, wait for that one already-started record to finish
+        # before fencing the session; no subsequent queued record can enter.
+        with self._record_process_lock:
+            self._active_dispatch_generation = 0
+        if worker is not None:
+            warned = False
+            while worker.is_alive():
+                worker.join(timeout=5)
+                if worker.is_alive() and not warned:
+                    warned = True
+                    logger.warning(
+                        "DatabentoBrain: waiting for in-flight record handler before reconnect"
+                    )
+        self._publish_queue_telemetry()
+
+    def _dispatch_record(self, rec: Any) -> None:
+        """Non-blocking feed-thread intake; overflow is explicit, never silent."""
+        kind = "mbp1" if self._is_mbp1_record(rec) else "trade" if self._is_trade_record(rec) else "unsupported"
+        inst = self._instrument_for_record(rec) if kind != "unsupported" else None
+        if kind == "unsupported":
+            with self._dispatch_lock:
+                self._queue_unsupported_global += 1
+            self._publish_queue_telemetry()
+            return
+        event_epoch = self._event_epoch(rec)
+        now = time.time()
+        unsupported = False
+        with self._dispatch_lock:
+            if inst not in DB_SYMBOLS:
+                # Preserve prior unsupported behavior (ignored record) while exposing it.
+                if inst:
+                    self._queue_unsupported_by_inst[inst] = self._queue_unsupported_by_inst.get(inst, 0) + 1
+                else:
+                    self._queue_unsupported_global += 1
+                unsupported = True
+            else:
+                self._last_enqueued_at[inst] = now
+                if event_epoch is not None:
+                    prior = self._last_enqueued_event[inst]
+                    self._last_enqueued_event[inst] = max(prior or event_epoch, event_epoch)
+                record_queue = self._record_queue
+                if record_queue is None:
+                    self._queue_dropped_by_inst[inst] += 1
+                    unsupported = True
+                else:
+                    try:
+                        record_queue.put_nowait((rec, inst, kind, event_epoch))
+                    except queue.Full:
+                        self._queue_dropped_by_inst[inst] += 1
+                        if self._queue_dropped_by_inst[inst] == 1:
+                            logger.warning(
+                                "DatabentoBrain: bounded record queue saturated; dropping new %s records for %s",
+                                kind, inst,
+                            )
+                        unsupported = True
+                    else:
+                        self._queue_depth_by_inst[inst] += 1
+                        self._queue_enqueued_by_inst[inst] += 1
+        self._publish_queue_telemetry(inst)
+        if unsupported:
+            return
+
+    def _record_worker_loop(
+        self,
+        record_queue: queue.Queue,
+        stop: threading.Event,
+        generation: int,
+    ) -> None:
+        """Consume records in stream order without ever blocking the live iterator."""
+        while not stop.is_set():
+            try:
+                rec, inst, kind, event_epoch = record_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            with self._dispatch_lock:
+                # Queue depth means records still waiting; the one now executing
+                # is deliberately excluded so it can never exceed max_depth.
+                self._queue_depth_by_inst[inst] = max(0, self._queue_depth_by_inst[inst] - 1)
+            try:
+                with self._record_process_lock:
+                    # Fence a disconnected or superseded session before it can
+                    # mutate bars, indicators, structure, or callbacks.
+                    if stop.is_set() or generation != self._active_dispatch_generation:
+                        continue
+                    if kind == "mbp1":
+                        self._on_mbp1(rec)
+                    else:
+                        self._on_trade(rec)
+                    with self._dispatch_lock:
+                        self._queue_processed_by_inst[inst] += 1
+                        self._last_processed_at[inst] = time.time()
+                        if event_epoch is not None:
+                            prior = self._last_processed_event[inst]
+                            self._last_processed_event[inst] = max(prior or event_epoch, event_epoch)
+            except Exception as exc:
+                logger.debug("DatabentoBrain record-worker error: %s", exc)
+            finally:
+                record_queue.task_done()
+                self._publish_queue_telemetry(inst)
 
     # ── HTTP symbology pre-fetch ──────────────────────────────────────────────
 
@@ -611,6 +903,7 @@ class DatabentoBrain:
                     "continuing with trades only (%s)",
                     exc,
                 )
+        self._start_record_dispatcher()
         DATABENTO_STATUS["connected"] = True
         logger.info(
             "DatabentoBrain: connected ✓  streaming %s", list(DB_SYMBOLS.values())
@@ -658,15 +951,17 @@ class DatabentoBrain:
         # map is built concurrently above and will be ready before either is used.
         try:
             for record in client:
-                if self._is_mbp1_record(record):
-                    self._on_mbp1(record)
-                elif self._is_trade_record(record):
-                    self._on_trade(record)
+                self._dispatch_record(record)
         finally:
+            # Disconnect first: no in-flight or callback-triggered execution can
+            # pass the existing Databento health boundary while shutdown drains.
+            DATABENTO_STATUS["connected"] = False
             # Stop the flush timer whether the feed exits cleanly or on error.
             _flush_stop.set()
+            # Do not replay backlog from a dead connection after reconnect.  Any
+            # discarded records make the affected instrument explicitly unavailable.
+            self._stop_record_dispatcher()
 
-        DATABENTO_STATUS["connected"] = False
         logger.warning("DatabentoBrain: feed closed by server — reconnecting …")
 
     # ── Shared record/instrument helpers ───────────────────────────────────────
@@ -746,7 +1041,11 @@ class DatabentoBrain:
             # remains available only until its regular stale timeout elapses.
             if bid_px <= 0 or ask_px <= bid_px or bid_sz <= 0 or ask_sz <= 0:
                 return
-            received_at = time.time()
+            processed_at = time.time()
+            event_epoch = self._event_epoch(rec)
+            # A quote delayed in the dispatcher must not regain freshness simply
+            # because it was processed moments ago.
+            received_at = event_epoch if event_epoch is not None else processed_at
             event_ts = getattr(rec, "ts_event", None)
             snapshot = {
                 "available": True,
@@ -756,7 +1055,8 @@ class DatabentoBrain:
                 "bid_size": bid_sz,
                 "ask_size": ask_sz,
                 "ts_event": event_ts,
-                "updated_at": datetime.now(timezone.utc).isoformat(),
+                "updated_at": self._iso_epoch(received_at) or datetime.now(timezone.utc).isoformat(),
+                "processed_at": self._iso_epoch(processed_at),
                 "_received_at": received_at,
             }
             with _TOP_OF_BOOK_LOCK:
@@ -798,11 +1098,18 @@ class DatabentoBrain:
             size  = int(rec.size)
             side  = getattr(rec, "side", None)  # 'A'=buy aggressor, 'B'=sell, 'N'=?
 
-            DATABENTO_STATUS["last_ts"] = datetime.now(timezone.utc).isoformat()
+            processed_iso = datetime.now(timezone.utc).isoformat()
+            event_iso = self._iso_epoch(ts_s) or processed_iso
+            # Keep the legacy timestamp as local processing time for connection
+            # liveness, but source-derived stores carry their actual event time.
+            DATABENTO_STATUS["last_ts"] = processed_iso
+            DATABENTO_STATUS["last_event_ts"] = event_iso
 
             # ── Live price (sub-second resolution) ──
             self._cp[inst]    = price
-            self._cp_ts[inst] = datetime.now(timezone.utc).isoformat()
+            # Freshness must describe the market event, not when an overloaded
+            # consumer eventually got around to handling it.
+            self._cp_ts[inst] = event_iso
 
             # ── CVD accumulation (bid/ask aggression) ──
             if side == "A":        # buyer hit the ask — demand pressure
@@ -974,7 +1281,11 @@ class DatabentoBrain:
         if len(bars) > self.MAX_BARS:
             del bars[0]
 
-        now_iso = datetime.now(timezone.utc).isoformat()
+        processed_iso = datetime.now(timezone.utc).isoformat()
+        # A completed bar is source-time data.  Using wall-clock processing time
+        # here would make a queued replay look current to VWAP/CVD/RVOL consumers.
+        source_iso = self._iso_epoch(bar.get("ts")) or processed_iso
+        self._active_bar_source_ts[inst] = bar.get("ts")
 
         # Session VWAP — accumulated from live trade ticks (_on_trade).
         # On boot, historical bars arrive before any live trades, so _v_sum is 0.
@@ -1003,7 +1314,8 @@ class DatabentoBrain:
             entry: dict[str, Any] = {
                 "vwap":        vwap,
                 "vwap_status": "ok",
-                "ts":          now_iso,
+                "ts":          source_iso,
+                "processed_at": processed_iso,
                 "source":      "databento",
             }
             if atr is not None:
@@ -1016,7 +1328,8 @@ class DatabentoBrain:
             "state":     cvd_state,
             "value":     cvd_val,
             "direction": "rising" if cvd_val > 0 else "falling",
-            "ts":        now_iso,
+            "ts":        source_iso,
+            "processed_at": processed_iso,
             "source":    "databento",
         }
 
@@ -1024,11 +1337,16 @@ class DatabentoBrain:
         if rvol is not None:
             self._rvol[inst] = {
                 "value":  rvol,
-                "ts":     now_iso,
+                "ts":     source_iso,
+                "processed_at": processed_iso,
                 "source": "databento",
             }
             if rvol >= self.VOL_SPIKE_MULT:
-                self._vs[inst] = {"ts": now_iso, "source": "databento"}
+                self._vs[inst] = {
+                    "ts": source_iso,
+                    "processed_at": processed_iso,
+                    "source": "databento",
+                }
 
         # ── Public bar store (dashboard live chart) ───────────────────────────
         # Order Flow V1: include per-bar buy/sell volume and the session CVD
@@ -1079,9 +1397,10 @@ class DatabentoBrain:
         if vwap is not None and self._vwap is not None:
             self._vwap[inst] = {
                 "value":   round(vwap, 4),
-                "ts":      now_iso,
+                "ts":      source_iso,
+                "processed_at": processed_iso,
                 "source":  "databento",
-                "db_ts":   now_iso,
+                "db_ts":   source_iso,
             }
 
         # ── Telemetry ─────────────────────────────────────────────────────────
@@ -1093,6 +1412,8 @@ class DatabentoBrain:
             "cvd":   round(cvd_val, 1),
             "rvol":  round(rvol, 2)  if rvol  is not None else None,
             "price": bar["close"],
+            "last_bar_source_timestamp": source_iso,
+            "last_bar_processed_at": processed_iso,
         })
         DATABENTO_STATUS["instruments"][inst] = telemetry
 
@@ -1340,6 +1661,10 @@ class DatabentoBrain:
 
     def _inject_alert(self, inst: str, alert_type: str, price: float) -> None:
         """Append a synthetic structure alert to the shared ALERT_HISTORY deque."""
+        source_timestamp = (
+            self._iso_epoch(self._active_bar_source_ts.get(inst))
+            or datetime.now(timezone.utc).isoformat()
+        )
         record = {
             "alert_type":        alert_type,
             "ticker":            inst + "1!",
@@ -1348,7 +1673,7 @@ class DatabentoBrain:
             "source":            "databento",   # explicit feed-source tag
             "canonical":         True,           # Databento events are always canonical
             "price":             float(price),
-            "timestamp":         datetime.now(timezone.utc).isoformat(),
+            "timestamp":         source_timestamp,
             "raw":               {"source": "databento_brain"},
         }
         # Snapshot history BEFORE appending so on_databento_event can retroactively
