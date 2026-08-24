@@ -1089,6 +1089,66 @@ def _build_eligibility_mock_conn(inst_rows, last20_rows):
     return mock_conn, mock_cur
 
 
+def test_coach_rule_engine_eligibility_bootstraps_empty_instruments_live():
+    """A reachable DB with no prior trades must fail open for every instrument.
+
+    This is intentionally distinct from the under-threshold path: zero history
+    means a first-ever trade must be allowed to bootstrap evidence, whereas a
+    positive but insufficient history remains GHOST_ONLY.
+    """
+    psycopg2_mod = getattr(app, "psycopg2", None)
+    if psycopg2_mod is None:
+        return
+
+    min_sample = app.LEARNING_LIVE_MIN_SAMPLE
+    assert min_sample > 0, "The under-threshold boundary must be above zero"
+    mock_conn, _ = _build_eligibility_mock_conn([], [])
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+
+    modes = ("SWING", "SCALP", "MICRO_SCALP")
+    try:
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(app, "_learning_conn", return_value=None),
+        ):
+            app._recompute_learning_eligibility(mock_conn)
+
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            entries = {
+                f"{instrument}::{mode}":
+                    dict(app.LEARNING_ELIGIBILITY.get(f"{instrument}::{mode}") or {})
+                for instrument in app.ASSETS
+                for mode in modes
+            }
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+
+    for key, entry in entries.items():
+        instrument, mode = key.split("::", 1)
+        assert entry, f"Expected an eligibility entry for {instrument} {mode}"
+        assert entry.get("sample_size") == 0, (
+            f"{key} should have zero prior trades, got "
+            f"{entry.get('sample_size')!r}")
+        assert entry.get("status") == "LIVE_ELIGIBLE", (
+            f"{key} must fail open as LIVE_ELIGIBLE with no history, got "
+            f"{entry.get('status')!r}")
+
+        rule = entry.get("rule_triggered", "")
+        expected_bootstrap_rule = (
+            f"no_prior_{mode}_trades (bootstrapping — fail-open)"
+        )
+        assert rule == expected_bootstrap_rule, (
+            f"{key} must identify the n=0 bootstrap path, got {rule!r}")
+        assert not rule.startswith(f"under_{min_sample}_"), (
+            f"{key} incorrectly used the under-threshold rule for n=0: {rule!r}")
+        assert rule != f"under_{min_sample}_{mode}_samples (0 recorded)", (
+            f"{key} bootstrap rule must remain distinct from under-threshold")
+
+
 def test_coach_rule_engine_eligibility_ghost_only_below_min_sample():
     """_recompute_learning_eligibility() must classify an instrument as GHOST_ONLY
     when the DB returns exactly LEARNING_LIVE_MIN_SAMPLE - 1 closed trades.
