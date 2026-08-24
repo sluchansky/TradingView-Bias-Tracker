@@ -611,6 +611,87 @@ class TestP5_005_ExecutionTimeout(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# V1-P5-005b: Ambiguous 5xx duplicate prevention
+# A broker 5xx can occur after the provider receives an order. The reservation
+# must therefore remain held, exactly like a RequestException, so an auto retry
+# cannot place a duplicate.
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestP5_005b_Broker5xxCooldown(unittest.TestCase):
+    """V1-P5-005b — 5xx holds the live auto-send cooldown reservation."""
+
+    def setUp(self):
+        self._orig_last = dict(app._TRADERSPOST_LAST)
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.pop("MGC", None)
+
+    def tearDown(self):
+        with app._TRADERSPOST_LOCK:
+            app._TRADERSPOST_LAST.clear()
+            app._TRADERSPOST_LAST.update(self._orig_last)
+
+    @staticmethod
+    def _ready_analysis():
+        """A complete, actionable plan that can reach the live broker sink."""
+        return {
+            "instrument": "MGC",
+            "verdict": "LONG READY",
+            "is_actionable": True,
+            "market_open": True,
+            "direction": "Long",
+            "edge_score": 90,
+            "trade_plan": {
+                "trade_plan": True,
+                "entry_zone": "2500.00",
+                "stop_loss": "2492.00",
+                "target1": "2508.00",
+                "target2": "2516.00",
+                "rr": "1:1",
+                "direction": "Long",
+            },
+            "price": 2500.0,
+            "vwap_value": 2498.0,
+        }
+
+    def test_5xx_holds_slot_and_suppresses_immediate_auto_retry(self):
+        """First auto send gets 503; the same immediate auto retry is a local 429.
+
+        The second call must not invoke requests.post: retrying an ambiguous broker
+        response could duplicate a live order that the broker already accepted.
+        """
+        broker_response = mock.Mock(status_code=503, text="Service Unavailable")
+
+        with mock.patch.object(app, "full_analysis",
+                               return_value=self._ready_analysis()), \
+             mock.patch.object(app, "resolve_execution_mode",
+                               return_value="traderspost"), \
+             mock.patch.object(app, "execution_configured", return_value=True), \
+             mock.patch.object(app, "execution_is_live", return_value=True), \
+             mock.patch.object(app, "_check_arm_for_transmission",
+                               return_value=(True, "", {})), \
+             mock.patch.object(app, "_save_market_state"), \
+             mock.patch.object(app, "_record_broker_send"), \
+             mock.patch.object(app, "_record_exec_rejection"), \
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_discord_url", return_value=None), \
+             mock.patch.object(app, "TRADERSPOST_WEBHOOK_URL",
+                               "https://broker.test/orders"), \
+             mock.patch("requests.post", return_value=broker_response) as post:
+            first, first_code = app.execute_trade_gateway(
+                "MGC", 1, source="auto", direction="Long")
+            second, second_code = app.execute_trade_gateway(
+                "MGC", 1, source="auto", direction="Long")
+
+        self.assertEqual(first_code, 502)
+        self.assertEqual(first.get("outcome"), "broker_rejected")
+        self.assertIs(first.get("broker_verify_required"), True)
+        self.assertIsNotNone(app._TRADERSPOST_LAST.get("MGC"))
+        self.assertEqual(second_code, 429)
+        self.assertEqual(second.get("outcome"), "rejected")
+        post.assert_called_once()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # V1-P5-006: Payload validation test
 # AC-5.3: Missing required field → outcome="invalid_payload"; no HTTP call sent
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1680,6 +1761,7 @@ def run_all():
         TestP5_003_DuplicateExecutionPrevention,
         TestP5_004_BrokerRejection,
         TestP5_005_ExecutionTimeout,
+        TestP5_005b_Broker5xxCooldown,
         TestP5_006_PayloadValidation,
         TestP5_007_SafeDisarm,
         TestP5_008_PaperModeE2E,
