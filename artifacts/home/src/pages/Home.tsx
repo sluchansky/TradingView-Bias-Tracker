@@ -1,6 +1,12 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import LordPiggingtonAvatar from '../components/avatar/LordPiggingtonAvatar';
 import AvatarAura from '../components/avatar/AvatarAura';
+import {
+  classifyDatabentoFreshness,
+  formatFreshnessAge,
+  latestBarTimestampMs,
+  timestampMs,
+} from '../lib/marketDataFreshness';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const BULL = '#22c55e'; const BEAR = '#ef4444'; const AMB = '#f59e0b';
@@ -2526,18 +2532,38 @@ export default function Home() {
     if (!authPwd || demoMode) return;
     const fetchDb = async () => {
       try {
-        const r = await fetch(`/api/databento-bars?inst=${ticker}&limit=80`,
-          { credentials: 'include', headers: authHeader });
-        if (!r.ok) return;
-        const d = await r.json();
-        if (d.enabled && Array.isArray(d.bars)) {
-          setDbBars(d.bars);
-          setDbStatus({ connected: true, inst: d.inst, count: d.count });
-        } else {
-          setDbBars([]);
-          setDbStatus({ connected: false, reason: d.reason });
-        }
-      } catch { /* feed may be off — silently ignore */ }
+        const [barsResponse, statusResponse] = await Promise.all([
+          fetch(`/api/databento-bars?inst=${ticker}&limit=80`, { credentials: 'include', headers: authHeader }),
+          fetch('/api/databento-status', { credentials: 'include', headers: authHeader }),
+        ]);
+        if (!barsResponse.ok || !statusResponse.ok) throw new Error('Databento status unavailable');
+        const barsPayload = await barsResponse.json();
+        const statusPayload = await statusResponse.json();
+        const service = statusPayload?.status ?? statusPayload ?? {};
+        const telemetry = service?.instruments?.[ticker] ?? {};
+        const bars = Array.isArray(barsPayload?.bars) ? barsPayload.bars : [];
+        const freshness = classifyDatabentoFreshness({
+          enabled: barsPayload?.enabled === true && statusPayload?.enabled !== false,
+          connected: service?.connected === true,
+          lastEventAt: service?.last_ts,
+          latestBarAt: latestBarTimestampMs(bars),
+        });
+        setDbStatus({
+          ...freshness,
+          inst: ticker,
+          count: bars.length,
+          connection: service?.status ?? (service?.connected ? 'CONNECTED' : 'DISCONNECTED'),
+          reason: barsPayload?.reason ?? service?.error ?? null,
+          price: telemetry?.price ?? null,
+          vwap: telemetry?.vwap ?? null,
+          lastEventAt: service?.last_ts ?? null,
+        });
+        setDbBars(freshness.current ? bars : []);
+      } catch {
+        // Fail closed in the display: an old quote or chart must never look live.
+        setDbBars([]);
+        setDbStatus({ state: 'OFFLINE', current: false, reason: 'Databento status request failed', count: 0 });
+      }
     };
     fetchDb();
     const id = setInterval(fetchDb, 5000);
@@ -2586,7 +2612,8 @@ export default function Home() {
   const strictR = (data?.strict_reason || mb.wait_reason || '') as string;
   const marketStatus = (data?.market_status ?? '') as string;
   const isOpen  = /open/i.test(marketStatus);
-  const isActionable = data?.is_actionable === true || status === 'READY';
+  const feedReady = demoMode || dbStatus?.current === true;
+  const isActionable = feedReady && (data?.is_actionable === true || status === 'READY');
   const isManaging = !!(data?.active_trade || data?.managing_trade);
 
   // Intelligence panel shortcuts
@@ -2924,6 +2951,11 @@ export default function Home() {
   }, [speaking, voiceState, startListening, stopListening, clearVoiceError]);
 
   const doEnter = async () => {
+    if (!feedReady) {
+      setConfirming(false);
+      setTradeSent('Market data is unavailable or stale. Refresh the Databento feed before taking action.');
+      return;
+    }
     if (!confirming) { setConfirming(true); return; }
     setConfirming(false);
     const dir = /short|bear/i.test(dirn) ? 'short' : 'long';
@@ -3181,6 +3213,16 @@ export default function Home() {
               {isOpen ? 'OPEN' : (marketStatus || 'CLOSED').toUpperCase()}
             </span>
           </div>
+          {!demoMode && (
+            <div title={dbStatus?.reason ?? 'Authoritative Databento data status'} style={{ display:'flex', alignItems:'center', gap:5, padding:'3px 9px', borderRadius:16,
+              border:`1px solid ${dbStatus?.state === 'LIVE' ? 'rgba(34,197,94,0.28)' : dbStatus?.state === 'STALE' ? 'rgba(249,115,22,0.32)' : 'rgba(245,158,11,0.28)'}`,
+              background: dbStatus?.state === 'LIVE' ? 'rgba(34,197,94,0.06)' : 'rgba(245,158,11,0.06)' }}>
+              <div style={{ width:5, height:5, borderRadius:'50%', background: dbStatus?.state === 'LIVE' ? BULL : AMB }} />
+              <span style={{ fontSize:9.5, color: dbStatus?.state === 'LIVE' ? BULL : AMB, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.06em' }}>
+                DB {dbStatus?.state ?? 'CONNECTING'}
+              </span>
+            </div>
+          )}
         </div>
         {/* Right: evidence + voice + eng */}
         <div style={{ display:'flex', alignItems:'center', gap:8 }}>
@@ -3269,6 +3311,21 @@ export default function Home() {
 
       {/* ── BODY ──────────────────────────────────────────────────────────── */}
       <div style={{ flex:1, display:'flex', overflow:'hidden' }}>
+         {!feedReady ? (
+           <div role="status" style={{ flex:1, display:'flex', flexDirection:'column', alignItems:'center', justifyContent:'center', gap:10, padding:32, textAlign:'center' }}>
+             <div style={{ fontFamily:'monospace', fontWeight:800, fontSize:14, letterSpacing:'0.08em', color: dbStatus?.state === 'STALE' ? '#fb923c' : AMB }}>
+               DATABENTO {dbStatus?.state ?? 'CONNECTING'}
+             </div>
+             <div style={{ maxWidth:520, fontSize:12, color:'rgba(255,255,255,0.52)', lineHeight:1.6 }}>
+               Live market prices, VWAP, setup status, and trade controls are hidden until the authoritative Databento feed is current.
+             </div>
+             <div style={{ fontFamily:'monospace', fontSize:10, color:'rgba(255,255,255,0.30)' }}>
+               SOURCE: DATABENTO · CONNECTION: {dbStatus?.connection ?? 'PENDING'} · FRESHNESS: {formatFreshnessAge(dbStatus?.ageMs ?? null)}
+             </div>
+             {dbStatus?.reason && <div style={{ fontFamily:'monospace', fontSize:10, color:'rgba(255,255,255,0.24)' }}>{String(dbStatus.reason).slice(0, 120)}</div>}
+           </div>
+         ) : (
+           <>
 
         {/* Left drawer: key levels + market context */}
         {leftOpen && (
@@ -4128,10 +4185,10 @@ export default function Home() {
                   to ship before the API key exists.  Display-only — never
                   touches the gate or any money-path state.              ── */}
               {!hiddenPanels.has('db-chart') && (() => {
-                const dbConnected = !!(dbStatus?.connected);
+                const dbConnected = dbStatus?.state === 'LIVE';
                 const dbCount     = Number(dbStatus?.count ?? dbBars.length);
-                const dbLastPrice = dbBars.length > 0 ? (dbBars[dbBars.length - 1].close || 0) : 0;
-                const dbVwap      = dbBars.length > 0 ? (dbBars[dbBars.length - 1].vwap  || 0) : 0;
+                const dbLastPrice = Number(dbStatus?.price ?? dbBars[dbBars.length - 1]?.close ?? 0);
+                const dbVwap      = Number(dbStatus?.vwap ?? dbBars[dbBars.length - 1]?.vwap ?? 0);
                 // Map Databento bars → Candle format used by the existing CandleChart
                 const dbCandles: Candle[] = dbBars.map((b: any) => ({
                   t:   (b.ts   || 0) * 1000,         // unix-s → unix-ms
@@ -4157,11 +4214,14 @@ export default function Home() {
                         <span style={{
                           fontSize:8, fontFamily:'monospace', fontWeight:700, letterSpacing:'0.06em',
                           padding:'1px 7px', borderRadius:8,
-                          background: dbConnected ? 'rgba(34,197,94,0.14)' : 'rgba(255,255,255,0.05)',
-                          color:       dbConnected ? '#22c55e' : 'rgba(255,255,255,0.22)',
-                          border:`1px solid ${dbConnected ? '#22c55e44' : 'rgba(255,255,255,0.08)'}`,
+                          background: dbConnected ? 'rgba(34,197,94,0.14)' : dbStatus?.state === 'STALE' ? 'rgba(249,115,22,0.14)' : 'rgba(255,255,255,0.05)',
+                          color:       dbConnected ? '#22c55e' : dbStatus?.state === 'STALE' ? '#fb923c' : 'rgba(255,255,255,0.22)',
+                          border:`1px solid ${dbConnected ? '#22c55e44' : dbStatus?.state === 'STALE' ? '#fb923c44' : 'rgba(255,255,255,0.08)'}`,
                         }}>
-                          {dbConnected ? `● LIVE · ${dbCount} bars` : '○ OFFLINE'}
+                          {dbConnected ? `● LIVE · ${dbCount} bars` : `○ ${dbStatus?.state ?? 'CONNECTING'}`}
+                        </span>
+                        <span style={{ fontSize:8, fontFamily:'monospace', color:'rgba(255,255,255,0.28)' }}>
+                          SOURCE DATABENTO · {dbStatus?.connection ?? 'PENDING'} · {formatFreshnessAge(dbStatus?.ageMs ?? null)}
                         </span>
                       </div>
                       <div style={{ display:'flex', alignItems:'center', gap:8 }}>
@@ -4949,6 +5009,8 @@ export default function Home() {
           )}{/* end rc-structure guard */}
 
         </div>
+           </>
+         )}
 
       </div>
     </div>

@@ -6,7 +6,6 @@
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 - [Visual Brain V1](visual-brain-engine.md) — inject db_conn_fn/price_store/bars_fn at start(); never `import app` from sub-modules; single-flight _schedule_next in finally only; screenshots ephemeral (no temp files).
 
-- [Main Brain route + builder (Phase 7B)](main-brain-route-p7b.md) — GET /main-brain; edge_breakdown.components is list-of-dicts; OPEN_PATHS is in dashboard-auth.ts not flask-proxy.ts.
 - [Databento MGC overnight silence + partial-flush fix](databento-mgc-overnight-silence.md) — MGC has 0 Databento records overnight (genuine COMEX silence); partial-flush daemon closes stale low-volume bars within 70s; thread-safety via _partial_lock.
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
@@ -19,7 +18,6 @@
 - [Production deployment topology](deployment-topology.md) — deploy as one Reserved VM; api-server prod build/run supervises Flask+Express; static `home` artifact serves `/`; target chosen in Publish UI.
 - [App-side DB convention: INSERT/SELECT only](db-app-insert-select-only.md) — app.py runs NO DDL; boot does no-DDL readiness probe + `*_DB_READY` flag; new tables via database tool (dev) + Publish schema-diff (prod).
 - [PostgreSQL startup durability guard](postgres-startup-durability-guard.md) — automatic SQL migrations are allowlisted to idempotent table/index creation; guard probes the existing DB read-only before service start.
-- [Market State Cache persistence](market-state-cache-persistence.md) — market_state_cache table persists CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY; freshness windows guard restores; READY intentionally NOT restored.
 - [Edge Score, grades & session bonus](edge-score-card-block.md) — EDGE_COMPONENTS BOS20/CHOCH20/VWAP15/Sweep15/Volume15/CVD15/Session10 = max110; grade ≥85A+/≥70A/≥50B/<50 WAIT; zone scores 0 so CHOCH-absent edge caps ~50.
 - [CVD hard filter + RVOL→Volume component](cvd-rvol-filter.md) — CVD = HARD fail-open directional veto; RVOL feeds Volume +15 (≥~1.5), NOT a standalone modifier; ceiling 110; display via alert_diagnostics.
 - [No-signals = structure gate](no-signals-alert-config-gap.md) — "0 signals" usually = no structure alert; structure = ANY-ONE of CHOCH/BOS/HH/HL/LH/LL (shared, needs a `ticker`); diagnose via gate_debug/strict_reason.
@@ -157,3 +155,4 @@
 - [Per-instrument structure isolation](instrument-structure-isolation.md) — suspected cross-instrument BOS/CHOCH leak DISPROVEN; all 3 structure readers share a_inst!=inst filter.
 - [Dashboard potential-plan preview](dashboard-potential-plan-preview.md) — forming-setup entry/stop/TP preview is display-only in directions[*].potential_plan; money path keys ONLY off actionable verdict + top-level trade_plan.
 - [Canonical Ghost durable evidence](canonical-ghost-durable-evidence.md) — each eligible generic SCALP/IT ghost result has one exact-ID shadow record; terminal copies are deterministic snapshots, never a new authority.
+- [Market data display freshness](market-data-display-freshness.md) — stale or unreachable Databento/Visual Brain snapshots are unavailable UI state: clear overlays and actions rather than retaining prior values.

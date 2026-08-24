@@ -29,6 +29,12 @@ import {
   visualBrainConfidence, visualBrainText, visualBrainToken,
 } from '../lib/visualBrainModes';
 import { getTopOfBookPresentation } from '../lib/topOfBookPresentation';
+import {
+  classifyDatabentoFreshness,
+  classifyVisualBrainFreshness,
+  formatFreshnessAge,
+  latestBarTimestampMs,
+} from '../lib/marketDataFreshness';
 
 // ── Design tokens ────────────────────────────────────────────────────────────
 const T = {
@@ -3534,6 +3540,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   const [lastFetch, setLastFetch] = React.useState<number | null>(null);
   const [open, setOpen]     = React.useState(true);
   const [histOpen, setHistOpen] = React.useState(false);
+  const [endpointError, setEndpointError] = React.useState<string | null>(null);
 
   // Fetch all-status + history for active tab
   const load = React.useCallback(async () => {
@@ -3542,17 +3549,28 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
       const hdr = { Authorization: authHeader };
       const sr = await fetch('/api/visual-brain/all-status', { headers: hdr })
         .then(r => r.ok ? r.json() : null).catch(() => null);
-      if (sr) {
-        setAllStatus(sr as AllStatus);
-        setLastFetch(Date.now());
-        // Set initial tab to first symbol with data, or first symbol
-        setActiveTab(prev => {
-          if (prev) return prev;
-          const syms: string[] = (sr as AllStatus).symbols ?? [];
-          return syms[0] ?? '';
-        });
+      if (!sr) {
+        setAllStatus(null);
+        setHist([]);
+        setLastFetch(null);
+        setEndpointError('Visual Brain status endpoint is unavailable');
+        return;
       }
-    } catch { /* pass */ }
+      setAllStatus(sr as AllStatus);
+      setLastFetch(Date.now());
+      setEndpointError(null);
+      // Set initial tab to first symbol with data, or first symbol
+      setActiveTab(prev => {
+        if (prev) return prev;
+        const syms: string[] = (sr as AllStatus).symbols ?? [];
+        return syms[0] ?? '';
+      });
+    } catch {
+      setAllStatus(null);
+      setHist([]);
+      setLastFetch(null);
+      setEndpointError('Visual Brain status endpoint is unavailable');
+    }
   }, [open, authHeader]);
 
   // Fetch history when active tab changes
@@ -3565,8 +3583,14 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
       if (hr) {
         setHist((hr as Record<string, unknown>).history as VBObs[] ?? []);
         setHistInst(inst);
+      } else {
+        setHist([]);
+        setHistInst(inst);
       }
-    } catch { /* pass */ }
+    } catch {
+      setHist([]);
+      setHistInst(inst);
+    }
   }, [open, authHeader]);
 
   React.useEffect(() => {
@@ -3628,7 +3652,10 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   const dbReady  = allStatus?.db_ready ?? false;
   const symbols  = allStatus?.symbols ?? [];
   const obsMap   = allStatus?.instruments ?? {};
-  const obs      = activeTab ? (obsMap[activeTab]?.observation ?? null) : null;
+  const rawObs   = activeTab ? (obsMap[activeTab]?.observation ?? null) : null;
+  const obsFreshness = classifyVisualBrainFreshness(rawObs?.timestamp);
+  // Never present a persisted observation as current after its observation window.
+  const obs      = obsFreshness.current ? rawObs : null;
   const transitions = hist.filter(h => h.state_changed);
   const modeAssessments = obs?.mode_assessments ?? {};
   const marketContext = obs?.market_context;
@@ -3742,7 +3769,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
   // Compact bias chip for tabs — shows bias of each instrument at a glance
   const biasDot = (inst: string) => {
     const o = obsMap[inst]?.observation;
-    if (!o) return null;
+    if (!o || !classifyVisualBrainFreshness(o.timestamp).current) return null;
     const col = biasColor(o.bias);
     return <span style={{ width: 6, height: 6, borderRadius: '50%', background: col,
       display: 'inline-block', marginLeft: 4, flexShrink: 0 }} />;
@@ -3770,6 +3797,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
             color={enabled ? T.green : T.txtMuted} />
         )}
         {dbReady && <Badge label="DB OK" color={T.green} />}
+        {rawObs && <Badge label={`DATA ${obsFreshness.state}`} color={obsFreshness.current ? T.green : T.amber} />}
         {allStatus?.cost && (
           <span style={{ fontSize: 9, color: T.txtMuted }}>
             {allStatus.cost.calls_today} calls · ${allStatus.cost.cost_today_usd.toFixed(4)}
@@ -3800,7 +3828,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
                   {symbols.map(inst => {
                     const isActive = inst === activeTab;
                     const instObs = obsMap[inst]?.observation;
-                    const instBias = instObs?.bias ?? null;
+                    const instBias = instObs && classifyVisualBrainFreshness(instObs.timestamp).current ? instObs.bias : null;
                     return (
                       <button key={inst}
                         onClick={() => setActiveTab(inst)}
@@ -3828,7 +3856,15 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
 
               {!obs ? (
                 <div style={{ textAlign: 'center', padding: '20px 0', color: T.txtMuted, fontSize: 11 }}>
-                  {dbReady ? `Awaiting first observation for ${activeTab || 'instrument'}…` : 'DB table not ready — apply migration first.'}
+                  {rawObs && !obsFreshness.current ? (
+                    <>
+                      <div style={{ color: T.amber, fontWeight: 700 }}>OBSERVATION {obsFreshness.state}</div>
+                      <div style={{ marginTop: 5 }}>
+                        Source: {rawObs.market_context?.source ?? 'Visual Brain'} · Freshness: {formatFreshnessAge(obsFreshness.ageMs)}.
+                        Bias, state, and action are hidden until a current observation arrives.
+                      </div>
+                    </>
+                  ) : endpointError ? endpointError : dbReady ? `Awaiting first observation for ${activeTab || 'instrument'}…` : 'DB table not ready — apply migration first.'}
                 </div>
               ) : (
                 <>
@@ -4031,7 +4067,7 @@ const VisualBrainPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
                     <span style={{ fontSize: 9, color: T.txtMuted }}>
                       {activeTab} · Last Updated: {fmtTs(obs.timestamp)} ET
                     </span>
-                    <span style={{ fontSize: 9, color: T.txtMuted }}>{fmtAge(obs.timestamp)}</span>
+                    <span style={{ fontSize: 9, color: T.txtMuted }}>Source: {obs.market_context?.source ?? 'Visual Brain'} · {fmtAge(obs.timestamp)}</span>
                   </div>
 
                   {/* ── State History ── */}
@@ -4471,6 +4507,80 @@ const CanonicalEvidenceHealthPanel: React.FC<{
   );
 };
 
+const IntradayMarketDataHealthPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
+  const [snapshot, setSnapshot] = React.useState<{ databento: Record<string, any> | null; visual: Record<string, any> | null; loadedAt: number | null }>({
+    databento: null, visual: null, loadedAt: null,
+  });
+
+  const load = React.useCallback(async () => {
+    const headers: Record<string, string> = authHeader ? { Authorization: authHeader } : {};
+    const [databento, visual] = await Promise.all([
+      fetch('/api/databento-status', { credentials: 'include', headers }).then(r => r.ok ? r.json() : null).catch(() => null),
+      fetch('/api/visual-brain/all-status', { credentials: 'include', headers }).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    setSnapshot({ databento, visual, loadedAt: Date.now() });
+  }, [authHeader]);
+
+  React.useEffect(() => {
+    void load();
+    const id = window.setInterval(() => { void load(); }, 10_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  const service = snapshot.databento?.status ?? {};
+  const telemetry = service?.instruments ?? {};
+  const newestBar = latestBarTimestampMs(Object.values(telemetry).map((item: any) => ({ ts: item?.bar_ts ?? item?.last_bar_ts })));
+  const dataFreshness = classifyDatabentoFreshness({
+    enabled: snapshot.databento?.enabled === true,
+    connected: service?.connected === true,
+    lastEventAt: service?.last_ts,
+    latestBarAt: newestBar,
+  });
+  const observations = Object.entries(snapshot.visual?.instruments ?? {}) as Array<[string, { observation?: { timestamp?: unknown; market_context?: { source?: unknown } } | null }]>;
+  const visualEnabled = snapshot.visual?.enabled === true;
+
+  return (
+    <Panel
+      title="Current market-data health"
+      badge={<Badge label={snapshot.loadedAt ? dataFreshness.state : 'CONNECTING'} color={dataFreshness.current ? T.green : T.amber} />}
+      style={{ marginBottom: 12 }}
+    >
+      <div style={{ display:'grid', gridTemplateColumns:'1fr 1fr', gap:10 }} className="mb-grid-2">
+        <div style={{ padding:'10px 11px', borderRadius:8, background:T.panelAlt, border:`1px solid ${dataFreshness.current ? T.green : T.amber}33` }}>
+          <div style={{ display:'flex', justifyContent:'space-between', gap:8, marginBottom:7 }}>
+            <span style={{ fontSize:10, fontWeight:800, color:T.txtSec, letterSpacing:'0.08em' }}>DATABENTO</span>
+            <Badge label={snapshot.loadedAt ? dataFreshness.state : 'CONNECTING'} color={dataFreshness.current ? T.green : T.amber} />
+          </div>
+          <div style={{ fontSize:10, color:T.txtMuted, lineHeight:1.6 }}>
+            <div>Source: <strong style={{ color:T.cyan }}>Databento</strong></div>
+            <div>Connection: <strong style={{ color:dataFreshness.current ? T.green : T.amber }}>{service?.connected === true ? (service?.status ?? 'CONNECTED') : 'UNAVAILABLE'}</strong></div>
+            <div>Latest event: <strong style={{ color:T.txtSec }}>{formatFreshnessAge(dataFreshness.ageMs)}</strong></div>
+          </div>
+        </div>
+        <div style={{ padding:'10px 11px', borderRadius:8, background:T.panelAlt, border:`1px solid ${visualEnabled ? T.cyan : T.amber}33` }}>
+          <div style={{ display:'flex', justifyContent:'space-between', gap:8, marginBottom:7 }}>
+            <span style={{ fontSize:10, fontWeight:800, color:T.txtSec, letterSpacing:'0.08em' }}>VISUAL BRAIN</span>
+            <Badge label={visualEnabled ? 'OBSERVING' : 'UNAVAILABLE'} color={visualEnabled ? T.cyan : T.amber} />
+          </div>
+          <div style={{ display:'flex', flexWrap:'wrap', gap:5 }}>
+            {observations.length === 0 ? <span style={{ fontSize:10, color:T.txtMuted }}>No current observations returned.</span> : observations.map(([inst, value]) => {
+              const freshness = classifyVisualBrainFreshness(value?.observation?.timestamp);
+              return <span key={inst} style={{ fontSize:9, fontFamily:T.mono, padding:'3px 6px', borderRadius:4,
+                color:freshness.current ? T.green : T.amber, border:`1px solid ${freshness.current ? T.green : T.amber}44` }}>
+                {inst} {freshness.state} {formatFreshnessAge(freshness.ageMs)}
+              </span>;
+            })}
+          </div>
+          <div style={{ marginTop:7, fontSize:9, color:T.txtMuted }}>Source: Visual Brain observations · display-only</div>
+        </div>
+      </div>
+      <div role="note" style={{ marginTop:9, fontSize:9.5, color:T.txtMuted, lineHeight:1.45 }}>
+        This is an operator health display only. It does not alter research qualification, risk, broker routing, execution, or coordinator fan-out.
+      </div>
+    </Panel>
+  );
+};
+
 const TrainingLanePanel: React.FC<{
   lane: 'scalp' | 'intraday';
   authHeader: string;
@@ -4538,6 +4648,7 @@ const TrainingLanePanel: React.FC<{
       <TrainingReadOnlyBanner>
         {config.description} Legacy writers and outcome resolvers remain authoritative; coordinator fan-out is not controlled here.
       </TrainingReadOnlyBanner>
+      {lane === 'intraday' && <IntradayMarketDataHealthPanel authHeader={authHeader} />}
       <CanonicalEvidenceHealthPanel mode={mode} health={data.canonicalHealth} />
 
       <div style={{ display: 'flex', alignItems: 'baseline', gap: 10, margin: '2px 0 12px' }}>

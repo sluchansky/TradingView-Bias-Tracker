@@ -30,6 +30,11 @@ import {
   Time,
   UTCTimestamp,
 } from "lightweight-charts";
+import {
+  classifyDatabentoFreshness,
+  formatFreshnessAge,
+  latestBarTimestampMs,
+} from "../lib/marketDataFreshness";
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -158,6 +163,8 @@ function statusColor(status: string): string {
     case "STALE":         return "#f97316";
     case "RECONNECTING":  return T.cyan;
     case "DISCONNECTED":  return T.red;
+    case "OFFLINE":       return T.red;
+    case "WARMING":       return T.amber;
     case "NO DATA":       return T.txtMuted;
     case "MARKET CLOSED": return T.purple;
     default:              return T.txtMuted;
@@ -212,6 +219,7 @@ function StatusStrip({
           <span style={{ color: T.amber }}> ×{conn!.reconnects}</span>
         )}
       </span>
+      <span>Source: <span style={{ color: T.cyan }}>DATABENTO</span></span>
       <span style={{
         color:      sseAuthFailed ? T.amber : (sseConnected ? T.green : T.txtMuted),
         fontWeight: (sseConnected || sseAuthFailed) ? 700 : 400,
@@ -358,6 +366,21 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   // Auth-failure latch — set when the token endpoint returns 401/403;
   // prevents infinite reconnect on authentication failure.
   const [sseAuthFailed, setSseAuthFailed] = useState(false);
+  const feedCurrentRef = useRef(false);
+
+  const clearChartSeries = useCallback(() => {
+    partialBarRef.current = null;
+    lastBarsRef.current = [];
+    try { candleSeriesRef.current?.setData([]); } catch { /* chart may be rebuilding */ }
+    try { vwapSeriesRef.current?.setData([]); } catch { /* chart may be rebuilding */ }
+    try { volSeriesRef.current?.setData([]); } catch { /* chart may be rebuilding */ }
+    try { markersApiRef.current?.setMarkers([]); } catch { /* chart may be rebuilding */ }
+    for (const line of [...tradeLinesRef.current, ...fvgLinesRef.current]) {
+      try { candleSeriesRef.current?.removePriceLine(line); } catch { /* already removed */ }
+    }
+    tradeLinesRef.current = [];
+    fvgLinesRef.current = [];
+  }, []);
 
   // ── Fetch ─────────────────────────────────────────────────────────────────
   const fetchData = useCallback(async () => {
@@ -369,11 +392,54 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       const headers: Record<string, string> = {};
       if (authHeader) headers["Authorization"] = authHeader;
       const res  = await fetch(url, { headers });
-      if (!res.ok) return;
+      if (!res.ok) {
+        feedCurrentRef.current = false;
+        clearChartSeries();
+        setData({
+          ok: false, enabled: true, reason: `Chart request failed (${res.status})`,
+          connection: { status: "OFFLINE", connected: false, reconnects: 0, last_ts: null, error: null },
+        });
+        return;
+      }
       const json = (await res.json()) as ChartResponse;
+      const freshness = classifyDatabentoFreshness({
+        enabled: json.enabled === true,
+        connected: json.connection?.connected === true,
+        lastEventAt: json.connection?.last_ts,
+        latestBarAt: latestBarTimestampMs(json.bars),
+      });
+      if (!freshness.current) {
+        feedCurrentRef.current = false;
+        clearChartSeries();
+        setData({
+          ...json,
+          reason: json.reason ?? `Databento ${freshness.state.toLowerCase()}`,
+          connection: {
+            status: freshness.state,
+            connected: false,
+            reconnects: json.connection?.reconnects ?? 0,
+            last_ts: json.connection?.last_ts ?? null,
+            error: json.connection?.error ?? null,
+          },
+          bars: [],
+          partial_bar: null,
+          vwap: null,
+          structure_events: [],
+          active_trade: null,
+          fvg_zones: [],
+          fvg_sequences: [],
+        });
+        return;
+      }
+      feedCurrentRef.current = true;
       setData(json);
     } catch {
-      // Silent — show stale data
+      feedCurrentRef.current = false;
+      clearChartSeries();
+      setData({
+        ok: false, enabled: true, reason: "Chart request unavailable",
+        connection: { status: "OFFLINE", connected: false, reconnects: 0, last_ts: null, error: null },
+      });
     } finally {
       inFlightRef.current = false;
     }
@@ -489,7 +555,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
 
       // Typed "tick" events — use server-authoritative partial_bar when present
       es.addEventListener('tick', (rawEv: Event) => {
-        if (gen !== generationRef.current) return;
+        if (gen !== generationRef.current || !feedCurrentRef.current) return;
         resetWatchdog(); // live tick = connection confirmed
         try {
           const ev = rawEv as MessageEvent;
@@ -904,9 +970,11 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   // does an incremental update, leaving the majority of old bars on screen.
   useEffect(() => {
     setData(null);
+    feedCurrentRef.current = false;
+    clearChartSeries();
     lastBarsRef.current   = [];
     partialBarRef.current = null;
-  }, [instrument]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [instrument, clearChartSeries]);
 
   // ── Instrument / timeframe change handlers ────────────────────────────────
   const handleInstrument = (inst: string) => {
@@ -935,6 +1003,15 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
   const conn       = data?.connection;
   const status     = conn?.status ?? (data?.enabled === false ? "DISCONNECTED" : "—");
   const isDisabled = data?.enabled === false;
+  const chartFreshness = classifyDatabentoFreshness({
+    enabled: data?.enabled === true,
+    // A stale response deliberately marks the connection unusable for display,
+    // while retaining its last event timestamp so the operator can see its age.
+    connected: conn?.connected === true || conn?.status === "STALE",
+    lastEventAt: conn?.last_ts,
+    latestBarAt: latestBarTimestampMs(data?.bars),
+  });
+  const isUnavailable = !!data && !chartFreshness.current;
   const isWarming  =
     !isDisabled &&
     !!data &&
@@ -1054,8 +1131,8 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
                 // Hide the canvas visually when disabled, but keep it in the
                 // layout so ResizeObserver keeps firing and clientWidth stays
                 // valid for chart.resize() calls.
-                visibility: isDisabled ? "hidden" : "visible",
-                pointerEvents: isDisabled ? "none" : "auto",
+                visibility: isDisabled || isUnavailable ? "hidden" : "visible",
+                pointerEvents: isDisabled || isUnavailable ? "none" : "auto",
               }}
             />
             {isDisabled && (
@@ -1069,6 +1146,23 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
                   Set{" "}
                   <code style={{ fontFamily: T.mono, color: T.cyan }}>DATABENTO_ENABLED=1</code>
                   {" "}to enable live data
+                </span>
+              </div>
+            )}
+            {isUnavailable && !isDisabled && (
+              <div role="status" style={{
+                position: "absolute", inset: 0,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                flexDirection: "column", gap: 8, textAlign: "center", padding: 20,
+              }}>
+                <span style={{ fontSize: 13, color: status === "STALE" ? "#fb923c" : T.red }}>
+                  DATABENTO {status}
+                </span>
+                <span style={{ fontSize: 10, color: T.txtMuted }}>
+                  Source: Databento · Connection: {conn?.connected ? "connected" : "unavailable"} · Freshness: {formatFreshnessAge(chartFreshness.ageMs)}
+                </span>
+                <span style={{ fontSize: 9, color: T.txtMuted }}>
+                  Chart, VWAP, structure, FVG, and active-trade overlays are hidden until current data returns.
                 </span>
               </div>
             )}
@@ -1086,7 +1180,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
           </div>
 
           {/* Active trade footer */}
-          {!isDisabled && at && showTrade && (
+          {!isDisabled && !isUnavailable && at && showTrade && (
             <div style={{
               display: "flex", gap: 12, padding: "4px 12px",
               borderTop: `1px solid ${T.border}`,
