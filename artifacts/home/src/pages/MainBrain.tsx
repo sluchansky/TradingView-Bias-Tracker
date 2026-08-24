@@ -2392,6 +2392,19 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     : null;
 
   const missingComps = edgeComps.filter(c => c.present === false);
+  const structure = (
+    v.structure_state ?? p.structure_state ?? {}
+  ) as Record<string, unknown>;
+  const structureState = safeStr(structure.state, 'NO_STRUCTURE');
+  const structureDir   = safeStr(structure.direction, '');
+  const structureEvent = safeStr(structure.last_event ?? structure.active_event, '');
+  const nextStructure  = safeStr(structure.next_event, '');
+  const structureNote  = safeStr(structure.next_event_reason ?? structure.summary, '');
+  const structureConfirmed = structure.confirmed === true;
+  const structurePoints = safeNum(structure.allocation_points) ?? 0;
+  const structureColor = structureConfirmed ? T.green
+    : structureState === 'REVERSAL_CANDIDATE' ? T.amber
+    : T.txtMuted;
 
   // Verdict explanation from Brain voice (already normalized)
   const mb          = (p.main_brain ?? {}) as Record<string, unknown>;
@@ -2433,6 +2446,36 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                 <span style={{ color:T.txtMuted }}> / {scoreMax}</span>
               </div>
             </div>
+          </div>
+
+          {/* ── State-aware Market Structure ─────────────────────────────── */}
+          <div style={{
+            marginBottom:12, padding:'8px 10px', borderRadius:7,
+            background: structureConfirmed ? 'rgba(34,197,94,0.05)' : 'rgba(245,158,11,0.05)',
+            border:`1px solid ${structureConfirmed ? 'rgba(34,197,94,0.17)' : 'rgba(245,158,11,0.17)'}`,
+          }}>
+            <div style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:8, marginBottom:5 }}>
+              <span style={{ fontSize:9, color:T.txtMuted, letterSpacing:'0.08em' }}>MARKET STRUCTURE CYCLE</span>
+              <span style={{ fontSize:9, color:structureColor, fontWeight:700, letterSpacing:'0.05em' }}>
+                {structureState.replace(/_/g, ' ')}
+              </span>
+            </div>
+            <div style={{ display:'flex', flexWrap:'wrap', alignItems:'center', gap:'4px 8px', fontSize:10 }}>
+              {structureDir && <span style={{ color:dirColor(structureDir), fontWeight:700 }}>{structureDir.toUpperCase()}</span>}
+              {structureEvent && <span style={{ color:T.txtSec, fontFamily:T.mono }}>{structureEvent}</span>}
+              <span style={{ color:structureColor, marginLeft:'auto' }}>
+                {structureConfirmed
+                  ? `CONFIRMED · +${structurePoints} STRUCTURE`
+                  : `CANDIDATE · +${structurePoints} STRUCTURE`}
+              </span>
+            </div>
+            {nextStructure && (
+              <div style={{ marginTop:6, fontSize:10, color:T.txtPri, lineHeight:1.45 }}>
+                <span style={{ color:T.txtMuted }}>NEXT VALID EVENT&nbsp;</span>
+                <span style={{ color:T.cyan, fontFamily:T.mono, fontWeight:700 }}>{nextStructure}</span>
+              </div>
+            )}
+            {structureNote && <div style={{ marginTop:3, fontSize:9.5, color:T.txtMuted, lineHeight:1.4 }}>{structureNote}</div>}
           </div>
 
           {/* ── Edge Score Breakdown (rich) ──────────────────────────────── */}
