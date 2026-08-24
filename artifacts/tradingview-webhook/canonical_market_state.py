@@ -870,34 +870,65 @@ def _augment_snapshot(inst: str, snap: dict) -> None:
     # ── 15m / 4H Trend ────────────────────────────────────────────────────────
     # TRUE SOURCE: DATABENTO — trend_alignment.ingest_1m_bar() consumes
     # DATABENTO_BARS_BY_INST; TradingView signals only read the snapshot.
+    # Consume the module's public display contract, never its mutable internal
+    # storage. The latter changed shape during the initial implementation and
+    # could turn a stale state into an ambiguous calculation error.
     try:
         import trend_alignment as _ta  # noqa: PLC0415
-        mtf = _ta.MTF_STATE_BY_INST.get(inst) or {}
-        t15 = mtf.get("trend_15m") or {}
-        t4h = mtf.get("trend_4h")  or {}
-        t15_dir = (t15.get("direction") or "UNKNOWN").upper()
-        t4h_dir = (t4h.get("direction") or "UNKNOWN").upper()
-
-        if t15_dir in ("BULLISH", "BEARISH") and t4h_dir in ("BULLISH", "BEARISH"):
-            alignment = "ALIGNED_BULLISH" if t15_dir == t4h_dir == "BULLISH" else (
-                "ALIGNED_BEARISH" if t15_dir == t4h_dir == "BEARISH" else "MIXED"
+        mtf = _ta.get_mtf_state(inst)
+        t15 = mtf.get("fifteen_minute") or {}
+        t4h = mtf.get("four_hour") or {}
+        t15_dir = str(t15.get("trend") or "UNAVAILABLE").upper()
+        t4h_dir = str(t4h.get("trend") or "UNAVAILABLE").upper()
+        alignment = str(mtf.get("alignment") or "UNAVAILABLE").upper()
+        alignment_freshness = str(
+            mtf.get("alignment_freshness") or "UNAVAILABLE"
+        ).upper()
+        trend_health = (
+            STALE if alignment_freshness == STALE else (
+                HEALTHY if alignment != "UNAVAILABLE" else INSUFFICIENT_HISTORY
             )
-        else:
-            alignment = "UNKNOWN"
+        )
 
         snap["trend"] = {
             "trend_15m":       t15_dir,
             "trend_4h":        t4h_dir,
             "trend_alignment": alignment,
-            "bars_15m":        t15.get("bars_count", 0),
-            "bars_4h":         t4h.get("bars_count", 0),
+            "alignment_freshness": alignment_freshness,
+            "bars_15m":        t15.get("bar_count", 0),
+            "bars_4h":         t4h.get("bar_count", 0),
+            "trend_15m_age_seconds": t15.get("age_seconds"),
+            "trend_4h_age_seconds":  t4h.get("age_seconds"),
+            "trend_15m_freshness": t15.get("freshness", "UNAVAILABLE"),
+            "trend_4h_freshness":  t4h.get("freshness", "UNAVAILABLE"),
             "true_source":     "databento",
-            "note":            "trend_alignment module fed by DATABENTO_BARS_BY_INST.",
-            "health":          HEALTHY if alignment != "UNKNOWN" else INSUFFICIENT_HISTORY,
+            "source":          mtf.get("source", "databento_1m_resample"),
+            "note": (
+                "Shadow-only higher-timeframe trend from closed Databento "
+                "1m-resampled bars. Stale values are unavailable by design and "
+                "never override the strict gate or Visual Brain."
+            ),
+            "health":          trend_health,
             "promotion_status":SHADOW,
         }
-    except Exception as exc:  # noqa: BLE001
-        snap["trend"] = {"health": CALCULATION_ERROR, "error": str(exc)[:80]}
+    except Exception:  # noqa: BLE001
+        snap["trend"] = {
+            "trend_15m": "UNAVAILABLE",
+            "trend_4h": "UNAVAILABLE",
+            "trend_alignment": "UNAVAILABLE",
+            "alignment_freshness": "UNAVAILABLE",
+            "trend_15m_age_seconds": None,
+            "trend_4h_age_seconds": None,
+            "true_source": "databento",
+            "source": "databento_1m_resample",
+            "health": CALCULATION_ERROR,
+            "error_code": "TREND_STATE_READ_FAILED",
+            "note": (
+                "Shadow trend calculation unavailable. This cannot influence "
+                "the strict gate, risk, execution, or Visual Brain."
+            ),
+            "promotion_status": SHADOW,
+        }
 
     # ── FVG zones ──────────────────────────────────────────────────────────────
     # TRUE SOURCE: DATABENTO — fvg_engine.process_bar_close() consumes

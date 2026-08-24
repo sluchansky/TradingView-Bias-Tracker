@@ -1495,13 +1495,26 @@ const VolatilityIntelligencePanel: React.FC<{ p: Record<string, unknown> }> = ({
 // ── MTF Trend Alignment Panel (Phase 8B.1 — DISPLAY-ONLY) ───────────────────
 // Fetches 4H/15M Databento-derived trend states every 30 s.
 // Purely informational — no gate, no scoring, no execution.
-interface MTFTf { trend: string; strength?: string; last_closed_bar?: string | null; bar_count: number; stale?: boolean }
+interface MTFTf {
+  trend: string;
+  strength?: string | null;
+  last_closed_bar?: string | null;
+  bar_count: number;
+  stale?: boolean;
+  freshness?: string;
+  age_seconds?: number | null;
+  source?: string;
+  unavailable_reason?: string | null;
+}
 interface MTFState {
   instrument: string;
   four_hour: MTFTf;
   fifteen_minute: MTFTf;
   alignment: string;
+  alignment_freshness?: string;
   updated_at?: string | null;
+  source?: string;
+  note?: string;
   error?: string;
 }
 const MTF_TREND_COLOR: Record<string, string> = {
@@ -1517,6 +1530,7 @@ const MTF_ALIGN_STYLE: Record<string, { bg: string; color: string; label: string
   CONFLICTING:   { bg: 'rgba(245,158,11,0.12)',  color: '#f59e0b', label: '⚠ CONFLICTING'   },
   MIXED:         { bg: 'rgba(107,114,128,0.12)', color: '#9ca3af', label: '○ MIXED'         },
   STALE:         { bg: 'rgba(107,114,128,0.10)', color: '#6b7280', label: '◈ STALE'         },
+  UNAVAILABLE:   { bg: 'rgba(107,114,128,0.10)', color: '#6b7280', label: '— UNAVAILABLE'   },
 };
 function mtfFmtTs(iso?: string | null): string {
   if (!iso) return '';
@@ -1524,6 +1538,25 @@ function mtfFmtTs(iso?: string | null): string {
     const d = new Date(iso);
     return d.toLocaleTimeString('en-US', { hour12: false, hour: '2-digit', minute: '2-digit' }) + ' UTC';
   } catch { return ''; }
+}
+function mtfFmtAge(age?: number | null): string {
+  if (age == null || !Number.isFinite(age)) return 'age unknown';
+  if (age < 60) return `age ${Math.floor(age)}s`;
+  if (age < 3600) return `age ${Math.floor(age / 60)}m`;
+  return `age ${(age / 3600).toFixed(age >= 86400 ? 0 : 1)}h`;
+}
+
+function mtfUnavailable(ticker: string, reason: string): MTFState {
+  const tf: MTFTf = {
+    trend: 'UNAVAILABLE', bar_count: 0, stale: false, freshness: 'UNAVAILABLE',
+    age_seconds: null, source: 'databento_1m_resample_closed_bars',
+    unavailable_reason: reason,
+  };
+  return {
+    instrument: ticker || 'MNQ', four_hour: tf, fifteen_minute: { ...tf },
+    alignment: 'UNAVAILABLE', alignment_freshness: 'UNAVAILABLE',
+    source: 'databento_1m_resample', error: reason,
+  };
 }
 
 const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
@@ -1537,10 +1570,15 @@ const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
           `/api/market/trend-alignment?instrument=${encodeURIComponent(ticker || 'MNQ')}`,
           { credentials: 'include', headers: getAuthHeader() },
         );
-        if (!r.ok || cancelled) return;
+        if (!r.ok) {
+          if (!cancelled) setState(mtfUnavailable(ticker, `request_failed_${r.status}`));
+          return;
+        }
         const j = await r.json() as MTFState;
         if (!cancelled) setState(j);
-      } catch { /* fail-open */ }
+      } catch {
+        if (!cancelled) setState(mtfUnavailable(ticker, 'request_unavailable'));
+      }
     };
     load();
     const id = setInterval(load, 30_000);
@@ -1556,8 +1594,11 @@ const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
     const arrow = tf.trend === 'BULLISH' ? '↑ ' : tf.trend === 'BEARISH' ? '↓ ' : tf.trend === 'NEUTRAL' ? '— ' : '';
     const col   = MTF_TREND_COLOR[tf.trend] ?? '#6b7280';
     const ts    = mtfFmtTs(tf.last_closed_bar);
+    const unavailable = tf.trend === 'UNAVAILABLE';
+    const freshness = tf.freshness === 'STALE' ? 'STALE · UNAVAILABLE'
+      : unavailable ? 'UNAVAILABLE' : 'CURRENT';
     return (
-      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '3px 0' }}>
+      <div style={{ display: 'flex', alignItems: 'center', gap: 6, padding: '4px 0', flexWrap: 'wrap' }}>
         <span style={{ fontSize: 9, fontWeight: 700, color: T.txtMuted, letterSpacing: '0.06em', minWidth: 26 }}>{label}</span>
         <span style={{ fontWeight: 700, fontSize: 13, color: col, fontFamily: T.mono }}>
           {arrow}{tf.trend || '—'}
@@ -1565,8 +1606,8 @@ const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
         {tf.strength && (
           <span style={{ fontSize: 9, color: '#9ca3af' }}>— {tf.strength}</span>
         )}
-        <span style={{ marginLeft: 'auto', fontSize: 9, color: T.txtMuted }}>
-          {ts || (tf.bar_count != null ? `${tf.bar_count} bar${tf.bar_count !== 1 ? 's' : ''}` : '')}
+        <span style={{ marginLeft: 'auto', fontSize: 9, color: unavailable && tf.freshness === 'STALE' ? '#f59e0b' : T.txtMuted }}>
+          {freshness} · {mtfFmtAge(tf.age_seconds)} · {ts || `${tf.bar_count} bars`}
         </span>
       </div>
     );
@@ -1579,7 +1620,7 @@ const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
     }}>
       <div style={{ display: 'flex', alignItems: 'center', marginBottom: 8 }}>
         <span style={{ fontSize: 10, fontWeight: 700, letterSpacing: '0.1em', color: T.txtMuted, textTransform: 'uppercase' }}>
-          Multi-Timeframe Trend
+          Shadow Multi-Timeframe Trend
         </span>
         <span style={{
           marginLeft: 'auto', fontSize: 10, fontWeight: 700,
@@ -1592,6 +1633,11 @@ const MTFTrendPanel: React.FC<{ ticker: string }> = ({ ticker }) => {
       </div>
       <TfRow label="4H"  tf={fh} />
       <TfRow label="15M" tf={fm} />
+      <div style={{ marginTop: 7, paddingTop: 7, borderTop: `1px solid ${T.border}`, fontSize: 9, color: T.txtMuted, lineHeight: 1.45 }}>
+        Source: <span style={{ color: T.txtPri }}>{state?.source ?? 'databento_1m_resample'}</span> · closed bars only · shadow/display-only.
+        <br />
+        This panel never overrides the strict gate, execution state, or Visual Brain. Stale directional values are intentionally hidden as unavailable.
+      </div>
     </div>
   );
 };
@@ -1622,6 +1668,7 @@ interface _InstrumentCompRow {
   inst:        string;
   vc:          Record<string, unknown>;
   warmup:      Record<string, unknown>;
+  trend:       Record<string, unknown>;
 }
 
 const _InstrumentRow: React.FC<{ row: _InstrumentCompRow }> = ({ row }) => {
@@ -1766,6 +1813,7 @@ const CanonicalStatePanel: React.FC = () => {
       inst,
       vc:     (s.vwap_comparison ?? {}) as Record<string, unknown>,
       warmup: (s.warmup ?? {}) as Record<string, unknown>,
+      trend:  (s.trend ?? {}) as Record<string, unknown>,
     };
   });
 
@@ -1808,6 +1856,36 @@ const CanonicalStatePanel: React.FC = () => {
           {rows.map(row => <_InstrumentRow key={row.inst} row={row} />)}
         </tbody>
       </table>
+
+      <div style={{ marginTop: 10, borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: 8 }}>
+        <div style={{ fontSize: 10, color: '#818cf8', fontWeight: 700, marginBottom: 5, letterSpacing: '0.05em' }}>
+          SHADOW HIGHER-TIMEFRAME TREND — NEVER OVERRIDES STRICT GATE OR VISUAL BRAIN
+        </div>
+        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, minmax(130px, 1fr))', gap: 6 }}>
+          {rows.map(row => {
+            const trend = row.trend;
+            const health = String(trend.health ?? 'UNAVAILABLE');
+            const stale = health === 'STALE';
+            const calcError = health === 'CALCULATION_ERROR';
+            const t15 = String(trend.trend_15m ?? 'UNAVAILABLE');
+            const t4h = String(trend.trend_4h ?? 'UNAVAILABLE');
+            const age15 = trend.trend_15m_age_seconds == null ? 'age unknown' : mtfFmtAge(Number(trend.trend_15m_age_seconds));
+            const age4 = trend.trend_4h_age_seconds == null ? 'age unknown' : mtfFmtAge(Number(trend.trend_4h_age_seconds));
+            return (
+              <div key={row.inst} style={{ padding: '6px 7px', borderRadius: 5, background: 'rgba(255,255,255,0.02)', fontSize: 10 }}>
+                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 3 }}>
+                  <strong style={{ color: '#a5b4fc' }}>{row.inst}</strong>
+                  <span style={{ color: calcError ? '#f87171' : stale ? '#f59e0b' : '#6b7280' }}>
+                    {calcError ? 'CALC ERROR · UNAVAILABLE' : stale ? 'STALE · UNAVAILABLE' : health}
+                  </span>
+                </div>
+                <div style={{ color: '#9ca3af' }}>15M {t15} · {age15}</div>
+                <div style={{ color: '#9ca3af' }}>4H {t4h} · {age4}</div>
+              </div>
+            );
+          })}
+        </div>
+      </div>
 
       {/* Comparison metrics sub-table */}
       <div style={{ marginTop: 10, borderTop: '1px solid rgba(255,255,255,0.05)', paddingTop: 8 }}>

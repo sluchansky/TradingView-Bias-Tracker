@@ -12,7 +12,9 @@ Computes whether MNQ (and other instruments) are trending BULLISH / BEARISH / NE
 - **`trend_alignment.py`** — pure module (no app.py imports). Maintains `MTF_STATE_BY_INST` dict per instrument.
 - Source: Databento 1m bars only (no Yahoo, no TradingView).
 - Trend: EMA(8) vs EMA(21) on **closed** bars; 0.03% neutral band. **EMA(21) requires ≥21 closed bars** at each timeframe — plan around this threshold.
-- Staleness: > 30 min for 15M → STALE; > 8h for 4H → STALE.
+- Staleness: > 30 min for 15M → STALE; > 8h for 4H → STALE internally.
+  Operator-facing stale data must be non-directional and unavailable, with
+  clear age and source context.
 
 ## Key public API
 - `ingest_1m_bar(instrument, bar)` — fail-open; accumulates into 15M/4H buckets; closes bucket on next bar.
@@ -45,7 +47,10 @@ Computes whether MNQ (and other instruments) are trending BULLISH / BEARISH / NE
 `ohlcv-1m` records via `store.to_df()` return prices as floats (e.g. `29800.5`), NOT fixed-point int64. The fixed-point divide-by-1e9 only applies when iterating raw records directly.
 
 ## Weekend behavior (expected)
-On Sunday restarts: 15M trend computes correctly (fresh bars since market reopened). 4H shows STALE because last 4H bar was Friday (~48h ago). This is correct and expected — frontend renders `◈ STALE` in gray. 4H resumes computing once the Sunday session's first 4H bar closes at 00:00 UTC.
+On Sunday restarts, historical 15M/4H bars can be stale while a new live stream
+is reconnecting. This is correct and expected — frontend renders the trend as
+`UNAVAILABLE` with a stale badge and exact age, not an old directional label.
+4H resumes once a current 4H bar closes.
 
 ## Tests
 48 tests in `tests/test_phase8b1_mtf_alignment.py` + 4 golden subtests all pass.
@@ -53,4 +58,7 @@ On Sunday restarts: 15M trend computes correctly (fresh bars since market reopen
 ## Key invariants
 - CLOSED bars only: partial (forming) bucket is never promoted to trend calculation.
 - Fail-open everywhere: no exception ever blocks the ghost/EL pipeline.
+- Public stale-trend safety: stale or failed shadow trend data must never
+  display as directional guidance; show an unavailable state with freshness,
+  age, source, and a safe error status instead.
 - SCALP golden byte-identical: trend context is additive only.

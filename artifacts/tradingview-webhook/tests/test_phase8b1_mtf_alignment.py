@@ -357,8 +357,8 @@ class TestStaleness(unittest.TestCase):
     def setUp(self):
         _reset("MNQ")
 
-    def test_41_old_bars_show_stale_on_read(self):
-        """State from very old bars reports STALE on get_mtf_state().
+    def test_41_old_bars_are_unavailable_on_display_with_stale_metadata(self):
+        """Old closed bars never retain a directional display value.
 
         Seed bars starting 48h ago, running for 24h → last bar ends ~24h ago
         which is well beyond STALE_15M_SEC (30 min) and STALE_4H_SEC (8h).
@@ -367,16 +367,25 @@ class TestStaleness(unittest.TestCase):
         bars = _bullish_bars_1m(old_base, 1440, start_price=21000, step=0.3)
         ta.seed_from_1m_bars("MNQ", bars)
         st = ta.get_mtf_state("MNQ")
-        # Both TFs must be STALE since last bar ended ~24h ago
-        self.assertEqual(st["fifteen_minute"]["trend"], ta.STALE)
-        self.assertEqual(st["four_hour"]["trend"],      ta.STALE)
+        # Both directional values are intentionally unavailable; the stale
+        # condition and source/age remain available for operators.
+        for tf in (st["fifteen_minute"], st["four_hour"]):
+            self.assertEqual(tf["trend"], ta.UNAVAILABLE)
+            self.assertTrue(tf["stale"])
+            self.assertEqual(tf["freshness"], ta.STALE)
+            self.assertGreater(tf["age_seconds"], 0)
+            self.assertIn("databento", tf["source"])
+            self.assertEqual(tf["unavailable_reason"], "closed_bar_stale")
+        self.assertEqual(st["alignment"], ta.UNAVAILABLE)
+        self.assertEqual(st["alignment_freshness"], ta.STALE)
 
-    def test_42_stale_15m_produces_stale_alignment(self):
+    def test_42_stale_15m_produces_unavailable_alignment(self):
         old_base = int(time.time()) - 48 * 3600   # bars end ~24h ago
         bars = _bullish_bars_1m(old_base, 1440, start_price=21000, step=0.3)
         ta.seed_from_1m_bars("MNQ", bars)
         st = ta.get_mtf_state("MNQ")
-        self.assertIn(st["alignment"], [ta.STALE, ta.UNAVAILABLE])
+        self.assertEqual(st["alignment"], ta.UNAVAILABLE)
+        self.assertEqual(st["alignment_freshness"], ta.STALE)
 
 
 # ===========================================================================

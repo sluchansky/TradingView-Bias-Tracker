@@ -482,6 +482,64 @@ def _ts_to_iso(ts: Optional[float]) -> Optional[str]:
         return None
 
 
+def _age_seconds(ts: Optional[float], now_ts: float) -> Optional[int]:
+    """Return a bounded whole-second age for an epoch timestamp."""
+    if ts is None:
+        return None
+    try:
+        return max(0, int(now_ts - float(ts)))
+    except (TypeError, ValueError):
+        return None
+
+
+def _display_timeframe(
+    *,
+    trend: str,
+    strength: Optional[str],
+    last_ts: Optional[float],
+    bar_count: int,
+    stale_threshold_sec: int,
+    now_ts: float,
+) -> Dict[str, Any]:
+    """Build a safe display contract for one higher timeframe.
+
+    A stale directional calculation must never look like current directional
+    guidance. The internal state keeps STALE so the resampler remains
+    observable, while the public/display value intentionally becomes
+    UNAVAILABLE and retains freshness, age, and source provenance.
+    """
+    age = _age_seconds(last_ts, now_ts)
+    is_stale = trend == STALE or (
+        age is not None and age > stale_threshold_sec
+    )
+    is_unavailable = trend == UNAVAILABLE or last_ts is None
+
+    if is_stale:
+        display_trend = UNAVAILABLE
+        freshness = STALE
+        reason = "closed_bar_stale"
+    elif is_unavailable:
+        display_trend = UNAVAILABLE
+        freshness = UNAVAILABLE
+        reason = "insufficient_closed_bars"
+    else:
+        display_trend = trend
+        freshness = "CURRENT"
+        reason = None
+
+    return {
+        "trend": display_trend,
+        "strength": None if is_stale else strength,
+        "last_closed_bar": _ts_to_iso(last_ts),
+        "bar_count": bar_count,
+        "stale": is_stale,
+        "freshness": freshness,
+        "age_seconds": age,
+        "source": "databento_1m_resample_closed_bars",
+        "unavailable_reason": reason,
+    }
+
+
 def get_mtf_state(instrument: str) -> Dict[str, Any]:
     """Return the current MTF trend state for display/API.  FAIL-OPEN.
 
@@ -502,39 +560,64 @@ def get_mtf_state(instrument: str) -> Dict[str, Any]:
             nb4h  = len(state["bars_4h"])
             nb15m = len(state["bars_15m"])
 
-        alignment = get_alignment(t4h, t15m)
+        now_ts = time.time()
+        four_hour = _display_timeframe(
+            trend=t4h,
+            strength=s4h,
+            last_ts=ts4h,
+            bar_count=nb4h,
+            stale_threshold_sec=STALE_4H_SEC,
+            now_ts=now_ts,
+        )
+        fifteen_minute = _display_timeframe(
+            trend=t15m,
+            strength=s15m,
+            last_ts=ts15m,
+            bar_count=nb15m,
+            stale_threshold_sec=STALE_15M_SEC,
+            now_ts=now_ts,
+        )
+        alignment = get_alignment(
+            four_hour["trend"],
+            fifteen_minute["trend"],
+        )
+        alignment_freshness = (
+            STALE if (four_hour["stale"] or fifteen_minute["stale"])
+            else ("CURRENT" if alignment != UNAVAILABLE else UNAVAILABLE)
+        )
 
         return {
             "instrument":     instrument,
-            "four_hour": {
-                "trend":          t4h,
-                "strength":       s4h,
-                "last_closed_bar": _ts_to_iso(ts4h),
-                "bar_count":      nb4h,
-                "stale":          t4h == STALE,
-            },
-            "fifteen_minute": {
-                "trend":          t15m,
-                "strength":       s15m,
-                "last_closed_bar": _ts_to_iso(ts15m),
-                "bar_count":      nb15m,
-                "stale":          t15m == STALE,
-            },
+            "four_hour":     four_hour,
+            "fifteen_minute": fifteen_minute,
             "alignment":     alignment,
-            "updated_at":    _ts_to_iso(time.time()),
+            "alignment_freshness": alignment_freshness,
+            "updated_at":    _ts_to_iso(now_ts),
             "source":        "databento_1m_resample",
             "note":          (
-                "Phase 8B.1 — display-only; never gates, scores, or sizes trades. "
-                "4H uses EMA on closed 4H bars resampled from Databento 1m stream."
+                "Shadow/display-only higher-timeframe context from closed Databento "
+                "1m-resampled bars. Stale values are exposed as UNAVAILABLE and "
+                "never gate, score, size, or override Visual Brain."
             ),
         }
 
     except Exception:
         return {
             "instrument":     instrument,
-            "four_hour":      {"trend": UNAVAILABLE, "stale": False, "last_closed_bar": None, "bar_count": 0},
-            "fifteen_minute": {"trend": UNAVAILABLE, "stale": False, "last_closed_bar": None, "bar_count": 0},
+            "four_hour": {
+                "trend": UNAVAILABLE, "stale": False, "freshness": UNAVAILABLE,
+                "age_seconds": None, "source": "databento_1m_resample_closed_bars",
+                "unavailable_reason": "state_read_failed",
+                "last_closed_bar": None, "bar_count": 0,
+            },
+            "fifteen_minute": {
+                "trend": UNAVAILABLE, "stale": False, "freshness": UNAVAILABLE,
+                "age_seconds": None, "source": "databento_1m_resample_closed_bars",
+                "unavailable_reason": "state_read_failed",
+                "last_closed_bar": None, "bar_count": 0,
+            },
             "alignment":      UNAVAILABLE,
+            "alignment_freshness": UNAVAILABLE,
             "updated_at":     _ts_to_iso(time.time()),
             "source":         "databento_1m_resample",
             "error":          "state_read_failed",

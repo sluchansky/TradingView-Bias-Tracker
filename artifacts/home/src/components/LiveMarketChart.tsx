@@ -220,6 +220,9 @@ function StatusStrip({
         )}
       </span>
       <span>Source: <span style={{ color: T.cyan }}>DATABENTO</span></span>
+      <span title="This live 1-minute chart is a separate current-data surface. Shadow 15M/4H trend panels never replace it or the strict gate.">
+        Feed role: <span style={{ color: T.green }}>CURRENT 1M CHART</span>
+      </span>
       <span style={{
         color:      sseAuthFailed ? T.amber : (sseConnected ? T.green : T.txtMuted),
         fontWeight: (sseConnected || sseAuthFailed) ? 700 : 400,

@@ -45314,8 +45314,10 @@ def route_market_trend_alignment():
     included.
 
     Returns:
-      instrument, four_hour (trend/strength/last_closed_bar/bar_count/stale),
-      fifteen_minute (same shape), alignment, updated_at, source.
+      instrument, four_hour (trend/strength/last_closed_bar/bar_count/stale/
+      age_seconds/source), fifteen_minute (same shape), alignment, updated_at,
+      source. Stale directional values are intentionally returned as
+      UNAVAILABLE with freshness=STALE.
 
     Auth: Express proxy (owner-only).  NOT in OPEN_PATHS.
     NEVER touches gate, scoring, sizing, learning, or execution.
@@ -45328,11 +45330,22 @@ def route_market_trend_alignment():
     except Exception as exc:
         return jsonify({
             "instrument": instrument,
-            "four_hour":      {"trend": "UNAVAILABLE", "stale": False, "last_closed_bar": None, "bar_count": 0},
-            "fifteen_minute": {"trend": "UNAVAILABLE", "stale": False, "last_closed_bar": None, "bar_count": 0},
+            "four_hour": {
+                "trend": "UNAVAILABLE", "stale": False, "freshness": "UNAVAILABLE",
+                "age_seconds": None, "source": "databento_1m_resample_closed_bars",
+                "unavailable_reason": "state_read_failed",
+                "last_closed_bar": None, "bar_count": 0,
+            },
+            "fifteen_minute": {
+                "trend": "UNAVAILABLE", "stale": False, "freshness": "UNAVAILABLE",
+                "age_seconds": None, "source": "databento_1m_resample_closed_bars",
+                "unavailable_reason": "state_read_failed",
+                "last_closed_bar": None, "bar_count": 0,
+            },
             "alignment": "UNAVAILABLE",
+            "alignment_freshness": "UNAVAILABLE",
             "updated_at": None,
-            "error": str(exc)[:80],
+            "error": "trend_state_read_failed",
         })
 
 

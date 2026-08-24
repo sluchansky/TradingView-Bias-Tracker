@@ -282,12 +282,12 @@ class TestTrend:
             snap = e.get_snapshot()
         # Augment manually
         from canonical_market_state import _augment_snapshot
-        with patch("trend_alignment.MTF_STATE_BY_INST", {
-            "MNQ": {
-                "trend_15m": {"direction": "BULLISH", "bars_count": 25},
-                "trend_4h":  {"direction": "BULLISH", "bars_count": 6},
-            }
-        }, create=True):
+        with patch("trend_alignment.get_mtf_state", return_value={
+            "source": "databento_1m_resample",
+            "alignment": "ALIGNED_LONG", "alignment_freshness": "CURRENT",
+            "fifteen_minute": {"trend": "BULLISH", "bar_count": 25, "freshness": "CURRENT", "age_seconds": 30},
+            "four_hour": {"trend": "BULLISH", "bar_count": 6, "freshness": "CURRENT", "age_seconds": 120},
+        }):
             with patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
                 _augment_snapshot("MNQ", snap)
         assert "trend" in snap
@@ -297,23 +297,29 @@ class TestTrend:
         e = _engine()
         _feed(e, _bars_trend_up(5))
         snap = e.get_snapshot()
-        with patch("trend_alignment.MTF_STATE_BY_INST", {
-            "MNQ": {"trend_15m": {"direction": "BULLISH"}, "trend_4h": {"direction": "BULLISH"}}
-        }, create=True), patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+        with patch("trend_alignment.get_mtf_state", return_value={
+            "source": "databento_1m_resample",
+            "alignment": "ALIGNED_LONG", "alignment_freshness": "CURRENT",
+            "fifteen_minute": {"trend": "BULLISH", "freshness": "CURRENT"},
+            "four_hour": {"trend": "BULLISH", "freshness": "CURRENT"},
+        }), patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
             from canonical_market_state import _augment_snapshot
             _augment_snapshot("MNQ", snap)
-        assert snap["trend"]["trend_alignment"] == "ALIGNED_BULLISH"
+        assert snap["trend"]["trend_alignment"] == "ALIGNED_LONG"
 
     def test_trend_alignment_mixed(self):
         e = _engine()
         _feed(e, _bars_trend_up(5))
         snap = e.get_snapshot()
-        with patch("trend_alignment.MTF_STATE_BY_INST", {
-            "MNQ": {"trend_15m": {"direction": "BULLISH"}, "trend_4h": {"direction": "BEARISH"}}
-        }, create=True), patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+        with patch("trend_alignment.get_mtf_state", return_value={
+            "source": "databento_1m_resample",
+            "alignment": "CONFLICTING", "alignment_freshness": "CURRENT",
+            "fifteen_minute": {"trend": "BULLISH", "freshness": "CURRENT"},
+            "four_hour": {"trend": "BEARISH", "freshness": "CURRENT"},
+        }), patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
             from canonical_market_state import _augment_snapshot
             _augment_snapshot("MNQ", snap)
-        assert snap["trend"]["trend_alignment"] == "MIXED"
+        assert snap["trend"]["trend_alignment"] == "CONFLICTING"
 
     def test_trend_alignment_unknown_when_no_data(self):
         e = _engine()
@@ -323,7 +329,37 @@ class TestTrend:
              patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
             from canonical_market_state import _augment_snapshot
             _augment_snapshot("MNQ", snap)
-        assert snap["trend"]["trend_alignment"] == "UNKNOWN"
+        assert snap["trend"]["trend_alignment"] == "UNAVAILABLE"
+
+    def test_stale_shadow_trend_is_unavailable_with_age(self):
+        e = _engine()
+        snap = e.get_snapshot()
+        with patch("trend_alignment.get_mtf_state", return_value={
+            "source": "databento_1m_resample",
+            "alignment": "UNAVAILABLE", "alignment_freshness": "STALE",
+            "fifteen_minute": {"trend": "UNAVAILABLE", "freshness": "STALE", "age_seconds": 1900, "bar_count": 25},
+            "four_hour": {"trend": "UNAVAILABLE", "freshness": "STALE", "age_seconds": 32000, "bar_count": 6},
+        }), patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+            from canonical_market_state import _augment_snapshot
+            _augment_snapshot("MNQ", snap)
+        assert snap["trend"]["trend_15m"] == "UNAVAILABLE"
+        assert snap["trend"]["trend_4h"] == "UNAVAILABLE"
+        assert snap["trend"]["health"] == STALE
+        assert snap["trend"]["trend_15m_age_seconds"] == 1900
+        assert snap["trend"]["true_source"] == "databento"
+
+    def test_malformed_shadow_trend_is_explicit_calculation_error(self):
+        e = _engine()
+        snap = e.get_snapshot()
+        with patch("trend_alignment.get_mtf_state", side_effect=TypeError("malformed trend state")), \
+             patch("fvg_engine.FVG_ZONES_BY_INST", {}, create=True):
+            from canonical_market_state import _augment_snapshot
+            _augment_snapshot("MNQ", snap)
+        assert snap["trend"]["health"] == cms.CALCULATION_ERROR
+        assert snap["trend"]["trend_15m"] == "UNAVAILABLE"
+        assert snap["trend"]["trend_4h"] == "UNAVAILABLE"
+        assert snap["trend"]["trend_alignment"] == "UNAVAILABLE"
+        assert snap["trend"]["error_code"] == "TREND_STATE_READ_FAILED"
 
 
 # ── 9-14. Market structure ────────────────────────────────────────────────────
