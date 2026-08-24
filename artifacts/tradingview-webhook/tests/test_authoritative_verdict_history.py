@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import copy
 import queue
+import threading
+import time
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -92,6 +94,16 @@ def test_scalp_long_ready_snapshot_contains_full_audit_context():
     assert snap["correlations"]["gate_audit_id"] == "audit-1"
     assert snap["correlations"]["evidence_id"] == "evidence-1"
     assert snap["safety"]["execution_enabled"] is False
+
+
+def test_snapshot_uses_explicit_native_source_timestamp_not_signal_wall_clock():
+    snap = avh._build_snapshot(
+        _result(signal_time="2026-08-24T19:00:00+00:00"),
+        "MNQ", "SCALP", {},
+        source_timestamp=1_787_599_200,
+    )
+
+    assert snap["source_timestamp"] == "2026-08-24T19:20:00+00:00"
 
 
 def test_intraday_short_wait_is_explicitly_non_actionable_and_blocked():
@@ -199,6 +211,92 @@ def test_persistence_failure_is_fail_open_and_does_not_mutate_live_result():
     conn.rollback.assert_called_once()
 
 
+def test_slow_writer_never_blocks_or_mutates_returned_analysis():
+    avh._DB_READY = True
+    writer_entered = threading.Event()
+    release_writer = threading.Event()
+
+    def slow_connection():
+        writer_entered.set()
+        assert release_writer.wait(1)
+        return _mock_connection()[0]
+
+    original = _result()
+    before = copy.deepcopy(original)
+    avh.configure(slow_connection)
+
+    started = time.monotonic()
+    assert avh.observe(original, "MNQ", "SCALP", {}) is True
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 0.05
+    assert original == before
+    assert writer_entered.wait(1)
+    release_writer.set()
+    assert avh._WORK_QUEUE.join() is None
+
+
+def test_first_write_failure_retries_once_then_persists_unchanged_event():
+    avh._DB_READY = True
+    attempts = []
+    persisted = threading.Event()
+
+    def fail_then_succeed(event):
+        attempts.append(copy.deepcopy(event))
+        if len(attempts) == 2:
+            persisted.set()
+            return True
+        return False
+
+    with patch.object(avh, "_persist_event", side_effect=fail_then_succeed):
+        assert avh.observe(_result(), "MNQ", "SCALP", {}) is True
+        assert persisted.wait(1)
+        assert avh._WORK_QUEUE.join() is None
+
+    assert len(attempts) == 2
+    assert attempts[0] == attempts[1]
+    assert attempts[0]["payload"]["source_timestamp"] is None
+    scope = ("MNQ", "SCALP")
+    assert avh._LAST_BY_SCOPE[scope][0] == attempts[0]["observation_key"]
+
+
+def test_failed_head_cancels_queued_descendant_and_restarts_valid_chain():
+    avh._DB_READY = True
+    first_attempt = threading.Event()
+    allow_failure = threading.Event()
+    attempts = []
+
+    def fail_head_then_persist_recovery(event):
+        attempts.append(copy.deepcopy(event))
+        if event["score"] == 78:
+            first_attempt.set()
+            assert allow_failure.wait(1)
+            return False
+        return True
+
+    successor = _result(score=79)
+    with patch.object(avh, "_persist_event", side_effect=fail_head_then_persist_recovery):
+        assert avh.observe(_result(score=78), "MNQ", "SCALP", {}) is True
+        assert first_attempt.wait(1)
+        # This event chains to the pending head at admission time.  Once that
+        # head exhausts its retries, it must be cancelled rather than inserted
+        # with a missing previous_observation_key.
+        assert avh.observe(successor, "MNQ", "SCALP", {}) is True
+        allow_failure.set()
+        assert avh._WORK_QUEUE.join() is None
+
+        scope = ("MNQ", "SCALP")
+        assert avh._LAST_BY_SCOPE[scope] == ("", "")
+        assert [event["score"] for event in attempts] == [78, 78, 78]
+
+        # The next analysis can retry the successor as a new root observation.
+        assert avh.observe(successor, "MNQ", "SCALP", {}) is True
+        assert avh._WORK_QUEUE.join() is None
+
+    assert attempts[-1]["score"] == 79
+    assert attempts[-1]["previous_observation_key"] is None
+
+
 def test_restart_boot_reconstructs_last_state_and_suppresses_duplicate():
     conn, _ = _mock_connection(rows=[("MNQ", "SCALP", "persisted-key", "persisted-hash")])
     avh._DB_READY = True
@@ -239,8 +337,10 @@ def test_app_wires_only_a_final_scalp_intraday_nonblocking_observer():
     hook = source.index("_avh_final.observe")
     order_flow = source.rindex('result["order_flow"]', 0, hook)
     final_return = source.index("return result", hook)
-    section = source[hook - 500:hook + 300]
+    section = source[hook - 1400:hook + 300]
     assert order_flow < hook < final_return
     assert '("SCALP", "INTRADAY_TREND")' in section
     assert "SWING" in section
     assert "bounded non-blocking queue" in section
+    assert "_avh_source_timestamp" in section
+    assert "source_timestamp=_avh_source_timestamp" in section

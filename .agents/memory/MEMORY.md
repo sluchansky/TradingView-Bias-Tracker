@@ -4,6 +4,7 @@
 - [INTRADAY_TREND native engine](intraday-trend-native-engine.md) — 6 native IT helpers + analyze_intraday_trend(); BLOCKED_EXTENSION/OPPOSED_1H status codes; 5 ghost_obs columns; 109 tests; ghost/shadow only.
 - [Native structure startup warm-up](native-structure-startup-warmup.md) — replay only validated closed Databento OHLCV before live subscription; suppress historical alert fan-out so startup bars never act like new evidence.
 - [Authoritative verdict history](authoritative-verdict-history.md) — final SCALP/IT snapshots are async, chained, append-only observations; structured live fields must be reduced to DB-safe scalars.
+- [Verdict-history pending chain](verdict-history-pending-chain.md) — a failed queued head cancels descendants and rewinds to the last durable link; never persist dangling chains.
 
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 - [Visual Brain V1](visual-brain-engine.md) — inject db_conn_fn/price_store/bars_fn at start(); never `import app` from sub-modules; single-flight _schedule_next in finally only; screenshots ephemeral (no temp files).

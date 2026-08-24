@@ -1351,7 +1351,9 @@ class DatabentoBrain:
             # ── Bar builder ──
             bar_minute = int(ts_s // 60) * 60
             self._check_session_reset(inst, bar_minute)
-            self._tick_bar(inst, bar_minute, price, size, side=side)
+            self._tick_bar(
+                inst, bar_minute, price, size, side=side, source_event_ts=ts_s,
+            )
 
             # ── Live tick broadcast (SSE chart feed) ──
             # Fire AFTER _tick_bar so DATABENTO_PARTIAL_BY_INST already reflects
@@ -1392,7 +1394,7 @@ class DatabentoBrain:
 
     def _tick_bar(
         self, inst: str, bar_minute: int, price: float, size: int,
-        side: "str | None" = None,
+        side: "str | None" = None, source_event_ts: float | None = None,
     ) -> None:
         # Hold the lock only for the read-modify of _partial so the periodic
         # flush thread cannot read a stale pointer or double-close the same bar.
@@ -1406,6 +1408,10 @@ class DatabentoBrain:
                 to_close = p           # capture old partial (may be None)
                 self._partial[inst] = {
                     "ts":          bar_minute,
+                    # `ts` is the minute bucket start.  Preserve the latest
+                    # actual Databento event independently for observers of
+                    # the resulting closed bar.
+                    "source_event_ts": source_event_ts,
                     "open":        price,
                     "high":        price,
                     "low":         price,
@@ -1424,6 +1430,12 @@ class DatabentoBrain:
                     p["buy_volume"]  = p.get("buy_volume",  0) + size
                 elif side == "B":
                     p["sell_volume"] = p.get("sell_volume", 0) + size
+                if source_event_ts is not None:
+                    prior_source = p.get("source_event_ts")
+                    p["source_event_ts"] = max(
+                        float(prior_source) if prior_source is not None else source_event_ts,
+                        source_event_ts,
+                    )
             # Publish a display snapshot so Flask routes can read the partial
             # bar without acquiring this lock.  dict() creates a frozen copy
             # while we're still inside the lock — consistent and lock-free for readers.
@@ -1510,8 +1522,13 @@ class DatabentoBrain:
         processed_iso = datetime.now(timezone.utc).isoformat()
         # A completed bar is source-time data.  Using wall-clock processing time
         # here would make a queued replay look current to VWAP/CVD/RVOL consumers.
-        source_iso = self._iso_epoch(bar.get("ts")) or processed_iso
-        self._active_bar_source_ts[inst] = bar.get("ts")
+        source_epoch = bar.get("source_event_ts")
+        if source_epoch is None:
+            # Historical OHLCV carries no constituent trade event; its
+            # validated closed-bar time is authoritative for warm-up only.
+            source_epoch = bar.get("ts")
+        source_iso = self._iso_epoch(source_epoch)
+        self._active_bar_source_ts[inst] = source_epoch
 
         # Session VWAP — accumulated from live trade ticks (_on_trade).
         # On boot, historical bars arrive before any live trades, so _v_sum is 0.
@@ -1581,6 +1598,10 @@ class DatabentoBrain:
         # detects the absence and returns available=False, reason=bars_pre_v1.
         pub: dict[str, Any] = {
             "ts":           bar["ts"],
+            # Retain source time separately from the minute bucket and local
+            # processing clock so downstream append-only observers can bind
+            # the decision to the real Databento event/closed bar.
+            "source_timestamp": source_iso,
             "open":         bar["open"],
             "high":         bar["high"],
             "low":          bar["low"],

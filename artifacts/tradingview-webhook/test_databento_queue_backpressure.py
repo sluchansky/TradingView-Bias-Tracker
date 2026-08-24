@@ -10,6 +10,7 @@ import time
 import types
 import unittest
 from collections import deque
+from datetime import datetime, timezone
 
 import databento_brain as db
 
@@ -88,6 +89,65 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
                 self.assertEqual(queue_state["freshness"], "FRESH")
         finally:
             brain._stop_record_dispatcher()
+
+    def test_four_instrument_pressure_stays_bounded_and_fresh_without_overflow(self):
+        """A busy but supported stream may backlog briefly without stale replay."""
+        db.RECORD_QUEUE_MAX = 256
+        brain = _brain()
+        ids = {"MGC": 11, "MNQ": 12, "MES": 13, "MYM": 14}
+        brain._id_to_inst = {iid: inst for inst, iid in ids.items()}
+        processed = []
+
+        def deliberately_busy(rec):
+            time.sleep(0.001)
+            processed.append((brain._instrument_for_record(rec), rec.sequence))
+
+        brain._on_trade = deliberately_busy
+        brain._start_record_dispatcher()
+        try:
+            max_depth = 0
+            for sequence in range(40):
+                for iid in ids.values():
+                    brain._dispatch_record(_trade(iid, sequence))
+                    max_depth = max(max_depth, sum(brain._queue_depth_by_inst.values()))
+
+            self.assertGreater(max_depth, 0)
+            self.assertLessEqual(max_depth, db.RECORD_QUEUE_MAX)
+            self._wait_empty(brain)
+            self.assertEqual(len(processed), 160)
+            for inst in ids:
+                queue_state = db.DATABENTO_STATUS["instruments"][inst]["queue"]
+                self.assertEqual(queue_state["queue_depth"], 0)
+                self.assertEqual(queue_state["dropped"], 0)
+                self.assertEqual(queue_state["processing_lag_s"], 0.0)
+                self.assertEqual(queue_state["freshness"], "FRESH")
+        finally:
+            brain._stop_record_dispatcher()
+
+    def test_closed_bar_retains_actual_source_event_timestamp(self):
+        brain = _brain()
+        source_event = 1_787_599_259.75
+        previous_public_bars = list(db.DATABENTO_BARS_BY_INST["MGC"])
+        try:
+            db.DATABENTO_BARS_BY_INST["MGC"].clear()
+            brain._on_bar_close("MGC", {
+                "ts": int(source_event // 60) * 60,
+                "source_event_ts": source_event,
+                "open": 100.0,
+                "high": 101.0,
+                "low": 99.0,
+                "close": 100.5,
+                "volume": 3,
+                "buy_volume": 2,
+                "sell_volume": 1,
+            })
+            source_timestamp = db.DATABENTO_BARS_BY_INST["MGC"][-1]["source_timestamp"]
+            assert source_timestamp == datetime.fromtimestamp(
+                source_event, tz=timezone.utc,
+            ).isoformat()
+        finally:
+            db.DATABENTO_BARS_BY_INST["MGC"].clear()
+            db.DATABENTO_BARS_BY_INST["MGC"].extend(previous_public_bars)
 
     def test_overflow_is_bounded_and_never_claims_freshness(self):
         db.RECORD_QUEUE_MAX = 4

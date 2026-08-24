@@ -31,6 +31,10 @@ _WORKER: Optional[threading.Thread] = None
 _WORKER_LOCK = threading.Lock()
 _STATE_LOCK = threading.RLock()
 _LAST_BY_SCOPE: Dict[Tuple[str, str], Tuple[str, str]] = {}
+# Events are added only after a successful non-blocking queue submission and
+# removed only after their INSERT succeeds.  This lets a failed head invalidate
+# its queued descendants instead of allowing a dangling previous-key link.
+_PENDING_BY_SCOPE: Dict[Tuple[str, str], List[dict]] = {}
 _DROPPED_EVENTS = 0
 _WRITTEN_EVENTS = 0
 
@@ -59,6 +63,17 @@ def _text(value: Any) -> Optional[str]:
     """Return a bounded scalar suitable for a TEXT/TIMESTAMPTZ bind."""
     value = _safe(value)
     return value if isinstance(value, str) else (str(value) if isinstance(value, (bool, int, float)) else None)
+
+
+def _source_timestamp(value: Any) -> Optional[str]:
+    """Return a source-derived timestamp, never a local recording-time fallback."""
+    value = _safe(value)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc).isoformat()
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+    return _text(value)
 
 
 def _number(value: Any) -> Optional[float]:
@@ -128,7 +143,8 @@ def _confidence(result: dict) -> Any:
 
 
 def _build_snapshot(result: dict, instrument: str, mode: str,
-                    arm_state: Optional[dict], recorded_at: Optional[str] = None) -> dict:
+                    arm_state: Optional[dict], recorded_at: Optional[str] = None,
+                    source_timestamp: Any = None) -> dict:
     """Create one whitelisted, final-result snapshot without importing app.py."""
     result = result if isinstance(result, dict) else {}
     gate = result.get("gate_debug") or {}
@@ -227,8 +243,8 @@ def _build_snapshot(result: dict, instrument: str, mode: str,
         "databento_health": _safe(databento),
         "correlations": _safe(correlations),
         "safety": _safe(safety),
-        "source_timestamp": _text(_first(
-            result.get("source_timestamp"), result.get("signal_time"),
+        "source_timestamp": _source_timestamp(_first(
+            source_timestamp, result.get("source_timestamp"),
             result.get("bar_timestamp"), result.get("bar_ts"),
             (databento if isinstance(databento, dict) else {}).get("last_bar_ts"),
         )),
@@ -335,14 +351,16 @@ def boot() -> None:
 
 
 def observe(result: dict, instrument: str, mode: str,
-            arm_state: Optional[dict] = None) -> bool:
+            arm_state: Optional[dict] = None, *, source_timestamp: Any = None) -> bool:
     """Enqueue a final verdict snapshot; never waits on the database."""
     global _DROPPED_EVENTS
     mode, instrument = str(mode or "").upper(), str(instrument or "").upper()
     if mode not in SUPPORTED_MODES or not instrument or not _DB_READY:
         return False
     try:
-        snapshot = _build_snapshot(result, instrument, mode, arm_state)
+        snapshot = _build_snapshot(
+            result, instrument, mode, arm_state, source_timestamp=source_timestamp,
+        )
         snapshot_hash = _snapshot_hash(snapshot)
         scope = (instrument, mode)
         with _STATE_LOCK:
@@ -355,6 +373,7 @@ def observe(result: dict, instrument: str, mode: str,
             event = {
                 **snapshot,
                 "previous_observation_key": previous_key or None,
+                "previous_snapshot_hash": previous_hash,
                 "snapshot_hash": snapshot_hash,
             }
             event["observation_key"] = _event_key(scope, previous_key, snapshot_hash)
@@ -365,6 +384,7 @@ def observe(result: dict, instrument: str, mode: str,
                 _DROPPED_EVENTS += 1
                 logger.warning("AuthoritativeVerdictHistory: queue full; observation dropped")
                 return False
+            _PENDING_BY_SCOPE.setdefault(scope, []).append(event)
             _LAST_BY_SCOPE[scope] = (event["observation_key"], snapshot_hash)
         _ensure_worker()
         return True
@@ -432,13 +452,45 @@ def _persist_event(event: dict) -> bool:
             pass
 
 
-def _rollback_pending(event: dict) -> None:
-    """Allow a later analysis cycle to retry a persistently failed event."""
+def _mark_persisted(event: dict) -> None:
+    """Remove one durable event from the pending chain without changing its head."""
     scope = (event["instrument"], event["mode"])
     with _STATE_LOCK:
-        current = _LAST_BY_SCOPE.get(scope)
-        if current and current[0] == event["observation_key"]:
-            _LAST_BY_SCOPE[scope] = (event.get("previous_observation_key") or "", "")
+        pending = _PENDING_BY_SCOPE.get(scope, [])
+        _PENDING_BY_SCOPE[scope] = [
+            candidate for candidate in pending
+            if candidate["observation_key"] != event["observation_key"]
+        ]
+        if not _PENDING_BY_SCOPE[scope]:
+            _PENDING_BY_SCOPE.pop(scope, None)
+
+
+def _rollback_pending(event: dict) -> None:
+    """Invalidate a failed event and queued descendants, preserving valid links."""
+    scope = (event["instrument"], event["mode"])
+    with _STATE_LOCK:
+        pending = _PENDING_BY_SCOPE.get(scope, [])
+        failed_at = next(
+            (index for index, candidate in enumerate(pending)
+             if candidate["observation_key"] == event["observation_key"]),
+            None,
+        )
+        if failed_at is None:
+            return
+        # A worker is ordered, so successors are still only queued.  Mark them
+        # cancelled in place; the worker will consume and task_done them without
+        # writing a row whose predecessor was never durable.
+        for descendant in pending[failed_at + 1:]:
+            descendant["_cancelled"] = True
+        del pending[failed_at:]
+        if pending:
+            _PENDING_BY_SCOPE[scope] = pending
+        else:
+            _PENDING_BY_SCOPE.pop(scope, None)
+        _LAST_BY_SCOPE[scope] = (
+            event.get("previous_observation_key") or "",
+            event.get("previous_snapshot_hash") or "",
+        )
 
 
 def _worker_loop() -> None:
@@ -447,6 +499,8 @@ def _worker_loop() -> None:
         try:
             if event is None:
                 return
+            if event.get("_cancelled"):
+                continue
             written = False
             for delay in _RETRY_DELAYS:
                 if delay:
@@ -456,6 +510,8 @@ def _worker_loop() -> None:
                     break
             if not written:
                 _rollback_pending(event)
+            else:
+                _mark_persisted(event)
         except Exception as exc:
             logger.debug("AuthoritativeVerdictHistory worker failure: %s", exc)
             if event is not None:
@@ -533,6 +589,7 @@ def _reset_for_tests() -> None:
     _DROPPED_EVENTS, _WRITTEN_EVENTS = 0, 0
     with _STATE_LOCK:
         _LAST_BY_SCOPE.clear()
+        _PENDING_BY_SCOPE.clear()
     while True:
         try:
             _WORK_QUEUE.get_nowait()

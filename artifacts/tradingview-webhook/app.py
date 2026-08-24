@@ -31406,7 +31406,22 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     if AVH_DB_READY and _eff_mode in ("SCALP", "INTRADAY_TREND"):
         try:
             import authoritative_verdict_history as _avh_final  # noqa: PLC0415
-            _avh_final.observe(result, active_ticker, _eff_mode, dict(_ARM_STATE))
+            # The ledger records the native source event/closed-bar timestamp,
+            # never this request's wall clock.  Reading the already-published
+            # Databento bar is observer-only and cannot change this final
+            # result, its gate, or its execution path.
+            _avh_source_timestamp = None
+            try:
+                from databento_brain import DATABENTO_BARS_BY_INST as _avh_bars  # noqa: PLC0415
+                _avh_latest_bar = list(_avh_bars.get(active_ticker) or [])[-1:]
+                if _avh_latest_bar:
+                    _avh_source_timestamp = _avh_latest_bar[0].get("source_timestamp")
+            except Exception:
+                pass
+            _avh_final.observe(
+                result, active_ticker, _eff_mode, dict(_ARM_STATE),
+                source_timestamp=_avh_source_timestamp,
+            )
         except Exception as _avh_exc:
             logger.debug(
                 "AuthoritativeVerdictHistory full_analysis observe (%s): %s",
