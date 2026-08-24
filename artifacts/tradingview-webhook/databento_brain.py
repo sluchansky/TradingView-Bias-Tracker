@@ -35,7 +35,7 @@ import time
 import threading
 import uuid
 from collections import deque
-from datetime import datetime, timezone, date as _date
+from datetime import datetime, timezone, timedelta, date as _date
 from typing import Any
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,14 @@ TOP_OF_BOOK_HISTORY_SAMPLE_S = max(0.25, float(os.environ.get("TOP_OF_BOOK_HISTO
 RECORD_QUEUE_MAX = max(64, int(os.environ.get("DATABENTO_RECORD_QUEUE_MAX", "4096")))
 RECORD_QUEUE_DELAY_S = max(1.0, float(os.environ.get("DATABENTO_RECORD_QUEUE_DELAY_S", "5")))
 RECORD_QUEUE_STALE_S = max(RECORD_QUEUE_DELAY_S, float(os.environ.get("DATABENTO_RECORD_QUEUE_STALE_S", "120")))
+# Native structure needs enough *closed* bars to confirm pivots, sweeps,
+# confirmation volume, ATR, and RVOL without inventing a single candle.
+STRUCTURE_WARMUP_BARS = max(
+    32, int(os.environ.get("DATABENTO_STRUCTURE_WARMUP_BARS", "60"))
+)
+STRUCTURE_WARMUP_MAX_AGE_HOURS = max(
+    6.0, float(os.environ.get("DATABENTO_STRUCTURE_WARMUP_MAX_AGE_HOURS", "72"))
+)
 
 # ── Public stores (read by Flask routes and the dashboard chart) ──────────────
 # Each bar entry: {ts, open, high, low, close, volume, vwap?, atr?}
@@ -338,6 +346,16 @@ DATABENTO_STATUS: dict[str, Any] = {
         "worker":          "stopped",
         "reset_at":        None,
     },
+    "structure_warmup": {
+        inst: {
+            "state": "WARMING_UP",
+            "bars": 0,
+            "required_bars": STRUCTURE_WARMUP_BARS,
+            "reason": "startup_history_pending",
+            "source_timestamp": None,
+        }
+        for inst in DB_SYMBOLS
+    },
 }
 
 
@@ -346,6 +364,10 @@ def get_databento_status_snapshot() -> dict[str, Any]:
     status = dict(DATABENTO_STATUS)
     status["queue"] = dict(DATABENTO_STATUS.get("queue") or {})
     status["order_book"] = dict(DATABENTO_STATUS.get("order_book") or {})
+    status["structure_warmup"] = {
+        inst: dict(values or {})
+        for inst, values in (DATABENTO_STATUS.get("structure_warmup") or {}).items()
+    }
     status["instruments"] = {
         inst: {
             **dict(values or {}),
@@ -452,6 +474,11 @@ class DatabentoBrain:
         self._prev_sh:      dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._prev_sl:      dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._session_day: dict[str, Any]         = {i: None for i in DB_SYMBOLS}
+        self._warmup_state: dict[str, dict[str, Any]] = {
+            i: dict((DATABENTO_STATUS.get("structure_warmup") or {}).get(i) or {})
+            for i in DB_SYMBOLS
+        }
+        self._suppress_replay_signals = False
         # Bar-close callbacks: called after every completed 1m bar per instrument.
         # Registered by app.py to trigger proactive scanning without polling.
         self._bar_close_callbacks: list = []
@@ -487,15 +514,146 @@ class DatabentoBrain:
     # ── Public API ────────────────────────────────────────────────────────────
 
     def start(self) -> None:
-        """Launch the live feed in a background daemon thread (call once at boot)."""
+        """Warm native state from closed history, then launch the live feed.
+
+        The live socket is deliberately not subscribed until replay finishes:
+        this prevents a startup history replay from racing the ordered record
+        dispatcher or overflowing its bounded queue.
+        """
         t = threading.Thread(
-            target=self._reconnect_loop,
+            target=self._warmup_then_connect,
             daemon=True,
             name="databento-brain",
         )
         t.start()
         logger.info("DatabentoBrain: started — watching instruments: %s",
                     list(DB_SYMBOLS.keys()))
+
+    def _set_warmup_state(self, inst: str, state: str, *, bars: int = 0,
+                          reason: str | None = None, source_ts: float | None = None) -> None:
+        payload = {
+            "state": state,
+            "bars": int(bars),
+            "required_bars": STRUCTURE_WARMUP_BARS,
+            "reason": reason,
+            "source_timestamp": self._iso_epoch(source_ts),
+        }
+        self._warmup_state[inst] = payload
+        DATABENTO_STATUS.setdefault("structure_warmup", {})[inst] = dict(payload)
+
+    @staticmethod
+    def _history_epoch(value: Any) -> float | None:
+        try:
+            if hasattr(value, "timestamp"):
+                return float(value.timestamp())
+            raw = float(value)
+            return raw / 1_000_000_000 if raw > 10_000_000_000 else raw
+        except (TypeError, ValueError, OverflowError, OSError):
+            return None
+
+    def _history_rows(self, store: Any) -> list[dict[str, Any]]:
+        """Convert Databento OHLCV rows to strictly valid source-time bars."""
+        rows: list[dict[str, Any]] = []
+        try:
+            frame = store.to_df()
+            iterator = frame.iterrows()
+            for ts, row in iterator:
+                rows.append({
+                    "ts": self._history_epoch(ts),
+                    "open": float(row.get("open")),
+                    "high": float(row.get("high")),
+                    "low": float(row.get("low")),
+                    "close": float(row.get("close")),
+                    "volume": int(row.get("volume", 0)),
+                    "buy_volume": 0,
+                    "sell_volume": 0,
+                })
+        except Exception:
+            for row in store:
+                rows.append({
+                    "ts": self._history_epoch(getattr(row, "ts_event", None)),
+                    "open": float(getattr(row, "open")),
+                    "high": float(getattr(row, "high")),
+                    "low": float(getattr(row, "low")),
+                    "close": float(getattr(row, "close")),
+                    "volume": int(getattr(row, "volume", 0)),
+                    "buy_volume": 0,
+                    "sell_volume": 0,
+                })
+        return rows
+
+    def _validated_history(self, rows: list[dict[str, Any]], now: float) -> tuple[list[dict[str, Any]], str | None]:
+        valid: list[dict[str, Any]] = []
+        last_ts = None
+        for bar in sorted(rows, key=lambda b: (b.get("ts") is None, b.get("ts") or 0)):
+            ts = bar.get("ts")
+            try:
+                if (ts is None or ts > now - 60 or ts <= 0 or
+                        bar["high"] < bar["low"] or bar["volume"] < 0 or
+                        not (bar["low"] <= bar["open"] <= bar["high"]) or
+                        not (bar["low"] <= bar["close"] <= bar["high"]) or
+                        (last_ts is not None and ts <= last_ts)):
+                    return [], "malformed_or_non_monotonic_history"
+            except (TypeError, ValueError):
+                return [], "malformed_history"
+            last_ts = ts
+            valid.append(bar)
+        if not valid:
+            return [], "empty_history"
+        if now - valid[-1]["ts"] > STRUCTURE_WARMUP_MAX_AGE_HOURS * 3600:
+            return [], "history_too_stale"
+        if len(valid) < STRUCTURE_WARMUP_BARS:
+            return valid, "insufficient_closed_history"
+        return valid[-min(self.MAX_BARS, STRUCTURE_WARMUP_BARS):], None
+
+    def _warmup_then_connect(self) -> None:
+        # Allow app.py to register its callbacks before replay.  Replay suppresses
+        # outputs regardless, but this keeps lifecycle ordering deterministic.
+        time.sleep(0.1)
+        for inst in DB_SYMBOLS:
+            self._set_warmup_state(inst, "WARMING_UP", reason="fetching_closed_history")
+        try:
+            import databento as db  # noqa: PLC0415
+            api_key = os.environ.get("DATABENTO_API_KEY", "").strip()
+            if not api_key:
+                for inst in DB_SYMBOLS:
+                    self._set_warmup_state(inst, "UNAVAILABLE", reason="missing_api_key")
+                return self._reconnect_loop()
+            historical = db.Historical(key=api_key)
+            # Historical data can lag live.  We only use it to reconstruct the
+            # native detector state, never to claim that price/CVD is fresh.
+            end = datetime.now(timezone.utc) - timedelta(hours=5)
+            start = end - timedelta(hours=12)
+            for inst, symbol in DB_SYMBOLS.items():
+                try:
+                    store = historical.timeseries.get_range(
+                        dataset=DB_DATASET, symbols=[symbol], schema="ohlcv-1m",
+                        stype_in="continuous", start=start.strftime("%Y-%m-%dT%H:%M"),
+                        end=end.strftime("%Y-%m-%dT%H:%M"),
+                    )
+                    bars, reason = self._validated_history(
+                        self._history_rows(store), time.time()
+                    )
+                    if reason:
+                        self._set_warmup_state(inst, "UNAVAILABLE", bars=len(bars), reason=reason)
+                        continue
+                    self._suppress_replay_signals = True
+                    try:
+                        for bar in bars:
+                            self._on_bar_close(inst, bar, replay=True)
+                    finally:
+                        self._suppress_replay_signals = False
+                    self._set_warmup_state(
+                        inst, "READY", bars=len(bars), reason=None, source_ts=bars[-1]["ts"]
+                    )
+                except Exception as exc:
+                    logger.warning("DatabentoBrain: structure warm-up failed for %s: %s", inst, exc)
+                    self._set_warmup_state(inst, "UNAVAILABLE", reason="history_fetch_failed")
+        except Exception as exc:
+            logger.warning("DatabentoBrain: structure warm-up unavailable: %s", exc)
+            for inst in DB_SYMBOLS:
+                self._set_warmup_state(inst, "UNAVAILABLE", reason="history_client_failed")
+        self._reconnect_loop()
 
     def register_bar_close_callback(self, fn) -> None:
         """Register a callable(inst: str, price: float) invoked after each bar close.
@@ -1275,7 +1433,7 @@ class DatabentoBrain:
 
     # ── Bar close — compute indicators and inject into shared state ───────────
 
-    def _on_bar_close(self, inst: str, bar: dict) -> None:
+    def _on_bar_close(self, inst: str, bar: dict, *, replay: bool = False) -> None:
         bars = self._bars[inst]
         bars.append(bar)
         if len(bars) > self.MAX_BARS:
@@ -1378,7 +1536,9 @@ class DatabentoBrain:
                 "atr_pts":     round(atr, 4),
                 "baseline_pts": round(baseline, 4),
                 "ratio":       ratio,
-                "ts":          now_iso,
+                # This is a source-time bar observation; processed_iso would
+                # falsely make historical replay look current.
+                "ts":          source_iso,
             }
 
         # ── VWAP_BY_TICKER (gate VWAP — replaces Yahoo Finance auto-refresh) ──
@@ -1426,11 +1586,15 @@ class DatabentoBrain:
         # ── Bar-close callbacks (proactive scanner hook) ───────────────────────
         # Called AFTER all detectors so every fresh signal is already in
         # ALERT_HISTORY before the scan evaluates the setup.
-        for _cb in self._bar_close_callbacks:
-            try:
-                _cb(inst, bars[-1]["close"])
-            except Exception:
-                pass
+        # Historical replay reconstructs native detector state only.  It must
+        # never fan out a startup callback as though the last closed historical
+        # bar were a newly actionable live event.
+        if not replay:
+            for _cb in self._bar_close_callbacks:
+                try:
+                    _cb(inst, bars[-1]["close"])
+                except Exception:
+                    pass
 
     # ── Structure detection ───────────────────────────────────────────────────
 
@@ -1661,6 +1825,11 @@ class DatabentoBrain:
 
     def _inject_alert(self, inst: str, alert_type: str, price: float) -> None:
         """Append a synthetic structure alert to the shared ALERT_HISTORY deque."""
+        if self._suppress_replay_signals:
+            # Detector transitions still update their own per-instrument state
+            # during replay; external evidence and execution-trigger callbacks
+            # wait for a genuinely live closed bar.
+            return
         source_timestamp = (
             self._iso_epoch(self._active_bar_source_ts.get(inst))
             or datetime.now(timezone.utc).isoformat()

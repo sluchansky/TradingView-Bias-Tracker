@@ -10000,6 +10000,23 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     structure_state = resolve_structure_cycle(
         recent, inst, now=now_utc(), window_minutes=int(stage_window or 20)
     )
+    # Native Databento structure warm-up is an operator-health annotation only.
+    # It never rewrites resolver state, confirmation, scoring, or any gate.
+    # The detector remains authoritative once real closed bars arrive.
+    if DATABENTO_ENABLED:
+        try:
+            from databento_brain import DATABENTO_STATUS as _db_warm_status  # noqa: PLC0415
+            _warmup = ((_db_warm_status.get("structure_warmup") or {}).get(inst) or {})
+            _warmup_state = _warmup.get("state")
+            if _warmup_state in ("WARMING_UP", "UNAVAILABLE"):
+                structure_state = dict(structure_state)
+                structure_state["warmup"] = dict(_warmup)
+                structure_state["operator_availability"] = _warmup_state
+            elif _warmup:
+                structure_state = dict(structure_state)
+                structure_state["warmup"] = dict(_warmup)
+        except Exception:
+            pass
     _structure_state_direction = structure_state.get("direction")
     _structure_state_confirmed = bool(structure_state.get("confirmed"))
     structure_cycle_long = bool(
@@ -25393,6 +25410,11 @@ def _structure_cycle_operator_guidance(structure_state):
         return None
     return {
         "state": state,
+        "operator_availability": structure_state.get("operator_availability"),
+        "warmup": (
+            dict(structure_state.get("warmup"))
+            if isinstance(structure_state.get("warmup"), dict) else None
+        ),
         "direction": structure_state.get("direction"),
         "confirmed": structure_state.get("confirmed") is True,
         # These resolved fields are presentation metadata for the cycle card.

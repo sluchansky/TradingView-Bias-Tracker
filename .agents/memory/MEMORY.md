@@ -2,6 +2,7 @@
 
 - [INTRADAY_TREND dedicated plan engine](intraday-trend-plan-engine.md) — build_intraday_trade_plan() fully separated from SWING; structural stop only, targets from real session levels ≥2R, 15:15 cutoff, chase gate; _swing_htf_enabled() SWING-only.
 - [INTRADAY_TREND native engine](intraday-trend-native-engine.md) — 6 native IT helpers + analyze_intraday_trend(); BLOCKED_EXTENSION/OPPOSED_1H status codes; 5 ghost_obs columns; 109 tests; ghost/shadow only.
+- [Native structure startup warm-up](native-structure-startup-warmup.md) — replay only validated closed Databento OHLCV before live subscription; suppress historical alert fan-out so startup bars never act like new evidence.
 
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 - [Visual Brain V1](visual-brain-engine.md) — inject db_conn_fn/price_store/bars_fn at start(); never `import app` from sub-modules; single-flight _schedule_next in finally only; screenshots ephemeral (no temp files).
