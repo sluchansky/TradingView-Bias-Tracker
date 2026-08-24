@@ -1203,6 +1203,104 @@ def test_coach_rule_engine_eligibility_live_eligible_at_min_sample():
         f"sample_size mismatch: expected {n_at}, got {entry.get('sample_size')!r}")
 
 
+def test_coach_rule_engine_eligibility_stays_ghost_only_with_negative_expectancy():
+    """Enough losing trades must not promote an instrument to LIVE_ELIGIBLE.
+
+    This exercises the secondary quality veto at the exact sample threshold,
+    where a single lucky trade must not override negative overall expectancy.
+    """
+    psycopg2_mod = getattr(app, "psycopg2", None)
+    if psycopg2_mod is None:
+        return
+
+    min_sample = app.LEARNING_LIVE_MIN_SAMPLE
+    inst_row = {
+        "symbol": "MGC", "trading_mode": "SWING",
+        "n": min_sample, "expectancy": -0.3,
+        "win_rate": 0.35, "tp1_hit_rate": 0.4,
+    }
+    # Keep the recent window positive so this test proves the overall
+    # expectancy veto independently of the last-20 veto.
+    last20_row = {
+        "symbol": "MGC", "trading_mode": "SWING",
+        "last_20_avg_r": 0.2,
+    }
+    mock_conn, _ = _build_eligibility_mock_conn([inst_row], [last20_row])
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+
+    try:
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(app, "_learning_conn", return_value=None),
+        ):
+            app._recompute_learning_eligibility(mock_conn)
+
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+
+    assert entry, "Expected a recomputed MGC::SWING eligibility entry"
+    assert entry.get("status") == "GHOST_ONLY", (
+        f"With n={min_sample} and expectancy=-0.3R, eligibility must remain "
+        f"GHOST_ONLY, got {entry.get('status')!r}")
+    assert entry.get("rule_triggered", "").startswith("negative_expectancy"), (
+        "Negative overall expectancy must be the veto that keeps the instrument "
+        "GHOST_ONLY")
+
+
+def test_coach_rule_engine_eligibility_stays_ghost_only_with_negative_last20():
+    """A negative last-20 average must veto LIVE_ELIGIBLE at the threshold.
+
+    Overall expectancy is positive in this fixture, so the result specifically
+    proves that deteriorating recent performance remains a GHOST_ONLY veto.
+    """
+    psycopg2_mod = getattr(app, "psycopg2", None)
+    if psycopg2_mod is None:
+        return
+
+    min_sample = app.LEARNING_LIVE_MIN_SAMPLE
+    inst_row = {
+        "symbol": "MGC", "trading_mode": "SWING",
+        "n": min_sample, "expectancy": 0.3,
+        "win_rate": 0.6, "tp1_hit_rate": 0.7,
+    }
+    last20_row = {
+        "symbol": "MGC", "trading_mode": "SWING",
+        "last_20_avg_r": -0.3,
+    }
+    mock_conn, _ = _build_eligibility_mock_conn([inst_row], [last20_row])
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+
+    try:
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(app, "_learning_conn", return_value=None),
+        ):
+            app._recompute_learning_eligibility(mock_conn)
+
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+
+    assert entry, "Expected a recomputed MGC::SWING eligibility entry"
+    assert entry.get("status") == "GHOST_ONLY", (
+        f"With n={min_sample}, positive overall expectancy, and last-20=-0.3R, "
+        f"eligibility must remain GHOST_ONLY, got {entry.get('status')!r}")
+    assert entry.get("rule_triggered", "").startswith("last_20_trades_negative"), (
+        "Negative last-20 expectancy must keep the instrument GHOST_ONLY even "
+        "when overall expectancy is positive")
+
+
 # ===========================================================================
 # CROSS-INTERFACE MATRIX — all 7 interfaces COMPLETE
 # ===========================================================================
