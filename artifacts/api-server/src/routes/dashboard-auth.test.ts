@@ -1,5 +1,6 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { dashboardAuth } from "./dashboard-auth";
+import { BOT1_ROUTES } from "./flask-proxy";
 
 const originalPassword = process.env.DASHBOARD_PASSWORD;
 const originalUsername = process.env.DASHBOARD_USERNAME;
@@ -114,5 +115,18 @@ describe("dashboardAuth", () => {
 
     expect(result.next).toBe(true);
     expect(result.status).toBe(0);
+  });
+
+  it("keeps the P4 health diagnostic behind dashboard authentication", () => {
+    process.env.DASHBOARD_PASSWORD = "correct-password";
+
+    const result = invoke({ path: "/authoritative-verdict-history-health" });
+
+    expect(result.next).toBe(false);
+    expect(result.status).toBe(401);
+  });
+
+  it("includes the P4 health diagnostic in the protected Flask proxy whitelist", () => {
+    expect(BOT1_ROUTES).toContain("/authoritative-verdict-history-health");
   });
 });

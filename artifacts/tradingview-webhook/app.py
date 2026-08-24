@@ -85288,6 +85288,262 @@ def route_canonical_evidence_health():
         }), 500
 
 
+def _authoritative_verdict_history_error_code(exc):
+    """Return a bounded diagnostic category without exposing DB error text."""
+    text = str(exc or "").lower()
+    class_name = type(exc).__name__.lower()
+    if "does not exist" in text or "undefinedtable" in class_name:
+        return "table_missing"
+    if (
+        "connect" in text
+        or "connection" in text
+        or "database unavailable" in text
+        or "operationalerror" in class_name
+    ):
+        return "database_connection_failed"
+    return "database_query_failed"
+
+
+def _authoritative_verdict_history_health():
+    """Read-only production health for the P4 observer and immutable ledger.
+
+    This surface intentionally reports process state separately from aggregate
+    table counts.  A missing/unreadable table returns null counts instead of
+    false zeroes, and no payload or connection detail is ever returned.
+    """
+    empty_mode = {
+        "rows": None,
+        "source_timestamp": {"null": None, "non_null": None},
+    }
+    empty_recent = {
+        "window_hours": 24,
+        "rows": None,
+        "by_mode": {
+            "SCALP": dict(empty_mode),
+            "INTRADAY_TREND": dict(empty_mode),
+        },
+        "source_timestamp": {"null": None, "non_null": None},
+    }
+    base = {
+        "ok": True,
+        "contract_version": 2,
+        "read_only": True,
+        "observer_only": True,
+        "health_status": "DISABLED",
+        "process": {
+            "database_configured": bool(LEARNING_DB_ENABLED),
+            "table_ready": False,
+            "database_ready": False,
+            "readiness_error": "observer_disabled",
+            "last_probe_error": None,
+            "last_probe_at": None,
+            "last_startup_error": None,
+            "last_startup_at": None,
+        },
+        "observer": {
+            "enabled": False,
+            "worker_enabled": False,
+            "worker_running": False,
+            "queue_depth": 0,
+            "queue_capacity": None,
+            "queue_saturated": False,
+            "dropped_events": 0,
+            "retry_attempts": 0,
+            "persistence_errors": 0,
+            "persistence_error": None,
+            "pending_events": 0,
+            "written_events": 0,
+            "recent": {
+                "window_seconds": 24 * 60 * 60,
+                "retry_attempts": 0,
+                "persistence_errors": 0,
+            },
+        },
+        "persistence": {
+            "total_rows": None,
+            "by_mode": {
+                "SCALP": dict(empty_mode),
+                "INTRADAY_TREND": dict(empty_mode),
+            },
+            "source_timestamp": {"null": None, "non_null": None},
+            "newest_recorded_at": None,
+            "newest_source_timestamp": None,
+            "recent": empty_recent,
+            "query_error": None,
+        },
+    }
+    try:
+        import authoritative_verdict_history as _avh  # noqa: PLC0415
+        observer = _avh.status()
+    except Exception:
+        base["process"]["readiness_error"] = "observer_module_unavailable"
+        base["health_status"] = "UNAVAILABLE"
+        return base
+
+    process_ready = bool(AVH_DB_READY and observer.get("db_ready"))
+    readiness_error = observer.get("readiness_error")
+    base["process"].update({
+        "database_configured": bool(LEARNING_DB_ENABLED),
+        "table_ready": process_ready,
+        "database_ready": process_ready,
+        "readiness_error": readiness_error if not process_ready else None,
+        "last_probe_error": observer.get("last_probe_error"),
+        "last_probe_at": observer.get("last_probe_at"),
+        "last_startup_error": observer.get("last_startup_error"),
+        "last_startup_at": observer.get("last_startup_at"),
+    })
+    base["observer"].update({
+        "enabled": bool(observer.get("observer_enabled")),
+        "worker_enabled": bool(observer.get("worker_enabled")),
+        "worker_running": bool(observer.get("worker_running")),
+        "queue_depth": int(observer.get("queue_depth") or 0),
+        "queue_capacity": observer.get("queue_capacity"),
+        "queue_saturated": bool(observer.get("queue_saturated")),
+        "dropped_events": int(observer.get("dropped_events") or 0),
+        "retry_attempts": int(observer.get("retry_attempts") or 0),
+        "persistence_errors": int(observer.get("persistence_errors") or 0),
+        "persistence_error": observer.get("persistence_error"),
+        "pending_events": int(observer.get("pending_events") or 0),
+        "written_events": int(observer.get("written_events") or 0),
+        "recent": {
+            "window_seconds": int(
+                (observer.get("recent") or {}).get("window_seconds") or 24 * 60 * 60
+            ),
+            "retry_attempts": int(
+                (observer.get("recent") or {}).get("retry_attempts") or 0
+            ),
+            "persistence_errors": int(
+                (observer.get("recent") or {}).get("persistence_errors") or 0
+            ),
+        },
+    })
+    if not LEARNING_DB_ENABLED or not process_ready:
+        base["health_status"] = (
+            "DISABLED" if not LEARNING_DB_ENABLED else
+            ("TABLE_MISSING" if readiness_error == "table_missing" else "DB_FAILURE")
+        )
+        return base
+
+    conn = _learning_conn()
+    if conn is None:
+        base["process"]["database_ready"] = False
+        base["process"]["readiness_error"] = "database_connection_unavailable"
+        base["health_status"] = "DB_FAILURE"
+        return base
+
+    def _aggregate(rows, recent=False):
+        result = {
+            "rows": 0,
+            "by_mode": {
+                "SCALP": {"rows": 0, "source_timestamp": {"null": 0, "non_null": 0}},
+                "INTRADAY_TREND": {"rows": 0, "source_timestamp": {"null": 0, "non_null": 0}},
+            },
+            "source_timestamp": {"null": 0, "non_null": 0},
+            "newest_recorded_at": None,
+            "newest_source_timestamp": None,
+        }
+        for (
+            mode, row_count, null_count, non_null_count,
+            newest_recorded_at, newest_source_timestamp,
+        ) in rows or []:
+            mode = str(mode or "").upper()
+            if mode not in result["by_mode"]:
+                continue
+            row_count, null_count, non_null_count = (
+                int(row_count or 0), int(null_count or 0), int(non_null_count or 0)
+            )
+            result["rows"] += row_count
+            result["by_mode"][mode] = {
+                "rows": row_count,
+                "source_timestamp": {"null": null_count, "non_null": non_null_count},
+            }
+            result["source_timestamp"]["null"] += null_count
+            result["source_timestamp"]["non_null"] += non_null_count
+            if newest_recorded_at is not None:
+                newest_recorded_at = (
+                    newest_recorded_at.isoformat()
+                    if hasattr(newest_recorded_at, "isoformat")
+                    else str(newest_recorded_at)
+                )
+                if (
+                    result["newest_recorded_at"] is None
+                    or newest_recorded_at > result["newest_recorded_at"]
+                ):
+                    result["newest_recorded_at"] = newest_recorded_at
+            if newest_source_timestamp is not None:
+                newest_source_timestamp = (
+                    newest_source_timestamp.isoformat()
+                    if hasattr(newest_source_timestamp, "isoformat")
+                    else str(newest_source_timestamp)
+                )
+                if (
+                    result["newest_source_timestamp"] is None
+                    or newest_source_timestamp > result["newest_source_timestamp"]
+                ):
+                    result["newest_source_timestamp"] = newest_source_timestamp
+        if recent:
+            result["window_hours"] = 24
+        return result
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """SELECT mode, COUNT(*),
+                          COUNT(*) FILTER (WHERE source_timestamp IS NULL),
+                          COUNT(*) FILTER (WHERE source_timestamp IS NOT NULL),
+                          MAX(recorded_at), MAX(source_timestamp)
+                   FROM authoritative_verdict_history
+                  WHERE mode IN ('SCALP', 'INTRADAY_TREND')
+                  GROUP BY mode"""
+            )
+            total = _aggregate(cur.fetchall())
+            cur.execute(
+                """SELECT mode, COUNT(*),
+                          COUNT(*) FILTER (WHERE source_timestamp IS NULL),
+                          COUNT(*) FILTER (WHERE source_timestamp IS NOT NULL),
+                          MAX(recorded_at), MAX(source_timestamp)
+                   FROM authoritative_verdict_history
+                  WHERE mode IN ('SCALP', 'INTRADAY_TREND')
+                    AND recorded_at >= CURRENT_TIMESTAMP - INTERVAL '24 hours'
+                  GROUP BY mode"""
+            )
+            recent = _aggregate(cur.fetchall(), recent=True)
+        base["persistence"].update({
+            "total_rows": total["rows"],
+            "by_mode": total["by_mode"],
+            "source_timestamp": total["source_timestamp"],
+            "newest_recorded_at": total["newest_recorded_at"],
+            "newest_source_timestamp": total["newest_source_timestamp"],
+            "recent": recent,
+        })
+        base["health_status"] = "READY"
+    except Exception as exc:
+        base["persistence"]["query_error"] = _authoritative_verdict_history_error_code(exc)
+        base["health_status"] = "DB_FAILURE"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return base
+
+
+@app.route("/authoritative-verdict-history-health", methods=["GET"])
+def route_authoritative_verdict_history_health():
+    """P4 observer/table health (GET-only, aggregate SELECTs, auth at Express)."""
+    try:
+        return jsonify(_authoritative_verdict_history_health())
+    except Exception:
+        return jsonify({
+            "ok": False,
+            "contract_version": 2,
+            "read_only": True,
+            "observer_only": True,
+            "health_status": "UNAVAILABLE",
+            "error": "diagnostic_unavailable",
+        }), 500
+
+
 @app.route("/ghost-research/health", methods=["GET"])
 def route_ghost_research_health():
     """Ghost Research Engine operational health — Phase 2 (DISPLAY-ONLY).

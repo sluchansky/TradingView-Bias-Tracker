@@ -14,6 +14,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
@@ -37,6 +38,17 @@ _LAST_BY_SCOPE: Dict[Tuple[str, str], Tuple[str, str]] = {}
 _PENDING_BY_SCOPE: Dict[Tuple[str, str], List[dict]] = {}
 _DROPPED_EVENTS = 0
 _WRITTEN_EVENTS = 0
+_RETRY_ATTEMPTS = 0
+_PERSISTENCE_ERRORS = 0
+_READINESS_ERROR: Optional[str] = None
+_PERSISTENCE_ERROR: Optional[str] = None
+_LAST_PROBE_ERROR: Optional[str] = None
+_LAST_PROBE_AT: Optional[str] = None
+_LAST_STARTUP_ERROR: Optional[str] = None
+_LAST_STARTUP_AT: Optional[str] = None
+_RECENT_WINDOW_SECONDS = 24 * 60 * 60
+_RETRY_EVENTS = deque(maxlen=1024)
+_PERSISTENCE_ERROR_EVENTS = deque(maxlen=1024)
 
 
 def _now_iso() -> str:
@@ -275,6 +287,59 @@ def configure(db_conn_fn: Optional[Callable[[], Any]]) -> None:
     _DB_FN = db_conn_fn
 
 
+def _error_code(exc: Any, default: str) -> str:
+    """Reduce DB errors to non-sensitive operational categories."""
+    text = str(exc or "").lower()
+    class_name = type(exc).__name__.lower()
+    if "does not exist" in text or "undefinedtable" in class_name:
+        return "table_missing"
+    if (
+        "connect" in text
+        or "connection" in text
+        or "database unavailable" in text
+        or "operationalerror" in class_name
+    ):
+        return "database_connection_failed"
+    return default
+
+
+def _set_readiness_error(code: Optional[str]) -> None:
+    global _READINESS_ERROR
+    with _STATE_LOCK:
+        _READINESS_ERROR = code
+
+
+def _set_probe_error(code: Optional[str]) -> None:
+    global _LAST_PROBE_ERROR, _LAST_PROBE_AT
+    with _STATE_LOCK:
+        if code is not None:
+            _LAST_PROBE_ERROR = code
+        _LAST_PROBE_AT = _now_iso()
+
+
+def _set_startup_error(code: Optional[str]) -> None:
+    global _LAST_STARTUP_ERROR, _LAST_STARTUP_AT
+    with _STATE_LOCK:
+        _LAST_STARTUP_ERROR = code
+        _LAST_STARTUP_AT = _now_iso()
+
+
+def _set_persistence_error(code: str) -> None:
+    global _PERSISTENCE_ERRORS, _PERSISTENCE_ERROR
+    with _STATE_LOCK:
+        _PERSISTENCE_ERRORS += 1
+        _PERSISTENCE_ERROR = code
+        _PERSISTENCE_ERROR_EVENTS.append(time.time())
+
+
+def _recent_event_count(events: deque, now: Optional[float] = None) -> int:
+    now = time.time() if now is None else now
+    cutoff = now - _RECENT_WINDOW_SECONDS
+    while events and events[0] < cutoff:
+        events.popleft()
+    return len(events)
+
+
 def _ensure_worker() -> None:
     global _WORKER
     with _WORKER_LOCK:
@@ -289,14 +354,20 @@ def check_db_ready(db_conn_fn: Optional[Callable[[], Any]]) -> bool:
     """No-DDL boot probe.  Failure disables only this observer."""
     global _DB_READY
     configure(db_conn_fn)
+    _set_readiness_error(None)
+    _set_probe_error(None)
     if not callable(db_conn_fn):
         _DB_READY = False
+        _set_readiness_error("database_not_configured")
+        _set_probe_error("database_not_configured")
         return False
     conn = None
     try:
         conn = db_conn_fn()
         if conn is None:
             _DB_READY = False
+            _set_readiness_error("database_connection_unavailable")
+            _set_probe_error("database_connection_unavailable")
             return False
         with conn.cursor() as cur:
             cur.execute("SELECT 1 FROM authoritative_verdict_history LIMIT 1")
@@ -307,6 +378,9 @@ def check_db_ready(db_conn_fn: Optional[Callable[[], Any]]) -> bool:
         return True
     except Exception as exc:
         _DB_READY = False
+        code = _error_code(exc, "database_probe_failed")
+        _set_readiness_error(code)
+        _set_probe_error(code)
         logger.warning("AuthoritativeVerdictHistory: DB probe failed (observer disabled): %s", exc)
         return False
     finally:
@@ -341,6 +415,7 @@ def boot() -> None:
                 )
         logger.info("AuthoritativeVerdictHistory: restored %d scopes", len(_LAST_BY_SCOPE))
     except Exception as exc:
+        _set_startup_error(_error_code(exc, "startup_readback_failed"))
         logger.warning("AuthoritativeVerdictHistory: readback failed (fail-open): %s", exc)
     finally:
         try:
@@ -397,11 +472,13 @@ def _persist_event(event: dict) -> bool:
     """Worker-only INSERT.  It has no caller on the live-analysis stack."""
     global _WRITTEN_EVENTS
     if not callable(_DB_FN):
+        _set_persistence_error("database_not_configured")
         return False
     conn = None
     try:
         conn = _DB_FN()
         if conn is None:
+            _set_persistence_error("database_connection_unavailable")
             return False
         with conn.cursor() as cur:
             cur.execute("""
@@ -442,6 +519,7 @@ def _persist_event(event: dict) -> bool:
                 conn.rollback()
         except Exception:
             pass
+        _set_persistence_error(_error_code(exc, "database_write_failed"))
         logger.debug("AuthoritativeVerdictHistory write failed: %s", exc)
         return False
     finally:
@@ -494,6 +572,7 @@ def _rollback_pending(event: dict) -> None:
 
 
 def _worker_loop() -> None:
+    global _RETRY_ATTEMPTS
     while True:
         event = _WORK_QUEUE.get()
         try:
@@ -502,9 +581,13 @@ def _worker_loop() -> None:
             if event.get("_cancelled"):
                 continue
             written = False
-            for delay in _RETRY_DELAYS:
+            for attempt, delay in enumerate(_RETRY_DELAYS):
                 if delay:
                     time.sleep(delay)
+                if attempt:
+                    with _STATE_LOCK:
+                        _RETRY_ATTEMPTS += 1
+                        _RETRY_EVENTS.append(time.time())
                 if _persist_event(event):
                     written = True
                     break
@@ -574,19 +657,50 @@ def get_history(instrument: str, mode: str, limit: int = 120) -> List[dict]:
 
 def status() -> dict:
     with _STATE_LOCK:
+        worker_running = bool(_WORKER is not None and _WORKER.is_alive())
+        now = time.time()
         return {
             "db_ready": bool(_DB_READY),
+            "observer_enabled": bool(_DB_READY),
+            "worker_enabled": bool(_DB_READY),
+            "worker_running": worker_running,
             "queue_depth": _WORK_QUEUE.qsize(),
+            "queue_capacity": _QUEUE_MAXSIZE,
+            "queue_saturated": _WORK_QUEUE.qsize() >= _QUEUE_MAXSIZE,
             "written_events": _WRITTEN_EVENTS,
             "dropped_events": _DROPPED_EVENTS,
+            "retry_attempts": _RETRY_ATTEMPTS,
+            "persistence_errors": _PERSISTENCE_ERRORS,
+            "readiness_error": _READINESS_ERROR,
+            "last_probe_error": _LAST_PROBE_ERROR,
+            "last_probe_at": _LAST_PROBE_AT,
+            "last_startup_error": _LAST_STARTUP_ERROR,
+            "last_startup_at": _LAST_STARTUP_AT,
+            "persistence_error": _PERSISTENCE_ERROR,
+            "pending_events": sum(len(events) for events in _PENDING_BY_SCOPE.values()),
+            "recent": {
+                "window_seconds": _RECENT_WINDOW_SECONDS,
+                "retry_attempts": _recent_event_count(_RETRY_EVENTS, now),
+                "persistence_errors": _recent_event_count(
+                    _PERSISTENCE_ERROR_EVENTS, now
+                ),
+            },
             "scopes": len(_LAST_BY_SCOPE),
         }
 
 
 def _reset_for_tests() -> None:
     global _DB_FN, _DB_READY, _DROPPED_EVENTS, _WRITTEN_EVENTS
+    global _RETRY_ATTEMPTS, _PERSISTENCE_ERRORS, _READINESS_ERROR, _PERSISTENCE_ERROR
+    global _LAST_PROBE_ERROR, _LAST_PROBE_AT, _LAST_STARTUP_ERROR, _LAST_STARTUP_AT
     _DB_FN, _DB_READY = None, False
     _DROPPED_EVENTS, _WRITTEN_EVENTS = 0, 0
+    _RETRY_ATTEMPTS, _PERSISTENCE_ERRORS = 0, 0
+    _READINESS_ERROR, _PERSISTENCE_ERROR = None, None
+    _LAST_PROBE_ERROR, _LAST_PROBE_AT = None, None
+    _LAST_STARTUP_ERROR, _LAST_STARTUP_AT = None, None
+    _RETRY_EVENTS.clear()
+    _PERSISTENCE_ERROR_EVENTS.clear()
     with _STATE_LOCK:
         _LAST_BY_SCOPE.clear()
         _PENDING_BY_SCOPE.clear()
