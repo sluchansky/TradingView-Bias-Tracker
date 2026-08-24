@@ -67,6 +67,117 @@ def test_multiple_sources_match_one_canonical_opportunity():
     ]
 
 
+def test_explicit_generic_anchor_links_only_the_declared_comparison_source():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    generic = coordinator.submit(_request(
+        source_system="generic_ghost",
+        source_event_id="ghost|MNQ|Long|BASELINE|20260821|1",
+        context={"canonical_authority_id": "ghost|MNQ|Long|BASELINE|20260821|1"},
+    ))
+    simulator = coordinator.submit(_request(
+        source_system="dual_mode_sim",
+        source_event_id="SCALP|MNQ|Long|20260821:1:1",
+        strategy_name="DUAL_SCALP",
+        experiment_variant="SCALP",
+        context={
+            "legacy_record_id": "SCALP|MNQ|Long|20260821:1:1",
+            "legacy_sim_key": "SCALP|MNQ|Long|20260821:1:1",
+            "canonical_authority_id": "ghost|MNQ|Long|BASELINE|20260821|1",
+        },
+    ))
+
+    assert generic.market_opportunity_id == simulator.market_opportunity_id
+    assert generic.observation_id != simulator.observation_id
+    report = coordinator.report()
+    assert report["cross_system_match_count"] == 1
+
+
+def test_explicit_anchor_never_cross_links_other_instruments():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    generic = coordinator.submit(_request(
+        source_event_id="ghost|MNQ|Long|BASELINE|20260821|1",
+        context={"canonical_authority_id": "ghost|MNQ|Long|BASELINE|20260821|1"},
+    ))
+    other_instrument = coordinator.submit(_request(
+        source_system="dual_mode_sim",
+        source_event_id="SCALP|MGC|Long|20260821:1:1",
+        instrument="MGC",
+        strategy_name="DUAL_SCALP",
+        experiment_variant="SCALP",
+        context={
+            "legacy_record_id": "SCALP|MGC|Long|20260821:1:1",
+            "legacy_sim_key": "SCALP|MGC|Long|20260821:1:1",
+            "canonical_authority_id": "ghost|MNQ|Long|BASELINE|20260821|1",
+        },
+    ))
+
+    assert generic.market_opportunity_id != other_instrument.market_opportunity_id
+    assert coordinator.report()["cross_system_match_count"] == 0
+
+
+def test_only_dual_mode_sim_can_use_the_generic_authority_anchor():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    generic = coordinator.submit(_request(
+        source_event_id="ghost|MNQ|Long|BASELINE|20260821|1",
+        context={"canonical_authority_id": "irrelevant-for-generic"},
+    ))
+    foreign = coordinator.submit(_request(
+        source_system="scalp_live_sim",
+        source_event_id="paper|MNQ|Long|20260821|1",
+        strategy_name="PAPER_SCALP",
+        context={
+            "legacy_record_id": "paper|MNQ|Long|20260821|1",
+            "canonical_authority_id": "ghost|MNQ|Long|BASELINE|20260821|1",
+        },
+    ))
+
+    assert generic.market_opportunity_id != foreign.market_opportunity_id
+    assert coordinator.report()["cross_system_match_count"] == 0
+
+
+def test_generic_anchor_mismatch_is_ignored_not_used_as_a_market_identity():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    generic = coordinator.submit(_request(
+        source_event_id="ghost|MNQ|Long|BASELINE|20260821|1",
+        context={"canonical_authority_id": "wrong-generic-id"},
+    ))
+    simulator = coordinator.submit(_request(
+        source_system="dual_mode_sim",
+        source_event_id="SCALP|MNQ|Long|20260821:1:1",
+        strategy_name="DUAL_SCALP",
+        experiment_variant="SCALP",
+        context={
+            "legacy_record_id": "SCALP|MNQ|Long|20260821:1:1",
+            "legacy_sim_key": "SCALP|MNQ|Long|20260821:1:1",
+            "canonical_authority_id": "wrong-generic-id",
+        },
+    ))
+
+    assert generic.market_opportunity_id != simulator.market_opportunity_id
+    assert coordinator.report()["cross_system_match_count"] == 0
+
+
+def test_dual_anchor_requires_matching_legacy_sim_key_not_legacy_record_id():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    generic = coordinator.submit(_request(
+        source_event_id="ghost|MNQ|Long|BASELINE|20260821|1",
+    ))
+    simulator = coordinator.submit(_request(
+        source_system="dual_mode_sim",
+        source_event_id="SCALP|MNQ|Long|20260821:1:1",
+        strategy_name="DUAL_SCALP",
+        experiment_variant="SCALP",
+        context={
+            "legacy_record_id": "SCALP|MNQ|Long|20260821:1:1",
+            "legacy_sim_key": "different-sim-key",
+            "canonical_authority_id": "ghost|MNQ|Long|BASELINE|20260821|1",
+        },
+    ))
+
+    assert generic.market_opportunity_id != simulator.market_opportunity_id
+    assert coordinator.report()["cross_system_match_count"] == 0
+
+
 def test_short_geometry_and_malformed_geometry_are_handled_safely():
     coordinator = gc.CentralGhostCoordinator(enabled=True)
     short = coordinator.submit(_request(direction="Short", entry=21000, stop=21010, targets=(20980,)))

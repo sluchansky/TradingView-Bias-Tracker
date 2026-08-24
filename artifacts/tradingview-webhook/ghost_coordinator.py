@@ -155,10 +155,28 @@ class CentralGhostCoordinator:
             self._requests_received += 1
         try:
             normalized = self._normalize(request)
+            # Producers may declare the exact generic-ghost identity they are
+            # comparing against.  The durable source_event_id is intentionally
+            # left untouched: this only gives an explicitly linked reference the
+            # same *market* identity as its generic authority.  No time, price,
+            # strategy-name, or current-mode inference is permitted here.
+            context = normalized.get("context") or {}
+            anchor_id = str(context.get("canonical_authority_id") or "").strip()
+            legacy_sim_key = str(context.get("legacy_sim_key") or "").strip()
+            # This bridge exists exclusively for the dual-mode simulator.  Its
+            # own immutable sim_key must remain the submitted source event and
+            # match the carried durable reference.  All other producers,
+            # including generic_ghost, continue to use their original IDs.
+            use_anchor = (
+                normalized["source_system"] == "dual_mode_sim"
+                and bool(anchor_id)
+                and legacy_sim_key == normalized["source_event_id"]
+            )
+            market_event_id = anchor_id if use_anchor else normalized["source_event_id"]
             market_id = _stable_hash("mop", {
                 "instrument": normalized["instrument"],
                 "timeframe": normalized["timeframe"],
-                "source_event_id": normalized["source_event_id"],
+                "source_event_id": market_event_id,
                 "source_bar_time": normalized["source_bar_time"],
                 "direction": normalized["direction"],
                 "setup_family": normalized["setup_family"],

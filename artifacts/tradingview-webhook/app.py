@@ -50255,6 +50255,30 @@ def _seed_mtf_from_historical():
         logger.warning("MTFTrend hist-seed: outer exception — %s", _outer_exc)
 
 
+def _generic_ghost_identity(result, inst, direction, entry):
+    """Return the existing generic ghost source identity without persisting it.
+
+    The coordinator can use this value as an explicit comparison anchor for a
+    dual-mode simulator reference.  It is the same durable obs_key formula the
+    generic ledger already owns; callers still retain their own source-row ID.
+    """
+    import profitability_engine as _pe  # noqa: PLC0415
+
+    ctx = result.get("learning_ctx") or {}
+    strategy_key = (
+        ctx.get("strategy_key")
+        or (result.get("strategy_scanner") or {}).get("strategy_key")
+        or "UNKNOWN"
+    )
+    strategy_short = _pe.extract_strategy_short(strategy_key)
+    now_et = now_utc().astimezone(ET_TZ)
+    et_day = now_et.strftime("%Y%m%d")
+    bucket = _pe.entry_bucket_from_price(entry)
+    return strategy_key, strategy_short, now_et, _pe.build_obs_key(
+        inst, direction, strategy_short, et_day, bucket
+    )
+
+
 def _ghost_observe_setup(result, inst, source="databento_scan"):
     """Create a ghost observation for a READY setup.
 
@@ -50298,17 +50322,13 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
         if risk_pts <= 0:
             return
 
-        # Build dedup key — stable within one session/entry-bucket bucket
+        # Build the existing durable generic identity once.  Its formula is
+        # unchanged; the same value is later carried as an exact coordinator
+        # authority anchor for comparison-only simulator references.
+        strategy_key, strategy_short, now_et, obs_key = _generic_ghost_identity(
+            result, inst, direction, entry
+        )
         ctx = result.get("learning_ctx") or {}
-        strategy_key = (ctx.get("strategy_key") or
-                        (result.get("strategy_scanner") or {}).get("strategy_key") or
-                        "UNKNOWN")
-        strategy_short = _pe.extract_strategy_short(strategy_key)
-
-        now_et = now_utc().astimezone(ET_TZ)
-        et_day = now_et.strftime("%Y%m%d")
-        bucket = _pe.entry_bucket_from_price(entry)
-        obs_key = _pe.build_obs_key(inst, direction, strategy_short, et_day, bucket)
 
         # Per-setup cooldown: suppress rapid re-creation for the same (inst, dir, strategy)
         ckey     = (inst, direction, strategy_short)
@@ -50426,7 +50446,8 @@ def _ghost_observe_setup(result, inst, source="databento_scan"):
                 direction=direction, entry=entry, stop=stop_px,
                 targets=(target1, target2), source_event_id=obs_key,
                 context={"legacy_obs_key": obs_key, "legacy_source": source,
-                         "session": sess_name, "edge_score": edge_score},
+                         "session": sess_name, "edge_score": edge_score,
+                         "canonical_authority_id": obs_key},
             )
             logger.info(
                 "ghost_obs opened: %s %s %s @ %.4f strategy=%s key=%s",
@@ -50544,7 +50565,11 @@ def _canonical_ghost_observe_submission(record):
         event = _canonical_ghost_authority.observe_coordinator_submission(record)
         if event is not None:
             _canonical_evidence_observe_submission(record, event)
-        else:
+        elif str(record.get("source_system") or "") == "generic_ghost":
+            # Only generic ghost is the canonical outcome authority.  A
+            # simulator reference without its generic authority is retained by
+            # the authority reconciliation ledger, not as an evidence row that
+            # could never link to a generic-only evidence record.
             _canonical_evidence_record_unmatched(
                 record,
                 reason="canonical_authority_observation_unmatched",
@@ -51085,9 +51110,11 @@ def _reconcile_canonical_ghost_from_legacy():
     """Recover missing sidecar copies by exact durable-ledger correlation only.
 
     This runs after a restart if a transient sidecar insert failed.  It reads
-    the already-persisted coordinator observation and joins it to the legacy
-    ghost record on `source_event_id = obs_key`; it never time/price matches,
-    changes either source ledger, or invokes an outcome resolver.
+    already-persisted coordinator observation and joins generic sources on
+    `source_event_id = obs_key` and dual references on `source_event_id =
+    sim_key`.  Generic authorities restore before comparison-only simulator
+    references.  It never time/price matches, changes either source ledger, or
+    invokes a simulator outcome resolver.
     """
     if not (CANONICAL_GHOST_SHADOW_ENABLED and CANONICAL_GHOST_DB_READY
             and CENTRAL_GHOST_COORDINATOR_DB_READY
@@ -51114,7 +51141,25 @@ def _reconcile_canonical_ghost_from_legacy():
                     AND c.source_event_id = g.obs_key
                    WHERE g.trading_mode IN ('SCALP', 'INTRADAY_TREND')
                    ORDER BY c.created_at ASC""")
-            rows = [dict(row) for row in cur.fetchall()]
+            generic_rows = [dict(row) for row in cur.fetchall()]
+            reference_rows = []
+            if DUAL_SIM_DB_READY:
+                cur.execute(
+                    """SELECT c.observation_id, c.market_opportunity_id, c.source_system,
+                              c.source_event_id, c.instrument, c.timeframe, c.setup_family,
+                              c.strategy_name, c.strategy_version, c.direction, c.signal_time,
+                              c.source_bar_time, c.entry_price, c.stop_price, c.targets,
+                              c.context, c.experiment_variant,
+                              d.sim_key, d.mode AS legacy_trading_mode
+                       FROM ghost_coordinator_observations c
+                       JOIN dual_sim_trades d
+                         ON c.source_system = 'dual_mode_sim'
+                        AND c.source_event_id = d.sim_key
+                        AND c.instrument = d.symbol
+                        AND c.direction = d.direction
+                       WHERE d.mode IN ('SCALP', 'INTRADAY_TREND')
+                       ORDER BY c.created_at ASC""")
+                reference_rows = [dict(row) for row in cur.fetchall()]
     except Exception as exc:
         logger.info("Canonical Ghost Phase 1 legacy recovery skipped: %s", exc)
         return 0
@@ -51124,7 +51169,7 @@ def _reconcile_canonical_ghost_from_legacy():
         except Exception:
             pass
     recovered = 0
-    for row in rows:
+    for row in generic_rows:
         context = row.get("context") if isinstance(row.get("context"), dict) else {}
         context = dict(context)
         context["trading_mode"] = row.get("legacy_trading_mode") or context.get("trading_mode")
@@ -51157,6 +51202,36 @@ def _reconcile_canonical_ghost_from_legacy():
                 mae_r=row.get("mae_r"), bars_held=row.get("bars_held"),
                 event_at=row.get("closed_at"), extra={"recovered_on_boot": True},
             )
+    # References do not become an outcome authority.  They are replayed only
+    # after the generic authority rows above and only when their exact sim_key
+    # exists in the durable dual-simulator ledger.
+    for row in reference_rows:
+        context = row.get("context") if isinstance(row.get("context"), dict) else {}
+        context = dict(context)
+        mode = row.get("legacy_trading_mode") or context.get("trading_mode") or context.get("mode")
+        if mode not in ("SCALP", "INTRADAY_TREND"):
+            continue
+        sim_key = str(row.get("sim_key") or row.get("source_event_id") or "").strip()
+        if not sim_key:
+            continue
+        context["trading_mode"] = mode
+        context["legacy_record_id"] = sim_key
+        context.setdefault("legacy_sim_key", sim_key)
+        context.setdefault("legacy_table", "dual_sim_trades")
+        record = {
+            "observation_id": row["observation_id"],
+            "market_opportunity_id": row["market_opportunity_id"],
+            "source_system": row["source_system"],
+            "source_event_id": row["source_event_id"],
+            "instrument": row["instrument"], "timeframe": row["timeframe"],
+            "setup_family": row["setup_family"], "strategy_name": row["strategy_name"],
+            "strategy_version": row["strategy_version"], "direction": row["direction"],
+            "signal_time": row["signal_time"], "source_bar_time": row["source_bar_time"],
+            "entry": row["entry_price"], "stop": row["stop_price"], "targets": row["targets"],
+            "experiment_variant": row["experiment_variant"], "context": context,
+        }
+        if _canonical_ghost_observe_submission(record) is not None:
+            recovered += 1
     if recovered:
         logger.info("Canonical Ghost Phase 1 recovered %d legacy-linked event(s)", recovered)
     return recovered
@@ -52619,13 +52694,31 @@ def _maybe_observe_dual_mode_sim(result, source="webhook"):
                                  verdict, entry, stop, target, rr,
                                  _learning_session_name(), None, edge_sc):
             opened += 1
+            try:
+                _, _, _, authority_anchor = _generic_ghost_identity(
+                    result, inst, direction, entry
+                )
+            except Exception:
+                authority_anchor = None
+            sim_context = {
+                "legacy_sim_key": sim_key,
+                "legacy_record_id": sim_key,
+                "legacy_table": "dual_sim_trades",
+                "verdict": verdict,
+                "edge_score": edge_sc,
+                "mode": mode,
+            }
+            if authority_anchor:
+                # The simulator keeps sim_key as its source_event_id and
+                # source-record provenance.  This is only an exact,
+                # producer-declared bridge to the corresponding generic obs_key.
+                sim_context["canonical_authority_id"] = authority_anchor
             _coordinator_submit_analysis(
                 result, inst=inst, source_system="dual_mode_sim",
                 setup_family="STRICT_SETUP", strategy_name="DUAL_%s" % mode,
                 direction=direction, entry=entry, stop=stop, targets=(target,),
                 source_event_id=sim_key, variant=mode,
-                context={"legacy_sim_key": sim_key, "verdict": verdict,
-                         "edge_score": edge_sc, "mode": mode},
+                context=sim_context,
             )
             with _DUAL_SIM_COOLDOWN_LOCK:
                 _DUAL_SIM_COOLDOWN[ckey] = now_mono

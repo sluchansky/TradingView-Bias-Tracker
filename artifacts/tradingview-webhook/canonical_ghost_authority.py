@@ -160,12 +160,23 @@ class CanonicalGhostAuthority:
                 self._ignored += 1
             return None
         source_system = str(record.get("source_system") or "").strip()
-        source_record_id = str(
-            context.get("legacy_obs_key")
-            or context.get("legacy_record_id")
-            or record.get("source_event_id")
-            or ""
-        ).strip()
+        if source_system == "dual_mode_sim":
+            # The simulator's sim_key is its sole durable source identity.
+            # legacy_record_id is a display/recovery convenience and must never
+            # authorize the generic-ghost comparison bridge.
+            source_record_id = str(context.get("legacy_sim_key") or "").strip()
+            dual_sim_identity_valid = (
+                bool(source_record_id)
+                and source_record_id == str(record.get("source_event_id") or "").strip()
+            )
+        else:
+            source_record_id = str(
+                context.get("legacy_obs_key")
+                or context.get("legacy_record_id")
+                or record.get("source_event_id")
+                or ""
+            ).strip()
+            dual_sim_identity_valid = True
         coordinator_id = str(record.get("market_opportunity_id") or "").strip()
         if not all((source_system, source_record_id, coordinator_id)):
             return self._fail("coordinator record lacks source identity")
@@ -173,6 +184,9 @@ class CanonicalGhostAuthority:
             "cgo",
             {"coordinator_market_opportunity_id": coordinator_id, "trading_mode": mode},
         )
+        declared_generic_obs_key = str(
+            context.get("canonical_authority_id") or ""
+        ).strip()
         # generic_ghost is the only Phase-1 authority. Other legacy systems may
         # attach as comparison references only after that authority has supplied
         # this exact stable coordinator identity; no fuzzy time/price matching.
@@ -181,8 +195,18 @@ class CanonicalGhostAuthority:
                 has_authority = any(
                     self._events[event_id].get("source_system") == "generic_ghost"
                     and self._events[event_id].get("event_type") == "OBSERVED"
+                    and (
+                        source_system != "dual_mode_sim"
+                        or (
+                            bool(declared_generic_obs_key)
+                            and self._events[event_id].get("source_record_id")
+                            == declared_generic_obs_key
+                        )
+                    )
                     for event_id in self._opportunities.get(canonical_opportunity_id, ())
                 )
+                if source_system == "dual_mode_sim" and not dual_sim_identity_valid:
+                    has_authority = False
             if not has_authority:
                 # An exact-ID reference rejected for lack of generic authority
                 # is evidence too. Persist its append-only telemetry so health
@@ -219,6 +243,8 @@ class CanonicalGhostAuthority:
                         "payload": {
                             "reason": "generic_authority_not_observed",
                             "coordinator_observation_id": record.get("observation_id"),
+                            "declared_generic_obs_key": declared_generic_obs_key,
+                            "submitted_source_event_id": record.get("source_event_id"),
                         },
                     }
                 )
@@ -233,7 +259,7 @@ class CanonicalGhostAuthority:
                 "source_record_id": source_record_id,
             },
         )
-        return self._record(
+        observed = self._record(
             {
                 "event_id": _stable_id(
                     "cge",
@@ -262,6 +288,13 @@ class CanonicalGhostAuthority:
                 },
             }
         )
+        # References may have arrived first.  They were preserved as
+        # REFERENCE_UNMATCHED because generic_ghost was not yet observed.  Once
+        # its exact authority appears, append the corresponding reference
+        # observation without changing either legacy ledger or guessing a match.
+        if source_system == "generic_ghost" and observed is not None:
+            self._promote_exact_references(canonical_opportunity_id)
+        return observed
 
     def observe_legacy_outcome(
         self,
@@ -718,10 +751,24 @@ class CanonicalGhostAuthority:
         self._matched_reference_keys.clear()
         self._unmatched_legacy_references = 0
         self._unmatched_by_mode.clear()
+        observed_reference_keys = set()
+        for event_ids in self._opportunities.values():
+            for event_id in event_ids:
+                row = self._events[event_id]
+                if row.get("event_type") != "OBSERVED":
+                    continue
+                source = str(row.get("source_system") or "").strip()
+                source_record_id = str(row.get("source_record_id") or "").strip()
+                if source and source_record_id and source != "generic_ghost":
+                    observed_reference_keys.add((source, source_record_id))
         for event_ids in self._opportunities.values():
             for event_id in event_ids:
                 row = self._events[event_id]
                 if row.get("event_type") == "REFERENCE_UNMATCHED":
+                    source = str(row.get("source_system") or "").strip()
+                    source_record_id = str(row.get("source_record_id") or "").strip()
+                    if (source, source_record_id) in observed_reference_keys:
+                        continue
                     mode = canonical_mode(row.get("trading_mode"))
                     if mode:
                         self._unmatched_legacy_references += 1
@@ -742,6 +789,93 @@ class CanonicalGhostAuthority:
                 source_record_id = str(row.get("source_record_id") or "").strip()
                 if source and source_record_id and source != "generic_ghost":
                     self._matched_reference_keys.add((source, source_record_id))
+
+    def _promote_exact_references(self, canonical_opportunity_id: str) -> int:
+        """Append exact reference observations after their generic authority exists.
+
+        A reference is promoted only from its own persisted
+        REFERENCE_UNMATCHED event and only inside the same already-computed
+        canonical opportunity.  This is deliberately not a matcher: it never
+        searches by time, price, mode, strategy, or instrument.
+        """
+        with self._lock:
+            event_ids = list(self._opportunities.get(canonical_opportunity_id, ()))
+            rows = [dict(self._events[event_id]) for event_id in event_ids]
+            already_observed = {
+                (
+                    str(row.get("source_system") or "").strip(),
+                    str(row.get("source_record_id") or "").strip(),
+                )
+                for row in rows
+                if row.get("event_type") == "OBSERVED"
+            }
+            pending = [
+                row for row in rows
+                if row.get("event_type") == "REFERENCE_UNMATCHED"
+                and str(row.get("source_system") or "").strip() != "generic_ghost"
+                and (
+                    str(row.get("source_system") or "").strip(),
+                    str(row.get("source_record_id") or "").strip(),
+                ) not in already_observed
+            ]
+            generic_source_ids = {
+                str(row.get("source_record_id") or "").strip()
+                for row in rows
+                if row.get("event_type") == "OBSERVED"
+                and row.get("source_system") == "generic_ghost"
+            }
+        promoted = 0
+        for row in pending:
+            source_system = str(row.get("source_system") or "").strip()
+            source_record_id = str(row.get("source_record_id") or "").strip()
+            if not source_system or not source_record_id:
+                continue
+            if source_system == "dual_mode_sim":
+                payload = row.get("payload") or {}
+                declared_anchor = str(
+                    payload.get("declared_generic_obs_key") or ""
+                ).strip()
+                submitted_source_event_id = str(
+                    payload.get("submitted_source_event_id") or ""
+                ).strip()
+                if (
+                    not declared_anchor
+                    or declared_anchor not in generic_source_ids
+                    or not submitted_source_event_id
+                    or source_record_id != submitted_source_event_id
+                ):
+                    continue
+            observed = self._record(
+                {
+                    "event_id": _stable_id(
+                        "cge",
+                        {
+                            "canonical_observation_id": row["canonical_observation_id"],
+                            "event_type": "OBSERVED",
+                        },
+                    ),
+                    "canonical_opportunity_id": row["canonical_opportunity_id"],
+                    "canonical_observation_id": row["canonical_observation_id"],
+                    "coordinator_market_opportunity_id": row[
+                        "coordinator_market_opportunity_id"
+                    ],
+                    "trading_mode": row["trading_mode"],
+                    "source_system": source_system,
+                    "source_record_id": source_record_id,
+                    "event_type": "OBSERVED",
+                    "legacy_table": row.get("legacy_table") or "unknown",
+                    "raw_status": row.get("raw_status") or "open",
+                    "raw_close_reason": row.get("raw_close_reason"),
+                    "normalized_outcome": row.get("normalized_outcome") or "OPEN",
+                    "event_at": row.get("event_at"),
+                    "payload": row.get("payload") or {},
+                }
+            )
+            if observed is not None:
+                promoted += 1
+        with self._lock:
+            self._rebuild_reference_index_locked()
+        return promoted
 
     def _record(self, event: Mapping[str, Any], *, restore: bool = False) -> Optional[Dict[str, Any]]:
         stored = _json_safe(dict(event))

@@ -173,6 +173,32 @@ def test_explicit_canonical_unmatched_persists_as_a_classified_shadow_fact():
     assert restarted.report()["errors"] == 0
 
 
+def test_app_keeps_non_authoritative_simulator_unmatched_out_of_generic_evidence():
+    namespace = _app_function("_canonical_ghost_observe_submission")
+    evidence_calls = []
+
+    class Authority:
+        @staticmethod
+        def observe_coordinator_submission(_record):
+            return None
+
+    namespace.update({
+        "CANONICAL_GHOST_SHADOW_ENABLED": True,
+        "_canonical_ghost_authority": Authority(),
+        "_canonical_evidence_record_unmatched": lambda *args, **kwargs: evidence_calls.append(
+            (args, kwargs)
+        ),
+        "logger": type("Logger", (), {"debug": staticmethod(lambda *_args: None)})(),
+    })
+    dual = dict(_submission(), source_system="dual_mode_sim")
+    generic = _submission()
+
+    assert namespace["_canonical_ghost_observe_submission"](dual) is None
+    assert evidence_calls == []
+    assert namespace["_canonical_ghost_observe_submission"](generic) is None
+    assert evidence_calls[0][0][0]["source_system"] == "generic_ghost"
+
+
 def test_unsupported_mode_unmatched_is_rejected_without_projection_error():
     evidence = CanonicalGhostEvidence(enabled=True)
     rejected = evidence.observe_unmatched(
