@@ -31396,6 +31396,23 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     if order_flow_enabled and isinstance(order_flow_snapshot, dict):
         result["order_flow"] = order_flow_snapshot
 
+    # ── P4: Append-only authoritative verdict history — OBSERVER ONLY ────────
+    # This is deliberately the final full_analysis seam: every verdict-mutating
+    # veto and the market-closed override have already resolved, and no later
+    # code can alter result["verdict"].  observe() copies only whitelisted data
+    # then uses a bounded non-blocking queue; all DB I/O/retries occur on its
+    # daemon worker, outside the live gate/execution call stack.  SCALP and
+    # INTRADAY_TREND only; SWING and shadow evaluators are excluded.
+    if AVH_DB_READY and _eff_mode in ("SCALP", "INTRADAY_TREND"):
+        try:
+            import authoritative_verdict_history as _avh_final  # noqa: PLC0415
+            _avh_final.observe(result, active_ticker, _eff_mode, dict(_ARM_STATE))
+        except Exception as _avh_exc:
+            logger.debug(
+                "AuthoritativeVerdictHistory full_analysis observe (%s): %s",
+                active_ticker, _avh_exc,
+            )
+
     return result
 
 
@@ -49720,6 +49737,7 @@ GHOST_OBS_DB_READY       = False
 EL_DB_READY              = False   # set by _check_edge_ledger_db_ready() — Phase 8A
 GRE_DB_READY             = False   # set by _check_gre_db_ready() — Phase 2 Ghost Research Engine
 DC_DB_READY              = False   # set by _check_dc_db_ready() — Phase 3 Canonical Decision Contract (shadow)
+AVH_DB_READY             = False   # set by _check_authoritative_verdict_history_db_ready() — P4 observer only
 GATE_AUDIT_DB_READY      = False   # set by _check_gate_audit_db_ready() — Phase 8C Gate Effectiveness Audit
 VB_DB_READY              = False   # set by _check_vb_db_ready() — Visual Brain V1 MNQ observer, SHADOW/DISPLAY-ONLY
 GHOST_OBS_WATCH_LOCK     = threading.Lock()   # single-flight watcher cycle
@@ -49902,6 +49920,30 @@ def _check_dc_db_ready() -> None:
             conn.close()
         except Exception:
             pass
+
+
+def _check_authoritative_verdict_history_db_ready() -> None:
+    """Probe P4 append-only history and restore only its observer dedup state.
+
+    FAIL-OPEN / OBSERVER-ONLY: a missing table, unavailable DB, or readback
+    failure disables verdict-history recording only.  This code never changes a
+    gate, score, risk, sizing, execution, coordinator, or evidence decision.
+    The table is created out-of-band via db_authoritative_verdict_history_schema.sql;
+    app.py performs no DDL.
+    """
+    global AVH_DB_READY
+    if not LEARNING_DB_ENABLED:
+        return
+    try:
+        import authoritative_verdict_history as _avh_probe  # noqa: PLC0415
+        AVH_DB_READY = _avh_probe.check_db_ready(_learning_conn)
+        if AVH_DB_READY:
+            _avh_probe.boot()
+    except Exception as exc:
+        logger.warning(
+            "AuthoritativeVerdictHistory: boot probe failed (observer disabled): %s",
+            exc,
+        )
 
 
 def _check_edge_ledger_db_ready():
@@ -88589,6 +88631,7 @@ if __name__ == "__main__":
         _reconcile_canonical_ghost_from_legacy()   # exact obs_key recovery for transient sidecar persistence failures
         _check_gre_db_ready()                      # probe ghost_opportunities/experiments/results (no DDL; created via DB tool/publish diff) — PHASE 2 GHOST RESEARCH ENGINE, RESEARCH/DISPLAY-ONLY
         _check_edge_ledger_db_ready()              # probe edge_ledger (no DDL; apply db_edge_ledger_schema.sql) — PHASE 8A signal-vs-management accounting, DISPLAY-ONLY
+        _check_authoritative_verdict_history_db_ready()  # probe/restore P4 append-only verdict observer (no DDL, never a trading input)
         _check_gate_audit_db_ready()               # probe gate_audit_log (no DDL; apply db_gate_effectiveness_schema.sql) — PHASE 8C Gate Effectiveness Audit, DISPLAY/MEASUREMENT-ONLY
         _check_vb_db_ready()                       # probe visual_brain_observations (no DDL; created via DB tool) — VISUAL BRAIN V1, SHADOW/OBSERVATION-ONLY, never touches gate/execution
         _check_bot_training_db_ready()             # probe bot_training_state/bot_training_trades (no DDL; created via DB tool/publish diff) — BOT TRAINING MODE
