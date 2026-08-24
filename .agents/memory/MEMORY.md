@@ -12,6 +12,7 @@
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); MGC/MNQ string symmetry; any scoring change must keep invariants.
 - [Switching the live trading mode](switching-live-trading-mode.md) — durable mode switch = TRADING_MODE env + republish; /mode toggle is in-memory/non-durable; "correctly quiet vs broken" via swing_diagnostics.
 - [Strict trade ruleset](strict-trade-ruleset.md) — READY gate MODE-TUNABLE: SWING zone+vwap+structure@80; SCALP demotes ZONE ONLY; Edge bands 40/50/60; alert_level≠conviction_tier; ticker-authoritative.
+- [State-aware BOS/CHOCH cycle](state-aware-bos-choch-cycle.md) — one active per-instrument structure cycle: CHOCH allocates 20, confirming/continuation BOS 40; no HH/HL bypass.
 - [full_analysis single return path](full-analysis-return-parity.md) — one return dict; hard-indexed consumers make a missing key a state-dependent 500; mirror keys if an early return is re-added.
 - [Zone Mitigated detection](zone-mitigated-detection.md) — mitigation is PER-INSTRUMENT w/ SCALP TTL; SCALP fully demotes zone at EVERY site (gate, full_analysis override, webhook short-circuit, structure-reset), cfg-guarded; demoting a gate flag alone LEAKS.
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.
