@@ -14254,6 +14254,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
   // ── Derived state ──────────────────────────────────────────────────────────
   const v      = (p.verdict           ?? {}) as Record<string, unknown>;
+  const op     = (p.operator_presentation ?? {}) as Record<string, unknown>;
   const lb     = (p.left_brain        ?? {}) as Record<string, unknown>;
   const cp     = (p.candidate_preview ?? {}) as Record<string, unknown>;
   const sc     = (p.strategy_scanner  ?? {}) as Record<string, unknown>;
@@ -14279,6 +14280,10 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const isAuthEarly  = !isAuthReady && safeStr(v.verdict_label ?? v.readiness, '').toUpperCase().includes('EARLY');
   const authDir      = safeStr(v.direction ?? cp.direction ?? sc.selected, '');
   const strictReason = safeStr(v.strict_reason, '');
+  const vwapWording  = safeStr(
+    ((op.vwap ?? v.vwap ?? {}) as Record<string, unknown>).wording,
+    ''
+  );
   const authVLabel   = isAuthReady ? '✓ READY' : isAuthEarly ? '⚡ EARLY' : '— WAIT';
   const authVCol     = isAuthReady ? T.green   : isAuthEarly ? T.amber   : T.txtMuted;
 
@@ -14402,6 +14407,13 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             border: `1px solid ${(/long/i.test(authDir) ? T.green : T.red)}40`,
           }}>
             {authDir.toUpperCase()}
+          </div>
+        )}
+
+        {/* Backend-owned price/VWAP relationship, never inferred by the UI. */}
+        {vwapWording && (
+          <div style={{ fontSize: 9, color: T.cyan, whiteSpace: 'nowrap' }}>
+            {vwapWording}
           </div>
         )}
 

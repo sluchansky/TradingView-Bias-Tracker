@@ -13,6 +13,7 @@ import sys
 import unittest
 from datetime import datetime, timezone
 from decimal import Decimal
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(__file__))
 import app  # noqa: E402
@@ -65,6 +66,10 @@ class TestOperatorPresentationMatrix(unittest.TestCase):
             "MGC", "SCALP", "LONG READY", "Long READY — all gates passed.",
             102.0, 101.0,
         ))
+        short_ready = app._build_operator_presentation(_result(
+            "MNQ", "SWING", "SHORT READY", "Short READY — all gates passed.",
+            100.0, 101.0,
+        ))
         waiting = app._build_operator_presentation(_result(
             "MGC", "SCALP", "WAIT", "Long WAIT — volume pending.",
             102.0, 101.0,
@@ -72,6 +77,10 @@ class TestOperatorPresentationMatrix(unittest.TestCase):
         self.assertEqual(ready["candidate_direction"], "Long")
         self.assertEqual(ready["actionable_direction"], "Long")
         self.assertTrue(ready["is_actionable"])
+        self.assertEqual(short_ready["candidate_direction"], "Short")
+        self.assertEqual(short_ready["actionable_direction"], "Short")
+        self.assertEqual(short_ready["candidate_label"], "Short READY")
+        self.assertTrue(short_ready["is_actionable"])
         self.assertEqual(waiting["candidate_direction"], "Long")
         self.assertIsNone(waiting["actionable_direction"])
         self.assertFalse(waiting["is_actionable"])
@@ -130,6 +139,32 @@ class TestStatusResponseBoundary(unittest.TestCase):
         self.assertIsInstance(safe["nested"]["unexpected"], str)
         self.assertIsInstance(source["tuple"], tuple)
         self.assertTrue(math.isnan(source["nan"]))
+
+    def test_status_route_sanitizes_nested_non_json_values_on_wire(self):
+        cycle = {}
+        cycle["self"] = cycle
+        source = {
+            "nested": {
+                "when": datetime(2026, 8, 24, 12, 30, tzinfo=timezone.utc),
+                "cycle": cycle,
+                "unexpected": object(),
+            },
+        }
+        previous_ttl = app.STATUS_CACHE_TTL_SEC
+        app.STATUS_CACHE_TTL_SEC = 0
+        try:
+            with patch.object(app, "_build_status_payload", return_value=source):
+                response = app.app.test_client().get("/status?ticker=MGC")
+        finally:
+            app.STATUS_CACHE_TTL_SEC = previous_ttl
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.content_type, "application/json")
+        wire = response.get_json()
+        self.assertEqual(wire["nested"]["when"], "2026-08-24T12:30:00+00:00")
+        self.assertIsNone(wire["nested"]["cycle"]["self"])
+        self.assertIsInstance(wire["nested"]["unexpected"], str)
+        self.assertIsInstance(source["nested"]["when"], datetime)
 
 
 if __name__ == "__main__":
