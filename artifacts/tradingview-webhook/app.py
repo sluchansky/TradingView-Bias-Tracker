@@ -88619,7 +88619,7 @@ if __name__ == "__main__":
         # in-memory only. Never touches gate, scoring, sizing, or execution.
         try:
             import fvg_sequence_engine as _fse_boot  # noqa: PLC0415
-            _fse_boot.check_fvg_seq_db_ready()
+            _fse_boot.check_fvg_seq_db_ready(get_db_connection)
         except Exception as _fse_boot_exc:
             logger.warning("FVG Sequence Engine boot probe failed: %s", _fse_boot_exc)
         _restore_market_state_from_db()            # restore fresh CVD/vol-spike/TradersPost-dedup/AUTO_FIRED_KEYS/ALERT_HISTORY (INERT; stale rows skipped; never submits a trade)

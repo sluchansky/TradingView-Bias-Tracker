@@ -16,6 +16,8 @@ SHADOW-ONLY INVARIANTS (verified by test_shadow_safety_*):
   - No risk-state mutation
 """
 import importlib
+import ast
+from pathlib import Path
 import sys
 import unittest
 from datetime import datetime, timedelta, timezone
@@ -101,6 +103,105 @@ def _get_seq(inst: str = "MNQ", fvg_id: str | None = None) -> dict | None:
 class _Base(unittest.TestCase):
     def setUp(self):
         fse.reset_all()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# STARTUP READINESS: callback wiring and fail-open shadow isolation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class _ReadinessCursor:
+    def __init__(self, error=None):
+        self.error = error
+        self.executed_sql = None
+        self.closed = False
+
+    def execute(self, sql):
+        self.executed_sql = sql
+        if self.error:
+            raise self.error
+
+    def close(self):
+        self.closed = True
+
+
+class _ReadinessConnection:
+    def __init__(self, cursor):
+        self.cursor_obj = cursor
+
+    def cursor(self):
+        return self.cursor_obj
+
+
+class TestStartupReadiness(unittest.TestCase):
+    def setUp(self):
+        fse.reset_all()
+        self._old_ready = fse._FVG_SEQ_DB_READY
+        self._old_db_fn = fse._db_fn
+
+    def tearDown(self):
+        fse._FVG_SEQ_DB_READY = self._old_ready
+        fse._db_fn = self._old_db_fn
+
+    def test_boot_passes_existing_database_callback(self):
+        """The app boot seam supplies the callback required by the helper."""
+        app_source = Path(__file__).with_name("app.py").read_text()
+        tree = ast.parse(app_source)
+        calls = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr == "check_fvg_seq_db_ready"
+        ]
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(calls[0].args), 1)
+        self.assertEqual(
+            ast.unparse(calls[0].args[0]),
+            "get_db_connection",
+        )
+
+    def test_available_database_marks_sequence_persistence_ready(self):
+        """A reachable sequence table produces clean startup readiness."""
+        cursor = _ReadinessCursor()
+        callback = lambda: _ReadinessConnection(cursor)
+
+        self.assertTrue(fse.check_fvg_seq_db_ready(callback))
+        self.assertTrue(fse._FVG_SEQ_DB_READY)
+        self.assertIs(fse._db_fn, callback)
+        self.assertEqual(
+            cursor.executed_sql,
+            "SELECT 1 FROM fvg_shadow_sequences LIMIT 1",
+        )
+        self.assertTrue(cursor.closed)
+
+    def test_unavailable_database_stays_fail_closed_for_persistence(self):
+        """Database failure disables persistence without affecting shadow state."""
+        cursor = _ReadinessCursor(error=RuntimeError("database unavailable"))
+        callback = lambda: _ReadinessConnection(cursor)
+
+        self.assertFalse(fse.check_fvg_seq_db_ready(callback))
+        self.assertFalse(fse._FVG_SEQ_DB_READY)
+        self.assertIs(fse._db_fn, callback)
+
+        # Runtime sequence processing remains available in-memory and does
+        # not become a production path when persistence is unavailable.
+        bars = _warmup_bars(20)
+        zones = [_make_zone("readiness-only", "BULLISH", 2000.0, 2010.0)]
+        fse.process_bar_close("MNQ", bars, zones)
+        self.assertEqual(len(fse.get_sequences("MNQ")), 1)
+
+    def test_readiness_probe_does_not_change_runtime_sequence_semantics(self):
+        """The probe only changes readiness plumbing, not sequence behavior."""
+        bars = _warmup_bars(20)
+        zones = [_make_zone("same-runtime", "BULLISH", 2000.0, 2010.0)]
+
+        fse.process_bar_close("MNQ", bars, zones)
+        before = fse.get_sequences("MNQ")
+
+        cursor = _ReadinessCursor()
+        fse.check_fvg_seq_db_ready(lambda: _ReadinessConnection(cursor))
+        after = fse.get_sequences("MNQ")
+
+        self.assertEqual(after, before)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
