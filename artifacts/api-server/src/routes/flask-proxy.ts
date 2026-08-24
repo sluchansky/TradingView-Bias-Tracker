@@ -504,6 +504,10 @@ export const BOT1_ROUTES = [
   // (TV events received, Databento events produced, matched/deduped, fallbacks,
   // conflicts). NEVER touches gate, scoring, sizing, learning, or execution.
   "/structure-dedup-metrics",
+  // Per-bar Databento pivot/BOS/CHOCH provenance trace. Bounded, in-memory, and
+  // observational only; shows raw detector reasoning beside the authoritative
+  // resolved structure cycle and gate snapshot. Never feeds any money path.
+  "/structure-provenance",
 ];
 
 // ANALYSIS-ONLY bot (artifacts/analysis-bot), seeded from the June-21 snapshot.

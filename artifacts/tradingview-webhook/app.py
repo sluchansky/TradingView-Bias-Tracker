@@ -32511,12 +32511,58 @@ def _databento_bar_scan(inst: str, price: float) -> None:
 
     Runs in a daemon thread to never block the Databento data-feed thread.
     """
+    # Capture the trace identity synchronously, while this callback still belongs
+    # to the detector invocation that just closed the bar.  The analysis itself
+    # can be slow and runs in a thread; it must never annotate a newer bar's
+    # audit record if another bar closes before it completes.
+    try:
+        from databento_brain import get_latest_structure_provenance_id  # noqa: PLC0415
+        _structure_trace_id = get_latest_structure_provenance_id(inst)
+    except Exception:
+        _structure_trace_id = None
+
     def _scan() -> None:
         try:
             if active_trade_for(inst):
                 _PENDING_READY.pop(inst, None)   # reset sustain counter when in a trade
                 return
             a = full_analysis(ticker_override=inst)
+            # ── Structure provenance (shadow-only) ─────────────────────────
+            # The detector records its own raw pivot/break decision before this
+            # callback runs.  Copy the already-authoritative full_analysis result
+            # onto that record for auditability; do not recompute or feed it back
+            # into any gate, score, strategy, risk, or execution decision.
+            try:
+                from databento_brain import annotate_structure_provenance  # noqa: PLC0415
+                _trace_dirs = a.get("directions") or {}
+                _trace_gate = {
+                    "source": "full_analysis",
+                    "verdict": a.get("verdict"),
+                    "strict_reason": a.get("strict_reason"),
+                    "Long": {
+                        "structure_confirmed": bool(
+                            ((_trace_dirs.get("Long") or {}).get("gate_debug") or {})
+                            .get("structure_confirmed")
+                        ),
+                    },
+                    "Short": {
+                        "structure_confirmed": bool(
+                            ((_trace_dirs.get("Short") or {}).get("gate_debug") or {})
+                            .get("structure_confirmed")
+                        ),
+                    },
+                }
+                annotate_structure_provenance(
+                    inst,
+                    _structure_trace_id,
+                    structure_cycle=(
+                        a.get("structure_state")
+                        if isinstance(a.get("structure_state"), dict) else None
+                    ),
+                    gate_result=_trace_gate,
+                )
+            except Exception as _trace_exc:
+                logger.debug("Structure provenance annotation (%s): %s", inst, _trace_exc)
 
             # ── Sustain counter: require READY_SUSTAIN_BARS consecutive bar-close
             #    READYs before firing the live alert card.  A single Databento burst
@@ -83865,6 +83911,48 @@ def structure_dedup_metrics_endpoint():
     except Exception as exc:
         logger.error("/structure-dedup-metrics error: %s", exc)
         return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/structure-provenance", methods=["GET"])
+def structure_provenance_endpoint():
+    """Read-only, shadow-only Databento pivot/BOS/CHOCH audit records.
+
+    This endpoint deliberately reads the bounded in-memory diagnostic ring only.
+    It is protected by the existing Express dashboard authentication and is never
+    a source of market-structure, scoring, risk, strategy, broker, or execution
+    state.
+    """
+    inst = (request.args.get("instrument") or request.args.get("ticker") or "MNQ").upper().strip()
+    try:
+        limit = int(request.args.get("limit", "50"))
+    except (TypeError, ValueError):
+        return jsonify({"ok": False, "error": "limit must be an integer"}), 400
+    try:
+        from databento_brain import (  # noqa: PLC0415
+            DB_SYMBOLS,
+            STRUCTURE_PROVENANCE_MAX,
+            get_structure_provenance,
+        )
+        if inst not in DB_SYMBOLS:
+            return jsonify({"ok": False, "error": f"Unknown instrument: {inst}"}), 400
+        safe_limit = max(1, min(limit, STRUCTURE_PROVENANCE_MAX))
+        records = get_structure_provenance(inst, limit=safe_limit)
+        return jsonify({
+            "ok": True,
+            "shadow_only": True,
+            "instrument": inst,
+            "limit": safe_limit,
+            "retention": "in_memory_bounded_since_process_start",
+            "records": records,
+            "count": len(records),
+            "note": (
+                "Observational provenance only. It never changes gates, scoring, "
+                "strategy, risk, broker routing, execution, or canonical evidence."
+            ),
+        }), 200
+    except Exception as exc:
+        logger.warning("/structure-provenance error: %s", exc)
+        return jsonify({"ok": False, "error": str(exc)}), 200
 
 
 @app.route("/fvg/sequences", methods=["GET"])

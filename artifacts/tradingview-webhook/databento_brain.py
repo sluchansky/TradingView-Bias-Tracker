@@ -32,6 +32,7 @@ import logging
 import os
 import time
 import threading
+import uuid
 from collections import deque
 from datetime import datetime, timezone, date as _date
 from typing import Any
@@ -103,33 +104,48 @@ def get_structure_provenance(
         }
 
 
-def annotate_latest_structure_provenance(
+def get_latest_structure_provenance_id(instrument: str) -> str | None:
+    """Return the current bar's opaque trace ID for callback correlation."""
+    inst = str(instrument or "").upper().strip()
+    with _STRUCTURE_PROVENANCE_LOCK:
+        records = _STRUCTURE_PROVENANCE_BY_INST.get(inst)
+        if not records:
+            return None
+        trace_id = records[-1].get("trace_id")
+        return str(trace_id) if trace_id is not None else None
+
+
+def annotate_structure_provenance(
     instrument: str,
+    trace_id: str | None,
     *,
     structure_cycle: dict[str, Any] | None = None,
     gate_result: dict[str, Any] | None = None,
 ) -> bool:
-    """Attach already-authoritative analysis output to the newest open trace.
+    """Attach authoritative analysis output to one exact detector trace.
 
     This function only enriches a diagnostic copy.  It does not return anything
     used by the gate, scorer, strategy layer, or execution gateway.
     """
     inst = str(instrument or "").upper().strip()
-    if not inst:
+    if not inst or not trace_id:
         return False
     with _STRUCTURE_PROVENANCE_LOCK:
         records = _STRUCTURE_PROVENANCE_BY_INST.get(inst)
         if not records:
             return False
-        record = records[-1]
-        if structure_cycle is not None:
-            record["resolved_structure_cycle"] = dict(structure_cycle)
-        if gate_result is not None:
-            record["structure_gate"] = dict(gate_result)
-        record["analysis_attached"] = bool(
-            structure_cycle is not None or gate_result is not None
-        )
-        return True
+        for record in reversed(records):
+            if record.get("trace_id") != trace_id:
+                continue
+            if structure_cycle is not None:
+                record["resolved_structure_cycle"] = dict(structure_cycle)
+            if gate_result is not None:
+                record["structure_gate"] = dict(gate_result)
+            record["analysis_attached"] = bool(
+                structure_cycle is not None or gate_result is not None
+            )
+            return True
+    return False
 
 
 def _append_structure_provenance(inst: str, record: dict[str, Any]) -> None:
@@ -1135,6 +1151,7 @@ class DatabentoBrain:
             "shadow_only": True,
             "instrument": inst,
             "source": "databento",
+            "trace_id": uuid.uuid4().hex,
             "evaluation_ts": _iso(now_ts),
             "bar_ts": now_ts,
             "history": {
@@ -1168,6 +1185,12 @@ class DatabentoBrain:
             "analysis_attached": False,
         }
         if len(bars) < required:
+            trace["raw_decisions"].append({
+                "alert_type": None,
+                "candidate": None,
+                "decision": "unavailable",
+                "reason": "insufficient_completed_bars_for_pivot_confirmation",
+            })
             _append_structure_provenance(inst, trace)
             return
 
@@ -1205,12 +1228,30 @@ class DatabentoBrain:
             "left_bars": min(n, pi),
             "right_bars": min(n, len(bars) - pi - 1),
         })
+        if not pivot_sides:
+            trace["raw_decisions"].append({
+                "candidate": None,
+                "decision": "reject",
+                "reason": "candidate_bar_is_not_a_confirmed_swing_pivot",
+            })
 
         close    = bars[-1]["close"]
         last_bos = self._last_bos[inst] or {}
 
         def _break_decision(side: str, level: float, broken: bool) -> None:
             side_label = "demand" if side == "high" else "supply"
+            expected_type = (
+                ("CHOCH " if trace["prior_trend"] == "bear" else "BOS ")
+                + side_label.upper()
+            )
+            trace["tested_break"] = {
+                "side": side_label,
+                "alert_type": expected_type,
+                "level": level,
+                "close": close,
+                "relation": "above" if side == "high" else "below",
+                "broken": bool(broken),
+            }
             if broken:
                 duplicate = (
                     last_bos.get("type") in (
@@ -1219,12 +1260,6 @@ class DatabentoBrain:
                     )
                     and abs(last_bos.get("level", 0) - level) < 0.01
                 )
-                trace["tested_break"] = {
-                    "side": side_label,
-                    "level": level,
-                    "close": close,
-                    "relation": "above" if side == "high" else "below",
-                }
                 trace["dedupe"].append({
                     "candidate": side_label,
                     "outcome": "duplicate" if duplicate else "new_level",
@@ -1232,6 +1267,7 @@ class DatabentoBrain:
                     "last_level": last_bos.get("level"),
                 })
                 trace["raw_decisions"].append({
+                    "alert_type": expected_type,
                     "candidate": side_label,
                     "decision": "reject" if duplicate else "accept",
                     "reason": (
@@ -1241,6 +1277,7 @@ class DatabentoBrain:
                 })
             else:
                 trace["raw_decisions"].append({
+                    "alert_type": expected_type,
                     "candidate": side_label,
                     "decision": "reject",
                     "reason": (

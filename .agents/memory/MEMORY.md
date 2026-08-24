@@ -69,7 +69,6 @@
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
 - [Canonical Decision Contract Phase 3](decision-contract-phase3.md) — shadow-only typed state machine; 5 app.py hooks; 166 tests; DC_DB_READY flag; /decision-state route; never gates.
-- [Decision Contract boot flags](decision-contract-boot-flags.md) — TWO separate DC_DB_READY flags; registry.boot() must be called or persistence silently skips; get_all_states() returns Dict not list.
 - [Signal source ownership](signal-source-ownership.md) — CVD/RVOL now Databento-only via _databento_is_canonical guard; FVG already clean; BOS/sweep/VWAP/zones still dual or legacy.
 - [Order Flow Engine V1](order-flow-v1.md) — Databento buy/sell flow maps directionally to bounded ±15 Edge Score points; missing flow is a no-op and hard-zero setups stay zero.
 - [MBP-1 top-of-book Order Flow](mbp1-top-of-book-order-flow.md) — additive Databento best-bid/ask snapshots are fresh-only and fail-open; stale/reconnect state never influences scoring.
@@ -77,16 +76,7 @@
 - [Central Ghost Coordinator Phase 2B](central-ghost-coordinator-phase2b.md) — live shadow intake is enabled; persistence and fan-out remain explicitly off, with legacy research ledgers authoritative until paired-event evidence is reviewed.
 - [Canonical Ghost Phase 1 shadow authority](canonical-ghost-phase1-shadow-authority.md) — generic ghost lifecycle alone establishes SCALP/IT authority; exact-ledger recovery and no fuzzy correlation protect shadow evidence across restart.
 - [GRE Phase 4 — FVG_REVISIT Research Family](gre-phase4-fvg-revisit.md) — FVG_REVISIT as Research Family #2; strategy_family/strategy SEPARATE fields; deterministic rfid/revisit_id; 10 variants; 86 tests; prod DB apply still needed.
-- [DC Phase 3 Closure](dc-phase3-closure.md) — 6 execution hooks wired; GRE DC enrichment; 13 ghost_opportunities DC columns; 6 new legal transitions (scalp path); get_record() + observe_order_accepted/rejected added; 45 tests.
-- [Profitability Engine Phase 1](profitability-engine-phase1.md) — ghost_observations table; ghost fires BEFORE _maybe_auto_execute; 69 tests; conservative stop-first resolution; net_r = gross_r − cost_r.
-- [Gate Effectiveness Audit Phase 8C](gate-effectiveness-audit.md) — unified pipeline: strategy+setup_id columns; IT hypothetical geometry (ATR×1.5/2R); get_mode_report/comparison/opportunities; GateEffectivenessPanel in MainBrain.
-- [Edge Ledger Phase 8A](edge-ledger-phase8a.md) — frozen-signal accounting; 5 integration points; EL_DB_READY flag; 55 tests; display-only, learning engine unchanged.
-- [Ops Readiness Phase 8B](ops-readiness-phase8b.md) — _re_event ring-buffer; 7 hooks; /research-health + /research-events; Research Engine Health panel; 35 tests; JS-in-Python backslash trap.
-- [FVG Engine Step A](fvg-engine-step-a.md) — all-day FVG/IFVG scanner (shadow/display-only); 3 engine bugs documented; IFVG direction semantics; fixture ATR ratio trap; `@_owner_required` undefined before line 75400.
-- [FVG Sequence Engine Step B](fvg-engine-step-b.md) — shadow state machine (55 tests); two families CONTINUATION/REVERSAL; CHASING fires before target-consumed; IFVG hold from bar data; `/fvg/sequences` route; FVG chart toggle.
 - [Canonical Databento Market State Engine](canonical-market-state.md) — shadow VWAP/ATR/structure/sweep engine; all selectors default LEGACY; bar callback reads full bar from DATABENTO_BARS_BY_INST[-1]; DB fn is get_db_connection; 56 tests.
-- [MTF Trend Alignment (Phase 8B.1)](mtf-trend-alignment.md) — DISPLAY-ONLY 4H/15M Databento-sourced EMA trend; frozen on ghost_obs+EL; staleness test must seed 48h ago or last bar ends at ~now.
-- [Main Brain cognitive layer](main-brain-cognitive.md) — 7 display-only keys at full_analysis seam (mirror in closed-override); _mb_cached None→coerce neutral; heartbeat capture fail-open, never gates.
 - [Scalp strategy advisory ("potential trades")](scalp-strategy-advisory.md) — DISPLAY-ONLY Main-Brain layer ranking 16 research scalp strategies; votes come from scalp_live_sim.diagnose_strategies; NEVER a money path; flag-OFF byte-identical.
 - [Learning influences live scoring](learning-score-influence.md) — master-flag bounded ±15 Edge-Score adjust; MUST fold inside _analysis_edge_breakdown; ONLY when eb.score>0 (hard-block 0 must not resurrect); OFF byte-identical.
 - [Scalp Research Engine](scalp-research-engine.md) — research/display-only scalp-strategy lab; separate detector registry (never bt.DETECTORS); live_status∈{watch,sim,recommended}; GET never recomputes; owner-only.
@@ -157,3 +147,4 @@
 - [Dashboard potential-plan preview](dashboard-potential-plan-preview.md) — forming-setup entry/stop/TP preview is display-only in directions[*].potential_plan; money path keys ONLY off actionable verdict + top-level trade_plan.
 - [Canonical Ghost durable evidence](canonical-ghost-durable-evidence.md) — each eligible generic SCALP/IT ghost result has one exact-ID shadow record; terminal copies are deterministic snapshots, never a new authority.
 - [Market data display freshness](market-data-display-freshness.md) — stale or unreachable Databento/Visual Brain snapshots are unavailable UI state: clear overlays and actions rather than retaining prior values.
+- [MNQ structure provenance tracing](mnq-structure-provenance.md) — async analysis must attach audit results by opaque per-bar trace ID, never by “latest” record.
