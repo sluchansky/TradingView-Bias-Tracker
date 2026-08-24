@@ -12393,6 +12393,56 @@ LEARNING_SETUP_DISABLE_MAX_WR = 0.25  # win-rate ceiling for "repeatedly failing
 LEARNING_SETUP_DISABLE_MAX_EXP = -0.5  # expectancy ceiling for "repeatedly failing" detection
 LEARNING_ELIGIBILITY          = {}    # instrument -> Rule Engine verdict (in-memory; DB-backed after recompute)
 LEARNING_ELIGIBILITY_LOCK     = threading.Lock()
+# Eligibility is a read-through cache for the money path. Keep recompute health
+# beside it so a transient database outage is observable without replacing a
+# known-good snapshot with defaults or a partial result.
+_LEARNING_ELIGIBILITY_DIAGNOSTICS = {
+    "status":                    "not_run",  # not_run | healthy | degraded
+    "last_success_at":            None,
+    "last_failure_at":            None,
+    "last_failure_reason":        None,
+    "failure_count":              0,
+    "cache_retained_on_failure":  False,
+    "cache_entry_count":          0,
+}
+
+def _record_learning_eligibility_success():
+    """Record a completed eligibility rebuild without changing rule results."""
+    try:
+        with LEARNING_ELIGIBILITY_LOCK:
+            _LEARNING_ELIGIBILITY_DIAGNOSTICS.update({
+                "status":                   "healthy",
+                "last_success_at":           now_utc().isoformat(),
+                "cache_retained_on_failure": False,
+                "cache_entry_count": sum(
+                    1 for key in LEARNING_ELIGIBILITY if key != "__today_labels__"
+                ),
+            })
+    except Exception:
+        # Diagnostics must never interfere with a successful learning rebuild.
+        pass
+
+def _record_learning_eligibility_failure(reason):
+    """Record a failed rebuild while retaining the prior cache snapshot."""
+    try:
+        with LEARNING_ELIGIBILITY_LOCK:
+            _LEARNING_ELIGIBILITY_DIAGNOSTICS.update({
+                "status":                   "degraded",
+                "last_failure_at":           now_utc().isoformat(),
+                "last_failure_reason":       str(reason),
+                "failure_count": int(
+                    _LEARNING_ELIGIBILITY_DIAGNOSTICS.get("failure_count") or 0
+                ) + 1,
+                "cache_retained_on_failure": any(
+                    key != "__today_labels__" for key in LEARNING_ELIGIBILITY
+                ),
+                "cache_entry_count": sum(
+                    1 for key in LEARNING_ELIGIBILITY if key != "__today_labels__"
+                ),
+            })
+    except Exception:
+        # Diagnostics must never turn a DB outage into an application error.
+        pass
 
 # ── HIGH-3: LRE error counter ─────────────────────────────────────────────────
 # Counts every LRE exception across both check points in _execute_trade_gateway_inner().
@@ -17012,9 +17062,8 @@ def _check_learning_eligibility(instrument, mode=None):
     if not LEARNING_DB_ENABLED:
         # DB layer unavailable — no opinion, not an approval.
         return "NO_RESEARCH_OPINION", "learning_db_disabled"
-    ns = _ns_learning_key(instrument, mode) if mode else instrument
     with LEARNING_ELIGIBILITY_LOCK:
-        elig = LEARNING_ELIGIBILITY.get(ns) or LEARNING_ELIGIBILITY.get(instrument)
+        elig = _get_learning_eligibility_entry(instrument, mode)
     if not elig:
         # Cache not yet warm (recompute hasn't run) — no opinion, not an approval.
         return "NO_RESEARCH_OPINION", "cache_not_warmed"
@@ -17026,10 +17075,33 @@ def _check_learning_eligibility(instrument, mode=None):
     return (elig.get("status") or "NO_RESEARCH_OPINION"), elig.get("rule_triggered")
 
 
+def _get_learning_eligibility_entry(instrument, mode=None, cache=None):
+    """Read a mode-qualified eligibility cache entry without inventing a verdict.
+
+    Eligibility recomputation stores `{instrument}::{mode}` entries.  Retain the
+    generic learning-key lookup as a compatibility fallback for any older warm
+    cache, then use the bare instrument record as the final legacy fallback.
+    """
+    source = LEARNING_ELIGIBILITY if cache is None else cache
+    inst = str(instrument or "")
+    stored_key = "%s::%s" % (inst, mode) if mode else inst
+    canonical_key = _ns_learning_key(inst, mode) if mode else inst
+    return (
+        source.get(stored_key)
+        or source.get(canonical_key)
+        or source.get(inst)
+    )
+
+
 def _recompute_learning_eligibility(conn, persist=True):
     """Compute per-instrument live-eligibility from strategy_trades and persist to
     learning_eligibility. Swaps LEARNING_ELIGIBILITY cache atomically. Called from
-    _recompute_learning (same connection reused for reads; FAIL-OPEN)."""
+    _recompute_learning (same connection reused for reads; FAIL-OPEN).
+
+    The cache is only swapped after every read and classification succeeds. Any
+    exception leaves the prior snapshot untouched, records degraded health, and
+    returns to the caller; this prevents a transient database outage from changing
+    an already-known eligibility result."""
     global LEARNING_ELIGIBILITY
     try:
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
@@ -17162,48 +17234,63 @@ def _recompute_learning_eligibility(conn, persist=True):
         # Persist derived eligibility only after a real post-trade recompute.
         # Startup rebuilds the same in-memory state without rewriting records.
         if persist:
+            wconn = None
             try:
                 wconn = _learning_conn()
-                if wconn is not None:
-                    with wconn.cursor() as wc:
-                        for inst, e in new_elig.items():
+                if wconn is None:
+                    raise RuntimeError("eligibility persistence connection unavailable")
+                with wconn.cursor() as wc:
+                    for inst, e in new_elig.items():
+                        wc.execute(
+                            """INSERT INTO learning_eligibility
+                                   (instrument, status, rule_triggered, sample_size,
+                                    expectancy, last_20_avg_r, win_rate, tp1_hit_rate, last_updated)
+                               VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
+                               ON CONFLICT (instrument) DO UPDATE SET
+                                   status=EXCLUDED.status, rule_triggered=EXCLUDED.rule_triggered,
+                                   sample_size=EXCLUDED.sample_size, expectancy=EXCLUDED.expectancy,
+                                   last_20_avg_r=EXCLUDED.last_20_avg_r, win_rate=EXCLUDED.win_rate,
+                                   tp1_hit_rate=EXCLUDED.tp1_hit_rate, last_updated=NOW()""",
+                            (inst, e["status"], e["rule_triggered"], e["sample_size"],
+                             e["expectancy"], e["last_20_avg_r"], e["win_rate"], e["tp1_hit_rate"]))
+                    for inst, setups in disabled_by_inst.items():
+                        for s in setups:
                             wc.execute(
-                                """INSERT INTO learning_eligibility
-                                       (instrument, status, rule_triggered, sample_size,
-                                        expectancy, last_20_avg_r, win_rate, tp1_hit_rate, last_updated)
-                                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,NOW())
-                                   ON CONFLICT (instrument) DO UPDATE SET
-                                       status=EXCLUDED.status, rule_triggered=EXCLUDED.rule_triggered,
-                                       sample_size=EXCLUDED.sample_size, expectancy=EXCLUDED.expectancy,
-                                       last_20_avg_r=EXCLUDED.last_20_avg_r, win_rate=EXCLUDED.win_rate,
-                                       tp1_hit_rate=EXCLUDED.tp1_hit_rate, last_updated=NOW()""",
-                                (inst, e["status"], e["rule_triggered"], e["sample_size"],
-                                 e["expectancy"], e["last_20_avg_r"], e["win_rate"], e["tp1_hit_rate"]))
-                        for inst, setups in disabled_by_inst.items():
-                            for s in setups:
-                                wc.execute(
-                                    """INSERT INTO learning_setup_rules
-                                           (instrument, setup_key, status, rule_reason,
-                                            sample_size, win_rate, expectancy, last_updated)
-                                       VALUES (%s,%s,'DISABLED',%s,%s,%s,%s,NOW())
-                                       ON CONFLICT (instrument, setup_key) DO UPDATE SET
-                                           status='DISABLED', rule_reason=EXCLUDED.rule_reason,
-                                           sample_size=EXCLUDED.sample_size, win_rate=EXCLUDED.win_rate,
-                                           expectancy=EXCLUDED.expectancy, last_updated=NOW()""",
-                                    (inst, s["setup_key"],
-                                     "WR=%.0f%% Exp=%+.2fR n=%d" % (s["win_rate"]*100, s["expectancy"], s["sample_size"]),
-                                     s["sample_size"], s["win_rate"], s["expectancy"]))
-                    wconn.commit()
-                    wconn.close()
+                                """INSERT INTO learning_setup_rules
+                                       (instrument, setup_key, status, rule_reason,
+                                        sample_size, win_rate, expectancy, last_updated)
+                                   VALUES (%s,%s,'DISABLED',%s,%s,%s,%s,NOW())
+                                   ON CONFLICT (instrument, setup_key) DO UPDATE SET
+                                       status='DISABLED', rule_reason=EXCLUDED.rule_reason,
+                                       sample_size=EXCLUDED.sample_size, win_rate=EXCLUDED.win_rate,
+                                       expectancy=EXCLUDED.expectancy, last_updated=NOW()""",
+                                (inst, s["setup_key"],
+                                 "WR=%.0f%% Exp=%+.2fR n=%d" % (s["win_rate"]*100, s["expectancy"], s["sample_size"]),
+                                 s["sample_size"], s["win_rate"], s["expectancy"]))
+                wconn.commit()
             except Exception as exc:
-                logger.debug("learning_eligibility persist skip: %s", exc)
+                try:
+                    if wconn is not None:
+                        wconn.rollback()
+                except Exception:
+                    pass
+                logger.warning("learning_eligibility persistence failed: %s", exc)
+                raise
+            finally:
+                try:
+                    if wconn is not None:
+                        wconn.close()
+                except Exception:
+                    pass
 
         with LEARNING_ELIGIBILITY_LOCK:
             LEARNING_ELIGIBILITY.clear()
             LEARNING_ELIGIBILITY.update(new_elig)
             LEARNING_ELIGIBILITY["__today_labels__"] = today_labels
+        _record_learning_eligibility_success()
         logger.info("learning_eligibility recomputed: %s instruments", len(new_elig))
     except Exception as exc:
+        _record_learning_eligibility_failure("eligibility_recompute_failed")
         logger.warning("_recompute_learning_eligibility failed: %s", exc)
 
 
@@ -17260,6 +17347,7 @@ def _recompute_learning(persist_derived_state=True, normalize_historical_symbols
     try:
         conn = _learning_conn()
         if conn is None:
+            _record_learning_eligibility_failure("learning_db_connection_unavailable")
             return
         # Historical symbol normalization is an explicit maintenance operation,
         # never an automatic restart side effect. Normal read paths already
@@ -17967,10 +18055,15 @@ def _learning_rule_engine_view():
     try:
         with LEARNING_ELIGIBILITY_LOCK:
             snap = dict(LEARNING_ELIGIBILITY)
+            diagnostics = dict(_LEARNING_ELIGIBILITY_DIAGNOSTICS)
         today_labels = snap.pop("__today_labels__", {})
         instruments  = {}
-        for inst, elig in snap.items():
-            if inst in ASSETS:
+        for inst in ASSETS:
+            # Recompute stores mode-qualified keys. Mirror the execution lookup
+            # order so the operator sees the actual retained status for the active
+            # mode instead of a cold-cache default.
+            elig = _get_learning_eligibility_entry(inst, TRADING_MODE, cache=snap)
+            if elig:
                 instruments[inst] = {
                     "status":        elig.get("status", "GHOST_ONLY"),
                     "rule_triggered": elig.get("rule_triggered"),
@@ -17994,10 +18087,11 @@ def _learning_rule_engine_view():
                 }
         return {
             "enabled":      True,
-            "db_connected": True,
+            "db_connected": diagnostics.get("status") != "degraded",
             "instruments":  instruments,
             "today_labels": today_labels,
             "min_sample":   LEARNING_LIVE_MIN_SAMPLE,
+            "diagnostics":  diagnostics,
         }
     except Exception as _lrev_exc:
         logger.warning("_learning_rule_engine_view fail-open: %s", _lrev_exc)
@@ -65820,9 +65914,8 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
 
         # Retrieve sample count for diagnostics (best-effort)
         try:
-            _ns = _ns_learning_key(instrument, TRADING_MODE)
             with LEARNING_ELIGIBILITY_LOCK:
-                _lre_entry = LEARNING_ELIGIBILITY.get(_ns) or LEARNING_ELIGIBILITY.get(instrument) or {}
+                _lre_entry = _get_learning_eligibility_entry(instrument, TRADING_MODE) or {}
             _lre_diag["sample_count"] = _lre_entry.get("sample_size")
         except Exception:
             pass
@@ -65876,10 +65969,8 @@ def _execute_trade_gateway_inner(instrument, contracts, source="manual", directi
         _lre_sk_diag["strategy_key"] = _lre_sk
 
         if _lre_sk and execution_is_live(mode):
-            _lre_ns_key = _ns_learning_key(instrument, TRADING_MODE)
             with LEARNING_ELIGIBILITY_LOCK:
-                _lre_elig_entry = (LEARNING_ELIGIBILITY.get(_lre_ns_key)
-                                   or LEARNING_ELIGIBILITY.get(instrument) or {})
+                _lre_elig_entry = _get_learning_eligibility_entry(instrument, TRADING_MODE) or {}
                 _lre_dis_set  = {s.get("setup_key") for s in
                                  _lre_elig_entry.get("disabled_setups", [])}
                 _lre_known_sk = _lre_elig_entry.get("strategy_key")  # key recorded at last recompute

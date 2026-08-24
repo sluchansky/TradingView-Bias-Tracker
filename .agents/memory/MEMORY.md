@@ -127,7 +127,7 @@
 - [Liquidity Sweep Focus overlay](liquidity-sweep-focus.md) — flag-gated DISPLAY/ADVISORY-ONLY sweep-state; recency re-scan of ALERT_HISTORY (never trust stale key presence); instrument-prefixed match; flag-OFF byte-identical.
 - [View-only share link](view-only-share-link.md) — Express-only /view; new route prefix must be in artifact.toml proxy `paths`; login under `no-referrer` sends `Origin: null` → strict sameOrigin CSRF 403s (use `same-origin`).
 - [Micro Scalp Mode](micro-scalp-mode.md) — sweep→trap→trigger; ghost ledger always + separate restart-resetting LIVE arm via shared gateway; SINGLE EXIT target1==target2; smokes must force _EXECUTION_MODE_RAW + stub sends.
-- [Real Learning Rule Engine](learning-rule-engine.md) — GHOST_ONLY/LIVE_ELIGIBLE per-instrument gate in execute_trade_gateway; demote-only FAIL-OPEN; 50-sample threshold; recomputed on every Nth close + boot.
+- [Real Learning Rule Engine](learning-rule-engine.md) — GHOST_ONLY/LIVE_ELIGIBLE gate; recompute outages retain last-known eligibility and expose degraded cache health without granting approval.
 - [Test-trade GHOST_ONLY trap](test-trade-ghost-only-trap.md) — test_p6_* fixture rows in strategy_trades trigger GHOST_ONLY (n=1–49 range), silently rerouting live orders to paper; _boot_purge_test_trades() deletes them at boot.
 - [Thesis Tracker system](thesis-tracker.md) — outcome-based analyst memory; snapshot→25-75min resolve→lesson+reflection; pattern memory SQL (≥3 samples); DISPLAY-ONLY/fail-open; _mb_capture_cognitive is the heartbeat hook.
 - [Left Brain / Right Brain dual-engine](right-brain-engine.md) — bar-close scanner + training-mode executor; Right Brain eval runs dev+prod; Flask has NO @owner_required; proxy whitelist required.

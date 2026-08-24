@@ -1113,7 +1113,7 @@ def test_coach_rule_engine_eligibility_bootstraps_empty_instruments_live():
             unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
             unittest.mock.patch.object(app, "_learning_conn", return_value=None),
         ):
-            app._recompute_learning_eligibility(mock_conn)
+            app._recompute_learning_eligibility(mock_conn, persist=False)
 
         with app.LEARNING_ELIGIBILITY_LOCK:
             entries = {
@@ -1185,7 +1185,7 @@ def test_coach_rule_engine_eligibility_ghost_only_below_min_sample():
             unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
             unittest.mock.patch.object(app, "_learning_conn", return_value=None),
         ):
-            app._recompute_learning_eligibility(mock_conn)
+            app._recompute_learning_eligibility(mock_conn, persist=False)
 
         with app.LEARNING_ELIGIBILITY_LOCK:
             entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
@@ -1242,7 +1242,7 @@ def test_coach_rule_engine_eligibility_live_eligible_at_min_sample():
             unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
             unittest.mock.patch.object(app, "_learning_conn", return_value=None),
         ):
-            app._recompute_learning_eligibility(mock_conn)
+            app._recompute_learning_eligibility(mock_conn, persist=False)
 
         with app.LEARNING_ELIGIBILITY_LOCK:
             entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
@@ -1295,7 +1295,7 @@ def test_coach_rule_engine_eligibility_stays_ghost_only_with_negative_expectancy
             unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
             unittest.mock.patch.object(app, "_learning_conn", return_value=None),
         ):
-            app._recompute_learning_eligibility(mock_conn)
+            app._recompute_learning_eligibility(mock_conn, persist=False)
 
         with app.LEARNING_ELIGIBILITY_LOCK:
             entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
@@ -1343,7 +1343,7 @@ def test_coach_rule_engine_eligibility_stays_ghost_only_with_negative_last20():
             unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
             unittest.mock.patch.object(app, "_learning_conn", return_value=None),
         ):
-            app._recompute_learning_eligibility(mock_conn)
+            app._recompute_learning_eligibility(mock_conn, persist=False)
 
         with app.LEARNING_ELIGIBILITY_LOCK:
             entry = app.LEARNING_ELIGIBILITY.get("MGC::SWING") or {}
@@ -1945,6 +1945,168 @@ def test_coach_thesis_last_resolved_at_does_not_mutate_canonical_timestamp():
         )
     finally:
         app._THESIS_LAST_RESOLVED_AT = saved
+
+
+# ===========================================================================
+# LEARNING ELIGIBILITY — retain last known cache during DB outage
+# ===========================================================================
+
+def _eligibility_outage_fixture():
+    return {
+        "MNQ::SCALP": {
+            "status": "GHOST_ONLY",
+            "rule_triggered": "under_50_SCALP_samples (12 recorded)",
+            "sample_size": 12,
+            "expectancy": -0.25,
+            "last_20_avg_r": -0.15,
+            "win_rate": 0.42,
+            "tp1_hit_rate": 0.5,
+            "updated_at": "2026-08-24T01:00:00+00:00",
+        },
+        "__today_labels__": {"LOSS": 2},
+    }
+
+
+def test_eligibility_recompute_failure_retains_last_known_cache():
+    """A failed eligibility query must preserve the prior decision exactly.
+
+    A transient database problem must not clear a known GHOST_ONLY verdict and
+    silently convert it to NO_RESEARCH_OPINION or a bootstrap LIVE_ELIGIBLE path.
+    """
+    known = _eligibility_outage_fixture()
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+        saved_diag = dict(app._LEARNING_ELIGIBILITY_DIAGNOSTICS)
+        app.LEARNING_ELIGIBILITY.clear()
+        app.LEARNING_ELIGIBILITY.update(known)
+        app._LEARNING_ELIGIBILITY_DIAGNOSTICS.clear()
+        app._LEARNING_ELIGIBILITY_DIAGNOSTICS.update({
+            "status": "healthy", "last_success_at": "2026-08-24T00:59:00+00:00",
+            "last_failure_at": None, "last_failure_reason": None,
+            "failure_count": 0, "cache_retained_on_failure": False,
+            "cache_entry_count": 1,
+        })
+
+    broken_conn = unittest.mock.MagicMock()
+    broken_conn.cursor.side_effect = RuntimeError("database temporarily unavailable")
+    try:
+        app._recompute_learning_eligibility(broken_conn, persist=False)
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            after = dict(app.LEARNING_ELIGIBILITY)
+        assert after == known, (
+            "A failed eligibility recompute must leave every cached eligibility "
+            "entry and today's labels unchanged")
+        with unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True):
+            status = app._check_learning_eligibility("MNQ", "SCALP")[0]
+        assert status == "GHOST_ONLY", (
+            "A DB failure must retain the known GHOST_ONLY eligibility; it must "
+            "not manufacture a LIVE_ELIGIBLE approval")
+
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(app, "TRADING_MODE", "SCALP"),
+        ):
+            view = app._learning_rule_engine_view()
+        diagnostics = view.get("diagnostics") or {}
+        assert view["db_connected"] is False
+        assert view["instruments"]["MNQ"]["status"] == "GHOST_ONLY"
+        assert view["instruments"]["MNQ"]["rule_triggered"] == (
+            "under_50_SCALP_samples (12 recorded)"
+        )
+        assert diagnostics["status"] == "degraded"
+        assert diagnostics["cache_retained_on_failure"] is True
+        assert diagnostics["last_failure_reason"] == "eligibility_recompute_failed"
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+            app._LEARNING_ELIGIBILITY_DIAGNOSTICS.clear()
+            app._LEARNING_ELIGIBILITY_DIAGNOSTICS.update(saved_diag)
+
+
+def test_eligibility_connection_outage_keeps_cache_without_false_approval():
+    """Top-level learning recompute must retain a known cache when no DB connects."""
+    known = _eligibility_outage_fixture()
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+        saved_diag = dict(app._LEARNING_ELIGIBILITY_DIAGNOSTICS)
+        app.LEARNING_ELIGIBILITY.clear()
+        app.LEARNING_ELIGIBILITY.update(known)
+        app._LEARNING_ELIGIBILITY_DIAGNOSTICS.clear()
+        app._LEARNING_ELIGIBILITY_DIAGNOSTICS.update({
+            "status": "healthy", "last_success_at": "2026-08-24T00:59:00+00:00",
+            "last_failure_at": None, "last_failure_reason": None,
+            "failure_count": 0, "cache_retained_on_failure": False,
+            "cache_entry_count": 1,
+        })
+    try:
+        with (
+            unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True),
+            unittest.mock.patch.object(app, "_learning_conn", return_value=None),
+        ):
+            app._recompute_learning()
+
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            after = dict(app.LEARNING_ELIGIBILITY)
+        assert after == known
+        with unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True):
+            status = app._check_learning_eligibility("MNQ", "SCALP")[0]
+        assert status == "GHOST_ONLY"
+
+        with unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True):
+            diagnostics = (app._learning_rule_engine_view().get("diagnostics") or {})
+        assert diagnostics["status"] == "degraded"
+        assert diagnostics["cache_retained_on_failure"] is True
+        assert diagnostics["last_failure_reason"] == "learning_db_connection_unavailable"
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+            app._LEARNING_ELIGIBILITY_DIAGNOSTICS.clear()
+            app._LEARNING_ELIGIBILITY_DIAGNOSTICS.update(saved_diag)
+
+
+def test_eligibility_persistence_failure_retains_last_known_cache():
+    """A write-stage outage must not replace a known GHOST_ONLY decision."""
+    known = _eligibility_outage_fixture()
+    read_conn, _ = _build_eligibility_mock_conn([], [])
+    broken_write_conn = unittest.mock.MagicMock()
+    broken_write_conn.cursor.side_effect = RuntimeError("database write unavailable")
+
+    with app.LEARNING_ELIGIBILITY_LOCK:
+        saved_elig = dict(app.LEARNING_ELIGIBILITY)
+        saved_diag = dict(app._LEARNING_ELIGIBILITY_DIAGNOSTICS)
+        app.LEARNING_ELIGIBILITY.clear()
+        app.LEARNING_ELIGIBILITY.update(known)
+        app._LEARNING_ELIGIBILITY_DIAGNOSTICS.clear()
+        app._LEARNING_ELIGIBILITY_DIAGNOSTICS.update({
+            "status": "healthy", "last_success_at": "2026-08-24T00:59:00+00:00",
+            "last_failure_at": None, "last_failure_reason": None,
+            "failure_count": 0, "cache_retained_on_failure": False,
+            "cache_entry_count": 1,
+        })
+    try:
+        with unittest.mock.patch.object(app, "_learning_conn", return_value=broken_write_conn):
+            app._recompute_learning_eligibility(read_conn, persist=True)
+
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            after = dict(app.LEARNING_ELIGIBILITY)
+        assert after == known, (
+            "A failed persistence stage must retain the previous eligibility "
+            "instead of accepting a fresh n=0 LIVE_ELIGIBLE classification")
+        with unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True):
+            assert app._check_learning_eligibility("MNQ", "SCALP")[0] == "GHOST_ONLY"
+        with unittest.mock.patch.object(app, "LEARNING_DB_ENABLED", True):
+            diagnostics = (app._learning_rule_engine_view().get("diagnostics") or {})
+        assert diagnostics["status"] == "degraded"
+        assert diagnostics["cache_retained_on_failure"] is True
+        assert diagnostics["last_failure_reason"] == "eligibility_recompute_failed"
+    finally:
+        with app.LEARNING_ELIGIBILITY_LOCK:
+            app.LEARNING_ELIGIBILITY.clear()
+            app.LEARNING_ELIGIBILITY.update(saved_elig)
+            app._LEARNING_ELIGIBILITY_DIAGNOSTICS.clear()
+            app._LEARNING_ELIGIBILITY_DIAGNOSTICS.update(saved_diag)
 
 
 # ===========================================================================

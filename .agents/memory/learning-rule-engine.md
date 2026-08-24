@@ -9,7 +9,7 @@ description: Per-instrument ghost/live eligibility gate in execute_trade_gateway
 `LEARNING_ELIGIBILITY` cache. In `execute_trade_gateway`:
 - `GHOST_ONLY` + live mode → `mode = "paper"` (demote-only; trade still fires, builds evidence)
 - `DISABLED` → 409 block (reserved for repeatedly-failing setups, n>=15 AND WR<25% AND Exp<-0.5)
-- No data / DB off → FAIL-OPEN (pass through unchanged)
+- No data / DB off → `NO_RESEARCH_OPINION` (pass through unchanged, never an approval)
 
 ## Rules for GHOST_ONLY
 
@@ -29,6 +29,14 @@ description: Per-instrument ghost/live eligibility gate in execute_trade_gateway
 - Boot fires eligibility recompute: "learning_eligibility recomputed: 4 instruments" in logs = working.
 - DB empty at launch → all instruments GHOST_ONLY by default (correct behavior — bot earns live trading through evidence).
 - E1 was initially never written (first script had `AssertionError` before `file.write()`); always verify constants exist before assuming they're in scope.
+
+## Eligibility cache outage contract
+
+An eligibility recompute may replace the cached snapshot only after all reads, classifications, and its required persistence step succeed. Connection, query, partial-read, and persistence failures retain the last known snapshot and report degraded eligibility-cache health. A cold cache remains `NO_RESEARCH_OPINION`, never an implicit `LIVE_ELIGIBLE` approval.
+
+**Why:** A temporary learning-database outage must not silently change a known trade-eligibility outcome or manufacture permission to trade.
+
+**How to apply:** Use the dedicated eligibility-cache lookup rather than generic learning-key lookups. Eligibility snapshots historically store `{instrument}::{mode}`, while generic learning keys namespace as `{mode}::{key}`; preserve both forms and the bare-instrument fallback for compatibility.
 
 ## DB Tables
 
