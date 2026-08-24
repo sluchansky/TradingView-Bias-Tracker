@@ -65,6 +65,80 @@ DATABENTO_BARS_BY_INST: dict[str, deque] = {
     inst: deque(maxlen=200) for inst in DB_SYMBOLS
 }
 
+# Shadow-only structure provenance.  This is intentionally separate from
+# ALERT_HISTORY: structure consumers never read it, and losing it on restart is
+# safe because it is an operator audit surface rather than trading evidence.
+STRUCTURE_PROVENANCE_MAX = max(
+    25, int(os.environ.get("STRUCTURE_PROVENANCE_MAX", "500"))
+)
+_STRUCTURE_PROVENANCE_BY_INST: dict[str, deque] = {
+    inst: deque(maxlen=STRUCTURE_PROVENANCE_MAX) for inst in DB_SYMBOLS
+}
+_STRUCTURE_PROVENANCE_LOCK = threading.RLock()
+
+
+def clear_structure_provenance() -> None:
+    """Clear the in-memory shadow trace (primarily useful for test isolation)."""
+    with _STRUCTURE_PROVENANCE_LOCK:
+        for records in _STRUCTURE_PROVENANCE_BY_INST.values():
+            records.clear()
+
+
+def get_structure_provenance(
+    instrument: str | None = None,
+    *,
+    limit: int = 50,
+) -> list[dict[str, Any]] | dict[str, list[dict[str, Any]]]:
+    """Return copied, bounded structure traces for read-only diagnostics."""
+    safe_limit = max(1, min(int(limit), STRUCTURE_PROVENANCE_MAX))
+    inst = str(instrument or "").upper().strip()
+    with _STRUCTURE_PROVENANCE_LOCK:
+        if inst:
+            return [dict(item) for item in list(
+                _STRUCTURE_PROVENANCE_BY_INST.get(inst, ())
+            )[-safe_limit:]]
+        return {
+            key: [dict(item) for item in list(records)[-safe_limit:]]
+            for key, records in _STRUCTURE_PROVENANCE_BY_INST.items()
+        }
+
+
+def annotate_latest_structure_provenance(
+    instrument: str,
+    *,
+    structure_cycle: dict[str, Any] | None = None,
+    gate_result: dict[str, Any] | None = None,
+) -> bool:
+    """Attach already-authoritative analysis output to the newest open trace.
+
+    This function only enriches a diagnostic copy.  It does not return anything
+    used by the gate, scorer, strategy layer, or execution gateway.
+    """
+    inst = str(instrument or "").upper().strip()
+    if not inst:
+        return False
+    with _STRUCTURE_PROVENANCE_LOCK:
+        records = _STRUCTURE_PROVENANCE_BY_INST.get(inst)
+        if not records:
+            return False
+        record = records[-1]
+        if structure_cycle is not None:
+            record["resolved_structure_cycle"] = dict(structure_cycle)
+        if gate_result is not None:
+            record["structure_gate"] = dict(gate_result)
+        record["analysis_attached"] = bool(
+            structure_cycle is not None or gate_result is not None
+        )
+        return True
+
+
+def _append_structure_provenance(inst: str, record: dict[str, Any]) -> None:
+    """Append a JSON-safe diagnostic record without affecting live state."""
+    with _STRUCTURE_PROVENANCE_LOCK:
+        _STRUCTURE_PROVENANCE_BY_INST.setdefault(
+            inst, deque(maxlen=STRUCTURE_PROVENANCE_MAX)
+        ).append(dict(record))
+
 # Current in-progress (partial) 1m bar per instrument.
 # Snapshot updated after every tick inside _partial_lock so Flask routes
 # can read a consistent copy without acquiring the lock themselves.
@@ -1046,7 +1120,55 @@ class DatabentoBrain:
         Each BOS/CHOCH level is injected once only (deduped via _last_bos).
         """
         n = self.SWING_N
-        if len(bars) < n * 2 + 2:
+        required = n * 2 + 2
+        now_bar = bars[-1] if bars else {}
+        now_ts = now_bar.get("ts") if isinstance(now_bar, dict) else None
+
+        def _iso(ts: Any) -> str | None:
+            try:
+                return datetime.fromtimestamp(float(ts), tz=timezone.utc).isoformat()
+            except (TypeError, ValueError, OSError, OverflowError):
+                return None
+
+        trace: dict[str, Any] = {
+            "schema": "mnq_structure_provenance.v1",
+            "shadow_only": True,
+            "instrument": inst,
+            "source": "databento",
+            "evaluation_ts": _iso(now_ts),
+            "bar_ts": now_ts,
+            "history": {
+                "available": len(bars) >= required,
+                "bars": len(bars),
+                "required": required,
+                "reason": (
+                    None if len(bars) >= required
+                    else "insufficient_completed_bars_for_pivot_confirmation"
+                ),
+            },
+            "pivot": {
+                "side": None,
+                "level": None,
+                "timestamp": None,
+                "age_bars": None,
+                "age_seconds": None,
+            },
+            "confirmation_progress": {
+                "left_bars": None,
+                "right_bars": None,
+                "left_required": n,
+                "right_required": n,
+            },
+            "prior_trend": self._trend.get(inst),
+            "tested_break": None,
+            "raw_decisions": [],
+            "dedupe": [],
+            "resolved_structure_cycle": None,
+            "structure_gate": None,
+            "analysis_attached": False,
+        }
+        if len(bars) < required:
+            _append_structure_provenance(inst, trace)
             return
 
         pi     = len(bars) - n - 1
@@ -1056,8 +1178,79 @@ class DatabentoBrain:
         is_sh = all(pivot["high"] >= bars[j]["high"] for j in window if j != pi)
         is_sl = all(pivot["low"]  <= bars[j]["low"]  for j in window if j != pi)
 
+        pivot_sides = [
+            side for side, confirmed in (("high", is_sh), ("low", is_sl))
+            if confirmed
+        ]
+        pivot_ts = pivot.get("ts")
+        try:
+            pivot_age_seconds = max(0.0, float(now_ts) - float(pivot_ts))
+        except (TypeError, ValueError):
+            pivot_age_seconds = None
+        trace["pivot"].update({
+            "side": "+".join(pivot_sides) if pivot_sides else "none",
+            "level": (
+                pivot.get("high") if is_sh
+                else pivot.get("low") if is_sl
+                else None
+            ),
+            "timestamp": _iso(pivot_ts),
+            "age_bars": len(bars) - 1 - pi,
+            "age_seconds": (
+                round(pivot_age_seconds, 3)
+                if pivot_age_seconds is not None else None
+            ),
+        })
+        trace["confirmation_progress"].update({
+            "left_bars": min(n, pi),
+            "right_bars": min(n, len(bars) - pi - 1),
+        })
+
         close    = bars[-1]["close"]
         last_bos = self._last_bos[inst] or {}
+
+        def _break_decision(side: str, level: float, broken: bool) -> None:
+            side_label = "demand" if side == "high" else "supply"
+            if broken:
+                duplicate = (
+                    last_bos.get("type") in (
+                        f"BOS {side_label.upper()}",
+                        f"CHOCH {side_label.upper()}",
+                    )
+                    and abs(last_bos.get("level", 0) - level) < 0.01
+                )
+                trace["tested_break"] = {
+                    "side": side_label,
+                    "level": level,
+                    "close": close,
+                    "relation": "above" if side == "high" else "below",
+                }
+                trace["dedupe"].append({
+                    "candidate": side_label,
+                    "outcome": "duplicate" if duplicate else "new_level",
+                    "last_type": last_bos.get("type"),
+                    "last_level": last_bos.get("level"),
+                })
+                trace["raw_decisions"].append({
+                    "candidate": side_label,
+                    "decision": "reject" if duplicate else "accept",
+                    "reason": (
+                        "same_break_level_already_emitted"
+                        if duplicate else "confirmed_pivot_break"
+                    ),
+                })
+            else:
+                trace["raw_decisions"].append({
+                    "candidate": side_label,
+                    "decision": "reject",
+                    "reason": (
+                        "close_not_above_confirmed_swing_high"
+                        if side == "high"
+                        else "close_not_below_confirmed_swing_low"
+                    ),
+                    "pivot_level": level,
+                    "close": close,
+                })
 
         # ── HH / LH — swing-high sequence labels ─────────────────────────────
         if is_sh:
@@ -1078,6 +1271,8 @@ class DatabentoBrain:
                 self._prev_sl[inst] = sl
 
         # ── BOS / CHOCH — close-based structure break ─────────────────────────
+        if is_sh:
+            _break_decision("high", pivot["high"], close > pivot["high"])
         if is_sh and close > pivot["high"]:
             if not (last_bos.get("type") in ("BOS DEMAND", "CHOCH DEMAND")
                     and abs(last_bos.get("level", 0) - pivot["high"]) < 0.01):
@@ -1087,6 +1282,8 @@ class DatabentoBrain:
                 self._last_bos[inst] = {"type": atype, "level": pivot["high"]}
                 self._trend[inst]    = "bull"
 
+        if is_sl:
+            _break_decision("low", pivot["low"], close < pivot["low"])
         if is_sl and close < pivot["low"]:
             if not (last_bos.get("type") in ("BOS SUPPLY", "CHOCH SUPPLY")
                     and abs(last_bos.get("level", 0) - pivot["low"]) < 0.01):
@@ -1095,6 +1292,7 @@ class DatabentoBrain:
                 self._inject_alert(inst, atype, close)
                 self._last_bos[inst] = {"type": atype, "level": pivot["low"]}
                 self._trend[inst]    = "bear"
+        _append_structure_provenance(inst, trace)
 
     # Alert types that warrant a full scored analysis pass (registered callbacks).
     # HH/HL/LH/LL are informational (edge-score only, no hard-gate effect).
