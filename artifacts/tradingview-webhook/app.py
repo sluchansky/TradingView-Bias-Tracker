@@ -9994,9 +9994,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     # Resolve BOS / CHOCH as one ordered, per-instrument state machine instead of
     # four independent booleans. The conventional detector semantics stay intact:
     # CHOCH begins a reversal candidate; BOS confirms it (or continues a standing
-    # trend). Only a confirmed ACTIVE cycle may satisfy the strict structure gate
-    # or receive the single +20 Edge allocation. This is mode-agnostic, so SCALP
-    # and INTRADAY_TREND consume the identical contract.
+    # trend). Only a confirmed ACTIVE cycle may satisfy the strict structure gate;
+    # initial/candidate cycles can carry reduced allocation but never pass that gate.
+    # This is mode-agnostic, so SCALP and INTRADAY_TREND consume the identical contract.
     structure_state = resolve_structure_cycle(
         recent, inst, now=now_utc(), window_minutes=int(stage_window or 20)
     )
@@ -10781,8 +10781,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
             "direction":             direction,
             "bos":                   bool(_bos),
             "choch":                 bool(_choch),
-            # Raw detector flags remain diagnostic; only structure_confirmed below
-            # can earn Edge or satisfy the gate.
+            # Raw detector flags remain diagnostic. The resolved active-cycle
+            # allocation below is the only structure credit; confirmation is
+            # additionally required for the strict structure gate.
             "bos_confirmed":         bool(_bos),
             "choch_confirmed":       bool(_choch),
             "swing":                 bool(_swing),

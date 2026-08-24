@@ -4,9 +4,10 @@ The producers keep their conventional labels:
   * CHOCH is the first break against the prior trend: a reversal candidate.
   * BOS confirms a same-trend continuation or the pending CHOCH reversal.
 
-One active cycle earns a bounded structure allocation: +20 while its CHOCH is a
-candidate, then +40 when a same-direction BOS confirms it. Historical events are
-never accumulated across cycles or allowed to survive a newer opposite-side CHOCH.
+One active cycle earns a bounded structure allocation: a neutral BOS establishes
+initial directional structure at +20, while a same-direction follow-up BOS or a
+CHOCH-to-BOS reversal confirmation earns +40. Historical events are never
+accumulated across cycles or allowed to survive a newer opposite-side CHOCH.
 """
 
 from __future__ import annotations
@@ -17,6 +18,7 @@ from typing import Any, Iterable
 
 
 STRUCTURE_CANDIDATE_POINTS = 20
+STRUCTURE_INITIAL_POINTS = 20
 STRUCTURE_POINTS = 40
 _STRUCTURE_TYPES = frozenset(
     {"CHOCH DEMAND", "CHOCH SUPPLY", "BOS DEMAND", "BOS SUPPLY"}
@@ -118,6 +120,10 @@ def resolve_structure_cycle(
                 # A duplicate candidate must not restart a cycle's clock or become
                 # a second source of credit.
                 continue
+            if state != "NO_STRUCTURE" and direction == event_direction:
+                # CHOCH is counter-trend by definition. A same-direction label
+                # cannot replace an active directional cycle or create new credit.
+                continue
             if state != "NO_STRUCTURE":
                 superseded_events += events_in_cycle
             state = "REVERSAL_CANDIDATE"
@@ -128,18 +134,22 @@ def resolve_structure_cycle(
             events_in_cycle = 1
             continue
 
-        # BOS can establish a continuation from a neutral tape, confirm the active
-        # same-direction CHOCH, or extend an existing confirmed trend.  A BOS in the
-        # opposite direction without its own CHOCH is invalid sequence noise.
+        # A neutral BOS establishes only initial directional structure. A second
+        # same-direction BOS confirms continuation, while BOS after a same-direction
+        # CHOCH confirms its reversal. A BOS in the opposite direction without its
+        # own CHOCH is invalid sequence noise.
         if state == "NO_STRUCTURE":
-            state = "TREND_CONFIRMED"
+            state = "TREND_INITIAL"
             direction = event_direction
             cycle_started_at = event_at
             last_event_at = event_at
             active_event = last_event = event_type
             events_in_cycle = 1
         elif direction == event_direction:
-            state = "REVERSAL_CONFIRMED" if state == "REVERSAL_CANDIDATE" else "TREND_CONFIRMED"
+            if state == "REVERSAL_CANDIDATE":
+                state = "REVERSAL_CONFIRMED"
+            elif state == "TREND_INITIAL":
+                state = "TREND_CONFIRMED"
             last_event_at = event_at
             last_event = event_type
             events_in_cycle += 1
@@ -160,6 +170,16 @@ def resolve_structure_cycle(
             f"{direction} {state.replace('_', ' ').lower()} — "
             f"one {STRUCTURE_POINTS}-point structure allocation is active."
         )
+    elif state == "TREND_INITIAL":
+        next_event = f"BOS {suffix}"
+        next_reason = (
+            f"{direction} BOS established initial directional structure only. "
+            f"Wait for {next_event} to confirm the continuation cycle."
+        )
+        summary = (
+            f"{direction} initial directional structure — awaiting {next_event} "
+            "for continuation confirmation."
+        )
     else:
         next_event = f"BOS {suffix}"
         next_reason = (
@@ -174,7 +194,11 @@ def resolve_structure_cycle(
         "direction": direction,
         "confirmed": confirmed,
         "allocation_points": (
-            STRUCTURE_POINTS if confirmed else STRUCTURE_CANDIDATE_POINTS
+            STRUCTURE_POINTS if confirmed else (
+                STRUCTURE_INITIAL_POINTS
+                if state == "TREND_INITIAL"
+                else STRUCTURE_CANDIDATE_POINTS
+            )
         ),
         "active_event": active_event,
         "last_event": last_event,

@@ -2403,8 +2403,16 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const structureConfirmed = structure.confirmed === true;
   const structurePoints = safeNum(structure.allocation_points) ?? 0;
   const structureColor = structureConfirmed ? T.green
+    : structureState === 'TREND_INITIAL' ? T.cyan
     : structureState === 'REVERSAL_CANDIDATE' ? T.amber
     : T.txtMuted;
+  const structureCreditLabel = structureConfirmed
+    ? `CONFIRMED · +${structurePoints} STRUCTURE`
+    : structureState === 'TREND_INITIAL'
+      ? `INITIAL · +${structurePoints} STRUCTURE`
+      : structureState === 'REVERSAL_CANDIDATE'
+        ? `REVERSAL CANDIDATE · +${structurePoints} STRUCTURE`
+        : 'AWAITING STRUCTURE · +0 STRUCTURE';
 
   // Verdict explanation from Brain voice (already normalized)
   const mb          = (p.main_brain ?? {}) as Record<string, unknown>;
@@ -2464,9 +2472,7 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
               {structureDir && <span style={{ color:dirColor(structureDir), fontWeight:700 }}>{structureDir.toUpperCase()}</span>}
               {structureEvent && <span style={{ color:T.txtSec, fontFamily:T.mono }}>{structureEvent}</span>}
               <span style={{ color:structureColor, marginLeft:'auto' }}>
-                {structureConfirmed
-                  ? `CONFIRMED · +${structurePoints} STRUCTURE`
-                  : `CANDIDATE · +${structurePoints} STRUCTURE`}
+                {structureCreditLabel}
               </span>
             </div>
             {nextStructure && (
