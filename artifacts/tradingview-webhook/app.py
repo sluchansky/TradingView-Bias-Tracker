@@ -8293,10 +8293,21 @@ def _it_daily_trade_count(instrument="MNQ"):
 
     Excludes EXPIRED_NO_ENTRY (setup never triggered) and PENDING rows.
     Returns (count, cap) where cap = MAX_INTRADAY_TREND_TRADES_PER_DAY (default 2).
-    Returns (-1, cap) on any DB error so the gate remains fail-open.
+    ``signal_time`` is the authoritative entry-observation timestamp: the
+    ghost writer persists it for every row, while ``opened_at`` is not a
+    column in this ledger.  ``obs_key`` is the durable idempotency identity,
+    so counting it distinctly also remains correct if a read encounters a
+    duplicated/replayed source row.
+    Returns (-1, cap) on any DB error or malformed aggregate so the gate
+    remains fail-closed.
     """
-    cap = int(os.environ.get("IT_DAILY_CAP",
-                             os.environ.get("MAX_INTRADAY_TREND_TRADES_PER_DAY", "3")))
+    try:
+        cap = int(os.environ.get("IT_DAILY_CAP",
+                                 os.environ.get("MAX_INTRADAY_TREND_TRADES_PER_DAY", "3")))
+    except (TypeError, ValueError):
+        # Preserve the existing configured-cap contract without allowing a
+        # malformed environment value to make context construction raise.
+        cap = 3
     if not GHOST_OBS_DB_READY:
         return (-1, cap)
     try:
@@ -8306,17 +8317,22 @@ def _it_daily_trade_count(instrument="MNQ"):
             with conn.cursor() as cur:
                 cur.execute(
                     """
-                    SELECT COUNT(*) FROM ghost_observations
+                    SELECT COUNT(DISTINCT obs_key) FROM ghost_observations
                      WHERE trading_mode = 'INTRADAY_TREND'
                        AND instrument   = %s
                        AND status NOT IN ('EXPIRED_NO_ENTRY', 'PENDING')
-                       AND (opened_at AT TIME ZONE 'America/New_York')::date
+                       AND (signal_time AT TIME ZONE 'America/New_York')::date
                            = %s::date
                     """,
                     (inst, today_et),
                 )
                 row = cur.fetchone()
-                return (int(row[0]) if row else 0, cap)
+                if not row or len(row) < 1 or isinstance(row[0], bool):
+                    return (-1, cap)
+                count = int(row[0])
+                if count < 0:
+                    return (-1, cap)
+                return (count, cap)
     except Exception:
         return (-1, cap)
 
