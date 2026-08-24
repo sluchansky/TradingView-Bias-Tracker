@@ -69,7 +69,7 @@ class TestStructureExplanationConsistency(unittest.TestCase):
         self.assertIn("CHOCH is a reversal candidate only", voice["narration"])
         self.assertIn("BOS SUPPLY", voice["narration"])
 
-    def test_confirmed_reversal_does_not_create_a_wait_requirement(self):
+    def test_confirmed_reversal_keeps_its_authoritative_next_event_guidance(self):
         raw = cycle(
             "REVERSAL_CONFIRMED", "Long", True, "CHOCH SUPPLY",
             "Current long structure is confirmed. The next valid state change is "
@@ -89,7 +89,10 @@ class TestStructureExplanationConsistency(unittest.TestCase):
             "verdict": "LONG WAIT",
             "structure_state": raw,
         })
-        self.assertNotIn("CHOCH SUPPLY", voice["narration"])
+        # The existing WAIT verdict comes from the supplied strict label, not
+        # from the next-event wording. Task #270 requires the narration to
+        # consume, rather than hide, the resolver's authoritative guidance.
+        self.assertIn("CHOCH SUPPLY", voice["narration"])
 
 
 if __name__ == "__main__":

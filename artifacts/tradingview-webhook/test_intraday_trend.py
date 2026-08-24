@@ -269,11 +269,11 @@ class TestTimeRestriction(unittest.TestCase):
         ok, _, _ = self._chk(13, 0)
         self.assertTrue(ok)
 
-    def test_blocked_at_14_30(self):
+    def test_allowed_at_14_30(self):
         ok, state, reason = self._chk(14, 30)
-        self.assertFalse(ok)
-        self.assertEqual(state, "ENTRY_BLOCKED")
-        self.assertIsNotNone(reason)
+        self.assertTrue(ok)
+        self.assertEqual(state, "OK")
+        self.assertIsNone(reason)
 
     def test_force_flat_at_15_55(self):
         ok, state, reason = self._chk(15, 55)
@@ -381,10 +381,9 @@ class TestComputeContext(unittest.TestCase):
         self.assertIsNotNone(ctx["projected_r"])
         self.assertAlmostEqual(ctx["projected_r"], 3.0, places=1)
 
-    def test_time_blocked_past_1430(self):
+    def test_time_allowed_before_1500_cutoff(self):
         ctx = self._ctx(et_now=_et(14, 45))
-        self.assertFalse(ctx["time_ok"])
-        self.assertEqual(ctx["status"], "BLOCKED")
+        self.assertTrue(ctx["time_ok"])
 
     def test_fail_open_on_bad_instrument(self):
         ctx = app.compute_intraday_trend_context(None, None)
@@ -409,6 +408,14 @@ class TestEntryVeto(unittest.TestCase):
             "instrument": "MNQ",
             "time_ok": True, "time_state": "OK", "time_reason": None,
             "location_quality": "GOOD",
+            # These are the established fail-closed prerequisites. Individual
+            # tests override one input at a time to isolate the asserted veto.
+            "setup_family": "TREND_PULLBACK",
+            "confirmation_complete": True,
+            "structural_stop_valid": True,
+            "structural_stop_pts": 50.0,
+            "daily_trade_count": 0,
+            "daily_trade_cap": 2,
         }
         defaults.update(kw)
         return defaults

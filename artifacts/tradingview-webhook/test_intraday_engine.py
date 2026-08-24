@@ -15,7 +15,7 @@ Coverage:
   11. Long trade plan:   real session level selected as TP2, rr_num >= 2.0
   12. Short trade plan:  real session level selected as TP2, rr_num >= 2.0
   13. Expiration:        expires_at present and per-family
-  14. Time cutoff:       IT_SESSION_BLOCKED after 15:15 ET
+  14. Time cutoff:       IT_SESSION_BLOCKED at/after 15:00 ET
   15. Time force-flat:   IT_SESSION_BLOCKED after 15:55 ET
   16. Daily cap veto:    IT_DAILY_CAP on _it_entry_veto_reasons
   17. _it_select_intraday_target Long / Short / no-candidate
@@ -630,10 +630,10 @@ class TestITTimeCutoff(unittest.TestCase):
         self.assertFalse(plan["trade_plan"])
         self.assertEqual(plan["it_veto_code"], "IT_SESSION_BLOCKED")
 
-    def test_default_cutoff_is_15_15(self):
-        """_IT_LAST_ENTRY_DEFAULT must be '15:15' after the spec change."""
-        self.assertEqual(A._IT_LAST_ENTRY_DEFAULT, "15:15",
-                         "Default IT last-entry cutoff must be 15:15 per spec")
+    def test_default_cutoff_is_15_00(self):
+        """The current conservative spec blocks new IT entries at 15:00 ET."""
+        self.assertEqual(A._IT_LAST_ENTRY_DEFAULT, "15:00",
+                         "Default IT last-entry cutoff must be 15:00 per spec")
 
     def test_time_restriction_blocks_at_1516(self):
         """_it_time_restriction returns blocked at 15:16 ET."""
@@ -645,11 +645,11 @@ class TestITTimeCutoff(unittest.TestCase):
         self.assertFalse(ok)
         self.assertEqual(state, "ENTRY_BLOCKED")
 
-    def test_time_restriction_allows_at_1514(self):
-        """_it_time_restriction returns allowed at 15:14 ET."""
+    def test_time_restriction_allows_at_1459(self):
+        """_it_time_restriction returns allowed immediately before cutoff."""
         from zoneinfo import ZoneInfo
         et = ZoneInfo("America/New_York")
-        t = datetime(2026, 8, 12, 15, 14, tzinfo=et)
+        t = datetime(2026, 8, 12, 14, 59, tzinfo=et)
         ok, state, _ = A._it_time_restriction(et_now=t)
         self.assertTrue(ok)
         self.assertEqual(state, "OK")
@@ -792,8 +792,8 @@ class TestITFindTP1(unittest.TestCase):
         self.assertLessEqual(tp1 - entry, 1.5 * risk,
                              "TP1 should not exceed 1.5R from entry")
 
-    def test_fallback_to_1_25r_when_no_structural_level(self):
-        """Falls back to 1.25R manufactured when no structural level in range."""
+    def test_fallback_to_1r_when_no_structural_level(self):
+        """Falls back to the current 1R manufactured target without a level."""
         entry = MNQ_PRICE
         risk  = 75.0
         empty_lv = {
@@ -805,9 +805,9 @@ class TestITFindTP1(unittest.TestCase):
             "major_15m_swing_lows":  [],
         }
         tp1 = A._it_find_tp1("Long", entry, risk, empty_lv, 0.25)
-        expected = round(round((entry + 1.25 * risk) / 0.25) * 0.25, 10)
+        expected = round(round((entry + 1.0 * risk) / 0.25) * 0.25, 10)
         self.assertAlmostEqual(tp1, expected, places=1,
-                               msg="Fallback TP1 should be 1.25R from entry")
+                               msg="Fallback TP1 should be 1R from entry")
 
 
 # ══════════════════════════════════════════════════════════════════════════════

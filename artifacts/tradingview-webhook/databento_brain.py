@@ -29,6 +29,7 @@ Public surface (imported by app.py):
 from __future__ import annotations
 
 import logging
+import math
 import os
 import queue
 import time
@@ -350,9 +351,17 @@ DATABENTO_STATUS: dict[str, Any] = {
         inst: {
             "state": "WARMING_UP",
             "bars": 0,
+            "seeded_closed_bar_count": 0,
+            "observed_closed_bar_count": 0,
             "required_bars": STRUCTURE_WARMUP_BARS,
             "reason": "startup_history_pending",
+            "completion_reason": None,
+            "failure_reason": None,
+            "warmup_started_at": None,
+            "warmup_completed_at": None,
+            "warmup_duration_ms": None,
             "source_timestamp": None,
+            "newest_historical_source_timestamp": None,
         }
         for inst in DB_SYMBOLS
     },
@@ -478,6 +487,13 @@ class DatabentoBrain:
             i: dict((DATABENTO_STATUS.get("structure_warmup") or {}).get(i) or {})
             for i in DB_SYMBOLS
         }
+        self._warmup_started_monotonic: dict[str, float | None] = {
+            i: None for i in DB_SYMBOLS
+        }
+        self._warmup_started_at: dict[str, str | None] = {
+            i: None for i in DB_SYMBOLS
+        }
+        self._warmup_lock = threading.RLock()
         self._suppress_replay_signals = False
         # Bar-close callbacks: called after every completed 1m bar per instrument.
         # Registered by app.py to trigger proactive scanning without polling.
@@ -530,16 +546,42 @@ class DatabentoBrain:
                     list(DB_SYMBOLS.keys()))
 
     def _set_warmup_state(self, inst: str, state: str, *, bars: int = 0,
-                          reason: str | None = None, source_ts: float | None = None) -> None:
-        payload = {
-            "state": state,
-            "bars": int(bars),
-            "required_bars": STRUCTURE_WARMUP_BARS,
-            "reason": reason,
-            "source_timestamp": self._iso_epoch(source_ts),
-        }
-        self._warmup_state[inst] = payload
-        DATABENTO_STATUS.setdefault("structure_warmup", {})[inst] = dict(payload)
+                          observed_bars: int | None = None, reason: str | None = None,
+                          source_ts: float | None = None) -> None:
+        now_wall = datetime.now(timezone.utc).isoformat()
+        with self._warmup_lock:
+            if state == "WARMING_UP" and self._warmup_started_monotonic.get(inst) is None:
+                self._warmup_started_monotonic[inst] = time.monotonic()
+                self._warmup_started_at[inst] = now_wall
+            started = self._warmup_started_monotonic.get(inst)
+            terminal = state in ("READY", "UNAVAILABLE")
+            duration_ms = (
+                round(max(0.0, time.monotonic() - started) * 1000.0, 3)
+                if terminal and started is not None else None
+            )
+            source_iso = self._iso_epoch(source_ts)
+            payload = {
+                "state": state,
+                "bars": int(bars),
+                "seeded_closed_bar_count": int(bars),
+                "observed_closed_bar_count": int(
+                    bars if observed_bars is None else observed_bars
+                ),
+                "required_bars": STRUCTURE_WARMUP_BARS,
+                "reason": reason,
+                "completion_reason": (
+                    "sufficient_valid_closed_history" if state == "READY"
+                    else None
+                ),
+                "failure_reason": reason if state == "UNAVAILABLE" else None,
+                "warmup_started_at": self._warmup_started_at.get(inst),
+                "warmup_completed_at": now_wall if terminal else None,
+                "warmup_duration_ms": duration_ms,
+                "source_timestamp": source_iso,
+                "newest_historical_source_timestamp": source_iso,
+            }
+            self._warmup_state[inst] = payload
+            DATABENTO_STATUS.setdefault("structure_warmup", {})[inst] = dict(payload)
 
     @staticmethod
     def _history_epoch(value: Any) -> float | None:
@@ -585,19 +627,33 @@ class DatabentoBrain:
     def _validated_history(self, rows: list[dict[str, Any]], now: float) -> tuple[list[dict[str, Any]], str | None]:
         valid: list[dict[str, Any]] = []
         last_ts = None
-        for bar in sorted(rows, key=lambda b: (b.get("ts") is None, b.get("ts") or 0)):
-            ts = bar.get("ts")
+        # Preserve source order: reordering an invalid response would fabricate
+        # a chronology and make a malformed warm-up look trustworthy.
+        for bar in rows:
             try:
-                if (ts is None or ts > now - 60 or ts <= 0 or
-                        bar["high"] < bar["low"] or bar["volume"] < 0 or
-                        not (bar["low"] <= bar["open"] <= bar["high"]) or
-                        not (bar["low"] <= bar["close"] <= bar["high"]) or
-                        (last_ts is not None and ts <= last_ts)):
+                ts = float(bar.get("ts"))
+                open_ = float(bar["open"])
+                high = float(bar["high"])
+                low = float(bar["low"])
+                close = float(bar["close"])
+                volume = float(bar["volume"])
+                if (not all(math.isfinite(v) for v in (ts, open_, high, low, close, volume))
+                        or ts > now - 60 or ts <= 0 or high < low or volume < 0
+                        or not (low <= open_ <= high) or not (low <= close <= high)
+                        or (last_ts is not None and ts <= last_ts)):
                     return [], "malformed_or_non_monotonic_history"
-            except (TypeError, ValueError):
+            except (KeyError, TypeError, ValueError):
                 return [], "malformed_history"
             last_ts = ts
-            valid.append(bar)
+            valid.append({
+                **bar,
+                "ts": ts,
+                "open": open_,
+                "high": high,
+                "low": low,
+                "close": close,
+                "volume": int(volume),
+            })
         if not valid:
             return [], "empty_history"
         if now - valid[-1]["ts"] > STRUCTURE_WARMUP_MAX_AGE_HOURS * 3600:
@@ -635,7 +691,10 @@ class DatabentoBrain:
                         self._history_rows(store), time.time()
                     )
                     if reason:
-                        self._set_warmup_state(inst, "UNAVAILABLE", bars=len(bars), reason=reason)
+                        self._set_warmup_state(
+                            inst, "UNAVAILABLE", bars=0, observed_bars=len(bars),
+                            reason=reason,
+                        )
                         continue
                     self._suppress_replay_signals = True
                     try:
@@ -645,6 +704,15 @@ class DatabentoBrain:
                         self._suppress_replay_signals = False
                     self._set_warmup_state(
                         inst, "READY", bars=len(bars), reason=None, source_ts=bars[-1]["ts"]
+                    )
+                    logger.info(
+                        "DatabentoBrain: structure warm-up READY for %s "
+                        "(seeded_closed_bar_count=%d newest_source=%s duration_ms=%s)",
+                        inst,
+                        len(bars),
+                        self._iso_epoch(bars[-1]["ts"]),
+                        (DATABENTO_STATUS.get("structure_warmup", {}).get(inst, {})
+                         .get("warmup_duration_ms")),
                     )
                 except Exception as exc:
                     logger.warning("DatabentoBrain: structure warm-up failed for %s: %s", inst, exc)
