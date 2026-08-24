@@ -6,6 +6,11 @@
  * No side-effects, no API calls, no trading computations.
  * Exported so they can be unit-tested independently of React.
  */
+import {
+  extractStructureGuidance,
+  structureWaitingText,
+  type StructureGuidance,
+} from './structureGuidance';
 
 // ── Minimal helpers (mirrors of safeStr/safeNum in MainBrain.tsx) ─────────────
 function safeStr(v: unknown, fallback = ''): string {
@@ -79,6 +84,7 @@ export interface ExplainData {
   hardBlockers: string[];
   missingConfirmations: string[];
   opposingStructure: OpposingStructure | null;
+  structureGuidance: StructureGuidance | null;
 
   // Derived "to-do" list
   mustChange: string[];
@@ -102,6 +108,7 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
   const dirs = (p.directions    ?? {}) as Record<string, unknown>;
   const tl   = (p.decision_timeline ?? {}) as Record<string, unknown>;
   const mb   = (p.main_brain    ?? {}) as Record<string, unknown>;
+  const structureGuidance = extractStructureGuidance(p);
 
   // ── Verdict ───────────────────────────────────────────────────────────────
   const readiness    = safeStr(v.readiness ?? v.readiness_label, 'WAIT');
@@ -214,6 +221,9 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
 
   // ── Must-change list ──────────────────────────────────────────────────────
   const mustChange: string[] = [];
+  if (structureGuidance?.isPendingConfirmation) {
+    mustChange.push(structureWaitingText(structureGuidance));
+  }
   for (const m of missingConfirmations) mustChange.push(`${m} must confirm`);
   if (
     opposingStructure &&
@@ -271,6 +281,7 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
     hardBlockers,
     missingConfirmations,
     opposingStructure,
+    structureGuidance,
     mustChange,
     timelineEvents,
     brainVoice: safeStr(mb.voice, ''),
@@ -283,19 +294,23 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
  * Never invents facts — only uses fields from ExplainData.
  */
 export function buildPlainEnglishSummary(d: ExplainData): string {
+  const structureNote = d.structureGuidance?.isPendingConfirmation
+    ? ` Structure cycle: ${d.structureGuidance.reason}`
+    : '';
+
   // Thesis unavailable / collecting
   if (!d.thesisAvailable && !d.thesisStale) {
     if (d.thesisDir === 'COLLECTING DATA') {
-      return 'Left Brain is still collecting bar-close data. No directional thesis yet — the system is in monitoring mode.';
+      return `Left Brain is still collecting bar-close data. No directional thesis yet — the system is in monitoring mode.${structureNote}`;
     }
-    return `Market thesis is ${d.thesisDir.toLowerCase()}. The system is waiting for Left Brain data before confirming a directional bias.`;
+    return `Market thesis is ${d.thesisDir.toLowerCase()}. The system is waiting for Left Brain data before confirming a directional bias.${structureNote}`;
   }
 
   // No active candidate
   if (d.candidateDir === 'NONE') {
     const thesisNote = d.thesisAvailable
       ? ` Market thesis is ${d.thesisDir.toLowerCase()}.` : '';
-    return `No active trade candidate.${thesisNote} The system is monitoring but no setup meets the entry criteria yet.`;
+    return `No active trade candidate.${thesisNote} The system is monitoring but no setup meets the entry criteria yet.${structureNote}`;
   }
 
   const cand  = d.candidateDir.toLowerCase();
@@ -320,7 +335,7 @@ export function buildPlainEnglishSummary(d: ExplainData): string {
   // Hard block active
   if (d.hardBlockers.length > 0) {
     const b = d.hardBlockers[0];
-    return `A hard block is active: ${b}. The ${cand} setup cannot become READY until this clears.`;
+    return `A hard block is active: ${b}. The ${cand} setup cannot become READY until this clears.${structureNote}`;
   }
 
   // Opposing structure blocking
@@ -337,7 +352,11 @@ export function buildPlainEnglishSummary(d: ExplainData): string {
   if (d.alignment === 'COUNTER-TREND') {
     const missStr = d.missingConfirmations.length > 0
       ? ` and still missing ${d.missingConfirmations[0].toLowerCase()}` : '';
-    return `The market thesis is ${thesis} but a ${cand} setup is forming. It is counter-trend${missStr}. The system is correctly waiting rather than recommending a ${d.candidateDir} entry.`;
+    return `The market thesis is ${thesis} but a ${cand} setup is forming. It is counter-trend${missStr}.${structureNote} The system is correctly waiting rather than recommending a ${d.candidateDir} entry.`;
+  }
+
+  if (d.structureGuidance?.isPendingConfirmation) {
+    return `The ${cand} candidate is building. ${d.structureGuidance.reason}`;
   }
 
   // Missing confirmations

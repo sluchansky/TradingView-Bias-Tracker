@@ -25378,6 +25378,35 @@ def _main_brain_voice_neutral(reason="Watching the tape — no clear read yet.")
     return {"available": False, "headline": "Watching", "narration": reason, "reason": reason}
 
 
+def _structure_cycle_operator_guidance(structure_state):
+    """Pass through resolver-owned structure guidance for operator copy only.
+
+    This intentionally does not re-evaluate a BOS/CHOCH sequence or influence
+    scoring, gates, execution, persistence, or any other money path.
+    """
+    if not isinstance(structure_state, dict):
+        return None
+    state = str(structure_state.get("state") or "")
+    next_event = str(structure_state.get("next_event") or "")
+    next_reason = str(structure_state.get("next_event_reason") or "")
+    if not state or not next_event or not next_reason:
+        return None
+    return {
+        "state": state,
+        "direction": structure_state.get("direction"),
+        "confirmed": structure_state.get("confirmed") is True,
+        # These resolved fields are presentation metadata for the cycle card.
+        # Preserve them verbatim; the projection must never erase the
+        # resolver's active credit or triggering event.
+        "allocation_points": structure_state.get("allocation_points"),
+        "active_event": structure_state.get("active_event"),
+        "last_event": structure_state.get("last_event"),
+        "next_event": next_event,
+        "next_event_reason": next_reason,
+        "summary": structure_state.get("summary"),
+    }
+
+
 def compute_main_brain_voice(result):
     """One natural, evolving paragraph — what I see / what changed / why / what I'm
     waiting for / what invalidates it — synthesized from the already-assembled blocks
@@ -25402,6 +25431,12 @@ def compute_main_brain_voice(result):
         inval    = str(mb.get("invalidation") or "")
         ct       = result.get("confidence_timeline") if isinstance(result.get("confidence_timeline"), dict) else {}
         trend    = str(ct.get("trend") or "")
+        structure_guidance = _structure_cycle_operator_guidance(result.get("structure_state"))
+        structure_pending = bool(
+            structure_guidance
+            and not structure_guidance.get("confirmed")
+            and structure_guidance.get("state") in ("TREND_INITIAL", "REVERSAL_CANDIDATE")
+        )
 
         parts = []
         phase_desc = phase.lower() if phase != "—" else "a developing tape"
@@ -25420,6 +25455,11 @@ def compute_main_brain_voice(result):
 
         if is_actionable(verdict):
             parts.append("The pieces are there — this is actionable.")
+        elif structure_pending:
+            # The resolver owns this exact next-event wording. Prefer it over a
+            # generic "what now" item so the operator never sees conflicting
+            # BOS/CHOCH advice.
+            parts.append(str(structure_guidance.get("next_event_reason")))
         elif what_now:
             nx = what_now[0] if isinstance(what_now[0], str) else str(what_now[0])
             parts.append("Still need %s before I'd pull the trigger." % nx.rstrip("."))
@@ -28466,6 +28506,7 @@ def _mb_verdict(result, errors):
             # remaining block window, effect classification. Never feeds the gate.
             "opposing_structure":  r.get("opposing_structure"),
             "structure_state":     r.get("structure_state"),
+            "structure_guidance":  _structure_cycle_operator_guidance(r.get("structure_state")),
         }
     except Exception as _exc:
         logger.debug("_mb_verdict: %s", _exc)
@@ -28479,6 +28520,7 @@ def _mb_verdict(result, errors):
             "edge_components": [], "score_breakdown": [],
             "failed_confirmations": [], "risks": [],
             "opposing_structure": None, "structure_state": None,
+            "structure_guidance": None,
         }
 
 

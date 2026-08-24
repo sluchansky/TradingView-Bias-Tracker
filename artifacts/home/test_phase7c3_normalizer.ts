@@ -18,6 +18,7 @@ import {
   mapStrategyResult,
   normalizeMainBrainPayload,
 } from './src/lib/mainBrainNormalizer.js';
+import { selectStructureCycleDisplay } from './src/lib/structureGuidance.js';
 
 // ── Test harness ─────────────────────────────────────────────────────────────
 let pass = 0;
@@ -47,7 +48,7 @@ const FULL_FIXTURE: Record<string, unknown> = {
   voice: {
     available: true,
     headline: 'Long · edge 45 WAIT',
-    narration: 'MGC consolidating — still need a CHOCH before entry.',
+    narration: 'MGC consolidating — waiting for BOS DEMAND to confirm continuation.',
     reason: null,
   },
   market: {
@@ -98,6 +99,14 @@ const FULL_FIXTURE: Record<string, unknown> = {
     ],
     failed_confirmations: ['Bullish BOS', 'Bullish CHOCH', 'Liquidity Sweep', 'Session Bonus'],
     risks: ['Choppy conditions'],
+    structure_guidance: {
+      state: 'TREND_INITIAL',
+      direction: 'Long',
+      confirmed: false,
+      next_event: 'BOS DEMAND',
+      next_event_reason: 'Long BOS established initial directional structure only. Wait for BOS DEMAND to confirm the continuation cycle.',
+      summary: 'Long initial directional structure — awaiting BOS DEMAND for continuation confirmation.',
+    },
   },
   strategy_scanner: {
     selected: 'VWAP_TREND_CONTINUATION',
@@ -344,7 +353,35 @@ startSection('T2: Normalizer contract — voice extraction');
   // Dict with narration
   const p1  = normalizeMainBrainPayload(FULL_FIXTURE);
   const mb1 = p1.main_brain as Record<string, unknown>;
-  check('voice dict → narration extracted', mb1.voice === 'MGC consolidating — still need a CHOCH before entry.');
+  check('voice dict → narration extracted', mb1.voice === 'MGC consolidating — waiting for BOS DEMAND to confirm continuation.');
+  const structure = mb1.structure_guidance as Record<string, unknown>;
+  check('structure guidance passes through without recomputation', structure.next_event === 'BOS DEMAND');
+  const initialCycle = selectStructureCycleDisplay(normalizeMainBrainPayload({
+    verdict: {
+      structure_state: {
+        state: 'TREND_INITIAL', allocation_points: 20, active_event: 'BOS DEMAND',
+      },
+      structure_guidance: {
+        state: 'TREND_INITIAL', next_event: 'BOS DEMAND',
+        next_event_reason: 'Wait for BOS DEMAND to confirm the continuation cycle.',
+      },
+    },
+  }));
+  check('initial cycle retains +20 credit and active event after normalization',
+    initialCycle.allocation_points === 20 && initialCycle.active_event === 'BOS DEMAND');
+  const confirmedCycle = selectStructureCycleDisplay(normalizeMainBrainPayload({
+    verdict: {
+      structure_state: {
+        state: 'REVERSAL_CONFIRMED', allocation_points: 40, last_event: 'BOS DEMAND',
+      },
+      structure_guidance: {
+        state: 'REVERSAL_CONFIRMED', next_event: 'CHOCH SUPPLY',
+        next_event_reason: 'Current long structure is confirmed.',
+      },
+    },
+  }));
+  check('confirmed cycle retains +40 credit and last event after normalization',
+    confirmedCycle.allocation_points === 40 && confirmedCycle.last_event === 'BOS DEMAND');
 
   // Dict with only headline
   const p2 = normalizeMainBrainPayload({ ...FULL_FIXTURE, voice: { headline: 'Long WAIT', narration: '' } });

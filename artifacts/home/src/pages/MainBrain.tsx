@@ -26,6 +26,9 @@ import {
   type ScoreComponent,
 } from '../lib/explainDecision';
 import {
+  extractStructureGuidance, selectStructureCycleDisplay, structureWaitingText,
+} from '../lib/structureGuidance';
+import {
   visualBrainConfidence, visualBrainText, visualBrainToken,
 } from '../lib/visualBrainModes';
 import { getTopOfBookPresentation } from '../lib/topOfBookPresentation';
@@ -2470,9 +2473,19 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     : null;
 
   const missingComps = edgeComps.filter(c => c.present === false);
-  const structure = (
-    v.structure_state ?? p.structure_state ?? {}
-  ) as Record<string, unknown>;
+  const structureGuidance = extractStructureGuidance(p);
+  const waitingFor = structureGuidance?.isPendingConfirmation
+    ? [{ label: structureWaitingText(structureGuidance), points: 0, structure: true }, ...missingComps.map(c => ({
+        label: safeStr(c.label, safeStr(c.key, '').replace(/_/g, ' ')),
+        points: safeNum(c.points) ?? 0,
+        structure: false,
+      }))]
+    : missingComps.map(c => ({
+        label: safeStr(c.label, safeStr(c.key, '').replace(/_/g, ' ')),
+        points: safeNum(c.points) ?? 0,
+        structure: false,
+      }));
+  const structure = selectStructureCycleDisplay(p);
   const structureState = safeStr(structure.state, 'NO_STRUCTURE');
   const structureDir   = safeStr(structure.direction, '');
   const structureEvent = safeStr(structure.last_event ?? structure.active_event, '');
@@ -2616,17 +2629,15 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
           )}
 
           {/* ── Waiting For checklist ────────────────────────────────────── */}
-          {missingComps.length > 0 && (
+          {waitingFor.length > 0 && (
             <div style={{ marginBottom:10, padding:'8px 10px', background:'rgba(239,68,68,0.05)', borderRadius:7, border:`1px solid rgba(239,68,68,0.14)` }}>
               <div style={{ fontSize:9, color:T.red, letterSpacing:'0.08em', marginBottom:6 }}>WAITING FOR</div>
-              {missingComps.map((c, i) => {
-                const lbl = safeStr(c.label, safeStr(c.key, '').replace(/_/g, ' '));
-                const pts = safeNum(c.points) ?? 0;
+              {waitingFor.map((item, i) => {
                 return (
                   <div key={i} style={{ display:'flex', alignItems:'center', gap:7, marginBottom:3 }}>
                     <span style={{ fontSize:9, color:T.red, opacity:0.6 }}>•</span>
-                    <span style={{ fontSize:10, color:`${T.txtPri}99`, flex:1 }}>{lbl}</span>
-                    {pts > 0 && <span style={{ fontSize:9, color:T.txtMuted, fontFamily:T.mono, flexShrink:0 }}>+{pts} pts</span>}
+                    <span style={{ fontSize:10, color: item.structure ? T.cyan : `${T.txtPri}99`, flex:1 }}>{item.label}</span>
+                    {item.points > 0 && <span style={{ fontSize:9, color:T.txtMuted, fontFamily:T.mono, flexShrink:0 }}>+{item.points} pts</span>}
                   </div>
                 );
               })}

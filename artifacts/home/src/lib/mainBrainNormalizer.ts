@@ -255,7 +255,17 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
           || safeStr((rawVoice as Record<string, unknown>).headline, '')
           || null)
       : null;
-  const main_brain: Record<string, unknown> = { voice: voiceStr };
+  const structureGuidance = (
+    vrd.structure_guidance
+    ?? vrd.structure_state
+    ?? raw.structure_guidance
+    ?? raw.structure_state
+    ?? null
+  );
+  const main_brain: Record<string, unknown> = {
+    voice: voiceStr,
+    structure_guidance: structureGuidance,
+  };
 
   // ── candidate_preview: pass-through (already normalized by backend) ─────────
   // status: "READY" | "POTENTIAL" | "NO_CANDIDATE" | "UNAVAILABLE"

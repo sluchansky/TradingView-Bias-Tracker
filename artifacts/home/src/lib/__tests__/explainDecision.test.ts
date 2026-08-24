@@ -41,6 +41,7 @@ function makePayload(overrides: Record<string, unknown> = {}): Record<string, un
     },
     decision_timeline: { available: true, events: [] },
     main_brain: { voice: '' },
+    structure_state: null,
     ...overrides,
   };
 }
@@ -267,4 +268,57 @@ it('Test 16 — extractExplainData does not throw on an empty payload (safe fall
   expect(d.candidateDir).toBe('NONE');
   expect(d.hasComponents).toBe(false);
   expect(d.timelineEvents).toHaveLength(0);
+});
+
+describe('resolved structure-cycle presentation', () => {
+  function withStructure(structure_state: Record<string, unknown>) {
+    return makePayload({ structure_state });
+  }
+
+  it('uses a bearish initial cycle as the continuation requirement everywhere', () => {
+    const d = extractExplainData(withStructure({
+      state: 'TREND_INITIAL', direction: 'Short', confirmed: false,
+      next_event: 'BOS SUPPLY',
+      next_event_reason: 'Short BOS established initial directional structure only. Wait for BOS SUPPLY to confirm the continuation cycle.',
+      summary: 'Short initial directional structure — awaiting BOS SUPPLY for continuation confirmation.',
+    }));
+    expect(d.structureGuidance?.nextEvent).toBe('BOS SUPPLY');
+    expect(d.mustChange[0]).toContain('BOS SUPPLY');
+    expect(buildPlainEnglishSummary(d)).toContain('Wait for BOS SUPPLY to confirm the continuation cycle.');
+    expect(buildPlainEnglishSummary(d)).not.toContain('CHOCH before');
+  });
+
+  it('uses a bullish initial cycle as the continuation requirement everywhere', () => {
+    const d = extractExplainData(withStructure({
+      state: 'TREND_INITIAL', direction: 'Long', confirmed: false,
+      next_event: 'BOS DEMAND',
+      next_event_reason: 'Long BOS established initial directional structure only. Wait for BOS DEMAND to confirm the continuation cycle.',
+      summary: 'Long initial directional structure — awaiting BOS DEMAND for continuation confirmation.',
+    }));
+    expect(d.structureGuidance?.nextEvent).toBe('BOS DEMAND');
+    expect(d.mustChange[0]).toContain('BOS DEMAND');
+    expect(buildPlainEnglishSummary(d)).toContain('Wait for BOS DEMAND to confirm the continuation cycle.');
+  });
+
+  it('keeps CHOCH language limited to a reversal candidate', () => {
+    const d = extractExplainData(withStructure({
+      state: 'REVERSAL_CANDIDATE', direction: 'Short', confirmed: false,
+      next_event: 'BOS SUPPLY',
+      next_event_reason: 'Short CHOCH is a reversal candidate only. Wait for BOS SUPPLY to confirm the new structure cycle.',
+      summary: 'Short reversal candidate — awaiting BOS SUPPLY.',
+    }));
+    expect(d.mustChange[0]).toContain('CHOCH is a reversal candidate only');
+    expect(buildPlainEnglishSummary(d)).toContain('Wait for BOS SUPPLY to confirm the new structure cycle.');
+  });
+
+  it('does not add a pending requirement after a reversal is confirmed', () => {
+    const d = extractExplainData(withStructure({
+      state: 'REVERSAL_CONFIRMED', direction: 'Long', confirmed: true,
+      next_event: 'CHOCH SUPPLY',
+      next_event_reason: 'Current long structure is confirmed. The next valid state change is CHOCH SUPPLY, a new reversal candidate.',
+      summary: 'Long reversal confirmed — one 40-point structure allocation is active.',
+    }));
+    expect(d.structureGuidance?.isPendingConfirmation).toBe(false);
+    expect(d.mustChange.some(item => item.includes('CHOCH SUPPLY'))).toBe(false);
+  });
 });

@@ -350,7 +350,6 @@ class TestVerdictSection(unittest.TestCase):
         payload = self.app.build_main_brain_payload(dict(FAKE_RESULT_BASE))
         self.assertTrue(payload["availability"]["verdict"]["available"])
 
-
 # ============================================================================
 # TC-P7B-006  Derived active-trade fields
 # ============================================================================
