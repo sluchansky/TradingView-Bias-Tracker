@@ -100,6 +100,12 @@ def _iso_datetime(value: Any) -> Optional[str]:
     return parsed.isoformat() if parsed else None
 
 
+def _event_instrument(event: Mapping[str, Any]) -> str:
+    """Return the explicit coordinator instrument carried in shadow payload."""
+    payload = event.get("payload") if isinstance(event.get("payload"), Mapping) else {}
+    return str(payload.get("instrument") or "").strip().upper()
+
+
 class CanonicalGhostAuthority:
     """Thread-safe, fail-open shadow projection over existing coordinator evidence."""
 
@@ -160,6 +166,12 @@ class CanonicalGhostAuthority:
                 self._ignored += 1
             return None
         source_system = str(record.get("source_system") or "").strip()
+        instrument = str(record.get("instrument") or "").strip().upper()
+        # An absent instrument is not an identity. Reject it before either
+        # generic authority or a simulator reference can enter this strict,
+        # instrument-scoped linkage ledger.
+        if not instrument:
+            return None
         if source_system == "dual_mode_sim":
             # The simulator's sim_key is its sole durable source identity.
             # legacy_record_id is a display/recovery convenience and must never
@@ -195,6 +207,7 @@ class CanonicalGhostAuthority:
                 has_authority = any(
                     self._events[event_id].get("source_system") == "generic_ghost"
                     and self._events[event_id].get("event_type") == "OBSERVED"
+                    and _event_instrument(self._events[event_id]) == instrument
                     and (
                         source_system != "dual_mode_sim"
                         or (
@@ -245,6 +258,7 @@ class CanonicalGhostAuthority:
                             "coordinator_observation_id": record.get("observation_id"),
                             "declared_generic_obs_key": declared_generic_obs_key,
                             "submitted_source_event_id": record.get("source_event_id"),
+                            "instrument": instrument,
                         },
                     }
                 )
@@ -285,6 +299,7 @@ class CanonicalGhostAuthority:
                     "entry": record.get("entry"),
                     "stop": record.get("stop"),
                     "targets": record.get("targets"),
+                    "instrument": instrument,
                 },
             }
         )
@@ -818,8 +833,8 @@ class CanonicalGhostAuthority:
                     str(row.get("source_record_id") or "").strip(),
                 ) not in already_observed
             ]
-            generic_source_ids = {
-                str(row.get("source_record_id") or "").strip()
+            generic_source_instruments = {
+                str(row.get("source_record_id") or "").strip(): _event_instrument(row)
                 for row in rows
                 if row.get("event_type") == "OBSERVED"
                 and row.get("source_system") == "generic_ghost"
@@ -840,7 +855,8 @@ class CanonicalGhostAuthority:
                 ).strip()
                 if (
                     not declared_anchor
-                    or declared_anchor not in generic_source_ids
+                    or not _event_instrument(row)
+                    or generic_source_instruments.get(declared_anchor) != _event_instrument(row)
                     or not submitted_source_event_id
                     or source_record_id != submitted_source_event_id
                 ):
@@ -989,6 +1005,313 @@ class CanonicalGhostAuthority:
             self._errors += 1
             self._last_error = str(message)[:180]
         return None
+
+
+def _strict_health_fixture_record(
+    *,
+    observation_id: str,
+    market_opportunity_id: str,
+    source_system: str,
+    source_event_id: str,
+    instrument: str,
+    trading_mode: str,
+    legacy_sim_key: Optional[str] = None,
+    canonical_authority_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Build a fixed in-memory coordinator record for strict-link verification."""
+    context = {
+        "trading_mode": trading_mode,
+        "legacy_table": (
+            "ghost_observations"
+            if source_system == "generic_ghost" else "dual_sim_trades"
+        ),
+    }
+    if source_system == "generic_ghost":
+        context["legacy_obs_key"] = source_event_id
+    else:
+        context["legacy_record_id"] = source_event_id
+        context["legacy_sim_key"] = (
+            legacy_sim_key if legacy_sim_key is not None else source_event_id
+        )
+    if canonical_authority_id is not None:
+        context["canonical_authority_id"] = canonical_authority_id
+    return {
+        "observation_id": observation_id,
+        "market_opportunity_id": market_opportunity_id,
+        "source_system": source_system,
+        "source_event_id": source_event_id,
+        "instrument": instrument,
+        "timeframe": "1m",
+        "strategy_name": "STRICT_HEALTH_FIXTURE",
+        "setup_family": "STRICT_HEALTH_FIXTURE",
+        "direction": "Long",
+        "entry": 21000.0,
+        "stop": 20990.0,
+        "targets": (21020.0,),
+        "signal_time": "2026-08-24T16:15:00+00:00",
+        "source_bar_time": "2026-08-24T16:15:00+00:00",
+        "context": context,
+    }
+
+
+def run_strict_link_health_verification() -> Dict[str, Any]:
+    """Prove strict durable-link protections using an in-memory shadow fixture.
+
+    The verifier intentionally invokes the production authority code rather
+    than a hand-written matcher.  Its persistence callback only appends to a
+    local list, so a health request cannot write a database, alter authority
+    state, or affect any trading path.
+    """
+    counters = {
+        "matched": 0,
+        "unmatched_retained": 0,
+        "unresolved": 0,
+        "relinked_after_authority": 0,
+        "wrong_ledger_rejected": 0,
+        "duplicates_replays_suppressed": 0,
+        "persistence_errors": 0,
+        "restart_errors": 0,
+        "mode_isolation_rejected": 0,
+        "instrument_isolation_rejected": 0,
+        "malformed_references_rejected": 0,
+        "missing_instrument_rejected": 0,
+        "unsupported_mode_rejected": 0,
+    }
+    checks: Dict[str, bool] = {}
+    try:
+        persisted: list[Dict[str, Any]] = []
+        authority = CanonicalGhostAuthority(enabled=True)
+        authority.configure(
+            enabled=True,
+            persistence_enabled=True,
+            persist_fn=lambda event: persisted.append(dict(event)) or True,
+        )
+
+        generic_id = "generic|MNQ|strict-health|1"
+        simulator_id = "SCALP|MNQ|strict-health|1"
+        reference = _strict_health_fixture_record(
+            observation_id="fixture-ref-first",
+            market_opportunity_id="fixture-market-mnq",
+            source_system="dual_mode_sim",
+            source_event_id=simulator_id,
+            instrument="MNQ",
+            trading_mode="SCALP",
+            canonical_authority_id=generic_id,
+        )
+        checks["reference_retained_before_authority"] = (
+            authority.observe_coordinator_submission(reference) is None
+        )
+        generic = _strict_health_fixture_record(
+            observation_id="fixture-generic-mnq",
+            market_opportunity_id="fixture-market-mnq",
+            source_system="generic_ghost",
+            source_event_id=generic_id,
+            instrument="MNQ",
+            trading_mode="SCALP",
+        )
+        checks["exact_reference_relinked_after_authority"] = (
+            authority.observe_coordinator_submission(generic) is not None
+        )
+        authority.observe_legacy_outcome(
+            source_system="generic_ghost",
+            source_record_id=generic_id,
+            raw_status="WIN",
+            result_r=1.0,
+            event_at="2026-08-24T16:20:00+00:00",
+        )
+        authority.observe_legacy_outcome(
+            source_system="dual_mode_sim",
+            source_record_id=simulator_id,
+            raw_status="WIN",
+            result_r=1.0,
+            event_at="2026-08-24T16:20:00+00:00",
+        )
+
+        # Exact replays collapse rather than creating another durable source.
+        authority.observe_coordinator_submission(reference)
+        authority.observe_coordinator_submission(generic)
+
+        # Same timestamp/price/strategy is insufficient in another instrument
+        # ledger. A later generic row in that ledger has a different exact ID.
+        wrong_instrument = _strict_health_fixture_record(
+            observation_id="fixture-ref-mgc",
+            # Deliberately collide the coordinator opportunity ID with MNQ.
+            # An instrument-agnostic matcher would incorrectly attach this
+            # MGC reference to the otherwise exact MNQ generic authority.
+            market_opportunity_id="fixture-market-mnq",
+            source_system="dual_mode_sim",
+            source_event_id="SCALP|MGC|strict-health|1",
+            instrument="MGC",
+            trading_mode="SCALP",
+            canonical_authority_id=generic_id,
+        )
+        checks["cross_instrument_reference_rejected"] = (
+            authority.observe_coordinator_submission(wrong_instrument) is None
+        )
+
+        # A SCALP authority cannot authorize an INTRADAY reference even when
+        # the declared generic key, time, price, and strategy are identical.
+        wrong_mode = _strict_health_fixture_record(
+            observation_id="fixture-ref-intraday",
+            market_opportunity_id="fixture-market-mnq",
+            source_system="dual_mode_sim",
+            source_event_id="INTRADAY|MNQ|strict-health|1",
+            instrument="MNQ",
+            trading_mode="INTRADAY_TREND",
+            canonical_authority_id=generic_id,
+        )
+        checks["cross_mode_reference_rejected"] = (
+            authority.observe_coordinator_submission(wrong_mode) is None
+        )
+
+        # A malformed dual source key and an unsupported lane never acquire a
+        # fuzzy link. Unsupported lanes remain outside canonical telemetry.
+        malformed = _strict_health_fixture_record(
+            observation_id="fixture-ref-malformed",
+            market_opportunity_id="fixture-market-mnq",
+            source_system="dual_mode_sim",
+            source_event_id="SCALP|MNQ|strict-health|malformed-submitted",
+            instrument="MNQ",
+            trading_mode="SCALP",
+            legacy_sim_key="SCALP|MNQ|strict-health|malformed-declared",
+            canonical_authority_id=generic_id,
+        )
+        checks["malformed_reference_rejected"] = (
+            authority.observe_coordinator_submission(malformed) is None
+        )
+        blank_authority = CanonicalGhostAuthority(enabled=True)
+        blank_generic = _strict_health_fixture_record(
+            observation_id="fixture-generic-blank",
+            market_opportunity_id="fixture-market-blank",
+            source_system="generic_ghost",
+            source_event_id="generic|blank|strict-health|1",
+            instrument="",
+            trading_mode="SCALP",
+        )
+        blank_reference = _strict_health_fixture_record(
+            observation_id="fixture-ref-blank",
+            market_opportunity_id="fixture-market-blank",
+            source_system="dual_mode_sim",
+            source_event_id="SCALP|blank|strict-health|1",
+            instrument="",
+            trading_mode="SCALP",
+            legacy_sim_key="SCALP|blank|strict-health|1",
+            canonical_authority_id="generic|blank|strict-health|1",
+        )
+        checks["missing_instrument_rejected"] = (
+            blank_authority.observe_coordinator_submission(blank_generic) is None
+            and blank_authority.observe_coordinator_submission(blank_reference) is None
+            and blank_authority.health_report()["intake_volume"] == 0
+        )
+        counters["missing_instrument_rejected"] = 2 if checks["missing_instrument_rejected"] else 0
+        # Re-running generic intake invokes promotion over every retained
+        # reference. The wrong instrument and malformed identities must remain
+        # unlinked despite the matching opportunity metadata.
+        authority.observe_coordinator_submission(generic)
+        unsupported = _strict_health_fixture_record(
+            observation_id="fixture-ref-swing",
+            market_opportunity_id="fixture-market-swing",
+            source_system="dual_mode_sim",
+            source_event_id="SWING|MNQ|strict-health|1",
+            instrument="MNQ",
+            trading_mode="SWING",
+            canonical_authority_id=generic_id,
+        )
+        checks["unsupported_mode_rejected"] = (
+            authority.observe_coordinator_submission(unsupported) is None
+        )
+
+        restarted = CanonicalGhostAuthority(enabled=True)
+        restored = restarted.restore(persisted)
+        post_restart_writes: list[Dict[str, Any]] = []
+        restarted.configure(
+            enabled=True,
+            persistence_enabled=True,
+            persist_fn=lambda event: post_restart_writes.append(dict(event)) or True,
+        )
+        restarted_reference = restarted.observe_coordinator_submission(reference)
+        restarted_generic = restarted.observe_coordinator_submission(generic)
+        report = restarted.health_report(now="2026-08-24T16:30:00+00:00")
+        scalp = report["by_mode"]["SCALP"]
+        intraday = report["by_mode"]["INTRADAY_TREND"]
+        counters.update({
+            "matched": int(report["reconciliation"]["exact_id_matches"]),
+            "unmatched_retained": sum(
+                1 for event in persisted
+                if event.get("event_type") == "REFERENCE_UNMATCHED"
+            ),
+            "unresolved": int(report["reconciliation"]["exact_id_unmatched"]),
+            "relinked_after_authority": int(
+                report["reconciliation"]["exact_id_matches"]
+            ),
+            "duplicates_replays_suppressed": (
+                int(authority.report()["duplicate_events"])
+                + int(restarted.report()["duplicate_events"])
+            ),
+            "persistence_errors": int(authority.report()["persistence_errors"]),
+            "restart_errors": max(0, len(persisted) - int(restored)),
+            "mode_isolation_rejected": int(
+                intraday["exact_id_unmatched_count"] > 0
+            ),
+            "instrument_isolation_rejected": int(
+                scalp["exact_id_unmatched_count"] > 1
+            ),
+            "malformed_references_rejected": int(
+                scalp["exact_id_unmatched_count"] > 1
+            ),
+            "unsupported_mode_rejected": int(
+                authority.report()["ignored_noncanonical_events"] > 0
+            ),
+        })
+        counters["wrong_ledger_rejected"] = (
+            counters["mode_isolation_rejected"]
+            + counters["instrument_isolation_rejected"]
+        )
+        checks.update({
+            "replay_suppressed": counters["duplicates_replays_suppressed"] >= 2,
+            "reconciliation_copied": (
+                report["outcomes"]["comparison_count"] == 1
+                and report["outcomes"]["agreement_count"] == 1
+            ),
+            "restart_restore_complete": (
+                counters["restart_errors"] == 0
+                and restarted_reference is not None
+                and restarted_generic is not None
+                and not post_restart_writes
+            ),
+            "strict_link_only": (
+                counters["matched"] == 1
+                and counters["unmatched_retained"] == 4
+                and counters["unresolved"] == 3
+                and counters["relinked_after_authority"] == 1
+                and counters["wrong_ledger_rejected"] == 2
+                and counters["malformed_references_rejected"] == 1
+                and counters["missing_instrument_rejected"] == 2
+                and counters["unsupported_mode_rejected"] == 1
+            ),
+            "persistence_healthy": counters["persistence_errors"] == 0,
+        })
+        return {
+            "ok": all(checks.values()),
+            "status": "PASSED" if all(checks.values()) else "FAILED",
+            "read_only": True,
+            "shadow_only": True,
+            "fixture": "in_memory_exact_id_generic_and_dual_sim",
+            "counters": counters,
+            "checks": checks,
+            "error": None,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "status": "FAILED",
+            "read_only": True,
+            "shadow_only": True,
+            "fixture": "in_memory_exact_id_generic_and_dual_sim",
+            "counters": counters,
+            "checks": checks,
+            "error": str(exc)[:180],
+        }
 
 
 _DEFAULT_AUTHORITY = CanonicalGhostAuthority(enabled=False)

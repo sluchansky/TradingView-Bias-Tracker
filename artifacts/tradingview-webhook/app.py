@@ -85267,6 +85267,17 @@ def route_canonical_evidence_health():
             if _canonical_ghost_evidence is not None
             else {"ok": True, "enabled": False, "reason": "module unavailable"}
         )
+        report["strict_link_verification"] = (
+            _canonical_ghost_authority.run_strict_link_health_verification()
+        )
+        report["strict_link_verification_status"] = (
+            report["strict_link_verification"]["status"]
+        )
+        if (
+            report["strict_link_verification_status"] != "PASSED"
+            and report["health_status"] != "UNAVAILABLE"
+        ):
+            report["health_status"] = "ATTENTION"
         return jsonify(report)
     except Exception as exc:
         return jsonify({

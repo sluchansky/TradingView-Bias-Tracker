@@ -51,3 +51,19 @@ target that looks resolved in health reporting.
 but retain runtime restore validation because historical rows may predate its
 enforcement. Never replace a distinct matched evidence ID for the same
 unmatched identity.
+
+Strict-link health verification must use a fresh local authority with an
+in-memory append callback. Its link predicate is the exact, nonempty
+instrument plus canonical mode, coordinator opportunity, and declared generic
+source identity; absent instrument data is rejected rather than compared as
+equal.
+
+**Why:** A different coordinator ID only proves opportunity isolation, not
+instrument isolation. A runtime health endpoint must prove the real matcher is
+safe without touching durable evidence or trading state.
+
+**How to apply:** Exercise a same-opportunity cross-instrument collision,
+cross-mode and malformed references, blank identities, reference-before-
+authority relinking, and restore-then-replay. Treat the verifier as healthy
+only when restore writes nothing on replay and its local callback receives no
+post-restart duplicate events.

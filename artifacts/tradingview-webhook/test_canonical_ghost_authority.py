@@ -19,6 +19,7 @@ def _record(**overrides):
         "entry": 21000,
         "stop": 20990,
         "targets": (21020,),
+        "instrument": "MNQ",
         "context": {
             "trading_mode": "SCALP",
             "legacy_obs_key": "ghost|MNQ|Long|STRAT|20260823|1",
@@ -188,6 +189,53 @@ def test_reference_anchor_never_crosses_canonical_modes():
     health = authority.health_report(now="2026-08-23T16:00:00+00:00")
     assert health["by_mode"]["SCALP"]["exact_id_match_count"] == 0
     assert health["by_mode"]["INTRADAY_TREND"]["exact_id_unmatched_count"] == 1
+
+
+def test_reference_anchor_never_crosses_instruments_inside_one_coordinator_opportunity():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    authority.observe_coordinator_submission(_record())
+
+    assert authority.observe_coordinator_submission(
+        _record(
+            observation_id="obs_mgc_collision",
+            source_system="dual_mode_sim",
+            source_event_id="SCALP|MGC|collision",
+            instrument="MGC",
+            context={
+                "trading_mode": "SCALP",
+                "legacy_record_id": "SCALP|MGC|collision",
+                "legacy_sim_key": "SCALP|MGC|collision",
+                "legacy_table": "dual_sim_trades",
+                "canonical_authority_id": "ghost|MNQ|Long|STRAT|20260823|1",
+            },
+        )
+    ) is None
+
+    health = authority.health_report(now="2026-08-23T16:00:00+00:00")
+    assert health["by_mode"]["SCALP"]["exact_id_match_count"] == 0
+    assert health["by_mode"]["SCALP"]["exact_id_unmatched_count"] == 1
+
+
+def test_missing_instrument_cannot_create_or_authorize_canonical_links():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    blank_generic = _record(instrument="")
+    blank_reference = _record(
+        observation_id="obs_blank_ref",
+        source_system="dual_mode_sim",
+        source_event_id="SCALP|blank|1",
+        instrument="",
+        context={
+            "trading_mode": "SCALP",
+            "legacy_record_id": "SCALP|blank|1",
+            "legacy_sim_key": "SCALP|blank|1",
+            "legacy_table": "dual_sim_trades",
+            "canonical_authority_id": "ghost|MNQ|Long|STRAT|20260823|1",
+        },
+    )
+
+    assert authority.observe_coordinator_submission(blank_generic) is None
+    assert authority.observe_coordinator_submission(blank_reference) is None
+    assert authority.health_report()["intake_volume"] == 0
 
 
 def test_dual_reference_requires_its_explicit_generic_obs_key():
@@ -512,3 +560,45 @@ def test_health_report_restores_durable_unmatched_exact_id_reference_after_resta
     assert scalp["exact_id_unmatched_count"] == 1
     assert scalp["exact_id_match_coverage"] == 0.0
     assert scalp["exact_id_coverage_scope"] == "append_only_exact_id_reference_events"
+
+
+def test_strict_link_health_fixture_proves_exact_durable_identity_boundaries():
+    """The health fixture is deterministic, shadow-only, and database-free."""
+    first = cga.run_strict_link_health_verification()
+    second = cga.run_strict_link_health_verification()
+
+    assert first == second
+    assert first["ok"] is True
+    assert first["status"] == "PASSED"
+    assert first["read_only"] is True
+    assert first["shadow_only"] is True
+    assert first["fixture"] == "in_memory_exact_id_generic_and_dual_sim"
+    assert first["checks"] == {
+        "reference_retained_before_authority": True,
+        "exact_reference_relinked_after_authority": True,
+        "cross_instrument_reference_rejected": True,
+        "cross_mode_reference_rejected": True,
+        "malformed_reference_rejected": True,
+        "missing_instrument_rejected": True,
+        "unsupported_mode_rejected": True,
+        "replay_suppressed": True,
+        "reconciliation_copied": True,
+        "restart_restore_complete": True,
+        "strict_link_only": True,
+        "persistence_healthy": True,
+    }
+    assert first["counters"] == {
+        "matched": 1,
+        "unmatched_retained": 4,
+        "unresolved": 3,
+        "relinked_after_authority": 1,
+        "wrong_ledger_rejected": 2,
+        "duplicates_replays_suppressed": 5,
+        "persistence_errors": 0,
+        "restart_errors": 0,
+        "mode_isolation_rejected": 1,
+        "instrument_isolation_rejected": 1,
+        "malformed_references_rejected": 1,
+        "missing_instrument_rejected": 2,
+        "unsupported_mode_rejected": 1,
+    }
