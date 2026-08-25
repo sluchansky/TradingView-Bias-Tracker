@@ -8,6 +8,23 @@ export interface FlaskProxyOptions {
   routes: string[];
 }
 
+export const DEFAULT_FLASK_PORT = 8000;
+
+/**
+ * Resolve the live bot port once at the proxy boundary. Hosted deployments
+ * keep the established :8000 default; local dashboard startup sets FLASK_PORT
+ * explicitly so the browser, Express, and Flask processes cannot silently
+ * disagree about which backend owns the chart data.
+ */
+export function resolveFlaskPort(rawPort: string | undefined): number {
+  if (rawPort == null || rawPort.trim() === "") return DEFAULT_FLASK_PORT;
+  const port = Number(rawPort);
+  if (!Number.isInteger(port) || port < 1 || port > 65535) {
+    throw new Error(`Invalid FLASK_PORT value: "${rawPort}"`);
+  }
+  return port;
+}
+
 // Build a Router that forwards a fixed whitelist of paths to a Flask process on
 // localhost:<port>, relaying the raw request body + original content-type so
 // webhook payloads (text/plain, application/json, …) arrive intact. Used twice:

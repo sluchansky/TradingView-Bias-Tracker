@@ -167,6 +167,7 @@ function statusColor(status: string): string {
     case "WARMING":       return T.amber;
     case "NO DATA":       return T.txtMuted;
     case "MARKET CLOSED": return T.purple;
+    case "DISABLED":      return T.txtMuted;
     default:              return T.txtMuted;
   }
 }
@@ -201,7 +202,9 @@ function StatusStrip({
   }
 
   const conn    = data.connection;
-  const status  = conn?.status ?? (data.enabled === false ? "DISCONNECTED" : "NO DATA");
+  const status  = data.enabled === false
+    ? "DISABLED"
+    : (conn?.status ?? "NO DATA");
   const bars    = data.bars ?? [];
   const partial = data.partial_bar;
   const lb      = data.left_brain;
@@ -1004,7 +1007,9 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
 
   // ── Derived display state ─────────────────────────────────────────────────
   const conn       = data?.connection;
-  const status     = conn?.status ?? (data?.enabled === false ? "DISCONNECTED" : "—");
+  const status     = data?.enabled === false
+    ? "DISABLED"
+    : (conn?.status ?? "—");
   const isDisabled = data?.enabled === false;
   const chartFreshness = classifyDatabentoFreshness({
     enabled: data?.enabled === true,
@@ -1146,9 +1151,10 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
               }}>
                 <span style={{ fontSize: 13, color: T.txtMuted }}>DATABENTO FEED DISABLED</span>
                 <span style={{ fontSize: 10, color: T.txtMuted }}>
-                  Set{" "}
-                  <code style={{ fontFamily: T.mono, color: T.cyan }}>DATABENTO_ENABLED=1</code>
-                  {" "}to enable live data
+                  {data?.reason ?? "Live market data is intentionally disabled."}
+                </span>
+                <span style={{ fontSize: 9, color: T.txtMuted }}>
+                  No chart data or overlays are available from this backend.
                 </span>
               </div>
             )}

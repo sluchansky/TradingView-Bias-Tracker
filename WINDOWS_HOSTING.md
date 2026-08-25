@@ -12,15 +12,14 @@ The production bot source is primarily:
 - `artifacts/tradingview-webhook/` — Flask webhook server, market-data engine,
   dashboard routes, research modules, and tests.
 - `artifacts/tradingview-webhook/requirements.txt` — Python dependencies.
-- `artifacts/home/` — optional React/Vite operator frontend.
-- `artifacts/api-server/` — the existing Express proxy and artifact API service.
-  It is required when the React dashboard is run locally because the dashboard's
-  `/api/*` requests must reach the same Flask process as the Databento feed.
+- `artifacts/home/` — React/Vite operator frontend.
+- `artifacts/api-server/` — Express `/api` proxy and artifact API service.
+  The coordinated local dashboard launcher runs this beside Flask so the
+  frontend reaches the same bot process as the hosted app.
 
 The validated source branch is `replit-dev`. For a recovery, check out the
 specific reviewed commit recorded with the backup/validation record, then verify
 the worktree is clean before starting the bot.
-
 ## 1. Install prerequisites
 
 Install these from their official installers:
@@ -137,7 +136,9 @@ only the first `=` and never prints values.
 
 The launcher loads a local `.env` when present, defaults every safety setting to
 the first-boot values above, and refuses to start if a local file attempts to
-enable execution, manual orders, live runner, Databento, or Discord delivery.
+enable execution, manual orders, live runner, or Discord delivery. Databento
+also remains disabled unless an operator passes the explicit
+`-EnableDatabento` switch described below.
 The default local port is 8000. To choose it explicitly:
 
 ```powershell
@@ -174,15 +175,75 @@ http://127.0.0.1:8000/dashboard
 Use the local `DASHBOARD_PASSWORD`. If `DATABENTO_ENABLED=0`, a disabled-data
 response is expected. Do not interpret that as a broker or strategy failure.
 
-## 7. Optional React frontend
 
-The React frontend is an optional Replit artifact. Its `/api/*` calls normally
-go through the Replit Express proxy, and its production configuration is a
-static artifact. Running it on Windows without an equivalent reverse proxy
-requires additional local routing work; do not assume `pnpm dev` alone will
-connect it to Flask.
+## 7. Coordinated React dashboard (recommended local UI)
 
-If the frontend is needed for development:
+The React dashboard must not be started with `pnpm dev` by itself: its `/api/*`
+requests are meant to reach an Express proxy, not Flask directly.
+
+### Release-safe local chart launcher
+
+Use the default local-chart topology when preparing a Windows host:
+
+```powershell
+.\scripts\windows\Start-WindowsDashboard.ps1
+```
+
+It owns Flask on port 8000, the proxy-only Express bridge on port 8080, and
+Vite on port 24319. The browser-facing chart route is
+`http://127.0.0.1:8080/api/main-brain/chart`; it forwards to the same
+launcher-owned Flask process that owns the in-memory Databento bars. The bridge
+does not load database routes or run migrations.
+
+With Databento disabled, the dashboard explicitly reports `DATABENTO FEED DISABLED`;
+this is unavailable market data, not a missing proxy or a
+strategy/broker failure. Chart overlays remain hidden until current data is
+available.
+
+To deliberately enable local market data, provide `DATABENTO_API_KEY` in the
+local environment and pass the explicit switch:
+
+```powershell
+.\scripts\windows\Start-WindowsDashboard.ps1 -EnableDatabento
+```
+
+This enables data ingestion only. It preserves disabled execution, manual
+orders, live runner, Discord delivery, and coordinator fan-out. The launcher
+refuses stale listeners and verifies direct Flask and browser-facing chart
+parity before it opens the browser.
+
+### Flexible development topology
+
+For local development or custom local ports, use the task-specific coordinator:
+
+```powershell
+.\scripts\windows\Start-TradingDashboard.ps1
+```
+
+It starts Flask, the existing Express `/api` service, and Vite together:
+
+```text
+React/Vite UI :5173
+        ↓ /api (Vite local proxy)
+Express proxy :8080
+        ↓ FLASK_PORT=8000
+Flask bot     :8000
+```
+
+For example, all three local ports can be changed together:
+
+```powershell
+.\scripts\windows\Start-TradingDashboard.ps1 -FlaskPort 8100 -ApiPort 8180 -UiPort 5173
+```
+
+To turn on its local feed, pass `-EnableDatabento`; that command requires
+`DATABENTO_API_KEY` and does not enable broker execution.
+
+Both launchers require free ports, refuse a deployment environment that could
+enable Discord, and terminate the child process trees they start. Use
+`-NoBrowser` when launching from automation.
+
+Install frontend packages once before either launcher:
 
 ```powershell
 corepack enable
@@ -191,46 +252,6 @@ pnpm install --frozen-lockfile
 pnpm --filter @workspace/home run typecheck
 pnpm --filter @workspace/home run build
 ```
-
-For the React dashboard, the repository now includes one coordinated local
-launcher. It keeps the Flask/Databento process on port 8000, builds and starts
-the existing Express `/api` proxy on port 8080, and starts Vite on port 24319
-with a local `/api` bridge:
-
-```powershell
-.\scripts\windows\Start-WindowsDashboard.ps1 -EnableDatabento
-```
-
-`-EnableDatabento` is deliberate: it enables market-data ingestion only. The
-launcher still enforces `EXECUTION_MODE=disabled`, `MANUAL_ORDER_ENABLED=0`,
-`LIVE_RUNNER_ENABLED=0`, `DISCORD_LIVE=0`, `DISCORD_LIVE_ENABLED=0`, and
-`REPLIT_DEPLOYMENT=0`, and `CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED=0`.
-Without `-EnableDatabento`, the launcher defaults the feed off and reports the
-truthful disabled chart state.
-The launcher refuses to adopt any process already listening on ports 8000 or
-8080. Stop an existing copy first, then use this command so the launcher owns
-the exact safe Flask process and its in-memory chart cache. The local Express
-bridge is proxy-only: it reuses the established Flask proxy/auth middleware but
-does not import database routes or run migrations. With Databento enabled,
-startup verifies that direct Flask and
-browser-facing `/api/main-brain/chart` return matching fresh MNQ bars before
-opening the browser.
-
-Required for the live-data command:
-
-- `.venv` created as described above
-- Node.js LTS and pnpm
-- `DATABENTO_API_KEY` and `DASHBOARD_PASSWORD` in the local `.env`
-- `DATABENTO_ENABLED=1` may be placed in `.env` instead of using the switch,
-  but the switch is the recommended explicit command
-- ports 8000, 8080, and 24319 must be free before startup
-
-Use `-NoBrowser` to start the same topology without opening a browser. The
-direct chart source is
-`http://127.0.0.1:8000/main-brain/chart`; the browser-facing chart is
-`http://127.0.0.1:8080/api/main-brain/chart`, and the dashboard is
-`http://127.0.0.1:24319/`.
-
 ## 8. Stop and restart
 
 Stop the foreground bot with `Ctrl+C`. Restart it with the same command:
@@ -253,16 +274,16 @@ settings are verified:
 2. Store secrets in protected Windows environment variables or a protected
    service secret store, not in the repository.
 3. Use Task Scheduler or a Windows service wrapper to run
-   `scripts\windows\Start-WindowsDashboard.ps1 -EnableDatabento` when the local
-   React dashboard is required. This keeps the Flask, Express, and Vite
-   processes on their expected ports and stops only processes it started.
+   `scripts\windows\Start-WindowsDashboard.ps1` for the release-safe local
+   chart, `Start-TradingDashboard.ps1` for the flexible development topology,
+   or `Start-TradingBot.ps1` for a Flask-only host. Do not schedule multiple
+   copies against the same ports or webhook endpoints.
 4. Configure **At startup**, **Run whether user is logged on or not**, restart
    on failure, and write logs outside the Git working tree.
 5. Test a controlled stop/start and confirm `/ping` before allowing any
    external webhook traffic.
 
 Do not enable automatic live execution as part of startup setup.
-
 ## Replit-specific dependencies and blockers
 
 The Flask bot itself can run locally, but the following current features are

@@ -2,6 +2,7 @@
 param(
     [ValidateRange(1, 65535)]
     [int]$Port = 8000,
+    [switch]$EnableDatabento,
     [switch]$SkipEnvFile
 )
 
@@ -18,6 +19,10 @@ if (-not $SkipEnvFile) {
     Import-LocalEnv -Path (Join-Path $repoRoot ".env")
 }
 
+if ([Environment]::GetEnvironmentVariable("REPLIT_DEPLOYMENT", "Process") -eq "1") {
+    throw "Refusing to start: REPLIT_DEPLOYMENT=1 can enable Discord delivery on this local launcher."
+}
+
 $safeDefaults = @{
     "EXECUTION_MODE" = "disabled"
     "DATABENTO_ENABLED" = "0"
@@ -32,9 +37,23 @@ foreach ($entry in $safeDefaults.GetEnumerator()) {
     }
 }
 
+# Market data is opt-in even for a local dashboard. Requiring both the
+# explicit switch and a configured provider key prevents an accidental .env
+# edit from turning the feed on. This never changes the execution safeguards.
+if ($EnableDatabento) {
+    if (-not [Environment]::GetEnvironmentVariable("DATABENTO_API_KEY", "Process")) {
+        throw "Refusing to start with -EnableDatabento: DATABENTO_API_KEY is not configured."
+    }
+    [Environment]::SetEnvironmentVariable("DATABENTO_ENABLED", "1", "Process")
+}
+
 foreach ($entry in $safeDefaults.GetEnumerator()) {
-    if ([Environment]::GetEnvironmentVariable($entry.Key, "Process") -ne $entry.Value) {
-        throw "Refusing to start: $($entry.Key) must be $($entry.Value) for this safe launcher."
+    $expected = $entry.Value
+    if ($EnableDatabento -and $entry.Key -eq "DATABENTO_ENABLED") {
+        $expected = "1"
+    }
+    if ([Environment]::GetEnvironmentVariable($entry.Key, "Process") -ne $expected) {
+        throw "Refusing to start: $($entry.Key) must be $expected for this safe launcher."
     }
 }
 

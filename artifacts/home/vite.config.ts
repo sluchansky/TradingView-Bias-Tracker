@@ -22,11 +22,15 @@ const basePath = process.env.BASE_PATH ?? "/";
 // Windows Vite server needs the same path bridge explicitly so the browser
 // talks to the Express proxy rather than asking Vite for an SPA fallback.
 const localApiProxyTarget = process.env.LOCAL_API_PROXY_TARGET ?? "http://127.0.0.1:8080";
-const localApiProxy = process.env.LOCAL_API_PROXY === "1"
+const localApiProxyEnabled =
+  process.env.LOCAL_API_PROXY === "1" ||
+  process.env.LOCAL_API_PROXY_TARGET != null;
+const localApiProxy = localApiProxyEnabled
   ? {
       "/api": {
         target: localApiProxyTarget,
         changeOrigin: false,
+        secure: false,
       },
     }
   : undefined;
