@@ -32627,44 +32627,40 @@ def _dominant_direction(outlook: dict) -> str:
 def _fvg_bar_close(inst: str, price: float) -> None:
     """Feed the FVG Engine and Sequence Engine on every Databento 1m bar close.
     Shadow/display-only — NEVER touches gate, scoring, sizing, or execution."""
-    def _run():
-        try:
-            import fvg_engine as _fvg                           # noqa: PLC0415
-            import fvg_sequence_engine as _fse                  # noqa: PLC0415
-            from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
-            bars = list(DATABENTO_BARS_BY_INST.get(inst, []))
-            if len(bars) >= 3:
-                _fvg.process_bar_close(inst, bars)
-                zones = _fvg.get_zones(inst, include_terminal=True)
-                # Safe reads — CVD_BY_TICKER and ALERT_HISTORY are module globals;
-                # list() snapshot of ALERT_HISTORY is atomic under the GIL.
+    # DatabentoBrain owns a bounded, ordered observer worker.  Do not create a
+    # thread per bar here: that unbounded fan-out was able to outrun the feed
+    # worker and hide the actual downstream pressure.
+    try:
+        import fvg_engine as _fvg                           # noqa: PLC0415
+        import fvg_sequence_engine as _fse                  # noqa: PLC0415
+        from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
+        bars = list(DATABENTO_BARS_BY_INST.get(inst, []))
+        if len(bars) >= 3:
+            _fvg.process_bar_close(inst, bars)
+            zones = _fvg.get_zones(inst, include_terminal=True)
+            try:
+                cvd_snap    = CVD_BY_TICKER.get(inst)
+                alerts_snap = list(ALERT_HISTORY)
+            except Exception:
+                cvd_snap    = None
+                alerts_snap = []
+            _fse.process_bar_close(inst, bars, zones,
+                                   cvd=cvd_snap, alert_history=alerts_snap)
+            if "_GHOST_RESEARCH_ENGINE" in globals():
                 try:
-                    cvd_snap    = CVD_BY_TICKER.get(inst)
-                    alerts_snap = list(ALERT_HISTORY)
-                except Exception:
-                    cvd_snap    = None
-                    alerts_snap = []
-                _fse.process_bar_close(inst, bars, zones,
-                                       cvd=cvd_snap, alert_history=alerts_snap)
-                # ── Phase 4: Ghost Research Engine (FVG_REVISIT) ─────────────
-                # Fail-open: any exception caught internally in on_fvg_bar_close.
-                # SAFETY: never calls broker path, never touches gate/scoring/sizing.
-                if "_GHOST_RESEARCH_ENGINE" in globals():
+                    _gre = globals()["_GHOST_RESEARCH_ENGINE"]
+                    _last_bar = bars[-1] if bars else {}
+                    _can: dict = {}
                     try:
-                        _gre = globals()["_GHOST_RESEARCH_ENGINE"]
-                        _last_bar = bars[-1] if bars else {}
-                        _can: dict = {}
-                        try:
-                            from databento_brain import CANONICAL_BY_INST as _DCABI  # noqa: PLC0415
-                            _can = dict(_DCABI.get(inst) or {})
-                        except Exception:
-                            pass
-                        _gre.on_fvg_bar_close(inst, zones, _last_bar, price, _can)
-                    except Exception as _gre_fvg_exc:
-                        logger.debug("GRE FVG hook (%s): %s", inst, _gre_fvg_exc)
-        except Exception as _fvg_exc:
-            logger.debug("FVG bar-close (%s): %s", inst, _fvg_exc)
-    threading.Thread(target=_run, daemon=True, name=f"fvg-scan-{inst}").start()
+                        from databento_brain import CANONICAL_BY_INST as _DCABI  # noqa: PLC0415
+                        _can = dict(_DCABI.get(inst) or {})
+                    except Exception:
+                        pass
+                    _gre.on_fvg_bar_close(inst, zones, _last_bar, price, _can)
+                except Exception as _gre_fvg_exc:
+                    logger.debug("GRE FVG hook (%s): %s", inst, _gre_fvg_exc)
+    except Exception as _fvg_exc:
+        logger.debug("FVG bar-close (%s): %s", inst, _fvg_exc)
 
 
 def _orb_bar_close(inst: str, price: float) -> None:

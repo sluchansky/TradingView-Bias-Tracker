@@ -67,6 +67,13 @@ TOP_OF_BOOK_HISTORY_SAMPLE_S = max(0.25, float(os.environ.get("TOP_OF_BOOK_HISTO
 RECORD_QUEUE_MAX = max(64, int(os.environ.get("DATABENTO_RECORD_QUEUE_MAX", "4096")))
 RECORD_QUEUE_DELAY_S = max(1.0, float(os.environ.get("DATABENTO_RECORD_QUEUE_DELAY_S", "5")))
 RECORD_QUEUE_STALE_S = max(RECORD_QUEUE_DELAY_S, float(os.environ.get("DATABENTO_RECORD_QUEUE_STALE_S", "120")))
+# Post-state observers are not allowed to hold the authoritative record worker.
+# This queue is deliberately bounded: losing an observer handoff is a health
+# failure, never a reason to process an old snapshot as current.
+DOWNSTREAM_QUEUE_MAX = max(16, int(os.environ.get("DATABENTO_DOWNSTREAM_QUEUE_MAX", "256")))
+DOWNSTREAM_STAGE_DELAY_S = max(
+    0.1, float(os.environ.get("DATABENTO_DOWNSTREAM_STAGE_DELAY_S", "2"))
+)
 # Native structure needs enough *closed* bars to confirm pivots, sweeps,
 # confirmation volume, ATR, and RVOL without inventing a single candle.
 STRUCTURE_WARMUP_BARS = max(
@@ -347,6 +354,29 @@ DATABENTO_STATUS: dict[str, Any] = {
         "worker":          "stopped",
         "reset_at":        None,
     },
+    "transport": {
+        "sdk_queue_pressure": 0,
+        "sdk_queue_full": 0,
+        "record_loss": 0,
+        "last_pressure_at": None,
+    },
+    "downstream": {
+        "max_depth": DOWNSTREAM_QUEUE_MAX,
+        "depth": 0,
+        "enqueued": 0,
+        "processed": 0,
+        "dropped": 0,
+        "unhealthy": False,
+        "slowest_stage": None,
+        "slowest_stage_ms": 0.0,
+        "last_error": None,
+    },
+    "session": {
+        "generation": 0,
+        "state": "DISCONNECTED",
+        "fenced_records": 0,
+    },
+    "partial_bars": {},
     "structure_warmup": {
         inst: {
             "state": "WARMING_UP",
@@ -372,6 +402,13 @@ def get_databento_status_snapshot() -> dict[str, Any]:
     """Return a JSON-safe copy of live telemetry without exposing mutable stores."""
     status = dict(DATABENTO_STATUS)
     status["queue"] = dict(DATABENTO_STATUS.get("queue") or {})
+    status["transport"] = dict(DATABENTO_STATUS.get("transport") or {})
+    status["downstream"] = dict(DATABENTO_STATUS.get("downstream") or {})
+    status["session"] = dict(DATABENTO_STATUS.get("session") or {})
+    status["partial_bars"] = {
+        inst: dict(values or {})
+        for inst, values in (DATABENTO_STATUS.get("partial_bars") or {}).items()
+    }
     status["order_book"] = dict(DATABENTO_STATUS.get("order_book") or {})
     status["structure_warmup"] = {
         inst: dict(values or {})
@@ -514,6 +551,9 @@ class DatabentoBrain:
         self._record_queue: queue.Queue | None = None
         self._record_worker: threading.Thread | None = None
         self._record_worker_stop: threading.Event | None = None
+        self._downstream_queue: queue.Queue | None = None
+        self._downstream_worker: threading.Thread | None = None
+        self._downstream_stop: threading.Event | None = None
         self._dispatch_generation = 0
         self._active_dispatch_generation = 0
         self._queue_depth_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
@@ -526,6 +566,10 @@ class DatabentoBrain:
         self._last_enqueued_event: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._last_processed_at: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._last_processed_event: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
+        self._downstream_depth_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._downstream_dropped_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._downstream_stage_ms: dict[str, float] = {}
+        self._downstream_unhealthy_by_inst: dict[str, bool] = {i: False for i in DB_SYMBOLS}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -776,9 +820,13 @@ class DatabentoBrain:
         event_age = max(0.0, now - last_processed_event) if last_processed_event is not None else None
         dropped = self._queue_dropped_by_inst.get(inst, 0)
         worker_alive = bool(self._record_worker and self._record_worker.is_alive())
+        downstream_unhealthy = self._downstream_unhealthy_by_inst.get(inst, False)
         if dropped:
             freshness = "UNAVAILABLE"
             reason = "records_dropped"
+        elif downstream_unhealthy:
+            freshness = "UNAVAILABLE"
+            reason = "downstream_handoff_unhealthy"
         elif last_processed_event is None:
             freshness = "UNAVAILABLE"
             reason = "no_processed_records"
@@ -806,6 +854,9 @@ class DatabentoBrain:
             "freshness": freshness,
             "unavailable_reason": reason,
             "worker_alive": worker_alive,
+            "downstream_queue_depth": self._downstream_depth_by_inst.get(inst, 0),
+            "downstream_dropped": self._downstream_dropped_by_inst.get(inst, 0),
+            "downstream_unhealthy": downstream_unhealthy,
         }
 
     def _publish_queue_telemetry(self, inst: str | None = None) -> None:
@@ -821,6 +872,21 @@ class DatabentoBrain:
                 "dropped": sum(self._queue_dropped_by_inst.values()),
                 "unsupported": sum(self._queue_unsupported_by_inst.values()) + self._queue_unsupported_global,
                 "worker": "running" if self._record_worker and self._record_worker.is_alive() else "stopped",
+            })
+            downstream = DATABENTO_STATUS["downstream"]
+            downstream.update({
+                "max_depth": DOWNSTREAM_QUEUE_MAX,
+                "depth": sum(self._downstream_depth_by_inst.values()),
+                "dropped": sum(self._downstream_dropped_by_inst.values()),
+                "unhealthy": any(self._downstream_unhealthy_by_inst.values()),
+                "slowest_stage": (
+                    max(self._downstream_stage_ms, key=self._downstream_stage_ms.get)
+                    if self._downstream_stage_ms else None
+                ),
+                "slowest_stage_ms": round(
+                    max(self._downstream_stage_ms.values())
+                    if self._downstream_stage_ms else 0.0, 3
+                ),
             })
             for key in instruments:
                 existing = dict(DATABENTO_STATUS["instruments"].get(key) or {})
@@ -838,6 +904,8 @@ class DatabentoBrain:
             self._active_dispatch_generation = generation
             self._record_queue = queue.Queue(maxsize=RECORD_QUEUE_MAX)
             self._record_worker_stop = threading.Event()
+            self._downstream_queue = queue.Queue(maxsize=DOWNSTREAM_QUEUE_MAX)
+            self._downstream_stop = threading.Event()
             self._queue_depth_by_inst = {i: 0 for i in DB_SYMBOLS}
             self._queue_enqueued_by_inst = {i: 0 for i in DB_SYMBOLS}
             self._queue_processed_by_inst = {i: 0 for i in DB_SYMBOLS}
@@ -848,7 +916,18 @@ class DatabentoBrain:
             self._last_enqueued_event = {i: None for i in DB_SYMBOLS}
             self._last_processed_at = {i: None for i in DB_SYMBOLS}
             self._last_processed_event = {i: None for i in DB_SYMBOLS}
+            self._downstream_depth_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._downstream_dropped_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._downstream_stage_ms = {}
+            self._downstream_unhealthy_by_inst = {i: False for i in DB_SYMBOLS}
             DATABENTO_STATUS["queue"]["reset_at"] = datetime.now(timezone.utc).isoformat()
+            DATABENTO_STATUS["downstream"].update({
+                "enqueued": 0, "processed": 0, "dropped": 0, "unhealthy": False,
+                "slowest_stage": None, "slowest_stage_ms": 0.0, "last_error": None,
+            })
+            DATABENTO_STATUS["session"].update({
+                "generation": generation, "state": "LIVE", "fenced_records": 0,
+            })
             worker = threading.Thread(
                 target=self._record_worker_loop,
                 args=(self._record_queue, self._record_worker_stop, generation),
@@ -857,6 +936,14 @@ class DatabentoBrain:
             )
             self._record_worker = worker
             worker.start()
+            downstream_worker = threading.Thread(
+                target=self._downstream_worker_loop,
+                args=(self._downstream_queue, self._downstream_stop, generation),
+                daemon=True,
+                name="databento-downstream-worker",
+            )
+            self._downstream_worker = downstream_worker
+            downstream_worker.start()
         self._publish_queue_telemetry()
 
     def _stop_record_dispatcher(self) -> None:
@@ -865,8 +952,12 @@ class DatabentoBrain:
             worker = self._record_worker
             stop = self._record_worker_stop
             record_queue = self._record_queue
+            downstream_stop = self._downstream_stop
+            downstream_queue = self._downstream_queue
             if stop is not None:
                 stop.set()
+            if downstream_stop is not None:
+                downstream_stop.set()
             while record_queue is not None:
                 try:
                     _, inst, _, _ = record_queue.get_nowait()
@@ -877,6 +968,19 @@ class DatabentoBrain:
                     self._queue_dropped_by_inst[inst] += 1
                 record_queue.task_done()
             DATABENTO_STATUS["queue"]["worker"] = "stopping"
+            if downstream_queue is not None:
+                while True:
+                    try:
+                        _, inst, _, _ = downstream_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                    if inst in DB_SYMBOLS:
+                        self._downstream_depth_by_inst[inst] = max(
+                            0, self._downstream_depth_by_inst[inst] - 1
+                        )
+                        self._downstream_dropped_by_inst[inst] += 1
+                    downstream_queue.task_done()
+                DATABENTO_STATUS["session"]["state"] = "FENCING"
         # Serialize shutdown against the actual record handler. If a callback is
         # currently running, wait for that one already-started record to finish
         # before fencing the session; no subsequent queued record can enter.
@@ -891,6 +995,21 @@ class DatabentoBrain:
                     logger.warning(
                         "DatabentoBrain: waiting for in-flight record handler before reconnect"
                     )
+        downstream_worker = self._downstream_worker
+        if downstream_worker is not None:
+            warned = False
+            while downstream_worker.is_alive():
+                downstream_worker.join(timeout=5)
+                if downstream_worker.is_alive() and not warned:
+                    warned = True
+                    logger.warning(
+                        "DatabentoBrain: waiting for in-flight downstream observer before reconnect"
+                    )
+        with self._dispatch_lock:
+            DATABENTO_STATUS["session"]["state"] = "DISCONNECTED"
+            DATABENTO_STATUS["session"]["fenced_records"] = (
+                sum(self._downstream_dropped_by_inst.values())
+            )
         self._publish_queue_telemetry()
 
     def _dispatch_record(self, rec: Any) -> None:
@@ -927,6 +1046,12 @@ class DatabentoBrain:
                         record_queue.put_nowait((rec, inst, kind, event_epoch))
                     except queue.Full:
                         self._queue_dropped_by_inst[inst] += 1
+                        DATABENTO_STATUS["transport"]["record_loss"] = (
+                            int(DATABENTO_STATUS["transport"].get("record_loss") or 0) + 1
+                        )
+                        DATABENTO_STATUS["transport"]["last_pressure_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
                         if self._queue_dropped_by_inst[inst] == 1:
                             logger.warning(
                                 "DatabentoBrain: bounded record queue saturated; dropping new %s records for %s",
@@ -939,6 +1064,66 @@ class DatabentoBrain:
         self._publish_queue_telemetry(inst)
         if unsupported:
             return
+
+    def _enqueue_downstream(self, fn, inst: str, price: float, generation: int) -> None:
+        """Handoff one post-state observer without blocking authoritative intake."""
+        item = (fn, inst, price, generation)
+        with self._dispatch_lock:
+            downstream_queue = self._downstream_queue
+            if downstream_queue is None:
+                return
+            try:
+                downstream_queue.put_nowait(item)
+            except queue.Full:
+                self._downstream_dropped_by_inst[inst] += 1
+                self._downstream_unhealthy_by_inst[inst] = True
+                DATABENTO_STATUS["transport"]["last_pressure_at"] = (
+                    datetime.now(timezone.utc).isoformat()
+                )
+                DATABENTO_STATUS["downstream"]["last_error"] = "handoff_queue_full"
+                logger.error(
+                    "DatabentoBrain: downstream handoff saturated; "
+                    "marking %s UNAVAILABLE (stage=%s)", inst, getattr(fn, "__name__", "callback")
+                )
+                return
+            self._downstream_depth_by_inst[inst] += 1
+            DATABENTO_STATUS["downstream"]["enqueued"] = (
+                int(DATABENTO_STATUS["downstream"].get("enqueued") or 0) + 1
+            )
+
+    def _downstream_worker_loop(self, downstream_queue, stop, generation) -> None:
+        """Run observers in order, fenced to the live session that queued them."""
+        while not stop.is_set():
+            try:
+                fn, inst, price, item_generation = downstream_queue.get(timeout=0.25)
+            except queue.Empty:
+                continue
+            started = time.monotonic()
+            try:
+                if item_generation != self._active_dispatch_generation or stop.is_set():
+                    continue
+                fn(inst, price)
+                elapsed_ms = (time.monotonic() - started) * 1000.0
+                name = getattr(fn, "__name__", fn.__class__.__name__)
+                with self._dispatch_lock:
+                    self._downstream_stage_ms[name] = max(
+                        elapsed_ms, self._downstream_stage_ms.get(name, 0.0)
+                    )
+                    if elapsed_ms / 1000.0 > DOWNSTREAM_STAGE_DELAY_S:
+                        DATABENTO_STATUS["downstream"]["last_error"] = "slow_stage"
+                    DATABENTO_STATUS["downstream"]["processed"] = (
+                        int(DATABENTO_STATUS["downstream"].get("processed") or 0) + 1
+                    )
+            except Exception as exc:
+                with self._dispatch_lock:
+                    self._downstream_unhealthy_by_inst[inst] = True
+                    DATABENTO_STATUS["downstream"]["last_error"] = str(exc)[:200]
+            finally:
+                with self._dispatch_lock:
+                    self._downstream_depth_by_inst[inst] = max(
+                        0, self._downstream_depth_by_inst[inst] - 1
+                    )
+                downstream_queue.task_done()
 
     def _record_worker_loop(
         self,
@@ -962,7 +1147,9 @@ class DatabentoBrain:
                     # mutate bars, indicators, structure, or callbacks.
                     if stop.is_set() or generation != self._active_dispatch_generation:
                         continue
-                    if kind == "mbp1":
+                    if kind == "bar_close":
+                        self._on_bar_close(inst, rec)
+                    elif kind == "mbp1":
                         self._on_mbp1(rec)
                     else:
                         self._on_trade(rec)
@@ -1054,6 +1241,20 @@ class DatabentoBrain:
                 DATABENTO_STATUS["connected"] = False
                 DATABENTO_STATUS["error"]     = str(exc)
                 DATABENTO_STATUS["reconnects"] += 1
+                DATABENTO_STATUS["session"]["state"] = "RECONNECTING"
+                if any(token in str(exc).lower() for token in (
+                    "queue", "backpressure", "buffer", "overflow",
+                )):
+                    transport = DATABENTO_STATUS["transport"]
+                    transport["sdk_queue_pressure"] = (
+                        int(transport.get("sdk_queue_pressure") or 0) + 1
+                    )
+                    transport["sdk_queue_full"] = (
+                        int(transport.get("sdk_queue_full") or 0) + 1
+                    )
+                    transport["last_pressure_at"] = datetime.now(
+                        timezone.utc
+                    ).isoformat()
                 logger.warning(
                     "DatabentoBrain: feed error — %s  (reconnect in %ds)",
                     exc, self.RECONNECT_DELAY,
@@ -1131,6 +1332,7 @@ class DatabentoBrain:
                 )
         self._start_record_dispatcher()
         DATABENTO_STATUS["connected"] = True
+        DATABENTO_STATUS["session"]["state"] = "LIVE"
         logger.info(
             "DatabentoBrain: connected ✓  streaming %s", list(DB_SYMBOLS.values())
         )
@@ -1442,6 +1644,17 @@ class DatabentoBrain:
             DATABENTO_PARTIAL_BY_INST[inst] = (
                 dict(self._partial[inst]) if self._partial[inst] is not None else None
             )
+            if self._partial[inst] is not None:
+                partial = self._partial[inst]
+                DATABENTO_STATUS.setdefault("partial_bars", {})[inst] = {
+                    "state": "OPEN",
+                    "bar_timestamp": self._iso_epoch(partial.get("ts")),
+                    "source_timestamp": self._iso_epoch(
+                        partial.get("source_event_ts")
+                    ),
+                    "age_s": round(max(0.0, time.time() - partial["ts"]), 3),
+                    "cause": "market_silence",
+                }
         # Call _on_bar_close OUTSIDE the lock — it runs detectors and callbacks
         # that take meaningful time and must not block the flush thread.
         if to_close is not None:
@@ -1478,14 +1691,51 @@ class DatabentoBrain:
                 if p is not None and (now_unix - p["ts"]) > self.PARTIAL_STALE_S:
                     # Clear inside the lock so _tick_bar won't double-close it.
                     self._partial[inst] = None
+                    DATABENTO_PARTIAL_BY_INST[inst] = None
                     to_flush.append((inst, p))
-        # Fire _on_bar_close outside the lock (runs detectors + callbacks).
+        # Submit finalization to the one ordered state worker.  The timer must
+        # never become a second state-mutating consumer during a quiet market.
         for inst, p in to_flush:
             try:
-                self._on_bar_close(inst, p)
+                with self._dispatch_lock:
+                    record_queue = self._record_queue
+                    if record_queue is None:
+                        self._queue_dropped_by_inst[inst] += 1
+                        self._downstream_unhealthy_by_inst[inst] = True
+                        continue
+                    try:
+                        record_queue.put_nowait((p, inst, "bar_close", p.get("source_event_ts")))
+                        self._queue_depth_by_inst[inst] += 1
+                        self._queue_enqueued_by_inst[inst] += 1
+                    except queue.Full:
+                        self._queue_dropped_by_inst[inst] += 1
+                        DATABENTO_STATUS["transport"]["record_loss"] = (
+                            int(DATABENTO_STATUS["transport"].get("record_loss") or 0) + 1
+                        )
+                        DATABENTO_STATUS["transport"]["last_pressure_at"] = (
+                            datetime.now(timezone.utc).isoformat()
+                        )
+                        logger.error(
+                            "DatabentoBrain: partial-bar finalization queue saturated for %s",
+                            inst,
+                        )
+                        continue
+                DATABENTO_STATUS.setdefault("partial_bars", {})[inst] = {
+                    "state": "QUEUED_FOR_CLOSE",
+                    "bar_timestamp": self._iso_epoch(p.get("ts")),
+                    "source_timestamp": self._iso_epoch(
+                        p.get("source_event_ts")
+                    ),
+                    "age_s": round(max(0.0, now_unix - p["ts"]), 3),
+                    "cause": (
+                        "local_processing_debt"
+                        if self._queue_depth_by_inst.get(inst, 0) > 0
+                        else "market_silence"
+                    ),
+                }
                 logger.info(
                     "DatabentoBrain: flushed stale partial bar for %s "
-                    "(bar_ts=%s, age=%.0fs)",
+                    "into ordered state path (bar_ts=%s, age=%.0fs)",
                     inst,
                     datetime.utcfromtimestamp(p["ts"]).strftime("%H:%M"),
                     now_unix - p["ts"],
@@ -1680,10 +1930,26 @@ class DatabentoBrain:
         # bar were a newly actionable live event.
         if not replay:
             for _cb in self._bar_close_callbacks:
-                try:
-                    _cb(inst, bars[-1]["close"])
-                except Exception:
-                    pass
+                # Observers can include database writes and analysis.  They are
+                # queued after all authoritative state/detectors are complete,
+                # so none can delay the next market record.
+                with self._dispatch_lock:
+                    downstream_ready = (
+                        self._downstream_queue is not None
+                        and self._record_worker is not None
+                    )
+                    generation = self._active_dispatch_generation
+                if downstream_ready:
+                    self._enqueue_downstream(
+                        _cb, inst, bars[-1]["close"], generation
+                    )
+                else:
+                    # Preserve direct/unit-test behavior before a live session
+                    # exists; production always has the bounded worker.
+                    try:
+                        _cb(inst, bars[-1]["close"])
+                    except Exception:
+                        pass
 
     # ── Structure detection ───────────────────────────────────────────────────
 
