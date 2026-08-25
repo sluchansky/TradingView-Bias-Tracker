@@ -4,6 +4,7 @@
 - [INTRADAY_TREND native engine](intraday-trend-native-engine.md) — 6 native IT helpers + analyze_intraday_trend(); BLOCKED_EXTENSION/OPPOSED_1H status codes; 5 ghost_obs columns; 109 tests; ghost/shadow only.
 - [Native structure startup warm-up](native-structure-startup-warmup.md) — replay only validated closed Databento OHLCV before live subscription; suppress historical alert fan-out so startup bars never act like new evidence.
 - [Native structure confirmed-pivot breaks](native-structure-confirmed-pivot-breaks.md) — BOS/CHOCH must compare against previously confirmed swing levels, never the still-confirming pivot window.
+- [Windows local dashboard topology](windows-local-dashboard-topology.md) — local chart must own Flask/proxy processes and use a proxy-only bridge so it never serves a different cache or mutates DB state.
 - [Authoritative verdict history](authoritative-verdict-history.md) — final SCALP/IT snapshots are async, chained, append-only observations; structured live fields must be reduced to DB-safe scalars.
 - [Verdict-history pending chain](verdict-history-pending-chain.md) — a failed queued head cancels descendants and rewinds to the last durable link; never persist dangling chains.
 

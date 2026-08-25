@@ -18,6 +18,19 @@ if (rawPort && (Number.isNaN(port) || port <= 0)) {
 // This artifact is always served at the root path; default to "/" so the
 // production build never depends on BASE_PATH being present in the env.
 const basePath = process.env.BASE_PATH ?? "/";
+// Replit's artifact router forwards /api at the deployment boundary. A local
+// Windows Vite server needs the same path bridge explicitly so the browser
+// talks to the Express proxy rather than asking Vite for an SPA fallback.
+const localApiProxyTarget = process.env.LOCAL_API_PROXY_TARGET ?? "http://127.0.0.1:8080";
+const localApiProxy = process.env.LOCAL_API_PROXY === "1"
+  ? {
+      "/api": {
+        target: localApiProxyTarget,
+        changeOrigin: false,
+      },
+    }
+  : undefined;
+const localDashboardHost = process.env.LOCAL_DASHBOARD_HOST ?? "0.0.0.0";
 
 export default defineConfig({
   base: basePath,
@@ -54,15 +67,17 @@ export default defineConfig({
   server: {
     port,
     strictPort: true,
-    host: "0.0.0.0",
+    host: localDashboardHost,
     allowedHosts: true,
+    ...(localApiProxy ? { proxy: localApiProxy } : {}),
     fs: {
       strict: true,
     },
   },
   preview: {
     port,
-    host: "0.0.0.0",
+    host: localDashboardHost,
     allowedHosts: true,
+    ...(localApiProxy ? { proxy: localApiProxy } : {}),
   },
 });
