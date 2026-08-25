@@ -1,0 +1,286 @@
+//@version=6
+indicator("Futures Price Action Toolkit", shorttitle="PA Toolkit", overlay=true,
+     max_boxes_count=200, max_labels_count=200)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Confirmed price-action structure for futures charts.
+// This is an indicator only: it does not place trades or define a backtest.
+// ─────────────────────────────────────────────────────────────────────────────
+
+groupStructure = "Market Structure"
+pivotLen = input.int(3, "Swing confirmation bars", minval=1, maxval=20,
+     group=groupStructure)
+showSwings = input.bool(true, "Show confirmed swing points", group=groupStructure)
+showStructure = input.bool(true, "Show BOS / CHOCH labels", group=groupStructure)
+
+groupZones = "Supply / Demand Zones"
+showZones = input.bool(true, "Show zones", group=groupZones)
+maxZones = input.int(8, "Maximum zones per side", minval=1, maxval=30,
+     group=groupZones)
+zoneExtendBars = input.int(80, "Zone extension bars", minval=5, maxval=500,
+     group=groupZones)
+removeMitigated = input.bool(true, "Remove fully broken zones", group=groupZones)
+
+groupFvg = "Fair Value Gaps"
+showFvg = input.bool(true, "Show FVGs", group=groupFvg)
+maxFvg = input.int(12, "Maximum FVGs per side", minval=1, maxval=40,
+     group=groupFvg)
+fvgExtendBars = input.int(40, "FVG extension bars", minval=5, maxval=300,
+     group=groupFvg)
+removeFilledFvg = input.bool(true, "Remove fully filled FVGs", group=groupFvg)
+
+groupLevels = "Support / Resistance Levels"
+showSwingLevels = input.bool(true, "Show latest swing levels", group=groupLevels)
+showPriorDay = input.bool(true, "Show prior-day high / low", group=groupLevels)
+showSession = input.bool(true, "Show session high / low", group=groupLevels)
+rthSession = input.session("0830-1500", "Session", group=groupLevels)
+
+groupStyle = "Style"
+bullColor = input.color(color.rgb(24, 163, 112), "Bullish color", group=groupStyle)
+bearColor = input.color(color.rgb(220, 76, 76), "Bearish color", group=groupStyle)
+neutralColor = input.color(color.rgb(120, 130, 145), "Neutral color", group=groupStyle)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Confirmed swings and state-aware BOS / CHOCH
+// ─────────────────────────────────────────────────────────────────────────────
+
+float confirmedHigh = ta.pivothigh(high, pivotLen, pivotLen)
+float confirmedLow = ta.pivotlow(low, pivotLen, pivotLen)
+int confirmedHighBar = bar_index - pivotLen
+int confirmedLowBar = bar_index - pivotLen
+
+var float lastSwingHigh = na
+var float lastSwingLow = na
+var int lastSwingHighBar = na
+var int lastSwingLowBar = na
+var int lastBrokenHighBar = na
+var int lastBrokenLowBar = na
+var int structureDirection = 0
+
+if not na(confirmedHigh)
+    lastSwingHigh := confirmedHigh
+    lastSwingHighBar := confirmedHighBar
+
+if not na(confirmedLow)
+    lastSwingLow := confirmedLow
+    lastSwingLowBar := confirmedLowBar
+
+bool bullishBreak = not na(lastSwingHigh) and close > lastSwingHigh and
+     (na(lastBrokenHighBar) or lastBrokenHighBar != lastSwingHighBar)
+bool bearishBreak = not na(lastSwingLow) and close < lastSwingLow and
+     (na(lastBrokenLowBar) or lastBrokenLowBar != lastSwingLowBar)
+
+bool bullishChoch = bullishBreak and structureDirection == -1
+bool bearishChoch = bearishBreak and structureDirection == 1
+bool bullishBos = bullishBreak and not bullishChoch
+bool bearishBos = bearishBreak and not bearishChoch
+
+if bullishBreak
+    lastBrokenHighBar := lastSwingHighBar
+    structureDirection := 1
+if bearishBreak
+    lastBrokenLowBar := lastSwingLowBar
+    structureDirection := -1
+
+plotshape(showSwings and not na(confirmedHigh), title="Confirmed swing high",
+     style=shape.triangledown, location=location.abovebar, offset=-pivotLen,
+     color=bearColor, size=size.tiny, text="SH", textcolor=bearColor)
+plotshape(showSwings and not na(confirmedLow), title="Confirmed swing low",
+     style=shape.triangleup, location=location.belowbar, offset=-pivotLen,
+     color=bullColor, size=size.tiny, text="SL", textcolor=bullColor)
+
+plotshape(showStructure and bullishBos, title="Bullish BOS",
+     style=shape.labelup, location=location.belowbar, color=bullColor,
+     text="BOS", textcolor=color.white, size=size.tiny)
+plotshape(showStructure and bearishBos, title="Bearish BOS",
+     style=shape.labeldown, location=location.abovebar, color=bearColor,
+     text="BOS", textcolor=color.white, size=size.tiny)
+plotshape(showStructure and bullishChoch, title="Bullish CHOCH",
+     style=shape.labelup, location=location.belowbar, color=color.new(bullColor, 0),
+     text="CHOCH", textcolor=color.white, size=size.tiny)
+plotshape(showStructure and bearishChoch, title="Bearish CHOCH",
+     style=shape.labeldown, location=location.abovebar, color=color.new(bearColor, 0),
+     text="CHOCH", textcolor=color.white, size=size.tiny)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Supply and demand zones
+// A zone uses the confirmed pivot wick and the pivot candle body.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<box> supplyBoxes = array.new_box()
+var array<box> demandBoxes = array.new_box()
+
+if showZones and not na(confirmedHigh)
+    float supplyTop = confirmedHigh
+    float supplyBottom = math.max(open[pivotLen], close[pivotLen])
+    box supply = box.new(left=confirmedHighBar, top=supplyTop,
+         right=bar_index + zoneExtendBars, bottom=supplyBottom,
+         border_color=color.new(bearColor, 25),
+         bgcolor=color.new(bearColor, 88))
+    array.push(supplyBoxes, supply)
+    if array.size(supplyBoxes) > maxZones
+        box.delete(array.shift(supplyBoxes))
+
+if showZones and not na(confirmedLow)
+    float demandBottom = confirmedLow
+    float demandTop = math.min(open[pivotLen], close[pivotLen])
+    box demand = box.new(left=confirmedLowBar, top=demandTop,
+         right=bar_index + zoneExtendBars, bottom=demandBottom,
+         border_color=color.new(bullColor, 25),
+         bgcolor=color.new(bullColor, 88))
+    array.push(demandBoxes, demand)
+    if array.size(demandBoxes) > maxZones
+        box.delete(array.shift(demandBoxes))
+
+if showZones and array.size(supplyBoxes) > 0
+    int supplyIndex = array.size(supplyBoxes) - 1
+    while supplyIndex >= 0
+        box supply = array.get(supplyBoxes, supplyIndex)
+        box.set_right(supply, bar_index + zoneExtendBars)
+        bool broken = close > box.get_top(supply)
+        if removeMitigated and broken
+            box.delete(supply)
+            array.remove(supplyBoxes, supplyIndex)
+        supplyIndex -= 1
+
+if showZones and array.size(demandBoxes) > 0
+    int demandIndex = array.size(demandBoxes) - 1
+    while demandIndex >= 0
+        box demand = array.get(demandBoxes, demandIndex)
+        box.set_right(demand, bar_index + zoneExtendBars)
+        bool broken = close < box.get_bottom(demand)
+        if removeMitigated and broken
+            box.delete(demand)
+            array.remove(demandBoxes, demandIndex)
+        demandIndex -= 1
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Fair value gaps
+// Bullish gap: current low is above the high from two bars earlier.
+// Bearish gap: current high is below the low from two bars earlier.
+// ─────────────────────────────────────────────────────────────────────────────
+
+var array<box> bullishFvgBoxes = array.new_box()
+var array<box> bearishFvgBoxes = array.new_box()
+
+bool newBullishFvg = bar_index >= 2 and low > high[2]
+bool newBearishFvg = bar_index >= 2 and high < low[2]
+
+if showFvg and newBullishFvg
+    box bullishFvg = box.new(left=bar_index - 2, top=low,
+         right=bar_index + fvgExtendBars, bottom=high[2],
+         border_color=color.new(bullColor, 45),
+         bgcolor=color.new(bullColor, 91))
+    array.push(bullishFvgBoxes, bullishFvg)
+    if array.size(bullishFvgBoxes) > maxFvg
+        box.delete(array.shift(bullishFvgBoxes))
+
+if showFvg and newBearishFvg
+    box bearishFvg = box.new(left=bar_index - 2, top=low[2],
+         right=bar_index + fvgExtendBars, bottom=high,
+         border_color=color.new(bearColor, 45),
+         bgcolor=color.new(bearColor, 91))
+    array.push(bearishFvgBoxes, bearishFvg)
+    if array.size(bearishFvgBoxes) > maxFvg
+        box.delete(array.shift(bearishFvgBoxes))
+
+if showFvg and array.size(bullishFvgBoxes) > 0
+    int bullishFvgIndex = array.size(bullishFvgBoxes) - 1
+    while bullishFvgIndex >= 0
+        box bullishFvg = array.get(bullishFvgBoxes, bullishFvgIndex)
+        box.set_right(bullishFvg, bar_index + fvgExtendBars)
+        bool filled = low <= box.get_bottom(bullishFvg)
+        if removeFilledFvg and filled
+            box.delete(bullishFvg)
+            array.remove(bullishFvgBoxes, bullishFvgIndex)
+        bullishFvgIndex -= 1
+
+if showFvg and array.size(bearishFvgBoxes) > 0
+    int bearishFvgIndex = array.size(bearishFvgBoxes) - 1
+    while bearishFvgIndex >= 0
+        box bearishFvg = array.get(bearishFvgBoxes, bearishFvgIndex)
+        box.set_right(bearishFvg, bar_index + fvgExtendBars)
+        bool filled = high >= box.get_top(bearishFvg)
+        if removeFilledFvg and filled
+            box.delete(bearishFvg)
+            array.remove(bearishFvgBoxes, bearishFvgIndex)
+        bearishFvgIndex -= 1
+
+plotshape(showFvg and newBullishFvg, title="Bullish FVG", style=shape.circle,
+     location=location.belowbar, color=bullColor, size=size.tiny, text="FVG")
+plotshape(showFvg and newBearishFvg, title="Bearish FVG", style=shape.circle,
+     location=location.abovebar, color=bearColor, size=size.tiny, text="FVG")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Support/resistance and session levels
+// ─────────────────────────────────────────────────────────────────────────────
+
+float priorDayHigh = request.security(syminfo.tickerid, "D", high[1],
+     lookahead=barmerge.lookahead_on)
+float priorDayLow = request.security(syminfo.tickerid, "D", low[1],
+     lookahead=barmerge.lookahead_on)
+
+bool inSession = not na(time(timeframe.period, rthSession))
+bool sessionStarted = inSession and (na(inSession[1]) or not inSession[1])
+var float sessionHigh = na
+var float sessionLow = na
+
+if sessionStarted
+    sessionHigh := high
+    sessionLow := low
+else if inSession
+    sessionHigh := math.max(nz(sessionHigh, high), high)
+    sessionLow := math.min(nz(sessionLow, low), low)
+
+plot(showSwingLevels ? lastSwingHigh : na, title="Latest swing resistance",
+     color=color.new(bearColor, 10), linewidth=1, style=plot.style_stepline)
+plot(showSwingLevels ? lastSwingLow : na, title="Latest swing support",
+     color=color.new(bullColor, 10), linewidth=1, style=plot.style_stepline)
+plot(showPriorDay ? priorDayHigh : na, title="Prior-day high",
+     color=color.new(bearColor, 35), linewidth=1, style=plot.style_linebr)
+plot(showPriorDay ? priorDayLow : na, title="Prior-day low",
+     color=color.new(bullColor, 35), linewidth=1, style=plot.style_linebr)
+plot(showSession and inSession ? sessionHigh : na, title="Session high",
+     color=color.new(bearColor, 50), linewidth=1, style=plot.style_linebr)
+plot(showSession and inSession ? sessionLow : na, title="Session low",
+     color=color.new(bullColor, 50), linewidth=1, style=plot.style_linebr)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Compact operator panel
+// ─────────────────────────────────────────────────────────────────────────────
+
+var table status = table.new(position.top_right, 2, 6, border_width=1)
+if barstate.islast
+    string biasText = structureDirection == 1 ? "BULLISH" :
+         structureDirection == -1 ? "BEARISH" : "NEUTRAL"
+    color biasColor = structureDirection == 1 ? bullColor :
+         structureDirection == -1 ? bearColor : neutralColor
+    table.cell(status, 0, 0, "PRICE ACTION", text_color=color.white,
+         bgcolor=color.rgb(30, 35, 45))
+    table.cell(status, 1, 0, syminfo.ticker, text_color=color.white,
+         bgcolor=color.rgb(30, 35, 45))
+    table.cell(status, 0, 1, "Structure", text_color=color.white)
+    table.cell(status, 1, 1, biasText, text_color=color.white, bgcolor=biasColor)
+    table.cell(status, 0, 2, "Swing high", text_color=color.white)
+    table.cell(status, 1, 2, na(lastSwingHigh) ? "—" : str.tostring(lastSwingHigh, format.mintick),
+         text_color=color.white)
+    table.cell(status, 0, 3, "Swing low", text_color=color.white)
+    table.cell(status, 1, 3, na(lastSwingLow) ? "—" : str.tostring(lastSwingLow, format.mintick),
+         text_color=color.white)
+    table.cell(status, 0, 4, "Session", text_color=color.white)
+    table.cell(status, 1, 4, inSession ? "ACTIVE" : "CLOSED",
+         text_color=color.white, bgcolor=inSession ? color.new(bullColor, 35) : neutralColor)
+    table.cell(status, 0, 5, "Confirmed", text_color=color.white)
+    table.cell(status, 1, 5, "BOS/CHOCH + FVG", text_color=color.white)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Alert hooks. Create an alert in TradingView using "Any alert() function call"
+// or one of these named conditions.
+// ─────────────────────────────────────────────────────────────────────────────
+
+alertcondition(bullishBos, "Bullish BOS", "Bullish BOS on {{ticker}} {{interval}}")
+alertcondition(bearishBos, "Bearish BOS", "Bearish BOS on {{ticker}} {{interval}}")
+alertcondition(bullishChoch, "Bullish CHOCH", "Bullish CHOCH on {{ticker}} {{interval}}")
+alertcondition(bearishChoch, "Bearish CHOCH", "Bearish CHOCH on {{ticker}} {{interval}}")
+alertcondition(newBullishFvg, "Bullish FVG", "Bullish FVG formed on {{ticker}} {{interval}}")
+alertcondition(newBearishFvg, "Bearish FVG", "Bearish FVG formed on {{ticker}} {{interval}}")
