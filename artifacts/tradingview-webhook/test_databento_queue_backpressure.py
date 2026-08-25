@@ -62,7 +62,13 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
     def _wait_empty(self, brain, timeout=3.0):
         deadline = time.time() + timeout
         while time.time() < deadline:
-            if sum(brain._queue_depth_by_inst.values()) == 0:
+            if (
+                sum(brain._queue_depth_by_inst.values()) == 0
+                and sum(brain._queue_inflight_by_inst.values()) == 0
+                and sum(brain._queue_enqueued_by_inst.values())
+                == sum(brain._queue_processed_by_inst.values())
+                and sum(brain._downstream_depth_by_inst.values()) == 0
+            ):
                 return
             time.sleep(0.01)
         self.fail("bounded Databento queue did not drain")
@@ -85,6 +91,7 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
                 self.assertEqual(observed, list(range(100)), inst)
                 queue_state = db.DATABENTO_STATUS["instruments"][inst]["queue"]
                 self.assertEqual(queue_state["queue_depth"], 0)
+                self.assertGreaterEqual(queue_state["max_observed_queue_depth"], 0)
                 self.assertEqual(queue_state["dropped"], 0)
                 self.assertEqual(queue_state["freshness"], "FRESH")
         finally:
@@ -171,6 +178,9 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
             self.assertGreater(queue_state["dropped"], 0)
             self.assertEqual(queue_state["freshness"], "UNAVAILABLE")
             self.assertEqual(db.DATABENTO_STATUS["queue"]["max_depth"], 4)
+            self.assertLessEqual(
+                db.DATABENTO_STATUS["queue"]["max_observed_depth"], 4
+            )
         finally:
             brain._stop_record_dispatcher()
 
@@ -204,6 +214,57 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
         self.assertGreater(state["dropped"], 0)
         self.assertEqual(state["freshness"], "UNAVAILABLE")
         self.assertFalse(brain._record_worker.is_alive())
+
+    def test_downstream_stage_timings_and_sdk_warning_telemetry(self):
+        brain = _brain()
+        brain._start_record_dispatcher()
+        try:
+            def measured_consumer(_inst, _price):
+                time.sleep(0.002)
+
+            brain._enqueue_downstream(
+                measured_consumer, "MGC", 100.0, brain._active_dispatch_generation
+            )
+            self._wait_empty(brain)
+            stage = db.DATABENTO_STATUS["downstream"]["stage_timings"]["measured_consumer"]
+            self.assertEqual(stage["count"], 1)
+            self.assertGreater(stage["max_ms"], 0.0)
+            self.assertGreater(stage["total_ms"], 0.0)
+            self.assertEqual(db.DATABENTO_STATUS["downstream"]["depth"], 0)
+
+            brain._observe_sdk_queue_warning(
+                "record queue is full; 358 record(s) to be processed"
+            )
+            transport = db.DATABENTO_STATUS["transport"]
+            self.assertGreaterEqual(transport["sdk_queue_full_warnings"], 1)
+            self.assertGreaterEqual(transport["sdk_queue_full_max_pending"], 358)
+        finally:
+            brain._stop_record_dispatcher()
+
+    def test_native_structure_breaks_previously_confirmed_levels(self):
+        """A BOS/CHOCH can only occur after, not inside, the pivot window."""
+        brain = _brain()
+        closes = [
+            100, 101, 102, 103, 104, 110, 104, 103, 102, 101, 100, 105, 111,
+            105, 100, 95, 90, 85, 112, 100, 105, 110, 115, 80,
+        ]
+        for index, close in enumerate(closes):
+            bars = brain._bars["MGC"]
+            bars.append({
+                "ts": 1_700_000_000 + index * 60,
+                "open": float(close),
+                "high": float(close) + 0.25,
+                "low": float(close) - 0.25,
+                "close": float(close),
+                "volume": 10,
+            })
+            brain._detect_structure("MGC", bars)
+        alert_types = [
+            alert.get("alert_type") for alert in brain._ah
+            if isinstance(alert, dict) and alert.get("instrument") == "MGC"
+        ]
+        self.assertIn("BOS DEMAND", alert_types)
+        self.assertIn("CHOCH SUPPLY", alert_types)
 
 
 if __name__ == "__main__":

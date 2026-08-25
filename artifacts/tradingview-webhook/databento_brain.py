@@ -32,6 +32,7 @@ import logging
 import math
 import os
 import queue
+import re
 import time
 import threading
 import uuid
@@ -40,6 +41,22 @@ from datetime import datetime, timezone, timedelta, date as _date
 from typing import Any
 
 logger = logging.getLogger(__name__)
+
+
+class _SdkQueuePressureHandler(logging.Handler):
+    """Observe Databento's own queue-full warnings without changing their output."""
+
+    def __init__(self, brain: "DatabentoBrain"):
+        super().__init__(level=logging.WARNING)
+        self._brain = brain
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self._brain._observe_sdk_queue_warning(record.getMessage())
+        except Exception:
+            # A telemetry hook must never interfere with the SDK logger.
+            pass
+
 
 # ── Instrument ↔ Databento continuous-contract symbol ────────────────────────
 # MGC rolls earlier than the calendar front-month: TradingView MGC1! typically
@@ -346,7 +363,9 @@ DATABENTO_STATUS: dict[str, Any] = {
     },
     "queue": {
         "max_depth":       RECORD_QUEUE_MAX,
+        "max_observed_depth": 0,
         "depth":           0,
+        "in_flight":       0,
         "enqueued":        0,
         "processed":       0,
         "dropped":         0,
@@ -357,11 +376,15 @@ DATABENTO_STATUS: dict[str, Any] = {
     "transport": {
         "sdk_queue_pressure": 0,
         "sdk_queue_full": 0,
+        "sdk_queue_full_warnings": 0,
+        "sdk_queue_full_max_pending": 0,
+        "last_sdk_queue_full_message": None,
         "record_loss": 0,
         "last_pressure_at": None,
     },
     "downstream": {
         "max_depth": DOWNSTREAM_QUEUE_MAX,
+        "max_observed_depth": 0,
         "depth": 0,
         "enqueued": 0,
         "processed": 0,
@@ -369,6 +392,7 @@ DATABENTO_STATUS: dict[str, Any] = {
         "unhealthy": False,
         "slowest_stage": None,
         "slowest_stage_ms": 0.0,
+        "stage_timings": {},
         "last_error": None,
     },
     "session": {
@@ -377,6 +401,13 @@ DATABENTO_STATUS: dict[str, Any] = {
         "fenced_records": 0,
     },
     "partial_bars": {},
+    "partial_flush": {
+        "queued": 0,
+        "queue_rejected": 0,
+        "backlog_caused": 0,
+        "max_age_s": 0.0,
+        "by_instrument": {},
+    },
     "structure_warmup": {
         inst: {
             "state": "WARMING_UP",
@@ -404,12 +435,25 @@ def get_databento_status_snapshot() -> dict[str, Any]:
     status["queue"] = dict(DATABENTO_STATUS.get("queue") or {})
     status["transport"] = dict(DATABENTO_STATUS.get("transport") or {})
     status["downstream"] = dict(DATABENTO_STATUS.get("downstream") or {})
+    status["downstream"]["stage_timings"] = {
+        name: dict(values or {})
+        for name, values in (status["downstream"].get("stage_timings") or {}).items()
+    }
     status["session"] = dict(DATABENTO_STATUS.get("session") or {})
     status["partial_bars"] = {
         inst: dict(values or {})
         for inst, values in (DATABENTO_STATUS.get("partial_bars") or {}).items()
     }
     status["order_book"] = dict(DATABENTO_STATUS.get("order_book") or {})
+    status["partial_flush"] = {
+        **dict(DATABENTO_STATUS.get("partial_flush") or {}),
+        "by_instrument": {
+            inst: dict(values or {})
+            for inst, values in (
+                (DATABENTO_STATUS.get("partial_flush") or {}).get("by_instrument") or {}
+            ).items()
+        },
+    }
     status["structure_warmup"] = {
         inst: dict(values or {})
         for inst, values in (DATABENTO_STATUS.get("structure_warmup") or {}).items()
@@ -557,6 +601,9 @@ class DatabentoBrain:
         self._dispatch_generation = 0
         self._active_dispatch_generation = 0
         self._queue_depth_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_max_depth_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_inflight_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._queue_max_observed_total = 0
         self._queue_enqueued_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
         self._queue_processed_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
         self._queue_dropped_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
@@ -567,9 +614,17 @@ class DatabentoBrain:
         self._last_processed_at: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._last_processed_event: dict[str, float | None] = {i: None for i in DB_SYMBOLS}
         self._downstream_depth_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._downstream_max_depth_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._downstream_max_observed_total = 0
         self._downstream_dropped_by_inst: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
         self._downstream_stage_ms: dict[str, float] = {}
+        self._downstream_stage_stats: dict[str, dict[str, float | int]] = {}
         self._downstream_unhealthy_by_inst: dict[str, bool] = {i: False for i in DB_SYMBOLS}
+        self._sdk_pressure_handler: _SdkQueuePressureHandler | None = None
+        self._partial_flush_counts: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._partial_flush_rejected: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._partial_flush_backlog_caused: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
+        self._partial_flush_max_age: dict[str, float] = {i: 0.0 for i in DB_SYMBOLS}
 
     # ── Public API ────────────────────────────────────────────────────────────
 
@@ -809,6 +864,7 @@ class DatabentoBrain:
         """Build a copied, current queue health view while holding _dispatch_lock."""
         now = time.time()
         depth = self._queue_depth_by_inst.get(inst, 0)
+        in_flight = self._queue_inflight_by_inst.get(inst, 0)
         last_enqueued_event = self._last_enqueued_event.get(inst)
         last_processed_event = self._last_processed_event.get(inst)
         processing_lag = None
@@ -833,14 +889,17 @@ class DatabentoBrain:
         elif event_age is not None and event_age > RECORD_QUEUE_STALE_S:
             freshness = "STALE"
             reason = "source_event_stale"
-        elif depth > 0 or (processing_lag is not None and processing_lag > RECORD_QUEUE_DELAY_S):
+        elif (depth > 0 or in_flight > 0
+              or (processing_lag is not None and processing_lag > RECORD_QUEUE_DELAY_S)):
             freshness = "DELAYED"
-            reason = "queue_backlog"
+            reason = "record_in_flight" if in_flight else "queue_backlog"
         else:
             freshness = "FRESH"
             reason = None
         return {
             "queue_depth": depth,
+            "max_observed_queue_depth": self._queue_max_depth_by_inst.get(inst, 0),
+            "in_flight": in_flight,
             "enqueued": self._queue_enqueued_by_inst.get(inst, 0),
             "processed": self._queue_processed_by_inst.get(inst, 0),
             "dropped": dropped,
@@ -855,6 +914,7 @@ class DatabentoBrain:
             "unavailable_reason": reason,
             "worker_alive": worker_alive,
             "downstream_queue_depth": self._downstream_depth_by_inst.get(inst, 0),
+            "downstream_max_observed_depth": self._downstream_max_depth_by_inst.get(inst, 0),
             "downstream_dropped": self._downstream_dropped_by_inst.get(inst, 0),
             "downstream_unhealthy": downstream_unhealthy,
         }
@@ -866,7 +926,9 @@ class DatabentoBrain:
             queue_state = DATABENTO_STATUS["queue"]
             queue_state.update({
                 "max_depth": RECORD_QUEUE_MAX,
+                "max_observed_depth": self._queue_max_observed_total,
                 "depth": sum(self._queue_depth_by_inst.values()),
+                "in_flight": sum(self._queue_inflight_by_inst.values()),
                 "enqueued": sum(self._queue_enqueued_by_inst.values()),
                 "processed": sum(self._queue_processed_by_inst.values()),
                 "dropped": sum(self._queue_dropped_by_inst.values()),
@@ -876,6 +938,7 @@ class DatabentoBrain:
             downstream = DATABENTO_STATUS["downstream"]
             downstream.update({
                 "max_depth": DOWNSTREAM_QUEUE_MAX,
+                "max_observed_depth": self._downstream_max_observed_total,
                 "depth": sum(self._downstream_depth_by_inst.values()),
                 "dropped": sum(self._downstream_dropped_by_inst.values()),
                 "unhealthy": any(self._downstream_unhealthy_by_inst.values()),
@@ -887,6 +950,17 @@ class DatabentoBrain:
                     max(self._downstream_stage_ms.values())
                     if self._downstream_stage_ms else 0.0, 3
                 ),
+                "stage_timings": {
+                    name: {
+                        "count": int(values.get("count") or 0),
+                        "total_ms": round(float(values.get("total_ms") or 0.0), 3),
+                        "avg_ms": round(float(values.get("total_ms") or 0.0)
+                                        / max(1, int(values.get("count") or 0)), 3),
+                        "max_ms": round(float(values.get("max_ms") or 0.0), 3),
+                        "last_ms": round(float(values.get("last_ms") or 0.0), 3),
+                    }
+                    for name, values in self._downstream_stage_stats.items()
+                },
             })
             for key in instruments:
                 existing = dict(DATABENTO_STATUS["instruments"].get(key) or {})
@@ -907,6 +981,9 @@ class DatabentoBrain:
             self._downstream_queue = queue.Queue(maxsize=DOWNSTREAM_QUEUE_MAX)
             self._downstream_stop = threading.Event()
             self._queue_depth_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_max_depth_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_inflight_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._queue_max_observed_total = 0
             self._queue_enqueued_by_inst = {i: 0 for i in DB_SYMBOLS}
             self._queue_processed_by_inst = {i: 0 for i in DB_SYMBOLS}
             self._queue_dropped_by_inst = {i: 0 for i in DB_SYMBOLS}
@@ -917,14 +994,26 @@ class DatabentoBrain:
             self._last_processed_at = {i: None for i in DB_SYMBOLS}
             self._last_processed_event = {i: None for i in DB_SYMBOLS}
             self._downstream_depth_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._downstream_max_depth_by_inst = {i: 0 for i in DB_SYMBOLS}
+            self._downstream_max_observed_total = 0
             self._downstream_dropped_by_inst = {i: 0 for i in DB_SYMBOLS}
             self._downstream_stage_ms = {}
+            self._downstream_stage_stats = {}
             self._downstream_unhealthy_by_inst = {i: False for i in DB_SYMBOLS}
+            self._partial_flush_counts = {i: 0 for i in DB_SYMBOLS}
+            self._partial_flush_rejected = {i: 0 for i in DB_SYMBOLS}
+            self._partial_flush_backlog_caused = {i: 0 for i in DB_SYMBOLS}
+            self._partial_flush_max_age = {i: 0.0 for i in DB_SYMBOLS}
             DATABENTO_STATUS["queue"]["reset_at"] = datetime.now(timezone.utc).isoformat()
             DATABENTO_STATUS["downstream"].update({
                 "enqueued": 0, "processed": 0, "dropped": 0, "unhealthy": False,
-                "slowest_stage": None, "slowest_stage_ms": 0.0, "last_error": None,
+                "slowest_stage": None, "slowest_stage_ms": 0.0, "stage_timings": {},
+                "last_error": None,
             })
+            DATABENTO_STATUS["partial_flush"] = {
+                "queued": 0, "queue_rejected": 0, "backlog_caused": 0,
+                "max_age_s": 0.0, "by_instrument": {},
+            }
             DATABENTO_STATUS["session"].update({
                 "generation": generation, "state": "LIVE", "fenced_records": 0,
             })
@@ -1060,6 +1149,14 @@ class DatabentoBrain:
                         unsupported = True
                     else:
                         self._queue_depth_by_inst[inst] += 1
+                        self._queue_max_depth_by_inst[inst] = max(
+                            self._queue_max_depth_by_inst[inst],
+                            self._queue_depth_by_inst[inst],
+                        )
+                        self._queue_max_observed_total = max(
+                            self._queue_max_observed_total,
+                            sum(self._queue_depth_by_inst.values()),
+                        )
                         self._queue_enqueued_by_inst[inst] += 1
         self._publish_queue_telemetry(inst)
         if unsupported:
@@ -1087,6 +1184,14 @@ class DatabentoBrain:
                 )
                 return
             self._downstream_depth_by_inst[inst] += 1
+            self._downstream_max_depth_by_inst[inst] = max(
+                self._downstream_max_depth_by_inst[inst],
+                self._downstream_depth_by_inst[inst],
+            )
+            self._downstream_max_observed_total = max(
+                self._downstream_max_observed_total,
+                sum(self._downstream_depth_by_inst.values()),
+            )
             DATABENTO_STATUS["downstream"]["enqueued"] = (
                 int(DATABENTO_STATUS["downstream"].get("enqueued") or 0) + 1
             )
@@ -1106,6 +1211,13 @@ class DatabentoBrain:
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 name = getattr(fn, "__name__", fn.__class__.__name__)
                 with self._dispatch_lock:
+                    stats = self._downstream_stage_stats.setdefault(name, {
+                        "count": 0, "total_ms": 0.0, "max_ms": 0.0, "last_ms": 0.0,
+                    })
+                    stats["count"] = int(stats["count"]) + 1
+                    stats["total_ms"] = float(stats["total_ms"]) + elapsed_ms
+                    stats["max_ms"] = max(float(stats["max_ms"]), elapsed_ms)
+                    stats["last_ms"] = elapsed_ms
                     self._downstream_stage_ms[name] = max(
                         elapsed_ms, self._downstream_stage_ms.get(name, 0.0)
                     )
@@ -1124,6 +1236,10 @@ class DatabentoBrain:
                         0, self._downstream_depth_by_inst[inst] - 1
                     )
                 downstream_queue.task_done()
+                # The only producer-side publish happens on record completion.
+                # Publish again here so stage timings and the drained downstream
+                # depth are visible immediately even when no further records arrive.
+                self._publish_queue_telemetry(inst)
 
     def _record_worker_loop(
         self,
@@ -1141,6 +1257,7 @@ class DatabentoBrain:
                 # Queue depth means records still waiting; the one now executing
                 # is deliberately excluded so it can never exceed max_depth.
                 self._queue_depth_by_inst[inst] = max(0, self._queue_depth_by_inst[inst] - 1)
+                self._queue_inflight_by_inst[inst] += 1
             try:
                 with self._record_process_lock:
                     # Fence a disconnected or superseded session before it can
@@ -1162,6 +1279,10 @@ class DatabentoBrain:
             except Exception as exc:
                 logger.debug("DatabentoBrain record-worker error: %s", exc)
             finally:
+                with self._dispatch_lock:
+                    self._queue_inflight_by_inst[inst] = max(
+                        0, self._queue_inflight_by_inst[inst] - 1
+                    )
                 record_queue.task_done()
                 self._publish_queue_telemetry(inst)
 
@@ -1229,6 +1350,50 @@ class DatabentoBrain:
                 "instrument resolution will rely on add_callback",
                 exc,
             )
+
+    def _observe_sdk_queue_warning(self, message: str) -> None:
+        """Count SDK-reported queue pressure from its native session logger."""
+        text = str(message or "")
+        lowered = text.lower()
+        if "queue" not in lowered or not any(
+            token in lowered for token in ("full", "backpressure", "overflow", "buffer")
+        ):
+            return
+        pending = 0
+        match = re.search(r"(\d+)\s+record\(s\)", text, flags=re.IGNORECASE)
+        if match:
+            try:
+                pending = int(match.group(1))
+            except ValueError:
+                pending = 0
+        with self._dispatch_lock:
+            transport = DATABENTO_STATUS["transport"]
+            transport["sdk_queue_pressure"] = int(transport.get("sdk_queue_pressure") or 0) + 1
+            transport["sdk_queue_full"] = int(transport.get("sdk_queue_full") or 0) + 1
+            transport["sdk_queue_full_warnings"] = (
+                int(transport.get("sdk_queue_full_warnings") or 0) + 1
+            )
+            transport["sdk_queue_full_max_pending"] = max(
+                int(transport.get("sdk_queue_full_max_pending") or 0), pending
+            )
+            transport["last_sdk_queue_full_message"] = text[:300]
+            transport["last_pressure_at"] = datetime.now(timezone.utc).isoformat()
+
+    def _attach_sdk_queue_pressure_handler(self) -> None:
+        """Attach exactly one passive warning observer for the current live session."""
+        self._detach_sdk_queue_pressure_handler()
+        handler = _SdkQueuePressureHandler(self)
+        logging.getLogger("databento.live.session").addHandler(handler)
+        self._sdk_pressure_handler = handler
+
+    def _detach_sdk_queue_pressure_handler(self) -> None:
+        handler = self._sdk_pressure_handler
+        if handler is not None:
+            try:
+                logging.getLogger("databento.live.session").removeHandler(handler)
+            except Exception:
+                pass
+        self._sdk_pressure_handler = None
 
     # ── Reconnect loop ────────────────────────────────────────────────────────
 
@@ -1298,6 +1463,7 @@ class DatabentoBrain:
         logger.info("DatabentoBrain: connecting to %s …", DB_DATASET)
         DATABENTO_STATUS["error"] = None
 
+        self._attach_sdk_queue_pressure_handler()
         client = db.Live(key=api_key)
         client.subscribe(
             dataset=DB_DATASET,
@@ -1389,6 +1555,7 @@ class DatabentoBrain:
             # Do not replay backlog from a dead connection after reconnect.  Any
             # discarded records make the affected instrument explicitly unavailable.
             self._stop_record_dispatcher()
+            self._detach_sdk_queue_pressure_handler()
 
         logger.warning("DatabentoBrain: feed closed by server — reconnecting …")
 
@@ -1702,13 +1869,23 @@ class DatabentoBrain:
                     if record_queue is None:
                         self._queue_dropped_by_inst[inst] += 1
                         self._downstream_unhealthy_by_inst[inst] = True
+                        self._partial_flush_rejected[inst] += 1
                         continue
                     try:
                         record_queue.put_nowait((p, inst, "bar_close", p.get("source_event_ts")))
                         self._queue_depth_by_inst[inst] += 1
+                        self._queue_max_depth_by_inst[inst] = max(
+                            self._queue_max_depth_by_inst[inst],
+                            self._queue_depth_by_inst[inst],
+                        )
+                        self._queue_max_observed_total = max(
+                            self._queue_max_observed_total,
+                            sum(self._queue_depth_by_inst.values()),
+                        )
                         self._queue_enqueued_by_inst[inst] += 1
                     except queue.Full:
                         self._queue_dropped_by_inst[inst] += 1
+                        self._partial_flush_rejected[inst] += 1
                         DATABENTO_STATUS["transport"]["record_loss"] = (
                             int(DATABENTO_STATUS["transport"].get("record_loss") or 0) + 1
                         )
@@ -1720,16 +1897,39 @@ class DatabentoBrain:
                             inst,
                         )
                         continue
+                    age_s = max(0.0, now_unix - p["ts"])
+                    backlog_caused = self._queue_depth_by_inst.get(inst, 0) > 1
+                    self._partial_flush_counts[inst] += 1
+                    self._partial_flush_max_age[inst] = max(
+                        self._partial_flush_max_age[inst], age_s
+                    )
+                    if backlog_caused:
+                        self._partial_flush_backlog_caused[inst] += 1
+                    DATABENTO_STATUS["partial_flush"] = {
+                        "queued": sum(self._partial_flush_counts.values()),
+                        "queue_rejected": sum(self._partial_flush_rejected.values()),
+                        "backlog_caused": sum(self._partial_flush_backlog_caused.values()),
+                        "max_age_s": round(max(self._partial_flush_max_age.values()), 3),
+                        "by_instrument": {
+                            key: {
+                                "queued": self._partial_flush_counts[key],
+                                "queue_rejected": self._partial_flush_rejected[key],
+                                "backlog_caused": self._partial_flush_backlog_caused[key],
+                                "max_age_s": round(self._partial_flush_max_age[key], 3),
+                            }
+                            for key in DB_SYMBOLS
+                        },
+                    }
                 DATABENTO_STATUS.setdefault("partial_bars", {})[inst] = {
                     "state": "QUEUED_FOR_CLOSE",
                     "bar_timestamp": self._iso_epoch(p.get("ts")),
                     "source_timestamp": self._iso_epoch(
                         p.get("source_event_ts")
                     ),
-                    "age_s": round(max(0.0, now_unix - p["ts"]), 3),
+                    "age_s": round(age_s, 3),
                     "cause": (
                         "local_processing_debt"
-                        if self._queue_depth_by_inst.get(inst, 0) > 0
+                        if backlog_caused
                         else "market_silence"
                     ),
                 }
@@ -2147,27 +2347,33 @@ class DatabentoBrain:
                     self._inject_alert(inst, "HL" if sl > prev_sl else "LL", sl)
                 self._prev_sl[inst] = sl
 
-        # ── BOS / CHOCH — close-based structure break ─────────────────────────
-        if is_sh:
-            _break_decision("high", pivot["high"], close > pivot["high"])
-        if is_sh and close > pivot["high"]:
+        # ── BOS / CHOCH — close-based break of an ALREADY confirmed pivot ─────
+        # A pivot cannot be both confirmed by its right-side window and broken by
+        # the current bar if that same current bar is part of the confirmation
+        # window.  Use the durable confirmed levels instead, so a later bar can
+        # legitimately break them without weakening the n-bar pivot confirmation.
+        confirmed_high = self._prev_sh[inst]
+        confirmed_low = self._prev_sl[inst]
+        if confirmed_high is not None:
+            _break_decision("high", confirmed_high, close > confirmed_high)
+        if confirmed_high is not None and close > confirmed_high:
             if not (last_bos.get("type") in ("BOS DEMAND", "CHOCH DEMAND")
-                    and abs(last_bos.get("level", 0) - pivot["high"]) < 0.01):
+                    and abs(last_bos.get("level", 0) - confirmed_high) < 0.01):
                 atype = ("CHOCH DEMAND"
                          if self._trend[inst] == "bear" else "BOS DEMAND")
                 self._inject_alert(inst, atype, close)
-                self._last_bos[inst] = {"type": atype, "level": pivot["high"]}
+                self._last_bos[inst] = {"type": atype, "level": confirmed_high}
                 self._trend[inst]    = "bull"
 
-        if is_sl:
-            _break_decision("low", pivot["low"], close < pivot["low"])
-        if is_sl and close < pivot["low"]:
+        if confirmed_low is not None:
+            _break_decision("low", confirmed_low, close < confirmed_low)
+        if confirmed_low is not None and close < confirmed_low:
             if not (last_bos.get("type") in ("BOS SUPPLY", "CHOCH SUPPLY")
-                    and abs(last_bos.get("level", 0) - pivot["low"]) < 0.01):
+                    and abs(last_bos.get("level", 0) - confirmed_low) < 0.01):
                 atype = ("CHOCH SUPPLY"
                          if self._trend[inst] == "bull" else "BOS SUPPLY")
                 self._inject_alert(inst, atype, close)
-                self._last_bos[inst] = {"type": atype, "level": pivot["low"]}
+                self._last_bos[inst] = {"type": atype, "level": confirmed_low}
                 self._trend[inst]    = "bear"
         _append_structure_provenance(inst, trace)
 

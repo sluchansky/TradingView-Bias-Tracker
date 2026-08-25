@@ -52648,10 +52648,25 @@ def _shadow_strict_verdict(mode, *, current_price, active_ticker, vwap_value,
     entry. Returns {verdict, direction, label, score, edge_score, reason, trade_plan,
     actionable}."""
     try:
+        # The persisted/test shadow envelope predates the structured session object
+        # and can carry a legacy string such as "open".  The live analysis path
+        # always supplies a mapping, but a malformed shadow-only envelope must not
+        # reach evaluate_strict_setup() and turn its fail-closed replay into an
+        # AttributeError.  Normalize locally; never mutate the supplied snapshot.
+        if isinstance(session_state, dict):
+            shadow_session = session_state
+        else:
+            legacy_session = str(session_state or "UNKNOWN").strip() or "UNKNOWN"
+            shadow_session = {
+                "session": legacy_session,
+                "name": legacy_session,
+                "active": legacy_session.lower() not in ("closed", "unknown"),
+            }
+        shadow_volatility = volatility if isinstance(volatility, dict) else {}
         strict = evaluate_strict_setup(
             current_price, active_ticker, vwap_value, vwap_status,
             nearest_supply, nearest_demand, bullish, bearish, confidence, ALERT_HISTORY,
-            volatility=volatility, session=session_state, cooldown_active=cooldown_active,
+            volatility=shadow_volatility, session=shadow_session, cooldown_active=cooldown_active,
             learning_score_influence=learning_score_influence, mode=mode,
         )
         strict_label     = strict["label"]

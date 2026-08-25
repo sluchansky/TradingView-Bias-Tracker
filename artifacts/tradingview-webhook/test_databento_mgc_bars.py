@@ -34,6 +34,7 @@ from databento_brain import (  # noqa: E402
     DATABENTO_BARS_BY_INST,
     DatabentoBrain,
 )
+MGC_SYMBOL = DB_SYMBOLS["MGC"]
 
 # ── Test helpers ──────────────────────────────────────────────────────────────
 
@@ -62,6 +63,20 @@ def _make_brain() -> tuple[DatabentoBrain, dict, dict, dict, dict, dict, dict, d
     )
     return brain, ah, cvd, rvol, ap, cp, cp_ts, vs
 
+def _wait_worker_drain(brain: DatabentoBrain, timeout_s: float = 2.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        with brain._dispatch_lock:
+            if (
+                sum(brain._queue_depth_by_inst.values()) == 0
+                and sum(brain._queue_inflight_by_inst.values()) == 0
+                and sum(brain._queue_enqueued_by_inst.values())
+                == sum(brain._queue_processed_by_inst.values())
+            ):
+                return True
+        time.sleep(0.01)
+    return False
+
 def _fake_rec(instrument_id: int, price_raw: int, size: int,
               ts_ns: int, side: str = "A") -> Any:
     """Minimal fake TradeMsg object."""
@@ -85,8 +100,8 @@ _MIN       = 60_000_000_000               # 1 minute in nanoseconds
 def case_a():
     brain, *_ = _make_brain()
     # _sym_to_inst is built at __init__ from DB_SYMBOLS
-    result = brain._sym_to_inst.get("MGC.c.0")
-    check("A", "MGC.c.0 → canonical 'MGC'",                 result == "MGC")
+    result = brain._sym_to_inst.get(MGC_SYMBOL)
+    check("A", f"{MGC_SYMBOL} → canonical 'MGC'",           result == "MGC")
     check("A", "MNQ.c.0 not mapped to MGC",                  brain._sym_to_inst.get("MNQ.c.0") != "MGC")
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -159,8 +174,13 @@ def case_e():
     check("E", "Before flush: partial bar exists for MGC",   brain._partial["MGC"] is not None)
     check("E", "Before flush: bars list empty",              len(brain._bars["MGC"]) == 0)
 
-    # Run the flush
-    brain._flush_stale_partials()
+    # Production finalizes stale partials through the ordered worker.
+    brain._start_record_dispatcher()
+    try:
+        brain._flush_stale_partials()
+        check("E", "Ordered worker drains partial finalization", _wait_worker_drain(brain))
+    finally:
+        brain._stop_record_dispatcher()
 
     # After flush: partial cleared, bar promoted
     check("E", "After flush: partial cleared",               brain._partial["MGC"] is None)
@@ -175,7 +195,8 @@ def case_f():
     # DB_SYMBOLS is a module-level constant; the subscription call inside
     # _run_feed always passes list(DB_SYMBOLS.values()) — static, cannot omit MGC.
     check("F", "DB_SYMBOLS contains MGC",                    "MGC" in DB_SYMBOLS)
-    check("F", "Subscription list includes MGC.c.0",        "MGC.c.0" in list(DB_SYMBOLS.values()))
+    check("F", "Subscription list includes active MGC symbol",
+          MGC_SYMBOL in list(DB_SYMBOLS.values()))
     check("F", "_id_to_inst reset on reconnect",
           True)  # structural: _id_to_inst = {} at top of _run_feed
 
@@ -249,7 +270,12 @@ def case_j():
     brain._on_trade(_fake_rec(iid, int(4105.0 * 1e9), 2, stale_min * 1_000_000_000 + 1_000_000))
 
     bars_before = len(brain._bars["MGC"])
-    brain._flush_stale_partials()
+    brain._start_record_dispatcher()
+    try:
+        brain._flush_stale_partials()
+        check("J", "Ordered worker drains partial finalization", _wait_worker_drain(brain))
+    finally:
+        brain._stop_record_dispatcher()
     bars_after  = len(brain._bars["MGC"])
 
     check("J", "Bar count increments after flush",           bars_after == bars_before + 1)
@@ -282,10 +308,11 @@ def case_l():
     brain, *_ = _make_brain()
     # DB_SYMBOLS is a module-level constant (never mutated at runtime).
     # The subscription call in _run_feed is: symbols=list(DB_SYMBOLS.values())
-    # — so exactly 4 symbols including MGC.c.0, regardless of restart count.
+    # — so exactly 4 symbols including the active MGC contract, regardless of
+    # restart count.
     syms = list(DB_SYMBOLS.values())
     check("L", "Exactly 4 symbols subscribed after restart",  len(syms) == 4)
-    check("L", "MGC.c.0 present after restart",               "MGC.c.0" in syms)
+    check("L", "Active MGC symbol present after restart",     MGC_SYMBOL in syms)
     check("L", "_id_to_inst reset on reconnect prevents ID bleed",
           True)  # structural guarantee: _id_to_inst = {} in _run_feed
 
