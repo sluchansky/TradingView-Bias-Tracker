@@ -16,9 +16,9 @@ The production bot source is primarily:
 - `artifacts/api-server/` — Replit-oriented Express proxy and artifact API
   service; it is not required to run the Flask bot directly on Windows.
 
-The current stable branch is `polish-v1`. Backup and recovery tooling is
-developed on `replit-dev`; verify the commit shown by `git log -1` matches the
-reviewed source you intentionally want to restore before starting the bot.
+The validated source branch is `replit-dev`. For a recovery, check out the
+specific reviewed commit recorded with the backup/validation record, then verify
+the worktree is clean before starting the bot.
 
 ## 1. Install prerequisites
 
@@ -45,8 +45,11 @@ node --version       # only needed for the optional frontend
 ```powershell
 git clone https://github.com/sluchansky/TradingView-Bias-Tracker.git
 cd TradingView-Bias-Tracker
-git checkout polish-v1
-git status
+git fetch origin
+git checkout replit-dev
+git pull --ff-only
+git status --short
+git rev-parse HEAD
 ```
 
 Do not copy the Replit `.env`, database dumps, caches, logs, or API keys into
@@ -121,26 +124,36 @@ Get-Content .env | Where-Object { $_ -and $_ -notmatch '^\s*#' } |
 ```
 
 For secrets containing `=` or more complex quoting, set them explicitly with
-`$env:NAME = "value"` instead of using the simple loader above.
+`$env:NAME = "value"` instead of using the simple loader above. The repository
+also includes `scripts\windows\Start-TradingBot.ps1`, whose parser safely splits
+only the first `=` and never prints values.
 
 ## 5. Start the backend
 
 ```powershell
-.\.venv\Scripts\Activate.ps1
-cd artifacts\tradingview-webhook
-python app.py
+.\scripts\windows\Start-TradingBot.ps1
 ```
 
+The launcher loads a local `.env` when present, defaults every safety setting to
+the first-boot values above, and refuses to start if a local file attempts to
+enable execution, manual orders, live runner, Databento, or Discord delivery.
 The default local port is 8000. To choose it explicitly:
 
 ```powershell
-$env:PORT = "8000"
-python app.py
+.\scripts\windows\Start-TradingBot.ps1 -Port 8000
 ```
 
 The process must remain running in that PowerShell window. TradingView webhook
 URLs must point to a secure, externally reachable HTTPS reverse proxy in front
 of this local service; do not expose Flask directly to the public internet.
+
+The isolated analysis bot is optional. It uses the `analysis_bot` PostgreSQL
+schema and has hard outbound broker/Discord suppression. Start it in a separate
+window only when its analysis UI is required:
+
+```powershell
+.\scripts\windows\Start-AnalysisBot.ps1 -Port 8001
+```
 
 ## 6. Health checks
 
@@ -222,15 +235,23 @@ Replit-specific or require replacement services:
 - React `/api/*` requests rely on the Replit Express proxy and dashboard auth
   edge; the direct Flask dashboard does not provide that same frontend routing.
 - Replit-managed PostgreSQL is not automatically available on Windows.
-  `DATABASE_URL` must point to an intentionally provisioned PostgreSQL server,
-  and the existing schema must be migrated deliberately later.
+  `DATABASE_URL` must point to an intentionally provisioned PostgreSQL server.
+  A verified custom-format backup restores both the database schema and rows;
+  do not run source schema files against an already restored database unless
+  applying a separately reviewed upgrade.
 - Replit secrets are not transferred by Git. Every provider credential must be
   recreated manually on the Windows host.
 - Replit deployment flags such as `REPLIT_DEPLOYMENT` have no Windows
   equivalent and must not be faked to enable live behavior.
+- The optional AI/Visual Brain functions use the Replit AI integration variable
+  names. On Windows, configure a direct OpenAI-compatible provider URL and key
+  explicitly, or leave the related feature flags disabled.
+- App/Object Storage used by the Express artifact service is not part of the
+  direct Flask runtime. Keep the direct dashboard path or provide an equivalent
+  external object-storage service before enabling artifact-dependent features.
 
-Database migration and replacement of Replit object storage are deliberately
-out of scope for this preparation pass.
+Replacing the React/Express proxy or Replit Object Storage is deliberately out
+of scope for this portability pass; neither blocks the direct Flask bot.
 
 ## 10. PostgreSQL evidence backup and restore validation
 
@@ -320,10 +341,13 @@ Each command writes two files outside the repository:
   counts/newest timestamps, backup bytes, and SHA-256 checksum. It never
   contains a connection string or credential.
 
-The critical evidence checks include thesis evaluations, decision transitions,
-GRE opportunities/experiments/results, SCALP simulations, Visual Brain, gate
-audit, dual sim, strategy/backtest data in both schemas, journals, and
-operator/safety state.
+The critical evidence checks explicitly include P4 authoritative verdict
+history; SCALP and INTRADAY_TREND research; generic, coordinator, and canonical
+ghost evidence; strategy-lab and simulation records; native/standard journals;
+edge and send snapshots; market-state evidence; strategy/backtest data in both
+`public` and `analysis_bot`; and safety, training, operator, and academy state.
+The dump still captures every accessible non-system schema/table, including a
+new durable table that is not yet listed in this compatibility checklist.
 
 ### Exact test restore and read-only validation commands
 

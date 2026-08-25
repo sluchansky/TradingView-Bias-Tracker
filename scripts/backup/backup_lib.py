@@ -15,6 +15,7 @@ import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Iterable
+from urllib.parse import parse_qs, unquote, urlsplit
 
 
 MANIFEST_VERSION = 1
@@ -28,16 +29,32 @@ SYSTEM_SCHEMAS = {"pg_catalog", "information_schema"}
 # do not necessarily have the same schema at a point in time.
 CRITICAL_TABLES: tuple[tuple[str, str], ...] = (
     ("public", "thesis_trade_evaluations"),
+    ("public", "authoritative_verdict_history"),
+    ("public", "decision_records"),
+    ("public", "decision_snapshots"),
     ("public", "decision_transitions"),
     ("public", "ghost_opportunities"),
     ("public", "ghost_experiments"),
     ("public", "ghost_experiment_results"),
+    ("public", "ghost_observations"),
+    ("public", "ghost_coordinator_observations"),
+    ("public", "ghost_coordinator_telemetry_events"),
+    ("public", "canonical_ghost_reconciliation_events"),
+    ("public", "canonical_ghost_evidence_records"),
+    ("public", "canonical_ghost_unmatched_evidence_records"),
     ("public", "scalp_strategy_sim_trades"),
+    ("public", "scalp_strategy_research"),
+    ("public", "scalp_strategy_library"),
+    ("public", "micro_scalp_ghost_trades"),
+    ("public", "micro_scalp_live_orders"),
     ("public", "visual_brain_observations"),
     ("public", "gate_audit_log"),
     ("public", "dual_sim_trades"),
     ("public", "strategy_trades"),
     ("analysis_bot", "strategy_trades"),
+    ("public", "strategy_weights"),
+    ("public", "learning_eligibility"),
+    ("public", "learning_setup_rules"),
     ("public", "backtest_candles"),
     ("public", "backtest_datasets"),
     ("public", "backtest_runs"),
@@ -48,12 +65,33 @@ CRITICAL_TABLES: tuple[tuple[str, str], ...] = (
     ("public", "journal_reviews"),
     ("public", "journal_attachments"),
     ("public", "native_journal"),
+    ("public", "edge_ledger"),
+    ("public", "internal_trade_snapshots"),
     ("public", "market_state_cache"),
+    ("public", "market_state_source_comparisons"),
     ("public", "safety_overrides"),
     ("public", "execution_arm_audit"),
     ("public", "open_trades"),
     ("public", "swing_theses"),
+    ("public", "manual_trades"),
+    ("public", "prop_accounts"),
     ("public", "bot_training_state"),
+    ("public", "bot_training_trades"),
+    ("public", "hysteresis_thesis"),
+    ("public", "thesis_snapshots"),
+    ("public", "confidence_snapshots"),
+    ("public", "main_brain_events"),
+    ("public", "market_events"),
+    ("public", "tradezella_trades"),
+    ("public", "tradezella_import_batches"),
+    ("public", "trade_management_metrics"),
+    ("public", "trade_failure_analysis"),
+    ("public", "performance_reports"),
+    ("public", "academy_sources"),
+    ("public", "academy_strategies"),
+    ("public", "academy_management_rules"),
+    ("public", "academy_strategy_sources"),
+    ("public", "academy_validation_events"),
 )
 
 TIMESTAMP_COLUMNS = (
@@ -112,10 +150,62 @@ def run_process(command: list[str], env: dict[str, str]) -> str:
 
 
 def connection_environment(url: str) -> dict[str, str]:
-    """Build child-only libpq environment without exposing the URL as an argument."""
+    """Build child-only libpq settings without exposing a URL as an argument.
+
+    ``PGDATABASE`` accepts a database name, not a PostgreSQL URI.  Passing the
+    complete URL there can silently target the local default server on Windows.
+    Split the URI into standard libpq environment variables instead; the values
+    exist only in the child process environment and never enter a command line or
+    manifest.
+    """
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme.lower() not in ("postgres", "postgresql"):
+            raise ValueError
+        host = parsed.hostname
+        port = parsed.port
+    except (TypeError, ValueError):
+        raise BackupToolError("DATABASE_URL must be a valid PostgreSQL connection URL.") from None
 
     environment = os.environ.copy()
-    environment["PGDATABASE"] = url
+    connection_keys = (
+        "PGHOST",
+        "PGPORT",
+        "PGUSER",
+        "PGPASSWORD",
+        "PGDATABASE",
+        "PGSERVICE",
+        "PGSSLMODE",
+        "PGSSLCERT",
+        "PGSSLKEY",
+        "PGSSLROOTCERT",
+        "PGTARGETSESSIONATTRS",
+    )
+    for key in connection_keys:
+        environment.pop(key, None)
+    if host:
+        environment["PGHOST"] = host
+    if port:
+        environment["PGPORT"] = str(port)
+    if parsed.username is not None:
+        environment["PGUSER"] = unquote(parsed.username)
+    if parsed.password is not None:
+        environment["PGPASSWORD"] = unquote(parsed.password)
+    database = unquote(parsed.path.lstrip("/"))
+    if not database:
+        raise BackupToolError("DATABASE_URL must include a database name.")
+    environment["PGDATABASE"] = database
+    query = parse_qs(parsed.query, keep_blank_values=False)
+    query_to_libpq = {
+        "sslmode": "PGSSLMODE",
+        "sslcert": "PGSSLCERT",
+        "sslkey": "PGSSLKEY",
+        "sslrootcert": "PGSSLROOTCERT",
+        "target_session_attrs": "PGTARGETSESSIONATTRS",
+    }
+    for query_key, env_key in query_to_libpq.items():
+        if query.get(query_key):
+            environment[env_key] = query[query_key][-1]
     return environment
 
 

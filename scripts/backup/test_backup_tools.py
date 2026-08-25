@@ -8,6 +8,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).parent))
 import backup_lib as lib  # noqa: E402
@@ -51,7 +52,48 @@ class BackupToolsTests(unittest.TestCase):
         url = "postgresql://operator:very-secret@db.example/test"
         self.assertEqual(lib.get_server_version(url, "psql", runner), "PostgreSQL 16")
         self.assertNotIn(url, " ".join(captured["command"]))  # type: ignore[arg-type]
-        self.assertEqual(captured["environment"]["PGDATABASE"], url)  # type: ignore[index]
+        child_env = captured["environment"]
+        self.assertEqual(child_env["PGHOST"], "db.example")  # type: ignore[index]
+        self.assertEqual(child_env["PGUSER"], "operator")  # type: ignore[index]
+        self.assertEqual(child_env["PGDATABASE"], "test")  # type: ignore[index]
+        self.assertEqual(child_env["PGPASSWORD"], "very-secret")  # type: ignore[index]
+
+    def test_connection_environment_decodes_windows_safe_uri_components(self) -> None:
+        environment = lib.connection_environment(
+            "postgresql://operator:p%40ss%3Dword@db.example:5433/trading"
+            "?sslmode=require&target_session_attrs=read-write"
+        )
+        self.assertEqual(environment["PGPASSWORD"], "p@ss=word")
+        self.assertEqual(environment["PGPORT"], "5433")
+        self.assertEqual(environment["PGSSLMODE"], "require")
+        self.assertEqual(environment["PGTARGETSESSIONATTRS"], "read-write")
+
+    def test_connection_environment_rejects_non_postgres_uri(self) -> None:
+        with self.assertRaises(lib.BackupToolError):
+            lib.connection_environment("https://not-a-database.example")
+
+    def test_connection_environment_clears_stale_libpq_connection_settings(self) -> None:
+        with patch.dict(
+            "os.environ",
+            {
+                "PGHOST": "wrong-host",
+                "PGDATABASE": "wrong-db",
+                "PGSERVICE": "wrong-service",
+                "PGSSLMODE": "disable",
+            },
+            clear=False,
+        ):
+            environment = lib.connection_environment(
+                "postgresql://operator:secret@right-host/right-db?sslmode=require"
+            )
+        self.assertEqual(environment["PGHOST"], "right-host")
+        self.assertEqual(environment["PGDATABASE"], "right-db")
+        self.assertEqual(environment["PGSSLMODE"], "require")
+        self.assertNotIn("PGSERVICE", environment)
+
+    def test_connection_environment_requires_database_name(self) -> None:
+        with self.assertRaises(lib.BackupToolError):
+            lib.connection_environment("postgresql://operator:secret@db.example/")
 
     def test_manifest_contains_dynamic_coordinator_and_critical_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
@@ -99,7 +141,7 @@ class BackupToolsTests(unittest.TestCase):
             return "9\t2026-08-22 12:00:00+00\n"
 
         evidence = lib.get_critical_evidence(
-            "postgresql://unused",
+            "postgresql://unused/test",
             "psql",
             tables,
             columns,
@@ -107,6 +149,26 @@ class BackupToolsTests(unittest.TestCase):
         )
         self.assertEqual(evidence["public.thesis_trade_evaluations"]["row_count"], 9)
         self.assertFalse(evidence["public.ghost_opportunities"]["present"])
+
+    def test_critical_set_covers_current_portability_evidence_families(self) -> None:
+        tables = set(lib.CRITICAL_TABLES)
+        self.assertTrue(
+            {
+                ("public", "authoritative_verdict_history"),
+                ("public", "canonical_ghost_evidence_records"),
+                ("public", "canonical_ghost_unmatched_evidence_records"),
+                ("public", "ghost_coordinator_observations"),
+                ("public", "scalp_strategy_sim_trades"),
+                ("public", "strategy_trades"),
+                ("public", "native_journal"),
+                ("public", "edge_ledger"),
+                ("public", "internal_trade_snapshots"),
+                ("public", "safety_overrides"),
+                ("public", "execution_arm_audit"),
+                ("analysis_bot", "strategy_trades"),
+                ("analysis_bot", "backtest_runs"),
+            }.issubset(tables)
+        )
 
     def test_compare_manifest_reports_count_and_timestamp_mismatch(self) -> None:
         manifest = {
