@@ -178,6 +178,13 @@ def _build_snapshot(result: dict, instrument: str, mode: str,
         + _list(it_ctx.get("veto_reasons")) + _list(it_ctx.get("veto_codes"))
         + _list(plan.get("it_veto_code")) + _list(result.get("strict_missing"))
     )
+    strict_blockers = _unique(
+        _list(result.get("strict_blockers")) + _list(result.get("strict_missing"))
+    )
+    final_veto_reasons = [
+        _safe(item) for item in _list(result.get("final_veto_reasons"))
+        if isinstance(_safe(item), dict)
+    ]
     waiting_for = _unique(
         _list(result.get("waiting_for")) + _list(gate.get("waiting_for"))
         + _list(it_ctx.get("ready_reduced_missing")) + _list(it_ctx.get("missing"))
@@ -224,6 +231,10 @@ def _build_snapshot(result: dict, instrument: str, mode: str,
         "grade": _text(_first(result.get("grade"), _grade(score))),
         "confidence": _number(_confidence(result)),
         "blockers": blockers,
+        # These are payload-only fields: the legacy blockers column remains
+        # unchanged and no history-table schema migration is required.
+        "strict_blockers": strict_blockers,
+        "final_veto_reasons": final_veto_reasons,
         "waiting_for": waiting_for,
         "waiting_for_guidance": strict_reason,
         "vwap_value": _number(_first(result.get("vwap_value"), gate.get("vwap_value"))),

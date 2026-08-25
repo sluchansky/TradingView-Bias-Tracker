@@ -96,6 +96,37 @@ def test_scalp_long_ready_snapshot_contains_full_audit_context():
     assert snap["safety"]["execution_enabled"] is False
 
 
+def test_snapshot_preserves_strict_blockers_separately_from_final_vetoes():
+    snap = avh._build_snapshot(
+        _result(
+            verdict="WAIT", score=96, strict_missing=[],
+            strict_blockers=[],
+            final_veto_reasons=[
+                {
+                    "stage": "scalp_quality",
+                    "code": "room",
+                    "reason": "only 0.8R room to the opposing zone (need 1.25R)",
+                },
+                {
+                    "stage": "scalp_quality",
+                    "code": "opposing_zone",
+                    "reason": "price entering the opposing zone",
+                },
+            ],
+        ),
+        "MNQ", "SCALP", {},
+    )
+
+    # Legacy blockers stay exactly where existing history readers expect them;
+    # the new final-veto diagnostics live in the immutable JSON payload only.
+    assert snap["strict_blockers"] == []
+    assert [item["code"] for item in snap["final_veto_reasons"]] == [
+        "room", "opposing_zone",
+    ]
+    assert snap["score"] == 96
+    assert snap["safety"]["execution_enabled"] is False
+
+
 def test_snapshot_uses_explicit_native_source_timestamp_not_signal_wall_clock():
     snap = avh._build_snapshot(
         _result(signal_time="2026-08-24T19:00:00+00:00"),

@@ -82,6 +82,7 @@ export interface ExplainData {
 
   // Blockers
   hardBlockers: string[];
+  finalVetoReasons: string[];
   missingConfirmations: string[];
   opposingStructure: OpposingStructure | null;
   structureGuidance: StructureGuidance | null;
@@ -204,6 +205,16 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
   // ── Blockers ──────────────────────────────────────────────────────────────
   const hardBlockers = Array.isArray(v.hard_blockers)
     ? (v.hard_blockers as unknown[]).map(String).filter(Boolean) : [];
+  const rawFinalVetoes = op.final_veto_reasons ?? v.final_veto_reasons ?? [];
+  const finalVetoReasons = (Array.isArray(rawFinalVetoes) ? rawFinalVetoes : [rawFinalVetoes])
+    .map(item => {
+      if (item && typeof item === 'object') {
+        const record = item as Record<string, unknown>;
+        return safeStr(record.reason ?? record.message ?? record.code, '');
+      }
+      return safeStr(item, '');
+    })
+    .filter(Boolean);
   const presentationWaiting = Array.isArray(op.waiting_for)
     ? (op.waiting_for as Record<string, unknown>[]).map(item => safeStr(item.label ?? item.key, '')).filter(Boolean)
     : [];
@@ -239,6 +250,7 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
     );
   }
   for (const b of hardBlockers) mustChange.push(`${b} must clear`);
+  for (const reason of finalVetoReasons) mustChange.push(reason);
   if (!isActionable && candidateDir !== 'NONE' && mustChange.length === 0) {
     mustChange.push('Edge score must reach the readiness threshold');
   }
@@ -283,6 +295,7 @@ export function extractExplainData(p: Record<string, unknown>): ExplainData {
     shortComponents,
     hasComponents,
     hardBlockers,
+    finalVetoReasons,
     missingConfirmations,
     opposingStructure,
     structureGuidance,

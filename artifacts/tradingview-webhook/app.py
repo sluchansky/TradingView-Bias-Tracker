@@ -12255,6 +12255,42 @@ def _scalp_entry_veto_reasons(sq):
     return reasons
 
 
+def _final_veto_records(stage, reasons):
+    """Normalize display-only final-veto diagnostics for every read surface.
+
+    This helper deliberately records existing decisions after they have been
+    made; it does not participate in a gate, score, plan, risk, or execution
+    decision.  Keeping the original codes is important because a single SCALP
+    quality veto can have more than one independently failing check.
+    """
+    records = []
+    for item in list(reasons or []):
+        item_stage = stage
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            code, reason = item[0], item[1]
+        elif isinstance(item, dict):
+            item_stage = item.get("stage") or stage
+            code = item.get("code") or item.get("key") or "final_wait_override"
+            reason = item.get("reason") or item.get("message") or code
+        else:
+            code, reason = "final_wait_override", item
+        text = str(reason or "").strip()
+        if text:
+            records.append({
+                "stage": str(item_stage or "final_resolution"),
+                "code": str(code or "final_wait_override"),
+                "reason": text,
+            })
+    return records
+
+
+def _record_final_veto_if_ready(records, prior_verdict, stage, reasons):
+    """Append a diagnostic only for an actual actionable-to-WAIT demotion."""
+    if is_actionable(prior_verdict):
+        records.extend(_final_veto_records(stage, reasons))
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Full analysis
 # ---------------------------------------------------------------------------
@@ -25511,6 +25547,10 @@ def _build_operator_presentation(result):
     structure = _structure_cycle_operator_guidance(r.get("structure_state"))
     waiting_for = [{"key": str(item), "label": str(item).replace("_", " ")}
                    for item in list(r.get("strict_missing") or []) if item]
+    strict_blockers = [str(item) for item in list(
+        r.get("strict_blockers", r.get("strict_missing", [])) or []) if item]
+    final_veto_reasons = _final_veto_records(
+        "final_resolution", r.get("final_veto_reasons") or [])
     if structure and not structure.get("confirmed") and structure.get("next_event_reason"):
         waiting_for.insert(0, {
             "key": "structure_cycle",
@@ -25533,6 +25573,8 @@ def _build_operator_presentation(result):
         "candidate_label": candidate_label,
         "reasoning": reason,
         "waiting_for": waiting_for,
+        "strict_blockers": strict_blockers,
+        "final_veto_reasons": final_veto_reasons,
         "vwap": {
             "value": vwap,
             "status": vwap_status,
@@ -29201,6 +29243,8 @@ def build_main_brain_payload(result, instrument=None):
         "is_actionable":        operator_presentation.get("is_actionable") is True,
         "strict_reason":        operator_presentation.get("reasoning"),
         "waiting_for":          operator_presentation.get("waiting_for"),
+        "strict_blockers":      operator_presentation.get("strict_blockers"),
+        "final_veto_reasons":   operator_presentation.get("final_veto_reasons"),
         "vwap":                 operator_presentation.get("vwap"),
         "structure_guidance":   operator_presentation.get("structure_guidance"),
     }
@@ -29442,6 +29486,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     confluences      = strict["confluences"]
     strict_reason    = strict.get("reason", "")
     strict_missing   = strict.get("missing", [])
+    # Keep strict-gate blockers distinct from later READY->WAIT safety demotions.
+    # These fields are observability-only and never feed back into the decision.
+    strict_blockers = list(strict_missing or [])
+    final_veto_reasons = []
 
     # SWING higher-timeframe context — computed ONCE here (only under SWING + flag-on)
     # and REUSED by the plan builder (target geometry), the P4 entry veto, the
@@ -29636,6 +29684,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _sq   = None
             _veto = [("unavailable", f"SCALP entry checks unavailable ({exc})")]
         if _veto:
+            _record_final_veto_if_ready(
+                final_veto_reasons, verdict, "scalp_quality", _veto)
             verdict       = "WAIT"
             strict_label  = "WAIT"
             strict_reason = "SCALP filter: " + "; ".join(m for _, m in _veto) + "."
@@ -29679,6 +29729,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         except Exception as exc:   # FAIL-CLOSED — a broken check must not let a trade through.
             _sv = [("unavailable", f"SWING entry checks unavailable ({exc})")]
         if _sv:
+            _record_final_veto_if_ready(
+                final_veto_reasons, verdict, "swing_entry", _sv)
             verdict       = "WAIT"
             strict_label  = "WAIT"
             strict_reason = "SWING filter: " + "; ".join(m for _, m in _sv) + "."
@@ -29722,6 +29774,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _iv = [("unavailable",
                     f"INTRADAY TREND entry checks unavailable ({exc})")]
         if _iv:
+            _record_final_veto_if_ready(
+                final_veto_reasons, verdict, "intraday_trend_entry", _iv)
             verdict       = "WAIT"
             strict_label  = "WAIT"
             strict_reason = ("INTRADAY TREND filter: "
@@ -29759,6 +29813,11 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 swing_strategy_filter["reason"] = f"strategy filter unavailable ({exc})"
                 _ss_veto = True
             if _ss_veto:
+                _record_final_veto_if_ready(
+                    final_veto_reasons, verdict, "swing_strategy_filter", [(
+                        "strategy_mismatch",
+                        swing_strategy_filter.get("reason") or "no match",
+                    )])
                 verdict       = "WAIT"
                 strict_label  = "WAIT"
                 strict_reason = ("SWING strategy filter: "
@@ -29807,6 +29866,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         except Exception:   # a broken brake must NEVER block a trade — fail OPEN.
             _brake_why = None
         if _brake_why:
+            _record_final_veto_if_ready(
+                final_veto_reasons, verdict, "trend_brake", [(
+                    "trend_brake", "Trend brake: " + _brake_why + ".",
+                )])
             verdict       = "WAIT"
             strict_label  = "WAIT"
             strict_reason = "Trend brake: " + _brake_why + "."
@@ -29869,6 +29932,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # structure+VWAP+Edge READY. cfg() reads the active mode so SWING stays unchanged.
     zone_hard_gate = bool(cfg("GATE_REQUIRE_ZONE"))
     if zone_broken_active and zone_hard_gate:
+        _record_final_veto_if_ready(
+            final_veto_reasons, verdict, "zone_integrity", [(
+                "zone_broken", "Structure invalidated — zone broken.",
+            )])
         confidence         = max(0, confidence - 30)
         setup_stage        = "Watching"
         stage_direction    = None
@@ -29911,6 +29978,11 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         or (_mit_records[-1]["price"] if _mit_records else None)
     )
     if zone_mitigated_near and zone_hard_gate:
+        _record_final_veto_if_ready(
+            final_veto_reasons, verdict, "zone_integrity", [(
+                "zone_mitigated",
+                "Zone consumed — wait for fresh supply or demand zone.",
+            )])
         # Full override — zone mitigation supersedes ALL scores, setups, and plans
         confidence         = max(0, confidence - 15)
         verdict            = "WAIT"
@@ -29957,7 +30029,14 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # above HOLD_READY_THRESHOLD may maintain a READY verdict against transient
     # WAIT noise from the raw gate. Hard invalidations always snap conf=0, so the
     # hold never traps a genuinely broken setup.  Flag OFF → pass-through.
+    _pre_thesis_verdict = verdict
     verdict, _thesis_snap = _apply_thesis(active_ticker, strict, verdict, trade_plan)
+    _record_final_veto_if_ready(
+        final_veto_reasons, _pre_thesis_verdict, "thesis_hysteresis", [(
+            "thesis_hysteresis",
+            (_thesis_snap or {}).get("reason")
+            or "Thesis hysteresis changed this setup to WAIT.",
+        )] if not is_actionable(verdict) else [])
 
     result = dict(
         bullish=bullish, bearish=bearish, counts=counts,
@@ -29986,7 +30065,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
         mitigated_zone_price=mitigated_zone_price,
         strict_label=strict_label, strict_score=strict_score,
         strict_direction=strict_direction, strict_reason=strict_reason,
-        strict_missing=strict_missing, confluences=confluences,
+        strict_missing=strict_missing, strict_blockers=strict_blockers,
+        final_veto_reasons=final_veto_reasons, confluences=confluences,
         vwap_value=vwap_value, vwap_status=vwap_status,
         volatility=volatility,
         active_ticker=active_ticker,
@@ -30012,9 +30092,20 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     _thesis_gate = _compute_thesis_gate(active_ticker, _thesis_snap, strict, verdict, edge_score)
     if _thesis_gate and _THESIS_ENFORCEMENT_MODE == "enforced":
         if _thesis_gate.get("action") == "BLOCK":
+            _thesis_reason = (
+                _thesis_gate.get("reason")
+                or _thesis_gate.get("summary")
+                or "Thesis enforcement blocked the ready setup."
+            )
+            _record_final_veto_if_ready(
+                result["final_veto_reasons"], result.get("verdict"),
+                "thesis_enforcement", [("thesis_block", _thesis_reason)])
             verdict = "WAIT"
             _thesis_gate["original_verdict"] = result.get("verdict", verdict)
             _thesis_gate["shadow_verdict"]   = "WAIT"
+            result["verdict"] = verdict
+            result["strict_label"] = "WAIT"
+            result["strict_reason"] = _thesis_reason
     result["thesis_gate"] = _thesis_gate if _thesis_gate else None
     # Per-gate WAIT debug (which READY gate failed) — surfaced on /status + logs.
     result["gate_debug"] = strict.get("gate_debug")
@@ -30461,6 +30552,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _veto_reason = ("Analyst veto: "
                             + (_analyst.get("why_not_trade")
                                or "analyst reasoning does not support the trade."))
+            _record_final_veto_if_ready(
+                result["final_veto_reasons"], result.get("verdict"),
+                "analyst_reasoning", [("analyst_veto", _veto_reason)])
             result["verdict"]       = "WAIT"
             result["strict_label"]  = "WAIT"
             result["strict_reason"] = _veto_reason
@@ -30509,6 +30603,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _pr_reason = ("Pro Review veto: "
                           + (_pr_act.get("why_not_trade")
                              or "professional review does not support the trade."))
+            _record_final_veto_if_ready(
+                result["final_veto_reasons"], result.get("verdict"),
+                "pro_review", [("pro_review_veto", _pr_reason)])
             result["verdict"]       = "WAIT"
             result["strict_label"]  = "WAIT"
             result["strict_reason"] = _pr_reason
@@ -30553,6 +30650,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _td_reason = ("Trade Debate veto: "
                           + (_td.get("summary")
                              or "the market is too balanced to trade."))
+            _record_final_veto_if_ready(
+                result["final_veto_reasons"], result.get("verdict"),
+                "trade_debate", [("trade_debate_veto", _td_reason)])
             result["verdict"]       = "WAIT"
             result["strict_label"]  = "WAIT"
             result["strict_reason"] = _td_reason
@@ -30600,6 +30700,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _eq_reason = ("Entry Quality veto: "
                           + (_eq.get("why_not_trade")
                              or ("entry location is poor (%s/100)." % _eq.get("score"))))
+            _record_final_veto_if_ready(
+                result["final_veto_reasons"], result.get("verdict"),
+                "entry_quality", [("entry_quality_veto", _eq_reason)])
             result["verdict"]       = "WAIT"
             result["strict_label"]  = "WAIT"
             result["strict_reason"] = _eq_reason
@@ -30638,6 +30741,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             _msf_veto, _msf_why = _mi_strategy_filter_veto(result)
             if _msf_veto:
                 _msf_reason = "MI Strategy Filter veto: " + _msf_why
+                _record_final_veto_if_ready(
+                    result["final_veto_reasons"], result.get("verdict"),
+                    "mi_strategy_filter", [("mi_strategy_filter_veto", _msf_reason)])
                 result["verdict"]       = "WAIT"
                 result["strict_label"]  = "WAIT"
                 result["strict_reason"] = _msf_reason
@@ -30717,6 +30823,9 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                       "threshold (historical edge for this setup is weak)." % (
                           int(_cg.get("final_confidence_score") or 0),
                           int(_cg.get("threshold") or 0)))
+        _record_final_veto_if_ready(
+            result["final_veto_reasons"], result.get("verdict"),
+            "learning_governor", [("learning_veto", _lr_reason)])
         result["verdict"]       = "WAIT"
         result["strict_label"]  = "WAIT"
         result["strict_reason"] = _lr_reason
@@ -31133,6 +31242,8 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             "actionable_direction": None, "candidate_label": "WAIT",
             "reasoning": "WAIT — operator presentation is unavailable.",
             "waiting_for": [],
+            "strict_blockers": [],
+            "final_veto_reasons": [],
             "vwap": {"value": None, "status": "unavailable", "side": "UNAVAILABLE",
                      "wording": "VWAP is unavailable or stale."},
             "regime_wording": "VWAP is unavailable or stale.",
@@ -61558,6 +61669,8 @@ def _build_status_payload(_tk):
         "strict_direction":    operator_presentation.get("candidate_direction"),
         "strict_reason":       operator_presentation.get("reasoning"),
         "strict_missing":      a.get("strict_missing"),
+        "strict_blockers":     a.get("strict_blockers"),
+        "final_veto_reasons": a.get("final_veto_reasons"),
         "gate_debug":          a.get("gate_debug"),
         "structure_state":     a.get("structure_state"),
         "learning_score_influence": a.get("learning_score_influence"),

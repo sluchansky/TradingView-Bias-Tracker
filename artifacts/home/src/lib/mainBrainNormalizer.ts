@@ -139,6 +139,8 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
     is_actionable:        operatorPresentation.is_actionable ?? vrd.is_actionable,
     strict_reason:        operatorPresentation.reasoning ?? vrd.strict_reason,
     waiting_for:          operatorPresentation.waiting_for ?? vrd.waiting_for,
+    strict_blockers:      operatorPresentation.strict_blockers ?? vrd.strict_blockers ?? [],
+    final_veto_reasons:   operatorPresentation.final_veto_reasons ?? vrd.final_veto_reasons ?? [],
     vwap:                 operatorPresentation.vwap ?? vrd.vwap,
     structure_guidance:   operatorPresentation.structure_guidance ?? vrd.structure_guidance,
     edge_grade:           vrd.grade,

@@ -36,6 +36,12 @@ const raw: Record<string, unknown> = {
     candidate_label: 'Short candidate — WAIT',
     reasoning: 'Short WAIT — structure confirmation required.',
     waiting_for: [{ key: 'structure_cycle', label: 'Wait for BOS SUPPLY confirmation.', structure: true }],
+    strict_blockers: [],
+    final_veto_reasons: [{
+      stage: 'scalp_quality',
+      code: 'room',
+      reason: 'only 0.8R room to the opposing zone (need 1.25R)',
+    }],
     vwap: { side: 'BELOW', wording: 'Price is below VWAP.' },
     structure_guidance: {
       state: 'TREND_INITIAL', direction: 'Short', confirmed: false,
@@ -63,6 +69,9 @@ check('VWAP wording is backend owned', (presentation.vwap as Record<string, unkn
 check('Decision Clarity uses candidate side', explain.candidateDir, 'SHORT');
 check('Decision Clarity keeps WAIT non-actionable', explain.isActionable, false);
 check('Waiting For uses operator state', explain.missingConfirmations[0], 'Wait for BOS SUPPLY confirmation.');
+check('final veto remains separate from strict blockers', (verdict.strict_blockers as unknown[]).length, 0);
+check('final veto appears in operator must-change list',
+  explain.mustChange.includes('only 0.8R room to the opposing zone (need 1.25R)'), true);
 check('Market Structure uses operator guidance', structure?.nextEvent, 'BOS SUPPLY');
 
 console.log(`Task #270 frontend contract: ${passed} passed`);
