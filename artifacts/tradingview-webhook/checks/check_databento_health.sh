@@ -74,3 +74,9 @@ print("")
 print("DATABENTO HEALTH SMOKE OK")
 print("(OFFLINE detection + gate continuity + interface contract confirmed)")
 PYEOF
+
+# Release-gate soak: deterministic four-instrument supported load plus
+# intentional overload.  It is local-only and emits JSON evidence on stdout.
+"${PY}" "${APP_DIR}/checks/databento_soak.py" >/tmp/databento_soak_report.json
+echo "  PASS  T5: four-instrument soak zero-drop budget and overload fail-closed behavior"
+echo "  Evidence: /tmp/databento_soak_report.json"

@@ -155,3 +155,4 @@
 - [MNQ structure provenance tracing](mnq-structure-provenance.md) — async analysis must attach audit results by opaque per-bar trace ID, never by “latest” record.
 - [Operator presentation contract](operator-presentation-contract.md) — one display-only strict-result projection owns candidate/actionable semantics, reason, VWAP wording, and structure guidance across every operator surface.
 - [Structure confirmation lag diagnostic](structure-confirmation-lag.md) — immutable verdict snapshots classify high-score structure waits as confirmed, expired, source-delayed, or detector-stale.
+- [Databento soak evidence](databento-soak-evidence.md) — sample queue peaks during intake; post-drain snapshots hide bounded-dispatcher pressure.

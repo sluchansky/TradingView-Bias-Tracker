@@ -13,6 +13,7 @@ from collections import deque
 from datetime import datetime, timezone
 
 import databento_brain as db
+from checks.databento_soak import build_report
 
 
 def _trade(iid: int, seq: int, *, ts: float | None = None):
@@ -265,6 +266,23 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
         ]
         self.assertIn("BOS DEMAND", alert_types)
         self.assertIn("CHOCH SUPPLY", alert_types)
+
+    def test_release_gate_soak_emits_pressure_and_drain_evidence(self):
+        report = build_report()
+        supported = report["supported_load"]
+        overload = report["intentional_overload"]
+        self.assertEqual(supported["queue_dropped"], 0)
+        self.assertEqual(supported["downstream_dropped"], 0)
+        self.assertEqual(set(supported["freshness"]), {"MGC", "MNQ", "MES", "MYM"})
+        self.assertTrue(all(v == "FRESH" for v in supported["freshness"].values()))
+        for key in (
+            "queue_depth_max", "sdk_pressure", "application_pressure",
+            "source_age_s_max", "processing_lag_s_max", "downstream_stage",
+            "drain_time_s",
+        ):
+            self.assertIn(key, supported)
+        self.assertGreater(overload["queue_dropped"], 0)
+        self.assertEqual(overload["freshness"]["MGC"], "UNAVAILABLE")
 
 
 if __name__ == "__main__":
