@@ -655,6 +655,223 @@ def get_history(instrument: str, mode: str, limit: int = 120) -> List[dict]:
             pass
 
 
+def _diagnostic_datetime(value: Any) -> Optional[datetime]:
+    """Normalize DB, ISO, and epoch timestamps for research reconstruction."""
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return datetime.fromtimestamp(float(value), tz=timezone.utc)
+        except (TypeError, ValueError, OSError, OverflowError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip().replace("Z", "+00:00")
+    try:
+        parsed = datetime.fromisoformat(text)
+        return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+    except ValueError:
+        return None
+
+
+def _diagnostic_texts(row: dict, *keys: str) -> List[str]:
+    values: List[str] = []
+    for key in keys:
+        value = row.get(key)
+        if isinstance(value, (list, tuple, set)):
+            values.extend(str(item) for item in value if item is not None)
+        elif value is not None:
+            values.append(str(value))
+    return values
+
+
+def _structure_blocked(row: dict) -> bool:
+    texts = _diagnostic_texts(row, "blockers", "waiting_for", "waiting_for_guidance")
+    return bool(row.get("blocked")) and any(
+        any(token in text.upper() for token in ("STRUCTURE", "BOS", "CHOCH"))
+        for text in texts
+    )
+
+
+def _structure_confirmed(row: dict) -> bool:
+    state = str(row.get("structure_cycle_state") or "").upper()
+    if any(token in state for token in ("CONTINUATION", "CONFIRMED", "TREND_CONFIRMED")):
+        return True
+    context = row.get("structure_context") or {}
+    return bool(
+        row.get("actionable")
+        and isinstance(context, dict)
+        and context.get("cycle_confirmed") is True
+    )
+
+
+def _structure_source_timestamp(row: dict) -> Optional[datetime]:
+    context = row.get("structure_context") or {}
+    if not isinstance(context, dict):
+        context = {}
+    payload = row.get("payload") or {}
+    if not isinstance(payload, dict):
+        payload = {}
+    return _diagnostic_datetime(_first(
+        context.get("source_timestamp"), context.get("event_timestamp"),
+        context.get("observed_at"), payload.get("structure_source_timestamp"),
+        payload.get("structure_event_timestamp"), row.get("source_timestamp"),
+    ))
+
+
+def build_structure_confirmation_diagnostic(
+    rows: List[dict],
+    *,
+    instrument: Optional[str] = None,
+    mode: Optional[str] = None,
+    min_score: float = 70.0,
+    confirmation_window_seconds: int = 600,
+    source_delay_seconds: int = 120,
+    detector_no_update_seconds: int = 300,
+    now: Any = None,
+) -> dict:
+    """Reconstruct structure waits from immutable verdict snapshots.
+
+    This is deliberately a pure, display-only reducer.  A high-score snapshot
+    blocked by structure starts a case; later immutable snapshots resolve it as
+    confirmed continuation, expiry, source-data delay, or detector no-update.
+    """
+    current = _diagnostic_datetime(now) or datetime.now(timezone.utc)
+    normalized: List[Tuple[datetime, dict]] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        observed = _structure_source_timestamp(row)
+        recorded = _diagnostic_datetime(row.get("recorded_at"))
+        at = observed or recorded
+        if at is not None:
+            normalized.append((at, row))
+    normalized.sort(key=lambda item: item[0])
+    cases: List[dict] = []
+    active: Dict[Tuple[str, str], dict] = {}
+
+    for at, row in normalized:
+        direction = _direction(_first(
+            row.get("candidate_direction"), row.get("actionable_direction")
+        ))
+        if not direction:
+            continue
+        scope = (str(row.get("instrument") or instrument or "").upper(), direction)
+        score = _number(row.get("score"))
+        is_candidate = (
+            score is not None and score >= float(min_score)
+            and _structure_blocked(row)
+        )
+        if is_candidate:
+            prior = active.get(scope)
+            event = _first(row.get("structure_next_event"), "structure confirmation")
+            if prior is None:
+                active[scope] = {
+                    "started_at": at,
+                    "last_at": at,
+                    "source_timestamp": at.isoformat(),
+                    "recorded_at": _text(row.get("recorded_at")),
+                    "instrument": scope[0],
+                    "mode": str(row.get("mode") or mode or "").upper(),
+                    "direction": direction,
+                    "score": score,
+                    "grade": row.get("grade"),
+                    "outstanding_event": str(event),
+                    "source": "authoritative_verdict_history",
+                    "source_delay_seconds": None,
+                }
+            else:
+                prior["last_at"] = at
+                prior["score"] = max(prior["score"], score)
+                prior["outstanding_event"] = str(event)
+            recorded = _diagnostic_datetime(row.get("recorded_at"))
+            if recorded is not None:
+                delay = max(0.0, (recorded - at).total_seconds())
+                prior = active[scope]
+                prior["source_delay_seconds"] = round(delay, 3)
+                if delay >= source_delay_seconds:
+                    prior["outcome"] = "SOURCE_DATA_DELAY"
+                    prior["elapsed_seconds"] = round((at - prior["started_at"]).total_seconds(), 3)
+                    cases.append(active.pop(scope))
+                    continue
+            continue
+
+        prior = active.get(scope)
+        if prior is None:
+            continue
+        elapsed = max(0.0, (at - prior["started_at"]).total_seconds())
+        prior["last_at"] = at
+        prior["elapsed_seconds"] = round(elapsed, 3)
+        if _structure_confirmed(row):
+            prior["outcome"] = "CONFIRMED_CONTINUATION"
+            cases.append(active.pop(scope))
+        elif elapsed >= confirmation_window_seconds:
+            prior["outcome"] = "EXPIRED"
+            cases.append(active.pop(scope))
+
+    for scope, prior in list(active.items()):
+        elapsed = max(0.0, (current - prior["started_at"]).total_seconds())
+        prior["elapsed_seconds"] = round(elapsed, 3)
+        if prior.get("source_delay_seconds") is not None and prior["source_delay_seconds"] >= source_delay_seconds:
+            prior["outcome"] = "SOURCE_DATA_DELAY"
+        elif elapsed >= confirmation_window_seconds:
+            prior["outcome"] = "EXPIRED"
+        elif elapsed >= detector_no_update_seconds:
+            prior["outcome"] = "DETECTOR_NO_UPDATE"
+        else:
+            prior["outcome"] = "WAITING_REAL_CONFIRMATION"
+        cases.append(active.pop(scope))
+
+    cases.sort(key=lambda item: (item["instrument"], item["mode"], item["started_at"]))
+    for case in cases:
+        case["started_at"] = case["started_at"].isoformat()
+        case["last_source_timestamp"] = case.pop("last_at").isoformat()
+    counts = {name: sum(case["outcome"] == name for case in cases) for name in (
+        "CONFIRMED_CONTINUATION", "EXPIRED", "SOURCE_DATA_DELAY",
+        "DETECTOR_NO_UPDATE", "WAITING_REAL_CONFIRMATION",
+    )}
+    return {
+        "ok": True,
+        "read_only": True,
+        "observer_only": True,
+        "contract_version": 1,
+        "filters": {
+            "instrument": str(instrument).upper() if instrument else None,
+            "mode": str(mode).upper() if mode else None,
+            "min_score": float(min_score),
+            "confirmation_window_seconds": int(confirmation_window_seconds),
+            "source_delay_seconds": int(source_delay_seconds),
+            "detector_no_update_seconds": int(detector_no_update_seconds),
+        },
+        "counts": counts,
+        "cases": cases,
+        "note": (
+            "Research reconstruction only. Source timestamps come from the "
+            "immutable verdict snapshot; this report never gates or executes."
+        ),
+    }
+
+
+def get_structure_confirmation_diagnostic(
+    instrument: Optional[str] = None,
+    mode: Optional[str] = None,
+    limit: int = 1200,
+    **kwargs: Any,
+) -> dict:
+    """Read immutable history and build the confirmation-lag report."""
+    instruments = [str(instrument).upper()] if instrument else ["MGC", "MNQ", "MES", "MYM"]
+    modes = [str(mode).upper()] if mode else list(SUPPORTED_MODES)
+    rows: List[dict] = []
+    for inst in instruments:
+        for selected_mode in modes:
+            if selected_mode not in SUPPORTED_MODES:
+                continue
+            rows.extend(get_history(inst, selected_mode, limit=limit))
+    return build_structure_confirmation_diagnostic(
+        rows, instrument=instrument, mode=mode, **kwargs
+    )
+
+
 def status() -> dict:
     with _STATE_LOCK:
         worker_running = bool(_WORKER is not None and _WORKER.is_alive())

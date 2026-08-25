@@ -85540,6 +85540,38 @@ def route_authoritative_verdict_history_health():
         }), 500
 
 
+@app.route("/structure-confirmation-diagnostics", methods=["GET"])
+def route_structure_confirmation_diagnostics():
+    """Read-only reconstruction of high-score structure confirmation waits."""
+    try:
+        import authoritative_verdict_history as _avh  # noqa: PLC0415
+        instrument = request.args.get("instrument", "").strip().upper() or None
+        mode = request.args.get("mode", "").strip().upper() or None
+        if instrument and instrument not in ("MGC", "MNQ", "MES", "MYM"):
+            return jsonify({"ok": False, "read_only": True, "error": "invalid instrument"}), 400
+        if mode and mode not in _avh.SUPPORTED_MODES:
+            return jsonify({"ok": False, "read_only": True, "error": "invalid mode"}), 400
+        try:
+            limit = max(1, min(int(request.args.get("limit", 1200)), 2000))
+            min_score = float(request.args.get("min_score", 70))
+            window = max(1, int(request.args.get("confirmation_window_seconds", 600)))
+            delay = max(1, int(request.args.get("source_delay_seconds", 120)))
+            no_update = max(1, int(request.args.get("detector_no_update_seconds", 300)))
+        except (TypeError, ValueError):
+            return jsonify({"ok": False, "read_only": True, "error": "invalid numeric filter"}), 400
+        return jsonify(_avh.get_structure_confirmation_diagnostic(
+            instrument=instrument, mode=mode, limit=limit, min_score=min_score,
+            confirmation_window_seconds=window, source_delay_seconds=delay,
+            detector_no_update_seconds=no_update,
+        ))
+    except Exception as exc:
+        logger.warning("structure confirmation diagnostics failed: %s", exc)
+        return jsonify({
+            "ok": False, "read_only": True, "observer_only": True,
+            "error": "diagnostic_unavailable",
+        }), 200
+
+
 @app.route("/ghost-research/health", methods=["GET"])
 def route_ghost_research_health():
     """Ghost Research Engine operational health — Phase 2 (DISPLAY-ONLY).

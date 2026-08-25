@@ -437,6 +437,9 @@ export const BOT1_ROUTES = [
   // counts only. Read-only, observer-only, owner-authenticated, and never a
   // gate, outcome resolver, strategy, risk, broker, or execution surface.
   "/authoritative-verdict-history-health",
+  // Structure confirmation timing / stale-detector research. GET-only and
+  // never a trading input.
+  "/structure-confirmation-diagnostics",
   // Research Operations panel — lightweight aggregated status for GRE/FVG/SCALP/IT
   // engines: observation counts, evidence-state breakdown, READY_FOR_REVIEW queue.
   // DISPLAY-ONLY; owner-only; NOT in OPEN_PATHS. Never touches gate or execution.

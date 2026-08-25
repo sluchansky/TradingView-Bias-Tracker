@@ -323,6 +323,80 @@ def test_readback_returns_chronological_rows_for_reconstruction():
     assert rows[1]["event_id"] == 100
 
 
+def _structure_row(at, *, recorded_at=None, state="REVERSAL_CANDIDATE",
+                    blocked=True, score=88, event="BOS continuation",
+                    actionable=False, direction="Long", **extra):
+    return {
+        "instrument": "MNQ",
+        "mode": "SCALP",
+        "candidate_direction": direction,
+        "actionable_direction": direction if actionable else None,
+        "actionable": actionable,
+        "blocked": blocked,
+        "score": score,
+        "grade": "A+",
+        "blockers": ["structure_confirmed"] if blocked else [],
+        "waiting_for": [event] if blocked else [],
+        "waiting_for_guidance": "Waiting for structure confirmation" if blocked else None,
+        "structure_cycle_state": state,
+        "structure_next_event": event,
+        "structure_context": {"cycle_confirmed": state == "TREND_CONTINUATION"},
+        "source_timestamp": at,
+        "recorded_at": recorded_at or at,
+        **extra,
+    }
+
+
+def test_structure_confirmation_diagnostic_classifies_continuation_and_exposes_event():
+    rows = [
+        _structure_row("2026-08-25T14:00:00+00:00", event="BOS continuation"),
+        _structure_row(
+            "2026-08-25T14:02:00+00:00", state="TREND_CONTINUATION",
+            blocked=False, actionable=True,
+        ),
+    ]
+    report = avh.build_structure_confirmation_diagnostic(rows, now="2026-08-25T14:03:00+00:00")
+    assert report["counts"]["CONFIRMED_CONTINUATION"] == 1
+    case = report["cases"][0]
+    assert case["elapsed_seconds"] == 120
+    assert case["outstanding_event"] == "BOS continuation"
+    assert case["source_timestamp"] == "2026-08-25T14:00:00+00:00"
+
+
+def test_structure_confirmation_diagnostic_separates_expiry_and_detector_no_update():
+    rows = [
+        _structure_row("2026-08-25T14:00:00+00:00"),
+        _structure_row("2026-08-25T14:07:00+00:00"),
+    ]
+    report = avh.build_structure_confirmation_diagnostic(
+        rows, now="2026-08-25T14:11:00+00:00",
+        confirmation_window_seconds=600, detector_no_update_seconds=900,
+    )
+    assert report["counts"]["EXPIRED"] == 1
+
+    report = avh.build_structure_confirmation_diagnostic(
+        [_structure_row("2026-08-25T14:00:00+00:00")],
+        now="2026-08-25T14:05:00+00:00",
+        confirmation_window_seconds=900, detector_no_update_seconds=300,
+    )
+    assert report["counts"]["DETECTOR_NO_UPDATE"] == 1
+
+
+def test_structure_confirmation_diagnostic_identifies_source_data_delay():
+    report = avh.build_structure_confirmation_diagnostic(
+        [_structure_row(
+            "2026-08-25T14:00:00+00:00",
+            recorded_at="2026-08-25T14:03:00+00:00",
+        )],
+        now="2026-08-25T14:04:00+00:00",
+        source_delay_seconds=120,
+    )
+    assert report["counts"]["SOURCE_DATA_DELAY"] == 1
+    case = report["cases"][0]
+    assert case["source_delay_seconds"] == 180
+    assert isinstance(case["started_at"], str)
+
+
 def test_schema_restricts_modes_and_rejects_mutation():
     schema = Path(__file__).parents[1].joinpath(
         "db_authoritative_verdict_history_schema.sql"
