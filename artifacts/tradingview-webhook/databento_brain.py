@@ -379,6 +379,9 @@ DATABENTO_STATUS: dict[str, Any] = {
         "sdk_queue_full_warnings": 0,
         "sdk_queue_full_max_pending": 0,
         "last_sdk_queue_full_message": None,
+        "sdk_records_dropped": 0,
+        "sdk_unavailable": False,
+        "sdk_unavailable_reason": None,
         "record_loss": 0,
         "last_pressure_at": None,
     },
@@ -621,6 +624,7 @@ class DatabentoBrain:
         self._downstream_stage_stats: dict[str, dict[str, float | int]] = {}
         self._downstream_unhealthy_by_inst: dict[str, bool] = {i: False for i in DB_SYMBOLS}
         self._sdk_pressure_handler: _SdkQueuePressureHandler | None = None
+        self._sdk_pressure_unavailable = False
         self._partial_flush_counts: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
         self._partial_flush_rejected: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
         self._partial_flush_backlog_caused: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
@@ -880,6 +884,9 @@ class DatabentoBrain:
         if dropped:
             freshness = "UNAVAILABLE"
             reason = "records_dropped"
+        elif self._sdk_pressure_unavailable:
+            freshness = "UNAVAILABLE"
+            reason = "sdk_feed_buffer_pressure"
         elif downstream_unhealthy:
             freshness = "UNAVAILABLE"
             reason = "downstream_handoff_unhealthy"
@@ -1000,6 +1007,7 @@ class DatabentoBrain:
             self._downstream_stage_ms = {}
             self._downstream_stage_stats = {}
             self._downstream_unhealthy_by_inst = {i: False for i in DB_SYMBOLS}
+            self._sdk_pressure_unavailable = False
             self._partial_flush_counts = {i: 0 for i in DB_SYMBOLS}
             self._partial_flush_rejected = {i: 0 for i in DB_SYMBOLS}
             self._partial_flush_backlog_caused = {i: 0 for i in DB_SYMBOLS}
@@ -1009,6 +1017,16 @@ class DatabentoBrain:
                 "enqueued": 0, "processed": 0, "dropped": 0, "unhealthy": False,
                 "slowest_stage": None, "slowest_stage_ms": 0.0, "stage_timings": {},
                 "last_error": None,
+            })
+            DATABENTO_STATUS["transport"].update({
+                "sdk_queue_pressure": 0,
+                "sdk_queue_full": 0,
+                "sdk_queue_full_warnings": 0,
+                "sdk_queue_full_max_pending": 0,
+                "last_sdk_queue_full_message": None,
+                "sdk_records_dropped": 0,
+                "sdk_unavailable": False,
+                "sdk_unavailable_reason": None,
             })
             DATABENTO_STATUS["partial_flush"] = {
                 "queued": 0, "queue_rejected": 0, "backlog_caused": 0,
@@ -1366,6 +1384,17 @@ class DatabentoBrain:
                 pending = int(match.group(1))
             except ValueError:
                 pending = 0
+        dropped = 0
+        drop_match = re.search(
+            r"(\d+)\s+record\(s\)\s+(?:were\s+)?(?:dropped|lost)",
+            text,
+            flags=re.IGNORECASE,
+        )
+        if drop_match:
+            try:
+                dropped = int(drop_match.group(1))
+            except ValueError:
+                dropped = 0
         with self._dispatch_lock:
             transport = DATABENTO_STATUS["transport"]
             transport["sdk_queue_pressure"] = int(transport.get("sdk_queue_pressure") or 0) + 1
@@ -1377,7 +1406,13 @@ class DatabentoBrain:
                 int(transport.get("sdk_queue_full_max_pending") or 0), pending
             )
             transport["last_sdk_queue_full_message"] = text[:300]
+            transport["sdk_records_dropped"] = (
+                int(transport.get("sdk_records_dropped") or 0) + dropped
+            )
+            transport["sdk_unavailable"] = True
+            transport["sdk_unavailable_reason"] = "sdk_feed_buffer_pressure"
             transport["last_pressure_at"] = datetime.now(timezone.utc).isoformat()
+            self._sdk_pressure_unavailable = True
 
     def _attach_sdk_queue_pressure_handler(self) -> None:
         """Attach exactly one passive warning observer for the current live session."""
@@ -1544,8 +1579,7 @@ class DatabentoBrain:
         # The session carries both TradeMsg and MBP1Msg records. The instrument
         # map is built concurrently above and will be ready before either is used.
         try:
-            for record in client:
-                self._dispatch_record(record)
+            self._consume_feed_iterator(client)
         finally:
             # Disconnect first: no in-flight or callback-triggered execution can
             # pass the existing Databento health boundary while shutdown drains.
@@ -1558,6 +1592,16 @@ class DatabentoBrain:
             self._detach_sdk_queue_pressure_handler()
 
         logger.warning("DatabentoBrain: feed closed by server — reconnecting …")
+
+    def _consume_feed_iterator(self, record_source: Any) -> None:
+        """Hand records from one SDK iterator to the non-blocking dispatcher.
+
+        Keeping this boundary explicit lets local release checks exercise the
+        SDK's iterator buffer with a deterministic fake source while production
+        continues to consume the real Databento Live client unchanged.
+        """
+        for record in record_source:
+            self._dispatch_record(record)
 
     # ── Shared record/instrument helpers ───────────────────────────────────────
 

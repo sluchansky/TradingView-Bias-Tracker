@@ -13,7 +13,12 @@ from collections import deque
 from datetime import datetime, timezone
 
 import databento_brain as db
-from checks.databento_soak import build_report
+from checks.databento_soak import (
+    FakeSdkIteratorSource,
+    SDK_OVERLOAD_BUFFER,
+    SDK_OVERLOAD_RECORDS,
+    build_report,
+)
 
 
 def _trade(iid: int, seq: int, *, ts: float | None = None):
@@ -242,6 +247,38 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
         finally:
             brain._stop_record_dispatcher()
 
+    def test_sdk_iterator_buffer_pressure_is_separate_and_fail_closed(self):
+        """SDK-buffer loss must be visible even when the app queue is healthy."""
+        brain = _brain()
+        brain._id_to_inst = {11: "MGC"}
+        brain._on_trade = lambda _rec: None
+        brain._start_record_dispatcher()
+        try:
+            source = FakeSdkIteratorSource(
+                [
+                    _trade(11, sequence, ts=time.time())
+                    for sequence in range(SDK_OVERLOAD_RECORDS)
+                ],
+                buffer_limit=SDK_OVERLOAD_BUFFER,
+            )
+            brain._attach_sdk_queue_pressure_handler()
+            try:
+                brain._consume_feed_iterator(source)
+            finally:
+                brain._detach_sdk_queue_pressure_handler()
+            self._wait_empty(brain)
+            transport = db.get_databento_status_snapshot()["transport"]
+            queue_state = db.DATABENTO_STATUS["instruments"]["MGC"]["queue"]
+            self.assertGreater(source.records_dropped, 0)
+            self.assertEqual(source.records_dropped, SDK_OVERLOAD_RECORDS - SDK_OVERLOAD_BUFFER)
+            self.assertEqual(transport["sdk_records_dropped"], source.records_dropped)
+            self.assertTrue(transport["sdk_unavailable"])
+            self.assertEqual(queue_state["dropped"], 0)
+            self.assertEqual(queue_state["freshness"], "UNAVAILABLE")
+            self.assertEqual(queue_state["unavailable_reason"], "sdk_feed_buffer_pressure")
+        finally:
+            brain._stop_record_dispatcher()
+
     def test_native_structure_breaks_previously_confirmed_levels(self):
         """A BOS/CHOCH can only occur after, not inside, the pivot window."""
         brain = _brain()
@@ -271,8 +308,11 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
         report = build_report()
         supported = report["supported_load"]
         overload = report["intentional_overload"]
+        sdk_overload = report["sdk_iterator_overload"]
         self.assertEqual(supported["queue_dropped"], 0)
         self.assertEqual(supported["downstream_dropped"], 0)
+        self.assertEqual(supported["sdk_pressure"]["records_dropped"], 0)
+        self.assertFalse(supported["sdk_pressure"]["sdk_unavailable"])
         self.assertEqual(set(supported["freshness"]), {"MGC", "MNQ", "MES", "MYM"})
         self.assertTrue(all(v == "FRESH" for v in supported["freshness"].values()))
         for key in (
@@ -282,7 +322,17 @@ class TestDatabentoQueueBackpressure(unittest.TestCase):
         ):
             self.assertIn(key, supported)
         self.assertGreater(overload["queue_dropped"], 0)
+        self.assertEqual(overload["sdk_pressure"]["sdk_records_dropped"], 0)
+        self.assertFalse(overload["sdk_pressure"]["sdk_unavailable"])
         self.assertEqual(overload["freshness"]["MGC"], "UNAVAILABLE")
+        self.assertGreater(sdk_overload["sdk_pressure"]["records_dropped"], 0)
+        self.assertEqual(sdk_overload["queue_dropped"], 0)
+        self.assertEqual(sdk_overload["application_pressure"]["queue_dropped"], 0)
+        self.assertFalse(sdk_overload["application_pressure"]["pressure_detected"])
+        self.assertTrue(sdk_overload["sdk_pressure"]["sdk_unavailable"])
+        self.assertEqual(
+            sdk_overload["freshness"]["MGC"], "UNAVAILABLE",
+        )
 
 
 if __name__ == "__main__":

@@ -7,7 +7,10 @@ The market-data soak gate must sample queue and downstream peaks while records
 are being admitted; a post-drain snapshot alone hides the pressure that the
 bounded queues experienced. Supported-load assertions require zero drops and
 freshness for every instrument, while overload assertions require explicit
-unavailability rather than silent recovery.
+unavailability rather than silent recovery. SDK iterator-buffer pressure is a
+separate fail-closed health domain: an SDK queue-full warning makes fresh-only
+consumers unavailable even if the application's own queue has not dropped a
+record.
 
 **Why:** queue depth returns to zero as soon as a worker takes the final item,
 even though the workload may have briefly approached its limit.
