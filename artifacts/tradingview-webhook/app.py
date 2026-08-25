@@ -17,6 +17,7 @@ from flask import Flask, request, jsonify, Response, send_file
 import requests
 from structure_dedup import STRUCTURE_DEDUP, STRUCTURE_TYPES as _SD_STRUCTURE_TYPES
 from structure_state import resolve_structure_cycle
+from fundamental_awareness import build_fundamental_context
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -667,6 +668,21 @@ STRUCTURE_REVERSAL_DEMOTE_ENABLED = _env_flag_on("STRUCTURE_REVERSAL_DEMOTE_ENAB
 # compact structured snapshot showing WHAT the system decided and WHY. Exposed
 # ONLY via the owner-only /decision-trace endpoint. Flag OFF => byte-identical.
 DECISION_TRACE_SHADOW_ENABLED = _env_flag_on("DECISION_TRACE_SHADOW_ENABLED", default_on=False)
+# Phase 1 fundamental awareness — scheduled high-impact events only.
+# Both controls must be enabled before observation appears:
+#   FUNDAMENTAL_AWARENESS_ENABLED=1        master feature flag
+#   FUNDAMENTAL_AWARENESS_SHADOW_ENABLED=1 explicit safe observation opt-in
+# DISPLAY/LOGGING-ONLY: neither can change verdicts, scoring, qualification,
+# risk, sizing, execution, alerts, schedulers, coordinators, or DB. Both default
+# OFF so the field is absent and the legacy payload remains unchanged.
+FUNDAMENTAL_AWARENESS_ENABLED = _env_flag_on(
+    "FUNDAMENTAL_AWARENESS_ENABLED", default_on=False)
+FUNDAMENTAL_AWARENESS_SHADOW_ENABLED = _env_flag_on(
+    "FUNDAMENTAL_AWARENESS_SHADOW_ENABLED", default_on=False)
+
+
+def _fundamental_awareness_observation_enabled():
+    return bool(FUNDAMENTAL_AWARENESS_ENABLED and FUNDAMENTAL_AWARENESS_SHADOW_ENABLED)
 # T3 — SCALP 1:2 reward upgrade: lift the SCALP primary/first target from 1R to 2R,
 #      with the staged exit multiples moving in lockstep (TP2 2.5R, runner 3R) so the
 #      broker TP, management geometry, dashboard quality and entry veto all agree.
@@ -19023,6 +19039,64 @@ def get_news_filter():
     }
 
 
+def get_fundamental_context():
+    """Read the existing cached calendar and return the Phase 1 shadow context.
+
+    The existing news helper is called only to preserve its asynchronous
+    refresh/backoff behavior.  It never performs a provider request inline:
+    stale data starts the existing daemon refresh and this function reads the
+    cache immediately.
+    """
+    if not _fundamental_awareness_observation_enabled():
+        return None
+    try:
+        get_news_filter()
+        with _NEWS_LOCK:
+            events = (list(_NEWS_STATE["events"])
+                      if _NEWS_STATE["events"] is not None else None)
+            fetched_at = _NEWS_STATE["fetched_at"]
+            error = _NEWS_STATE["error"]
+        stale = (events is None or
+                 (fetched_at > 0 and (time.time() - fetched_at) > NEWS_TTL_SEC))
+        return build_fundamental_context(
+            events,
+            fetched_at=fetched_at or None,
+            stale=stale,
+            provider_error=error if events is None else None,
+        )
+    except Exception as exc:
+        logger.debug("fundamental awareness cache projection failed: %s", exc)
+        return build_fundamental_context(
+            None, provider_error="projection_failed", stale=True)
+
+
+def _attach_fundamental_context_shadow(result, active_ticker):
+    """Attach/log the observation without mutating technical decision fields."""
+    if not _fundamental_awareness_observation_enabled():
+        return result
+    try:
+        result["fundamental_context"] = get_fundamental_context()
+        _fc = result["fundamental_context"] or {}
+        logger.info(
+            "[Fundamental Shadow] %s | technical_verdict=%s | status=%s | "
+            "event=%s | phase=%s | minutes_to_event=%s | reason=%s",
+            active_ticker,
+            result.get("verdict"),
+            _fc.get("status"),
+            _fc.get("event_name") or "NONE",
+            _fc.get("event_phase"),
+            _fc.get("minutes_to_event"),
+            _fc.get("reason"),
+        )
+    except Exception as exc:
+        # The technical result is already complete; fundamental awareness must
+        # never make this evaluation fail.
+        result["fundamental_context"] = build_fundamental_context(
+            None, provider_error="projection_failed", stale=True)
+        logger.debug("fundamental awareness full_analysis seam: %s", exc)
+    return result
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # MARKET ENVIRONMENT LAYER — PHASE 1A (READ-ONLY SHADOW MODE)
 # ══════════════════════════════════════════════════════════════════════════════
@@ -29355,7 +29429,7 @@ def build_main_brain_payload(result, instrument=None):
     except Exception as _book_exc:
         logger.debug("build_main_brain_payload top_of_book: %s", _book_exc)
 
-    return {
+    payload = {
         "_version":          "v1",
         "generated_at":      now_utc().isoformat(),
         "voice":             voice,
@@ -29383,6 +29457,9 @@ def build_main_brain_payload(result, instrument=None):
         "availability":      availability,
         "errors":            errors,
     }
+    if isinstance(result, dict) and "fundamental_context" in result:
+        payload["fundamental_context"] = result.get("fundamental_context")
+    return payload
 
 
 def full_analysis(current_price_override=None, ticker_override=None, cooldown_active=False):
@@ -31506,6 +31583,12 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
     # setup because compute_edge_breakdown applies hard blockers last.
     if order_flow_enabled and isinstance(order_flow_snapshot, dict):
         result["order_flow"] = order_flow_snapshot
+
+    # ── Fundamental awareness (Phase 1 — DISPLAY/LOGGING-ONLY shadow) ────────
+    # Runs after the technical decision is complete and is not an input to any
+    # gate, score, risk, sizing, execution, alert, scheduler, coordinator, or
+    # persistence path. Flag OFF => field absent for legacy payload identity.
+    _attach_fundamental_context_shadow(result, active_ticker)
 
     # ── P4: Append-only authoritative verdict history — OBSERVER ONLY ────────
     # This is deliberately the final full_analysis seam: every verdict-mutating
@@ -61757,6 +61840,8 @@ def _build_status_payload(_tk):
         "decision_pipeline_v2": a.get("decision_pipeline_v2"),
         "equity_curve_today":  a.get("equity_curve_today"),
         "news_filter":         a.get("news_filter"),
+        **({"fundamental_context": a.get("fundamental_context")}
+           if "fundamental_context" in a else {}),
         "dual_sim":            (_dual_sim_stats() if DUAL_MODE_SHADOW_SIM_ENABLED else None),
         "learning_engine":     _learning_engine_view(),
         "learning_rule_engine": _learning_rule_engine_view(),

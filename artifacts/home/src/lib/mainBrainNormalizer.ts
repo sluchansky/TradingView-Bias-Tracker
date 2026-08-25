@@ -229,6 +229,9 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
   // ── system_status: already has canonical aliases added by backend ────────────
   //    (db_ready, databento_ready, broker_ready, learning_ready now in payload)
   const system_status = (raw.system_status ?? {}) as Record<string, unknown>;
+  // Phase 1 fundamentals are already normalized by the backend. Preserve the
+  // read-only contract without deriving any trading values in the client.
+  const fundamental_context = raw.fundamental_context;
 
   // ── performance: add trade_count alias ──────────────────────────────────────
   const perf = (raw.performance ?? {}) as Record<string, unknown>;
@@ -345,5 +348,6 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
     main_brain,
     candidate_preview,
     risk_ops,
+    ...(fundamental_context !== undefined ? { fundamental_context } : {}),
   };
 }

@@ -207,6 +207,7 @@ function buildMbContext(p: Record<string, unknown>, ticker: string): string {
   const sys     = (p.system_status     ?? {}) as Record<string, unknown>;
   const propFirm    = (p.prop_firm ?? {}) as Record<string, unknown>;
   const propMetrics = (propFirm.metrics ?? {}) as Record<string, unknown>;
+  const fundamental = (p.fundamental_context ?? {}) as Record<string, unknown>;
 
   const edgeScore = Math.round(safeNum(eb.score ?? eb.total) ?? 0);
   const edgeGrade = safeStr(eb.grade ?? eb.label, '');
@@ -251,6 +252,10 @@ function buildMbContext(p: Record<string, unknown>, ticker: string): string {
     'VERDICT',
     `Readiness: ${vReadiness} | Edge: ${edgeScore}/110 | Grade: ${edgeGrade || '—'}`,
     `Candidate Direction: ${vDir || '—'} | Candidate Status: ${vCandSt || '—'}`,
+    '',
+    'FUNDAMENTALS — SHADOW ONLY',
+    `Status: ${safeStr(fundamental.status, 'NOT ENABLED')} | Event: ${safeStr(fundamental.event_name, 'None')}`,
+    `Phase: ${safeStr(fundamental.event_phase, 'NONE')} | Minutes: ${safeStr(fundamental.minutes_to_event, '—')} | Reason: ${safeStr(fundamental.reason, '—')}`,
     '',
     'STRATEGY',
     `Active: ${activeSt || '—'}`,
@@ -2717,6 +2722,67 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
       )}
     </Panel>
     </>
+  );
+};
+
+// ── Fundamental Context — Phase 1 scheduled-event shadow display ─────────────
+const FundamentalContextPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
+  const fc = (p.fundamental_context ?? {}) as Record<string, unknown>;
+  if (Object.keys(fc).length === 0) return null;
+
+  const status = safeStr(fc.status, 'UNKNOWN').toUpperCase();
+  const phase  = safeStr(fc.event_phase, 'NONE').toUpperCase();
+  const mins   = safeNum(fc.minutes_to_event);
+  const impact = safeStr(fc.impact, '');
+  const color  = status === 'EVENT_RISK' ? T.amber
+    : status === 'TAILWIND' ? T.green
+    : status === 'HEADWIND' ? T.red
+    : status === 'NEUTRAL' ? T.cyan
+    : T.txtMuted;
+  const eventTime = (() => {
+    if (!fc.scheduled_at) return '—';
+    try {
+      return new Date(String(fc.scheduled_at)).toLocaleString('en-US', {
+        month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+        hour12: true, timeZone: 'America/New_York',
+      }) + ' ET';
+    } catch { return '—'; }
+  })();
+  const timing = mins == null ? '—'
+    : mins > 0 ? `in ${mins}m`
+    : mins < 0 ? `${Math.abs(mins)}m ago`
+    : 'now';
+
+  return (
+    <Panel
+      title="Fundamental Context"
+      badge={<Badge label={status.replace(/_/g, ' ')} color={color} />}
+      style={{ height: '100%' }}
+    >
+      <div style={{ fontSize:9, lineHeight:1.45, color:T.txtMuted, marginBottom:10 }}>
+        Scheduled-event context only. It cannot change the technical verdict.
+      </div>
+      <div style={{ padding:'9px 10px', borderRadius:7, background:`${color}0d`,
+        border:`1px solid ${color}33`, marginBottom:9 }}>
+        <div style={{ fontSize:11, fontWeight:700, color:T.txtPri, marginBottom:4, lineHeight:1.3 }}>
+          {safeStr(fc.event_name, 'No in-scope event nearby')}
+        </div>
+        <div style={{ display:'flex', flexWrap:'wrap', gap:'4px 10px', fontSize:9.5 }}>
+          <span style={{ color }}>PHASE · {phase}</span>
+          <span style={{ color:T.txtSec }}>{timing}</span>
+          {impact && <span style={{ color:T.txtMuted }}>{impact} IMPACT</span>}
+        </div>
+      </div>
+      <KV label="Scheduled (ET)" value={eventTime} mono />
+      <KV label="Source" value={safeStr(fc.source, 'Unavailable')} />
+      <KV label="Cache" value={fc.stale === true ? 'STALE / UNAVAILABLE' : 'CACHED'} valueColor={fc.stale === true ? T.amber : T.green} />
+      <div style={{ marginTop:9, fontSize:9, color:T.txtMuted, lineHeight:1.45 }}>
+        {safeStr(fc.reason, 'No additional context')}
+      </div>
+      <div style={{ marginTop:8, fontSize:8.5, color:T.purple, letterSpacing:'0.05em', fontWeight:700 }}>
+        SHADOW ONLY · NO VERDICT, RISK, OR EXECUTION EFFECT
+      </div>
+    </Panel>
   );
 };
 
@@ -15506,9 +15572,11 @@ export default function MainBrain() {
                 <MarketStrip p={p} />
               </div>
 
-              {/* ── Authoritative verdict — always visible on the overview ───── */}
-              <div style={{ marginBottom:12 }}>
+              {/* ── Technical verdict + shadow fundamental context ─────────── */}
+              <div className="mb-verdict-row" style={{ marginBottom:12, display:'grid',
+                gridTemplateColumns:'minmax(0, 2fr) minmax(280px, 1fr)', gap:12, alignItems:'stretch' }}>
                 <VerdictPanel p={p} />
+                <FundamentalContextPanel p={p} />
               </div>
 
               {/* ── Mode Overview — best setup across SCALP / Intraday / SWING ── */}
@@ -15633,7 +15701,7 @@ export default function MainBrain() {
           .mb-training-stats { grid-template-columns: repeat(3, minmax(0, 1fr)) !important; }
         }
         @media (max-width: 768px) {
-          .mb-grid-3, .mb-grid-2, .mb-training-stats { grid-template-columns: 1fr !important; }
+          .mb-grid-3, .mb-grid-2, .mb-training-stats, .mb-verdict-row { grid-template-columns: 1fr !important; }
           .mb-desktop-sidenav { display: none !important; }
           .mb-mobile-menu-toggle { width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; border-radius:8px; border:1px solid ${T.borderMid}; color:${T.cyan}; background:${T.cyan}12; cursor:pointer; font-size:20px; line-height:1; }
           .mb-main-header { min-height:58px !important; height:auto !important; padding:8px 12px !important; gap:8px !important; flex-wrap:wrap; }
