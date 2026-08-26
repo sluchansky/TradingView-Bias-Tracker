@@ -10,7 +10,7 @@
 
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 - [Visual Brain V1](visual-brain-engine.md) — inject db_conn_fn/price_store/bars_fn at start(); never `import app` from sub-modules; single-flight _schedule_next in finally only; screenshots ephemeral (no temp files).
-- [Visual Brain SDK transport](visual-brain-sdk-transport.md) — use OpenAI’s bundled DefaultHttpxClient, not top-level httpx; scope trust_env=False to observer calls.
+- [Visual Brain SDK transport](visual-brain-sdk-transport.md) — pin OpenAI 3.3.1 + HTTPX 0.28.1; pass an explicit verified, proxy-isolated HTTPX client only to the observer.
 
 - [Databento MGC overnight silence + partial-flush fix](databento-mgc-overnight-silence.md) — MGC has 0 Databento records overnight (genuine COMEX silence); partial-flush daemon closes stale low-volume bars within 70s; thread-safety via _partial_lock.
 - [Databento bounded backpressure](databento-bounded-backpressure.md) — source-time freshness and non-overlapping record consumers prevent delayed market data from looking live.

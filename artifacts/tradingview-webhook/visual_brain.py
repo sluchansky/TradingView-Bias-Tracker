@@ -29,6 +29,8 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Optional
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
@@ -43,6 +45,7 @@ _VB_IMAGE_MAX_PX       = 800                      # max width before JPEG downsc
 _VB_HISTORY_LIMIT      = 10                       # last N state transitions passed to model
 _VB_SCREENSHOT_TIMEOUT = 30                       # seconds per Playwright capture
 _CHART_BARS_LOOKBACK   = 60                       # bars sent to chart renderer
+_VB_OPENAI_TIMEOUT_SECONDS = 20
 
 # ── Module-level state ────────────────────────────────────────────────────────
 VB_DB_READY          = False
@@ -786,6 +789,22 @@ def _validate_mode_assessment(mode: str, assessment: Any) -> tuple[bool, str]:
     return True, ""
 
 
+def _log_openai_transport_diagnostic() -> None:
+    """Log safe dependency/transport facts when the observer starts."""
+    try:
+        import openai  # noqa: PLC0415
+        openai_version = getattr(openai, "__version__", "unknown")
+    except Exception:
+        openai_version = "unavailable"
+    logger.info(
+        "[VISUAL_BRAIN] OpenAI transport diagnostic: openai=%s httpx=%s "
+        "trust_env=False tls_verify=True timeout=%ss",
+        openai_version,
+        getattr(httpx, "__version__", "unknown"),
+        _VB_OPENAI_TIMEOUT_SECONDS,
+    )
+
+
 def analyze_visual_market(
     screenshot_bytes: bytes,
     previous_state: Optional[dict],
@@ -805,12 +824,15 @@ def analyze_visual_market(
     if not api_key:
         raise RuntimeError("AI_INTEGRATIONS_OPENAI_API_KEY not set")
 
-    from openai import DefaultHttpxClient, OpenAI  # noqa: PLC0415
-    # Visual Brain is a local observation worker.  Give its OpenAI client an
-    # isolated transport so broken Windows proxy/CA environment variables do
-    # not redirect or break the request.  TLS verification remains enabled;
-    # this only disables HTTPX's environment-based proxy/certificate lookup.
-    http_client = DefaultHttpxClient(verify=True, trust_env=False)
+    from openai import OpenAI  # noqa: PLC0415
+    # Use the explicit transport proven on the Windows home PC.  This client is
+    # scoped only to the observation worker, disables proxy-environment
+    # inheritance, and retains normal TLS certificate verification.
+    http_client = httpx.Client(
+        trust_env=False,
+        timeout=_VB_OPENAI_TIMEOUT_SECONDS,
+        verify=True,
+    )
     client = OpenAI(
         api_key=api_key,
         base_url=base_url,
@@ -1451,6 +1473,7 @@ def start(
     if not VISUAL_BRAIN_ENABLED:
         logger.info("[VISUAL_BRAIN] disabled (VISUAL_BRAIN_ENABLED not set) — byte-identical mode")
         return
+    _log_openai_transport_diagnostic()
     logger.info("[VISUAL_BRAIN] enabled — instruments: %s  interval=%ds",
                 ", ".join(_VB_SYMBOLS), VISUAL_BRAIN_INTERVAL)
     # Each instrument's first tick is delayed by at least one full VISUAL_BRAIN_INTERVAL

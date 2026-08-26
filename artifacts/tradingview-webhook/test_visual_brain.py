@@ -240,7 +240,7 @@ class TestMalformedModelResponse(unittest.TestCase):
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestOpenAITransportIsolation(unittest.TestCase):
-    """Visual Brain disables HTTPX environment routing only on its own client."""
+    """Visual Brain uses the proven explicit HTTPX transport only for itself."""
 
     def setUp(self):
         self.vb = _import_vb()
@@ -259,7 +259,7 @@ class TestOpenAITransportIsolation(unittest.TestCase):
             "AI_INTEGRATIONS_OPENAI_API_KEY": "configured-test-key",
             "AI_INTEGRATIONS_OPENAI_BASE_URL": "https://provider.example/v1",
         }, clear=False), \
-             patch("openai.DefaultHttpxClient") as MockHttpxClient, \
+             patch("visual_brain.httpx.Client") as MockHttpxClient, \
              patch("openai.OpenAI") as MockOpenAI:
             MockOpenAI.return_value.chat.completions.create.return_value = \
                 self._mock_model_response()
@@ -267,7 +267,11 @@ class TestOpenAITransportIsolation(unittest.TestCase):
             result = self.vb.analyze_visual_market(b"fake-img", None, [], "MNQ")
 
         self.assertEqual(result["instrument"], "MNQ")
-        MockHttpxClient.assert_called_once_with(verify=True, trust_env=False)
+        MockHttpxClient.assert_called_once_with(
+            trust_env=False,
+            timeout=20,
+            verify=True,
+        )
         MockOpenAI.assert_called_once()
         kwargs = MockOpenAI.call_args.kwargs
         self.assertEqual(kwargs["api_key"], "configured-test-key")
@@ -276,7 +280,7 @@ class TestOpenAITransportIsolation(unittest.TestCase):
         MockHttpxClient.return_value.close.assert_called_once_with()
 
     def test_environment_and_unrelated_httpx_clients_are_unchanged(self):
-        from openai import DefaultHttpxClient
+        import httpx
 
         proxy_env = {
             "HTTP_PROXY": "http://proxy.example.invalid:8080",
@@ -290,7 +294,7 @@ class TestOpenAITransportIsolation(unittest.TestCase):
                 self._mock_model_response()
             self.vb.analyze_visual_market(b"fake-img", None, [], "MNQ")
 
-            unrelated = DefaultHttpxClient()
+            unrelated = httpx.Client()
             try:
                 self.assertTrue(getattr(unrelated, "_trust_env", False))
             finally:
@@ -298,6 +302,30 @@ class TestOpenAITransportIsolation(unittest.TestCase):
 
         after = {name: os.environ.get(name) for name in proxy_env}
         self.assertEqual(after, before)
+
+    def test_startup_diagnostic_logs_versions_and_no_secrets(self):
+        with patch.object(self.vb.logger, "info") as mock_info:
+            self.vb._log_openai_transport_diagnostic()
+
+        diagnostic = " ".join(
+            str(call_args.args[0]) for call_args in mock_info.call_args_list
+        )
+        self.assertIn("OpenAI transport diagnostic", diagnostic)
+        self.assertIn("openai=%s", diagnostic)
+        self.assertIn("httpx=%s", diagnostic)
+        self.assertIn("trust_env=False", diagnostic)
+        self.assertIn("tls_verify=True", diagnostic)
+        self.assertIn("timeout=%ss", diagnostic)
+        self.assertNotIn("AI_INTEGRATIONS_OPENAI_API_KEY", diagnostic)
+        self.assertNotIn("AI_INTEGRATIONS_OPENAI_BASE_URL", diagnostic)
+
+    def test_enabled_start_emits_transport_diagnostic(self):
+        self.vb.VISUAL_BRAIN_ENABLED = True
+        with patch("visual_brain._log_openai_transport_diagnostic") as mock_diag, \
+             patch("visual_brain._schedule_next"):
+            self.vb.start()
+
+        mock_diag.assert_called_once_with()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
