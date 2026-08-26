@@ -20,6 +20,7 @@ if ($FlaskPort -eq $ApiPort -or $FlaskPort -eq $UiPort -or $ApiPort -eq $UiPort)
 $repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
 $botScript = Join-Path $PSScriptRoot "Start-TradingBot.ps1"
 $python = Join-Path $repoRoot ".venv\Scripts\python.exe"
+$apiEntry = Join-Path $repoRoot "artifacts\api-server\dist\windows-local-proxy.mjs"
 
 if (-not (Test-Path -LiteralPath $python -PathType Leaf)) {
     throw "Missing .venv. Follow WINDOWS_HOSTING.md to create the Python environment first."
@@ -33,6 +34,13 @@ if (-not $pnpmCommand) {
     throw "pnpm is required for the local Express proxy and React dashboard."
 }
 $pnpm = $pnpmCommand.Source
+$nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
+if (-not $nodeCommand) {
+    $nodeCommand = Get-Command node -ErrorAction SilentlyContinue
+}
+if (-not $nodeCommand) {
+    throw "Node.js LTS is required for the local Express proxy and React dashboard."
+}
 
 if (-not $SkipEnvFile) {
     . (Join-Path $PSScriptRoot "Import-LocalEnv.ps1")
@@ -153,6 +161,9 @@ try {
     } finally {
         Pop-Location
     }
+    if (-not (Test-Path -LiteralPath $apiEntry -PathType Leaf)) {
+        throw "Express proxy build completed without producing $apiEntry."
+    }
 
     $botArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$botScript`" -Port $FlaskPort -SkipEnvFile"
     if ($EnableDatabento) {
@@ -163,18 +174,17 @@ try {
 
     $oldPort = [Environment]::GetEnvironmentVariable("PORT", "Process")
     $oldFlaskPort = [Environment]::GetEnvironmentVariable("FLASK_PORT", "Process")
-    $oldNodeEnv = [Environment]::GetEnvironmentVariable("NODE_ENV", "Process")
     [Environment]::SetEnvironmentVariable("PORT", "$ApiPort", "Process")
     [Environment]::SetEnvironmentVariable("FLASK_PORT", "$FlaskPort", "Process")
-    [Environment]::SetEnvironmentVariable("NODE_ENV", "development", "Process")
     try {
-        $api = Start-Process -FilePath "node.exe" `
-            -ArgumentList "--enable-source-maps artifacts/api-server/dist/index.mjs" `
+        # Use the focused proxy-only bundle so the Windows chart topology neither
+        # initializes artifact services nor mutates any database state.
+        $api = Start-Process -FilePath $nodeCommand.Source `
+            -ArgumentList @("--enable-source-maps", $apiEntry) `
             -WorkingDirectory $repoRoot -PassThru
     } finally {
         Restore-EnvironmentValue "PORT" $oldPort
         Restore-EnvironmentValue "FLASK_PORT" $oldFlaskPort
-        Restore-EnvironmentValue "NODE_ENV" $oldNodeEnv
     }
 
     $oldUiPort = [Environment]::GetEnvironmentVariable("PORT", "Process")

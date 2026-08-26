@@ -28,7 +28,7 @@ Install these from their official installers:
 2. Python 3.11 or newer: <https://www.python.org/downloads/windows/>
    Enable **Add python.exe to PATH** during installation.
 3. Node.js LTS: <https://nodejs.org/en/download> for the Express proxy or React
-   frontend.
+   frontend. Use the Windows x64 installer (Node.js 20.19 or newer).
 4. PostgreSQL client/server only if using a local PostgreSQL database.
    The application expects PostgreSQL, not SQLite.
 
@@ -38,6 +38,7 @@ Confirm PowerShell sees them:
 git --version
 python --version
 node --version       # only needed for the optional frontend
+corepack --version
 ```
 
 ## 2. Clone the repository
@@ -247,11 +248,20 @@ Install frontend packages once before either launcher:
 
 ```powershell
 corepack enable
-corepack prepare pnpm@latest --activate
+# The repository pins pnpm 10.26.1 in package.json.
+corepack prepare pnpm@10.26.1 --activate
 pnpm install --frozen-lockfile
 pnpm --filter @workspace/home run typecheck
 pnpm --filter @workspace/home run build
+pnpm --filter @workspace/api-server run typecheck
+pnpm --filter @workspace/api-server run build
 ```
+
+This is a native PowerShell install: it does not require Git Bash, MSYS2, or
+`--ignore-scripts`. The checked-in lockfile includes the Linux/Replit and
+Windows x64 native packages needed by esbuild, Rollup, Lightning CSS, and
+Tailwind. The API workspace development script is also Node-launched rather
+than relying on a POSIX `export` command.
 ## 8. Stop and restart
 
 Stop the foreground bot with `Ctrl+C`. Restart it with the same command:
