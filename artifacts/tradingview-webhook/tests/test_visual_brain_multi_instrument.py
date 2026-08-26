@@ -34,7 +34,7 @@ def _load_vb(env_overrides: dict | None = None, *, enabled: bool = False) -> typ
     """
     env = {
         "VISUAL_BRAIN_ENABLED": "true" if enabled else "false",
-        "VISUAL_BRAIN_INTERVAL_SECONDS": "60",
+        "VISUAL_BRAIN_INTERVAL_SECONDS": "300",
         **(env_overrides or {}),
     }
     # Remove any previously cached module so constants re-evaluate
@@ -74,20 +74,25 @@ class TestVBSymbolsParsing(unittest.TestCase):
     def tearDown(self) -> None:
         _cleanup_vb()
 
-    def test_default_four_instruments(self):
-        """Default config (no override) must produce all 4 instrument loops."""
+    def test_default_two_instruments(self):
+        """Default config (no override) must produce MNQ and MGC loops only."""
         vb = _load_vb()
-        self.assertEqual(vb._VB_SYMBOLS, ["MNQ", "MGC", "MES", "MYM"])
+        self.assertEqual(vb._VB_SYMBOLS, ["MNQ", "MGC"])
 
     def test_single_custom_symbol(self):
         vb = _load_vb({"VISUAL_BRAIN_SYMBOL": "MGC"})
         self.assertEqual(vb._VB_SYMBOLS, ["MGC"])
 
     def test_default_preserves_string_compat(self):
-        """VISUAL_BRAIN_SYMBOL string must still contain all 4 tickers for back-compat."""
+        """VISUAL_BRAIN_SYMBOL remains a comma-separated string for compatibility."""
         vb = _load_vb()
-        for t in ("MNQ", "MGC", "MES", "MYM"):
+        for t in ("MNQ", "MGC"):
             self.assertIn(t, vb.VISUAL_BRAIN_SYMBOL)
+
+    def test_default_interval_is_five_minutes(self):
+        """Default observer cadence is five minutes."""
+        vb = _load_vb()
+        self.assertEqual(vb.VISUAL_BRAIN_INTERVAL, 300)
 
     def test_two_symbols_comma_separated(self):
         vb = _load_vb({"VISUAL_BRAIN_SYMBOL": "MNQ,MGC"})
@@ -318,7 +323,7 @@ class TestStart(unittest.TestCase):
             self.assertEqual(mock_timer.call_count, 4)
 
     def test_start_stagger_three_instruments(self):
-        """3 instruments at interval=60 → slot=20s → delays 60, 80, 100 (boot-safe)."""
+        """Three instruments spread evenly across the five-minute interval."""
         vb = _load_vb({"VISUAL_BRAIN_SYMBOL": "MNQ,MGC,MES"}, enabled=True)
         delays = []
         with patch.object(vb.threading, "Timer") as mock_timer:
@@ -328,15 +333,16 @@ class TestStart(unittest.TestCase):
                 delays.append(c[0][0])
         delays.sort()
         iv = float(vb.VISUAL_BRAIN_INTERVAL)
+        slot = iv / 3.0
         self.assertAlmostEqual(delays[0], iv +  0.0, places=1)
-        self.assertAlmostEqual(delays[1], iv + 20.0, places=1)
-        self.assertAlmostEqual(delays[2], iv + 40.0, places=1)
+        self.assertAlmostEqual(delays[1], iv + slot, places=1)
+        self.assertAlmostEqual(delays[2], iv + (2.0 * slot), places=1)
 
     def test_start_stagger_four_instruments(self):
-        """4 instruments at interval=60 → slots of 15s → delays 60, 75, 90, 105.
+        """Four instruments spread evenly across the five-minute interval.
 
         All first ticks are ≥ VISUAL_BRAIN_INTERVAL so boot completes before any
-        screenshot/model work begins (matches original single-instrument safety delay).
+        screenshot/model work begins.
         """
         vb = _load_vb({"VISUAL_BRAIN_SYMBOL": "MNQ,MGC,MES,MYM"}, enabled=True)
         delays = []
@@ -347,7 +353,8 @@ class TestStart(unittest.TestCase):
                 delays.append(c[0][0])
         delays.sort()
         iv = float(vb.VISUAL_BRAIN_INTERVAL)
-        expected = [iv + 0.0, iv + 15.0, iv + 30.0, iv + 45.0]
+        slot = iv / 4.0
+        expected = [iv + (i * slot) for i in range(4)]
         for got, exp in zip(delays, expected):
             self.assertAlmostEqual(got, exp, places=1)
 
@@ -382,26 +389,22 @@ class TestStart(unittest.TestCase):
         self.assertEqual(vb._VB_SYMBOLS, symbols_before)
         self.assertEqual(vb._VB_TIMERS, timers_before)
 
-    def test_default_config_spawns_four_timers(self):
-        """Regression: default config (no VISUAL_BRAIN_SYMBOL override) must boot
-        4 instrument loops — MNQ, MGC, MES, MYM.  This is the deployed configuration.
+    def test_default_config_spawns_two_timers(self):
+        """Regression: default config boots MNQ and MGC observer loops only.
         """
-        vb = _load_vb(enabled=True)  # no override → uses default "MNQ,MGC,MES,MYM"
-        self.assertEqual(len(vb._VB_SYMBOLS), 4,
-            f"Default _VB_SYMBOLS should be 4 instruments, got {vb._VB_SYMBOLS}")
+        vb = _load_vb(enabled=True)  # no override → uses default "MNQ,MGC"
+        self.assertEqual(len(vb._VB_SYMBOLS), 2,
+            f"Default _VB_SYMBOLS should be 2 instruments, got {vb._VB_SYMBOLS}")
         with patch.object(vb.threading, "Timer") as mock_timer:
             mock_timer.return_value = MagicMock()
             vb.start()
-            self.assertEqual(mock_timer.call_count, 4,
-                f"Expected 4 timers for 4 default instruments, got {mock_timer.call_count}")
+            self.assertEqual(mock_timer.call_count, 2,
+                f"Expected 2 timers for 2 default instruments, got {mock_timer.call_count}")
 
-    def test_default_all_status_returns_four_symbols(self):
-        """Regression: all-status symbols list must include all 4 default instruments."""
+    def test_default_all_status_returns_two_symbols(self):
+        """Regression: all-status symbols list contains only the configured defaults."""
         vb = _load_vb(enabled=True)
-        self.assertIn("MNQ", vb._VB_SYMBOLS)
-        self.assertIn("MGC", vb._VB_SYMBOLS)
-        self.assertIn("MES", vb._VB_SYMBOLS)
-        self.assertIn("MYM", vb._VB_SYMBOLS)
+        self.assertEqual(vb._VB_SYMBOLS, ["MNQ", "MGC"])
 
 
 # ---------------------------------------------------------------------------
