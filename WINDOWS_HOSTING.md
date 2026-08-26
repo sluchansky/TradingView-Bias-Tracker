@@ -244,6 +244,12 @@ Both launchers require free ports, refuse a deployment environment that could
 enable Discord, and terminate the child process trees they start. Use
 `-NoBrowser` when launching from automation.
 
+The release workflow also runs `scripts\windows\Test-WindowsDashboard.ps1` on
+a clean Windows runner. It starts this release-safe launcher without a browser
+or `.env`, forces market data, execution, Discord, and database access off,
+confirms `/ping`, and verifies the launcher releases its owned ports. It does
+not connect to an operator's providers, broker, or PostgreSQL instance.
+
 Install frontend packages once before either launcher:
 
 ```powershell

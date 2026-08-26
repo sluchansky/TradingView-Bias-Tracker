@@ -11,7 +11,9 @@ param(
 
     [switch]$EnableDatabento,
     [switch]$SkipEnvFile,
-    [switch]$NoBrowser
+    [switch]$NoBrowser,
+    # Automation-only: return after all local services pass their readiness checks.
+    [switch]$ExitAfterReady
 )
 
 Set-StrictMode -Version Latest
@@ -280,6 +282,9 @@ try {
     Write-Host "Keep this PowerShell window open. Press Ctrl+C to stop processes started by this launcher."
     if (-not $NoBrowser) {
         Start-Process $dashboardUrl | Out-Null
+    }
+    if ($ExitAfterReady) {
+        return
     }
     while ($true) {
         foreach ($item in $started) {

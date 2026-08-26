@@ -55,3 +55,50 @@ jobs:
 
       - name: Run canonical workspace typecheck
         run: pnpm run typecheck
+
+  windows-dashboard-smoke:
+    name: Release-safe Windows dashboard smoke
+    runs-on: windows-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 10.26.1
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install frontend and proxy dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Set up isolated Python runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Flask runtime dependencies
+        shell: pwsh
+        run: |
+          python -m venv .venv
+          .\.venv\Scripts\python.exe -m pip install --disable-pip-version-check -r artifacts\tradingview-webhook\requirements.txt
+
+      - name: Run release-safe dashboard smoke
+        shell: pwsh
+        env:
+          EXECUTION_MODE: disabled
+          DATABENTO_ENABLED: "0"
+          DISCORD_LIVE: "0"
+          DISCORD_LIVE_ENABLED: "0"
+          REPLIT_DEPLOYMENT: "0"
+          MANUAL_ORDER_ENABLED: "0"
+          LIVE_RUNNER_ENABLED: "0"
+          CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED: "0"
+          TRAINING_MODE_ENABLED: "1"
+          DATABASE_URL: ""
+        run: .\scripts\windows\Test-WindowsDashboard.ps1
