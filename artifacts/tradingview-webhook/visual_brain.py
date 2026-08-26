@@ -11,10 +11,10 @@ SHADOW / OBSERVATION ONLY.
 - Does NOT modify SCALP / INTRADAY_TREND / SWING decision logic.
 - Does NOT alter gate thresholds, edge scores, or execution paths.
 - All writes FAIL-OPEN — a bug here cannot affect the money path.
-- One model call maximum per 60 seconds; screenshot compressed to ≤800px wide.
+- One model call maximum per 300 seconds; screenshot compressed to ≤800px wide.
 
 Flag: VISUAL_BRAIN_ENABLED=true  (default OFF → byte-identical).
-Instruments: VISUAL_BRAIN_SYMBOL=MNQ,MGC,MES,MYM  (comma-separated; default all 4).
+Instruments: VISUAL_BRAIN_SYMBOL=MNQ,MGC  (comma-separated; default MNQ and MGC).
 """
 
 from __future__ import annotations
@@ -35,10 +35,10 @@ logger = logging.getLogger(__name__)
 
 # ── Config ────────────────────────────────────────────────────────────────────
 VISUAL_BRAIN_ENABLED   = os.getenv("VISUAL_BRAIN_ENABLED", "false").lower() in ("true", "1", "yes")
-VISUAL_BRAIN_SYMBOL    = os.getenv("VISUAL_BRAIN_SYMBOL", "MNQ,MGC,MES,MYM")
+VISUAL_BRAIN_SYMBOL    = os.getenv("VISUAL_BRAIN_SYMBOL", "MNQ,MGC")
 # Parsed list — used by all multi-instrument logic; VISUAL_BRAIN_SYMBOL kept for compat
 _VB_SYMBOLS: list = [s.strip().upper() for s in VISUAL_BRAIN_SYMBOL.split(",") if s.strip()]
-VISUAL_BRAIN_INTERVAL  = max(60, int(os.getenv("VISUAL_BRAIN_INTERVAL_SECONDS", "60")))
+VISUAL_BRAIN_INTERVAL  = max(60, int(os.getenv("VISUAL_BRAIN_INTERVAL_SECONDS", "300")))
 _VB_MODEL              = "gpt-5.4"               # vision-capable; matches ASSISTANT_MODEL used throughout app.py
 _VB_MAX_TOKENS         = 1200
 _VB_IMAGE_MAX_PX       = 800                      # max width before JPEG downscale
@@ -1478,11 +1478,11 @@ def start(
                 ", ".join(_VB_SYMBOLS), VISUAL_BRAIN_INTERVAL)
     # Each instrument's first tick is delayed by at least one full VISUAL_BRAIN_INTERVAL
     # (preserving the original "let boot complete first" safety margin) plus a
-    # per-instrument slot offset that spreads all first ticks across the 60-second
+    # per-instrument slot offset that spreads all first ticks across the 300-second
     # window, preventing a concurrent model-call burst at startup.
     #
-    # With n=4 and interval=60s → slots of 15s → delays: 60, 75, 90, 105.
-    # With n=1 (single-instrument override) → delay: 60 (matches original behaviour).
+    # With n=2 and interval=300s → slots of 150s → delays: 300, 450.
+    # With n=1 (single-instrument override) → delay: 300.
     n = max(len(_VB_SYMBOLS), 1)
     slot = float(VISUAL_BRAIN_INTERVAL) / n
     for i, inst in enumerate(_VB_SYMBOLS):
