@@ -236,7 +236,72 @@ class TestMalformedModelResponse(unittest.TestCase):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Test 3: Screenshot failure
+# Test 3: OpenAI transport isolation
+# ─────────────────────────────────────────────────────────────────────────────
+
+class TestOpenAITransportIsolation(unittest.TestCase):
+    """Visual Brain disables HTTPX environment routing only on its own client."""
+
+    def setUp(self):
+        self.vb = _import_vb()
+
+    def _mock_model_response(self):
+        mock_choice = MagicMock()
+        mock_choice.message.content = json.dumps(_make_obs())
+        mock_resp = MagicMock()
+        mock_resp.choices = [mock_choice]
+        mock_resp.usage.prompt_tokens = 100
+        mock_resp.usage.completion_tokens = 50
+        return mock_resp
+
+    def test_configured_credentials_and_base_url_use_isolated_verified_transport(self):
+        with patch.dict(os.environ, {
+            "AI_INTEGRATIONS_OPENAI_API_KEY": "configured-test-key",
+            "AI_INTEGRATIONS_OPENAI_BASE_URL": "https://provider.example/v1",
+        }, clear=False), \
+             patch("openai.DefaultHttpxClient") as MockHttpxClient, \
+             patch("openai.OpenAI") as MockOpenAI:
+            MockOpenAI.return_value.chat.completions.create.return_value = \
+                self._mock_model_response()
+
+            result = self.vb.analyze_visual_market(b"fake-img", None, [], "MNQ")
+
+        self.assertEqual(result["instrument"], "MNQ")
+        MockHttpxClient.assert_called_once_with(verify=True, trust_env=False)
+        MockOpenAI.assert_called_once()
+        kwargs = MockOpenAI.call_args.kwargs
+        self.assertEqual(kwargs["api_key"], "configured-test-key")
+        self.assertEqual(kwargs["base_url"], "https://provider.example/v1")
+        self.assertIs(kwargs["http_client"], MockHttpxClient.return_value)
+        MockHttpxClient.return_value.close.assert_called_once_with()
+
+    def test_environment_and_unrelated_httpx_clients_are_unchanged(self):
+        from openai import DefaultHttpxClient
+
+        proxy_env = {
+            "HTTP_PROXY": "http://proxy.example.invalid:8080",
+            "HTTPS_PROXY": "http://proxy.example.invalid:8080",
+            "ALL_PROXY": "http://proxy.example.invalid:8080",
+        }
+        before = {name: os.environ.get(name) for name in proxy_env}
+        with patch.dict(os.environ, proxy_env, clear=False), \
+             patch("openai.OpenAI") as MockOpenAI:
+            MockOpenAI.return_value.chat.completions.create.return_value = \
+                self._mock_model_response()
+            self.vb.analyze_visual_market(b"fake-img", None, [], "MNQ")
+
+            unrelated = DefaultHttpxClient()
+            try:
+                self.assertTrue(getattr(unrelated, "_trust_env", False))
+            finally:
+                unrelated.close()
+
+        after = {name: os.environ.get(name) for name in proxy_env}
+        self.assertEqual(after, before)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Test 4: Screenshot failure
 # ─────────────────────────────────────────────────────────────────────────────
 
 class TestScreenshotFailure(unittest.TestCase):
