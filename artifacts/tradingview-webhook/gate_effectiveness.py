@@ -16,6 +16,7 @@ Table:     gate_audit_log  (DDL: db_gate_effectiveness_schema.sql)
 from __future__ import annotations
 
 import json
+import hashlib
 import logging
 import os
 import threading
@@ -54,6 +55,41 @@ _GE_WATCHER_STATE: dict = {
 }
 _BACKFILL_RUNNING = False
 _BACKFILL_LOCK    = threading.Lock()
+
+
+def _coordinator_evaluation_fingerprint(
+    info: dict, gate_verdict: str, full_verdict: str
+) -> str:
+    """Return the stable state identity for a gate-evaluation heartbeat.
+
+    Wall-clock buckets and timestamps are intentionally excluded. A changed
+    gate verdict, blocker, score, component, or proposed geometry is a new
+    state observation; an unchanged state is only a coordinator heartbeat.
+    """
+    state = {
+        "gate_verdict": gate_verdict,
+        "full_verdict": full_verdict,
+        "edge_score": info.get("edge_score"),
+        "primary_blocker": info.get("primary_blocker"),
+        "all_blockers": info.get("all_blockers"),
+        "direction": info.get("direction"),
+        "entry_price": info.get("entry_price"),
+        "stop_price": info.get("stop_price"),
+        "target1_price": info.get("target1_price"),
+        "target2_price": info.get("target2_price"),
+        "risk_points": info.get("risk_points"),
+        "comp_bos": info.get("comp_bos"),
+        "comp_choch": info.get("comp_choch"),
+        "comp_vwap": info.get("comp_vwap"),
+        "comp_sweep": info.get("comp_sweep"),
+        "comp_volume": info.get("comp_volume"),
+        "comp_cvd": info.get("comp_cvd"),
+        "comp_session": info.get("comp_session"),
+        "comp_zone": info.get("comp_zone"),
+        "geometry_source": info.get("geometry_source"),
+    }
+    packed = json.dumps(state, sort_keys=True, separators=(",", ":"), default=str)
+    return hashlib.sha256(packed.encode("utf-8")).hexdigest()[:24]
 
 
 # ── IT gate-category mapping ───────────────────────────────────────────────────
@@ -705,13 +741,11 @@ def _record(result: dict, instrument: str, mode: str) -> None:
     # are tracked as SEPARATE opportunities in analytics queries.
     setup_id = f"{mode}|{strategy}|{inst}|{direction}|{now.strftime('%Y%m%d')}"
 
-    # ── Dedup key ──
-    # Identity = mode + strategy + instrument + direction + 10-minute bucket.
-    # • ALLOWED: each 10-minute READY window records its own row.
-    # • BLOCKED: polls within the same 10-minute window collapse to one row;
-    #   a genuine later setup on the same day gets a new row (different bucket).
-    # Including strategy prevents different sub-strategies from collapsing into
-    # a single row when they block in the same window.
+    # ── Legacy audit dedup key ──
+    # The gate-audit table remains bucketed for its existing resolver contract.
+    # The coordinator mirror uses setup_id plus a state fingerprint below, so
+    # unchanged polls across audit buckets become heartbeats while transitions
+    # remain separate coordinator observations.
     _ten_min = now.strftime("%Y%m%d%H") + f"{now.minute // 10:02d}"
     if gate_verdict in ("ALLOWED", "EARLY_ALLOWED"):
         audit_id = f"{mode}|{strategy}|{inst}|{direction}|ALLOWED|{_ten_min}"
@@ -846,7 +880,13 @@ def _record(result: dict, instrument: str, mode: str) -> None:
                         targets=(info["target1_price"], info["target2_price"]),
                         source_event_id=audit_id, variant=mode,
                         context={"legacy_audit_id": audit_id, "gate_verdict": gate_verdict,
-                                 "geometry_source": info.get("geometry_source")},
+                                 "geometry_source": info.get("geometry_source"),
+                                 "coordinator_evaluation_kind": "gate_check",
+                                 "coordinator_opportunity_key": setup_id,
+                                 "coordinator_evaluation_fingerprint":
+                                     _coordinator_evaluation_fingerprint(
+                                         info, gate_verdict, verdict,
+                                     )},
                     )
             except Exception:
                 pass

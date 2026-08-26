@@ -51045,9 +51045,9 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
         event_id = source_event_id or "%s|%s|%s|%s" % (
             inst, setup_family, direction, source_bar)
         shadow_context = dict(context or {})
-        # The existing coordinator identity intentionally remains unchanged.
-        # Phase-1's sidecar receives the explicit lane only in copied context,
-        # so SCALP and INTRADAY can never collapse in its shadow projection.
+        # Preserve the legacy source identity in the copied request. The
+        # coordinator may apply an explicit evaluation identity for gate checks,
+        # while SCALP and INTRADAY remain separated by their copied lane context.
         if source_system == "generic_ghost":
             shadow_context.setdefault("trading_mode", TRADING_MODE)
             shadow_context.setdefault("legacy_table", "ghost_observations")
@@ -51068,7 +51068,7 @@ def _coordinator_submit_analysis(result, *, inst, source_system, setup_family,
             submission = _ghost_coordinator.route_research(observation)[0]
         else:
             submission = _ghost_coordinator.submit_shadow(observation)
-        if (submission is not None and submission.accepted
+        if (submission is not None and submission.accepted and not submission.duplicate
                 and submission.market_opportunity_id and submission.observation_id):
             _canonical_ghost_observe_submission({
                 "observation_id": submission.observation_id,
@@ -51892,6 +51892,12 @@ def _coordinator_persist(kind, record):
                        (telemetry_id, source_system, event_id)
                        VALUES (%s,%s,%s) ON CONFLICT (telemetry_id) DO NOTHING""",
                     (record["telemetry_id"], record["source_system"], record["event_id"]))
+            elif kind == "evaluation_heartbeat":
+                cur.execute(
+                    """UPDATE ghost_coordinator_observations
+                          SET context = %s::jsonb
+                        WHERE observation_id = %s""",
+                    (json.dumps(record.get("context") or {}), record["observation_id"]))
             else:
                 return False
             wrote = cur.rowcount == 1

@@ -749,6 +749,27 @@ class CanonicalGhostAuthority:
             "coordinator": {
                 "enabled": coordinator.get("enabled"),
                 "requests_received": int(coordinator.get("requests_received", 0) or 0),
+                "opportunity_count": int(
+                    coordinator.get(
+                        "opportunity_count",
+                        coordinator.get("unique_market_opportunities", 0),
+                    )
+                    or 0
+                ),
+                "opportunity_observation_count": int(
+                    coordinator.get(
+                        "opportunity_observation_count",
+                        coordinator.get("unique_observations", 0),
+                    )
+                    or 0
+                ),
+                "evaluation_checks": int(coordinator.get("evaluation_checks", 0) or 0),
+                "evaluation_heartbeats": int(
+                    coordinator.get("evaluation_heartbeats", 0) or 0
+                ),
+                "evaluation_transitions": int(
+                    coordinator.get("evaluation_transitions", 0) or 0
+                ),
                 "duplicate_submissions": int(coordinator.get("duplicate_submissions", 0) or 0),
                 "malformed_or_rejected": int(coordinator.get("malformed_or_rejected", 0) or 0),
                 "persistence_errors": int(coordinator.get("persistence_errors", 0) or 0),

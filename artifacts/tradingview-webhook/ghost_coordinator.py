@@ -81,6 +81,7 @@ class SubmissionResult:
     market_opportunity_id: Optional[str] = None
     observation_id: Optional[str] = None
     duplicate: bool = False
+    heartbeat: bool = False
     error: Optional[str] = None
 
 
@@ -104,14 +105,21 @@ class CentralGhostCoordinator:
         self._lock = threading.Lock()
         self._requests_received = 0
         self._duplicates = 0
+        self._evaluation_checks = 0
+        self._evaluation_heartbeats = 0
+        self._evaluation_transitions = 0
         self._rejected = 0
         self._errors = 0
         self._source_counts: Counter[str] = Counter()
         self._source_unique: Dict[str, set[str]] = defaultdict(set)
+        self._source_evaluation_checks: Counter[str] = Counter()
+        self._source_evaluation_heartbeats: Counter[str] = Counter()
+        self._source_evaluation_transitions: Counter[str] = Counter()
         self._source_errors: Counter[str] = Counter()
         self._telemetry_events: set[str] = set()
         self._opportunities: Dict[str, Dict[str, Any]] = {}
         self._observations: Dict[str, Dict[str, Any]] = {}
+        self._evaluation_latest: Dict[Tuple[str, str], Dict[str, Any]] = {}
         self._last_error: Optional[str] = None
         self._persistence_writes = 0
         self._persistence_errors = 0
@@ -163,6 +171,16 @@ class CentralGhostCoordinator:
             context = normalized.get("context") or {}
             anchor_id = str(context.get("canonical_authority_id") or "").strip()
             legacy_sim_key = str(context.get("legacy_sim_key") or "").strip()
+            evaluation_kind = str(context.get("coordinator_evaluation_kind") or "").strip().lower()
+            evaluation_key = str(
+                context.get("coordinator_opportunity_key") or ""
+            ).strip()
+            evaluation_fingerprint = str(
+                context.get("coordinator_evaluation_fingerprint") or ""
+            ).strip()
+            is_evaluation = evaluation_kind == "gate_check" and bool(evaluation_key) and bool(
+                evaluation_fingerprint
+            )
             # This bridge exists exclusively for the dual-mode simulator.  Its
             # own immutable sim_key must remain the submitted source event and
             # match the carried durable reference.  All other producers,
@@ -172,58 +190,148 @@ class CentralGhostCoordinator:
                 and bool(anchor_id)
                 and legacy_sim_key == normalized["source_event_id"]
             )
-            market_event_id = anchor_id if use_anchor else normalized["source_event_id"]
+            # Gate-effectiveness polls have a stable daily setup key but a
+            # changing time-bucketed audit id. Keep the opportunity stable and
+            # make the meaningful state fingerprint part of the observation
+            # identity. This collapses unchanged checks without collapsing a
+            # real gate-state transition.
+            market_event_id = (
+                evaluation_key
+                if is_evaluation and normalized["source_system"] == "gate_effectiveness"
+                else (anchor_id if use_anchor else normalized["source_event_id"])
+            )
             market_id = _stable_hash("mop", {
                 "instrument": normalized["instrument"],
                 "timeframe": normalized["timeframe"],
                 "source_event_id": market_event_id,
-                "source_bar_time": normalized["source_bar_time"],
+                # A gate check's daily setup key is its opportunity identity;
+                # the bar that happened to trigger a poll is heartbeat
+                # metadata, not a new opportunity.
+                "source_bar_time": (
+                    None if is_evaluation else normalized["source_bar_time"]
+                ),
                 "direction": normalized["direction"],
                 "setup_family": normalized["setup_family"],
                 "strategy_version": normalized["strategy_version"],
             })
-            observation_id = _stable_hash("obs", {
-                "market_opportunity_id": market_id,
-                "source_system": normalized["source_system"],
-                "strategy_name": normalized["strategy_name"],
-                "experiment_variant": normalized["experiment_variant"],
-            })
             with self._lock:
                 self._source_counts[normalized["source_system"]] += 1
+                if is_evaluation:
+                    source = normalized["source_system"]
+                    self._evaluation_checks += 1
+                    self._source_evaluation_checks[source] += 1
+                    evaluation_state_key = (market_id, source)
+                    previous_state = self._evaluation_latest.get(evaluation_state_key)
+                    if previous_state is None:
+                        transition_index = 0
+                    elif previous_state["fingerprint"] == evaluation_fingerprint:
+                        transition_index = int(previous_state["transition_index"])
+                    else:
+                        transition_index = int(previous_state["transition_index"]) + 1
+                    observation_id = _stable_hash("obs", {
+                        "market_opportunity_id": market_id,
+                        "source_system": normalized["source_system"],
+                        "strategy_name": normalized["strategy_name"],
+                        "experiment_variant": normalized["experiment_variant"],
+                        "evaluation_fingerprint": evaluation_fingerprint,
+                        "evaluation_transition_index": transition_index,
+                    })
+                else:
+                    transition_index = None
+                    observation_id = _stable_hash("obs", {
+                        "market_opportunity_id": market_id,
+                        "source_system": normalized["source_system"],
+                        "strategy_name": normalized["strategy_name"],
+                        "experiment_variant": normalized["experiment_variant"],
+                        "evaluation_fingerprint": None,
+                    })
                 existing = self._observations.get(observation_id)
                 if existing is not None:
                     self._duplicates += 1
-                    return SubmissionResult(
-                        accepted=True,
-                        ignored=False,
-                        market_opportunity_id=market_id,
-                        observation_id=observation_id,
-                        duplicate=True,
-                    )
-                opportunity = self._opportunities.get(market_id)
-                if opportunity is None:
-                    opportunity = {
+                    if is_evaluation:
+                        self._evaluation_heartbeats += 1
+                        self._source_evaluation_heartbeats[
+                            normalized["source_system"]
+                        ] += 1
+                        existing_context = existing.setdefault("context", {})
+                        try:
+                            heartbeat_count = int(
+                                existing_context.get("evaluation_heartbeat_count", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            heartbeat_count = 0
+                        existing_context["evaluation_heartbeat_count"] = heartbeat_count + 1
+                        existing_context["evaluation_last_seen_at"] = normalized["signal_time"]
+                        existing_context["evaluation_last_source_event_id"] = normalized[
+                            "source_event_id"
+                        ]
+                        heartbeat_record = {
+                            "observation_id": observation_id,
+                            "market_opportunity_id": market_id,
+                            "source_system": normalized["source_system"],
+                            "evaluation_heartbeat_count": heartbeat_count + 1,
+                            "evaluation_last_seen_at": normalized["signal_time"],
+                            "evaluation_last_source_event_id": normalized["source_event_id"],
+                            "context": existing_context,
+                        }
+                    else:
+                        heartbeat_record = None
+                else:
+                    if is_evaluation:
+                        self._evaluation_transitions += 1
+                        self._source_evaluation_transitions[
+                            normalized["source_system"]
+                        ] += 1
+                        normalized["context"]["evaluation_transition_index"] = transition_index
+                        self._evaluation_latest[evaluation_state_key] = {
+                            "fingerprint": evaluation_fingerprint,
+                            "transition_index": transition_index,
+                            "observation_id": observation_id,
+                        }
+                    heartbeat_record = None
+                if existing is None:
+                    opportunity = self._opportunities.get(market_id)
+                    if opportunity is None:
+                        opportunity = {
+                            "market_opportunity_id": market_id,
+                            "instrument": normalized["instrument"],
+                            "timeframe": normalized["timeframe"],
+                            "source_event_id": normalized["source_event_id"],
+                            "source_bar_time": normalized["source_bar_time"],
+                            "direction": normalized["direction"],
+                            "setup_family": normalized["setup_family"],
+                            "strategy_version": normalized["strategy_version"],
+                            "source_systems": set(),
+                            "observation_ids": [],
+                        }
+                        self._opportunities[market_id] = opportunity
+                    opportunity["source_systems"].add(normalized["source_system"])
+                    opportunity["observation_ids"].append(observation_id)
+                    stored = {
+                        **normalized,
                         "market_opportunity_id": market_id,
-                        "instrument": normalized["instrument"],
-                        "timeframe": normalized["timeframe"],
-                        "source_event_id": normalized["source_event_id"],
-                        "source_bar_time": normalized["source_bar_time"],
-                        "direction": normalized["direction"],
-                        "setup_family": normalized["setup_family"],
-                        "strategy_version": normalized["strategy_version"],
-                        "source_systems": set(),
-                        "observation_ids": [],
+                        "observation_id": observation_id,
                     }
-                    self._opportunities[market_id] = opportunity
-                opportunity["source_systems"].add(normalized["source_system"])
-                opportunity["observation_ids"].append(observation_id)
-                stored = {
-                    **normalized,
-                    "market_opportunity_id": market_id,
-                    "observation_id": observation_id,
-                }
-                self._observations[observation_id] = stored
-                self._source_unique[normalized["source_system"]].add(market_id)
+                    self._observations[observation_id] = stored
+                    self._source_unique[normalized["source_system"]].add(market_id)
+            if heartbeat_record is not None:
+                self._persist("evaluation_heartbeat", heartbeat_record)
+                return SubmissionResult(
+                    accepted=True,
+                    ignored=False,
+                    market_opportunity_id=market_id,
+                    observation_id=observation_id,
+                    duplicate=True,
+                    heartbeat=True,
+                )
+            if existing is not None:
+                return SubmissionResult(
+                    accepted=True,
+                    ignored=False,
+                    market_opportunity_id=market_id,
+                    observation_id=observation_id,
+                    duplicate=True,
+                )
             self._persist("observation", stored)
             return SubmissionResult(
                 accepted=True,
@@ -329,6 +437,9 @@ class CentralGhostCoordinator:
                 "source_system": source,
                 "submissions": int(self._source_counts[source]),
                 "unique_opportunities": len(self._source_unique[source]),
+                "evaluation_checks": int(self._source_evaluation_checks[source]),
+                "evaluation_heartbeats": int(self._source_evaluation_heartbeats[source]),
+                "evaluation_transitions": int(self._source_evaluation_transitions[source]),
             } for source in source_systems]
             cross = []
             for opportunity in self._opportunities.values():
@@ -365,6 +476,11 @@ class CentralGhostCoordinator:
                 "requests_received": self._requests_received,
                 "unique_market_opportunities": len(self._opportunities),
                 "unique_observations": len(self._observations),
+                "opportunity_count": len(self._opportunities),
+                "opportunity_observation_count": len(self._observations),
+                "evaluation_checks": self._evaluation_checks,
+                "evaluation_heartbeats": self._evaluation_heartbeats,
+                "evaluation_transitions": self._evaluation_transitions,
                 "visual_or_nontrade_events": len(self._telemetry_events),
                 "duplicate_submissions": self._duplicates,
                 "malformed_or_rejected": self._rejected,
@@ -508,6 +624,43 @@ class CentralGhostCoordinator:
                     self._observations[observation_id] = stored
                     self._source_unique[source].add(market_id)
                     self._source_counts[source] += 1
+                    context = stored.get("context") if isinstance(stored.get("context"), Mapping) else {}
+                    if (
+                        str(context.get("coordinator_evaluation_kind") or "").strip().lower()
+                        == "gate_check"
+                    ):
+                        evaluation_state_key = (market_id, source)
+                        evaluation_fingerprint = str(
+                            context.get("coordinator_evaluation_fingerprint") or ""
+                        ).strip()
+                        try:
+                            transition_index = int(
+                                context.get("evaluation_transition_index", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            transition_index = 0
+                        previous_state = self._evaluation_latest.get(evaluation_state_key)
+                        if (
+                            previous_state is None
+                            or transition_index >= int(previous_state["transition_index"])
+                        ):
+                            self._evaluation_latest[evaluation_state_key] = {
+                                "fingerprint": evaluation_fingerprint,
+                                "transition_index": transition_index,
+                                "observation_id": observation_id,
+                            }
+                        try:
+                            heartbeat_count = int(
+                                context.get("evaluation_heartbeat_count", 0) or 0
+                            )
+                        except (TypeError, ValueError):
+                            heartbeat_count = 0
+                        self._evaluation_checks += 1 + max(0, heartbeat_count)
+                        self._evaluation_heartbeats += max(0, heartbeat_count)
+                        self._evaluation_transitions += 1
+                        self._source_evaluation_checks[source] += 1 + max(0, heartbeat_count)
+                        self._source_evaluation_heartbeats[source] += max(0, heartbeat_count)
+                        self._source_evaluation_transitions[source] += 1
                     self._restored_observations += 1
                     restored += 1
             except Exception:

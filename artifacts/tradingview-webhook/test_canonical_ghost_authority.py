@@ -524,6 +524,26 @@ def test_health_report_restores_durable_exact_id_matches_after_restart():
     assert health["persistence"]["durable_persisted_events"] == 4
 
 
+def test_health_report_separates_coordinator_opportunities_from_gate_heartbeats():
+    authority = cga.CanonicalGhostAuthority(enabled=True)
+    health = authority.health_report(
+        coordinator_report={
+            "enabled": True,
+            "opportunity_count": 3,
+            "opportunity_observation_count": 4,
+            "evaluation_checks": 19,
+            "evaluation_heartbeats": 15,
+            "evaluation_transitions": 4,
+        }
+    )
+
+    assert health["coordinator"]["opportunity_count"] == 3
+    assert health["coordinator"]["opportunity_observation_count"] == 4
+    assert health["coordinator"]["evaluation_checks"] == 19
+    assert health["coordinator"]["evaluation_heartbeats"] == 15
+    assert health["coordinator"]["evaluation_transitions"] == 4
+
+
 def test_health_report_restores_durable_unmatched_exact_id_reference_after_restart():
     persisted = []
     first = cga.CanonicalGhostAuthority(enabled=True)

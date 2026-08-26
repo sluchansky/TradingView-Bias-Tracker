@@ -4669,6 +4669,7 @@ const CanonicalEvidenceHealthPanel: React.FC<{
   const persistence = (health?.persistence ?? {}) as JsonRecord;
   const reconciliation = (health?.reconciliation ?? {}) as JsonRecord;
   const outcomes = (health?.outcomes ?? {}) as JsonRecord;
+  const coordinator = (health?.coordinator ?? {}) as JsonRecord;
   const staleAfter = safeNum(health?.stale_after_minutes);
   const status = safeStr(lane?.status ?? health?.health_status, 'UNAVAILABLE');
   const statusColor = status === 'HEALTHY' ? T.green
@@ -4710,7 +4711,14 @@ const CanonicalEvidenceHealthPanel: React.FC<{
               <KV label="Last write / reconcile" value={`${lastWrite} / ${lastReconciliation}`} />
             </div>
           </div>
-          <div style={{ marginTop: 10, fontSize: 9.5, color: T.txtMuted }}>
+          <div style={{ marginTop: 10, fontSize: 9.5, color: T.txtSec }}>
+            Coordinator: <strong style={{ color: T.cyan }}>{safeNum(coordinator.opportunity_count) ?? 0} opportunities</strong>
+            {' · '}
+            <strong style={{ color: T.txtPri }}>{safeNum(coordinator.opportunity_observation_count) ?? 0} state observations</strong>
+            {' · '}
+            <strong style={{ color: T.amber }}>{safeNum(coordinator.evaluation_heartbeats) ?? 0} evaluation heartbeats</strong>
+          </div>
+          <div style={{ marginTop: 6, fontSize: 9.5, color: T.txtMuted }}>
             Overdue means unresolved for more than {staleAfter ?? '—'} minutes. This panel reads evidence only; it cannot route, resolve, size, gate, or execute.
           </div>
         </>

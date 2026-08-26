@@ -47,6 +47,163 @@ def test_deterministic_ids_and_deduplication():
     assert report["duplicate_submissions"] == 1
 
 
+def _gate_evaluation_request(**overrides):
+    context = {
+        "coordinator_evaluation_kind": "gate_check",
+        "coordinator_opportunity_key": "SCALP|BASELINE|MNQ|Long|20260821",
+        "coordinator_evaluation_fingerprint": "state-a",
+    }
+    context.update(overrides.pop("context", {}))
+    data = {
+        "source_system": "gate_effectiveness",
+        "source_event_id": "SCALP|BASELINE|MNQ|Long|BLOCKED|202608211430",
+        "instrument": "MNQ",
+        "timeframe": "1m",
+        "setup_family": "STRICT_SETUP",
+        "strategy_name": "BASELINE",
+        "strategy_version": "v1",
+        "direction": "Long",
+        "signal_time": "2026-08-21T14:30:00+00:00",
+        "source_bar_time": "2026-08-21T14:30:00+00:00",
+        "entry": 21000,
+        "stop": 20990,
+        "targets": (21020, 21030),
+        "context": context,
+        "experiment_variant": "SCALP",
+    }
+    data.update(overrides)
+    return gc.ObservationRequest(**data)
+
+
+def test_unchanged_gate_evaluations_are_heartbeats_not_observations():
+    writes = []
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda kind, row: writes.append((kind, dict(row))) or True,
+    )
+
+    first = coordinator.submit(_gate_evaluation_request())
+    heartbeat = coordinator.submit(_gate_evaluation_request(
+        source_event_id="SCALP|BASELINE|MNQ|Long|BLOCKED|202608211440",
+        signal_time="2026-08-21T14:40:00+00:00",
+        source_bar_time="2026-08-21T14:40:00+00:00",
+    ))
+
+    assert first.accepted and not first.heartbeat
+    assert heartbeat.duplicate and heartbeat.heartbeat
+    assert heartbeat.observation_id == first.observation_id
+    assert heartbeat.market_opportunity_id == first.market_opportunity_id
+    report = coordinator.report()
+    assert report["opportunity_count"] == 1
+    assert report["opportunity_observation_count"] == 1
+    assert report["evaluation_checks"] == 2
+    assert report["evaluation_heartbeats"] == 1
+    assert report["evaluation_transitions"] == 1
+    assert report["source_systems"][0]["evaluation_heartbeats"] == 1
+    assert [kind for kind, _ in writes] == ["observation", "evaluation_heartbeat"]
+    assert writes[-1][1]["evaluation_heartbeat_count"] == 1
+
+
+def test_gate_state_transition_keeps_opportunity_and_adds_auditable_observation():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    first = coordinator.submit(_gate_evaluation_request())
+    transitioned = coordinator.submit(_gate_evaluation_request(
+        source_event_id="SCALP|BASELINE|MNQ|Long|ALLOWED|202608211450",
+        context={"coordinator_evaluation_fingerprint": "state-b"},
+    ))
+
+    assert transitioned.accepted
+    assert transitioned.duplicate is False
+    assert transitioned.market_opportunity_id == first.market_opportunity_id
+    assert transitioned.observation_id != first.observation_id
+    report = coordinator.report()
+    assert report["opportunity_count"] == 1
+    assert report["opportunity_observation_count"] == 2
+    assert report["evaluation_checks"] == 2
+    assert report["evaluation_heartbeats"] == 0
+    assert report["evaluation_transitions"] == 2
+
+
+def test_gate_state_reversion_is_a_new_auditable_transition():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    first = coordinator.submit(_gate_evaluation_request())
+    coordinator.submit(_gate_evaluation_request(
+        source_event_id="SCALP|BASELINE|MNQ|Long|ALLOWED|202608211450",
+        context={"coordinator_evaluation_fingerprint": "state-b"},
+    ))
+    reverted = coordinator.submit(_gate_evaluation_request(
+        source_event_id="SCALP|BASELINE|MNQ|Long|BLOCKED|202608211500",
+        context={"coordinator_evaluation_fingerprint": "state-a"},
+    ))
+
+    assert reverted.duplicate is False
+    assert reverted.observation_id not in {first.observation_id}
+    assert coordinator.report()["opportunity_observation_count"] == 3
+    assert coordinator.report()["evaluation_transitions"] == 3
+
+
+def test_gate_heartbeat_restore_preserves_counts_without_replaying_storage():
+    writes = []
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda kind, row: writes.append((kind, dict(row))) or True,
+    )
+    coordinator.submit(_gate_evaluation_request())
+    coordinator.submit(_gate_evaluation_request(
+        source_event_id="SCALP|BASELINE|MNQ|Long|BLOCKED|202608211440",
+    ))
+
+    restored = gc.CentralGhostCoordinator(enabled=True)
+    assert restored.restore([writes[0][1]]) == 1
+    report = restored.report()
+    assert report["evaluation_checks"] == 2
+    assert report["evaluation_heartbeats"] == 1
+    assert report["evaluation_transitions"] == 1
+
+
+def test_gate_state_transition_sequence_survives_restore():
+    persisted = []
+    first = gc.CentralGhostCoordinator(enabled=True)
+    first.configure(
+        enabled=True,
+        persistence_enabled=True,
+        persist_fn=lambda kind, row: persisted.append((kind, dict(row))) or True,
+    )
+    first.submit(_gate_evaluation_request())
+    first.submit(_gate_evaluation_request(
+        source_event_id="SCALP|BASELINE|MNQ|Long|ALLOWED|202608211450",
+        context={"coordinator_evaluation_fingerprint": "state-b"},
+    ))
+
+    restored = gc.CentralGhostCoordinator(enabled=True)
+    assert restored.restore([row for kind, row in persisted if kind == "observation"]) == 2
+    reverted = restored.submit(_gate_evaluation_request(
+        source_event_id="SCALP|BASELINE|MNQ|Long|BLOCKED|202608211500",
+        context={"coordinator_evaluation_fingerprint": "state-a"},
+    ))
+
+    assert reverted.duplicate is False
+    assert restored.report()["opportunity_observation_count"] == 3
+
+
+def test_gate_opportunity_key_remains_instrument_scoped():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    mnq = coordinator.submit(_gate_evaluation_request())
+    mgc = coordinator.submit(_gate_evaluation_request(
+        instrument="MGC",
+        context={
+            "coordinator_opportunity_key": "SCALP|BASELINE|MGC|Long|20260821",
+        },
+    ))
+
+    assert mnq.market_opportunity_id != mgc.market_opportunity_id
+    assert coordinator.report()["opportunity_count"] == 2
+
+
 def test_variants_do_not_collapse_into_one_observation():
     coordinator = gc.CentralGhostCoordinator(enabled=True)
     baseline = coordinator.submit(_request(experiment_variant="BASELINE"))
