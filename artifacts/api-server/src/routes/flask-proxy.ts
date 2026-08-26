@@ -440,6 +440,11 @@ export const BOT1_ROUTES = [
   // (DISPLAY-ONLY; owner-only; NOT in dashboard-auth OPEN_PATHS).
   // Never touches gate, scoring, sizing, learning, or execution.
   "/research-health",
+  // Persistent Market Student — consolidated immutable hypotheses, exact
+  // terminal evidence, calibration/expectancy health, and independent READY
+  // notifier health. Read-only and never a money-path surface.
+  "/market-student/health",
+  "/market-student/strategy-lab",
   "/research-events",
   "/research-coordinator-report",
   // Canonical Ghost Phase 1 — append-only reconciliation telemetry for the

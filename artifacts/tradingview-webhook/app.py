@@ -18,6 +18,7 @@ import requests
 from structure_dedup import STRUCTURE_DEDUP, STRUCTURE_TYPES as _SD_STRUCTURE_TYPES
 from structure_state import resolve_structure_cycle
 from fundamental_awareness import build_fundamental_context
+from market_student import MarketStudentLedger
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -12380,6 +12381,15 @@ except Exception:                                  # pragma: no cover - optional
 
 LEARNING_DB_URL        = os.environ.get("DATABASE_URL")
 LEARNING_DB_ENABLED    = bool(LEARNING_DB_URL and psycopg2)
+MARKET_STUDENT_ENABLED = os.environ.get("MARKET_STUDENT_ENABLED", "1") == "1"
+MARKET_STUDENT_READY_ALERTS_ENABLED = os.environ.get(
+    "MARKET_STUDENT_READY_ALERTS_ENABLED", "0"
+) == "1"
+MARKET_STUDENT_DB_READY = False
+_MARKET_STUDENT = MarketStudentLedger(
+    db_conn_fn=lambda: get_db_connection(),
+    enabled=MARKET_STUDENT_ENABLED,
+)
 
 def get_db_connection():
     """Return a new psycopg2 connection to the shared DB, or None on failure.
@@ -12394,6 +12404,42 @@ def get_db_connection():
     except Exception as exc:
         logger.debug("get_db_connection failed (fail-open): %s", exc)
         return None
+
+
+def _check_market_student_db_ready():
+    """Probe the additive market-student schema without running DDL."""
+    global MARKET_STUDENT_DB_READY
+    if not (MARKET_STUDENT_ENABLED and LEARNING_DB_ENABLED):
+        return False
+    conn = get_db_connection()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM market_student_observations LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM market_student_hypotheses LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM market_student_outcomes LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM market_student_reconciliations LIMIT 1")
+            cur.fetchone()
+        MARKET_STUDENT_DB_READY = True
+        _MARKET_STUDENT.configure(persistence_enabled=True)
+        restored = _MARKET_STUDENT.restore()
+        logger.info("Market Student ready; restored %s", restored)
+        return True
+    except Exception as exc:
+        MARKET_STUDENT_DB_READY = False
+        _MARKET_STUDENT.configure(persistence_enabled=False)
+        logger.info("Market Student persistence unavailable (research remains in-memory): %s",
+                    type(exc).__name__)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 LEARNING_LOCK          = threading.Lock()          # guards the in-memory caches below
 LEARNING_RECOMPUTE_LOCK = threading.Lock()         # serializes recomputes so a slow run can't overwrite a newer cache
@@ -31621,6 +31667,64 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                 "AuthoritativeVerdictHistory full_analysis observe (%s): %s",
                 active_ticker, _avh_exc,
             )
+
+    # ── Persistent Market Student — RESEARCH/DISPLAY ONLY ───────────────────
+    # This is deliberately after the authoritative final verdict. It creates
+    # immutable mode/horizon contracts but never adds a result key and never
+    # feeds the gate, learning, risk, sizing, arm, broker, or execution paths.
+    try:
+        if MARKET_STUDENT_ENABLED:
+            _student_source_ts = None
+            try:
+                from databento_brain import DATABENTO_BARS_BY_INST as _student_bars
+                _student_latest = list(_student_bars.get(active_ticker) or [])[-1:]
+                if _student_latest:
+                    _student_source_ts = _student_latest[0].get("source_timestamp")
+            except Exception:
+                pass
+            _student_record = _MARKET_STUDENT.observe(
+                result,
+                active_ticker,
+                _eff_mode,
+                source_timestamp=_student_source_ts,
+                source_system="full_analysis",
+            )
+            if (
+                _student_record
+                and MARKET_STUDENT_READY_ALERTS_ENABLED
+                and _MARKET_STUDENT.meaningful_ready_transition(
+                    active_ticker, _eff_mode, _student_record
+                )
+            ):
+                _student_contract = _student_record.get("contract") or {}
+                _student_msg = (
+                    "🧠 **MARKET STUDENT READY SETUP**\n"
+                    f"**{active_ticker}** · {_eff_mode} · "
+                    f"{_student_contract.get('direction', 'NEUTRAL')}\n"
+                    f"Verdict: **{_student_contract.get('deterministic_verdict', 'WAIT')}**\n"
+                    f"Horizon: {_student_contract.get('horizon', 'unknown')} · "
+                    f"Confidence: {_student_contract.get('confidence', '—')}\n"
+                    "Research alert only — no order was created."
+                )
+
+                def _send_student_alert(msg=_student_msg, inst=active_ticker):
+                    delivered = False
+                    try:
+                        _student_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
+                        if _student_url:
+                            _student_resp = requests.post(
+                                _student_url, json={"content": msg}, timeout=5
+                            )
+                            delivered = _student_resp.status_code in (200, 204)
+                    except Exception:
+                        delivered = False
+                    _MARKET_STUDENT.record_alert_delivery(delivered)
+                    if not delivered:
+                        logger.debug("Market Student READY alert delivery failed for %s", inst)
+
+                _enqueue_slow(_send_student_alert)
+    except Exception as _student_exc:
+        logger.debug("Market Student observe (%s): %s", active_ticker, _student_exc)
 
     return result
 
@@ -51008,6 +51112,47 @@ def _canonical_ghost_observe_submission(record):
                 record,
                 reason="canonical_authority_observation_unmatched",
             )
+        try:
+            _ms_ctx = record.get("context") if isinstance(record.get("context"), dict) else {}
+            _ms_mode = str(_ms_ctx.get("trading_mode") or _ms_ctx.get("mode") or "").upper()
+            if MARKET_STUDENT_ENABLED and _ms_mode in ("SCALP", "INTRADAY_TREND", "SWING"):
+                _ms_targets = list(record.get("targets") or [])
+                _ms_snapshot = {
+                    "verdict": "READY",
+                    "strict_direction": record.get("direction"),
+                    "confidence": _ms_ctx.get("confidence") or _ms_ctx.get("edge_score"),
+                    "strategy_version": record.get("strategy_version"),
+                    "strategy_key": record.get("strategy_name"),
+                    "source_event_id": record.get("source_event_id"),
+                    "trade_plan": {
+                        "entry": record.get("entry"),
+                        "stop": record.get("stop"),
+                        "target": _ms_targets[0] if _ms_targets else None,
+                        "target2": _ms_targets[1] if len(_ms_targets) > 1 else None,
+                    },
+                    "market_student_context": {
+                        "coordinator_observation_id": record.get("observation_id"),
+                        "coordinator_opportunity_id": record.get("market_opportunity_id"),
+                    },
+                }
+                _ms_row = _MARKET_STUDENT.observe(
+                    _ms_snapshot, record.get("instrument"), _ms_mode,
+                    source_timestamp=record.get("source_bar_time") or record.get("signal_time"),
+                    source_system=str(record.get("source_system") or "coordinator"),
+                    source_event_id=str(record.get("source_event_id") or ""),
+                    force=True,
+                )
+                if _ms_row:
+                    _MARKET_STUDENT.reconcile(
+                        source_system=str(record.get("source_system") or "coordinator"),
+                        source_record_id=str(record.get("source_event_id") or ""),
+                        hypothesis_id=str(_ms_row.get("hypothesis_id") or ""),
+                        instrument=str(record.get("instrument") or ""),
+                        mode=_ms_mode,
+                        provenance=_ms_snapshot["market_student_context"],
+                    )
+        except Exception as _ms_exc:
+            logger.debug("Market Student coordinator copy: %s", _ms_exc)
         return event
     except Exception as exc:
         logger.debug("canonical ghost observation (%s): %s", record.get("source_system"), exc)
@@ -51100,6 +51245,28 @@ def _canonical_ghost_record_outcome(*, obs_key, status, close_reason,
                 },
                 reason="terminal_outcome_without_canonical_observation",
             )
+        try:
+            _ms_status = str(status or "").upper()
+            if _ms_status not in ("WIN", "LOSS", "BREAKEVEN", "EXPIRED", "AMBIGUOUS"):
+                if net_r is None:
+                    _ms_status = "AMBIGUOUS"
+                elif float(net_r) > 0:
+                    _ms_status = "WIN"
+                elif float(net_r) < 0:
+                    _ms_status = "LOSS"
+                else:
+                    _ms_status = "BREAKEVEN"
+            _MARKET_STUDENT.record_outcome_by_source(
+                "generic_ghost", str(obs_key),
+                status=_ms_status, exit_price=exit_price,
+                gross_r=gross_r, cost_r=cost_r, net_r=net_r,
+                reason=close_reason,
+                provenance={"canonical_event_id": (
+                    event.get("event_id") if isinstance(event, dict) else None
+                )},
+            )
+        except Exception as _ms_exc:
+            logger.debug("Market Student outcome copy (%s): %s", obs_key, _ms_exc)
         return event
     except Exception as exc:
         logger.debug("canonical ghost outcome (%s): %s", obs_key, exc)
@@ -85273,6 +85440,35 @@ def route_research_health():
     return jsonify(out)
 
 
+@app.route("/market-student/health", methods=["GET"])
+def route_market_student_health():
+    """Consolidated read-only research ledger and READY-alert health."""
+    try:
+        return jsonify({
+            **_MARKET_STUDENT.health(),
+            "db_ready": bool(MARKET_STUDENT_DB_READY),
+            "ready_alerts": {
+                "enabled": bool(MARKET_STUDENT_READY_ALERTS_ENABLED),
+                **_MARKET_STUDENT.alert_health(),
+            },
+            "money_path": "isolated",
+        })
+    except Exception as exc:
+        logger.debug("Market Student health unavailable: %s", exc)
+        return jsonify({"ok": False, "error": "market_student_health_unavailable"}), 500
+
+
+@app.route("/market-student/strategy-lab", methods=["GET"])
+def route_market_student_strategy_lab():
+    """Exact terminal-evidence view with an explicit manual promotion firewall."""
+    try:
+        minimum = max(10, min(500, int(request.args.get("min_closed_sample", 30))))
+        return jsonify(_MARKET_STUDENT.strategy_lab_report(minimum))
+    except Exception as exc:
+        logger.debug("Market Student strategy lab unavailable: %s", exc)
+        return jsonify({"ok": False, "error": "market_student_strategy_lab_unavailable"}), 500
+
+
 @app.route("/research-coordinator-report", methods=["GET"])
 def route_research_coordinator_report():
     """Phase 1 Central Ghost Coordinator diagnostic (GET-only, shadow-only)."""
@@ -89117,6 +89313,7 @@ if __name__ == "__main__":
     _sys.excepthook = _main_fatal_hook
 
     if LEARNING_DB_ENABLED:
+        _check_market_student_db_ready()           # probe/restore additive research-only market-student ledger
         _check_journal_db_ready()                  # probe journal_entries (no DDL; table created via DB tool/publish diff)
         _load_journal_from_db()                    # restore today's journal so EOD survives restarts (BEFORE the worker)
         _check_tradezella_db_ready()               # probe tradezella_trades (no DDL; owner-only review import, FAIL-OPEN)

@@ -5110,19 +5110,20 @@ const StrategyLabPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
 };
 
 const TrainingInfrastructurePanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
-  const [data, setData] = React.useState<{ health: JsonRecord | null; operations: JsonRecord | null; coordinator: JsonRecord | null; events: JsonRecord[] }>({
-    health: null, operations: null, coordinator: null, events: [],
+  const [data, setData] = React.useState<{ health: JsonRecord | null; operations: JsonRecord | null; coordinator: JsonRecord | null; student: JsonRecord | null; events: JsonRecord[] }>({
+    health: null, operations: null, coordinator: null, student: null, events: [],
   });
   const [advancedOpen, setAdvancedOpen] = React.useState(false);
 
   const load = React.useCallback(async () => {
-    const [health, operations, coordinator, eventsResponse] = await Promise.all([
+    const [health, operations, coordinator, student, eventsResponse] = await Promise.all([
       getReadOnlyJson('/api/research-health', authHeader),
       getReadOnlyJson('/api/research-ops', authHeader),
       getReadOnlyJson('/api/research-coordinator-report?limit=10', authHeader),
+      getReadOnlyJson('/api/market-student/health', authHeader),
       getReadOnlyJson('/api/research-events?limit=10', authHeader),
     ]);
-    setData({ health, operations, coordinator, events: Array.isArray(eventsResponse?.events) ? eventsResponse?.events as JsonRecord[] : [] });
+    setData({ health, operations, coordinator, student, events: Array.isArray(eventsResponse?.events) ? eventsResponse?.events as JsonRecord[] : [] });
   }, [authHeader]);
 
   React.useEffect(() => {
@@ -5134,6 +5135,10 @@ const TrainingInfrastructurePanel: React.FC<{ authHeader: string }> = ({ authHea
   const ghost = (data.health?.ghost_engine ?? {}) as JsonRecord;
   const edge = (data.health?.edge_ledger ?? {}) as JsonRecord;
   const coordinator = data.coordinator ?? {};
+  const student = data.student ?? {};
+  const freshness = (student.freshness ?? {}) as JsonRecord;
+  const studentOutcomes = (student.outcomes ?? {}) as JsonRecord;
+  const studentAlerts = (student.ready_alerts ?? {}) as JsonRecord;
 
   return (
     <div>
@@ -5150,6 +5155,18 @@ const TrainingInfrastructurePanel: React.FC<{ authHeader: string }> = ({ authHea
         <TrainingStat label="Coordinator" value={coordinator.enabled === true ? 'INTAKE ON' : 'OFF'} color={coordinator.enabled === true ? T.cyan : T.txtMuted} />
         <TrainingStat label="Fan-out" value={coordinator.fanout_enabled === true ? 'ON' : 'OFF'} color={coordinator.fanout_enabled === true ? T.red : T.green} />
       </div>
+      <Panel title="Persistent Market Student" badge={<Badge label={student.money_path === 'isolated' ? 'RESEARCH ONLY' : 'PENDING'} color={student.money_path === 'isolated' ? T.green : T.amber} />}>
+        <div style={{ padding: 12, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8 }}>
+          <TrainingStat label="Hypotheses" value={safeNum(student.hypothesis_count) ?? '—'} />
+          <TrainingStat label="Unresolved" value={safeNum(student.unresolved_hypotheses) ?? '—'} color={(safeNum(student.unresolved_hypotheses) ?? 0) > 0 ? T.amber : T.green} />
+          <TrainingStat label="Canonical link" value={safeNum(student.canonical_link_rate) == null ? '—' : `${Math.round((safeNum(student.canonical_link_rate) ?? 0) * 100)}%`} />
+          <TrainingStat label="Recent expectancy" value={safeNum(studentOutcomes.recent_expectancy_r) == null ? '—' : `${safeNum(studentOutcomes.recent_expectancy_r)?.toFixed(2)}R`} color={(safeNum(studentOutcomes.recent_expectancy_r) ?? 0) >= 0 ? T.green : T.red} />
+          <TrainingStat label="Last observation" value={safeNum(freshness.last_observation_age_sec) == null ? '—' : `${safeNum(freshness.last_observation_age_sec)}s ago`} />
+          <TrainingStat label="DB persistence" value={student.db_ready === true ? 'READY' : 'PENDING'} color={student.db_ready === true ? T.green : T.amber} />
+          <TrainingStat label="READY notifier" value={studentAlerts.enabled === true ? 'ON' : 'OFF'} color={studentAlerts.enabled === true ? T.cyan : T.txtMuted} />
+          <TrainingStat label="Alert errors" value={safeNum(studentAlerts.delivery_errors) ?? 0} color={(safeNum(studentAlerts.delivery_errors) ?? 0) > 0 ? T.amber : T.green} />
+        </div>
+      </Panel>
       <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10 }} className="mb-grid-2">
         <Panel title="Research pipeline health" badge={<Badge label={data.operations?.healthy === true ? 'HEALTHY' : data.operations?.needs_attention === true ? 'ATTENTION' : 'PENDING'} color={data.operations?.healthy === true ? T.green : T.amber} />}>
           <div style={{ padding: 12, display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 8, fontSize: 10 }}>

@@ -57,6 +57,7 @@ def _reset_arm_state():
     """Reset arm state to fresh DISARMED for test isolation."""
     with APP._ARM_STATE_LOCK:
         APP._ARM_STATE.update({
+            "execution_enabled":      True,
             "armed":                  False,
             "armed_at":               None,
             "expires_at":             None,
