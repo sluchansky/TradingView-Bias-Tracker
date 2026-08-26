@@ -42,3 +42,10 @@ uri = "file://artifacts/tradingview-webhook/pine_scripts/mnq_scalp_bot.pine"
 type = "unspecified"
 title = "MNQ Scalp Bot — Pine Script v5 (fixed v2)"
 description = "Fixed: ta.vwap tuple syntax and multi-var declarations. Should compile clean now."
+
+[[outputs]]
+id = "U5UGeo09t1hvkwBFydP8Q"
+uri = "file://price_action_futures.pine"
+type = "unspecified"
+title = "Futures Price Action Toolkit"
+description = "Corrected Pine v6 indicator with the Boolean session fix and ASCII-only characters."
