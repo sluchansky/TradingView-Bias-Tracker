@@ -221,7 +221,7 @@ float priorDayLow = request.security(syminfo.tickerid, "D", low[1],
      lookahead=barmerge.lookahead_on)
 
 bool inSession = not na(time(timeframe.period, rthSession))
-bool sessionStarted = inSession and (na(inSession[1]) or not inSession[1])
+bool sessionStarted = inSession and not inSession[1]
 var float sessionHigh = na
 var float sessionLow = na
 
