@@ -24,5 +24,11 @@ stream to prove winners before manual promotion. **Fully walled off from the mon
 - **Why it's dangerous:** `py_compile` + goldens (flag OFF) + an HTTP smoke all pass while this is broken. Only an explicit LONG *and* SHORT outcome test catches it. Always test both directions for any ±R resolver.
 - The max-hold "expired" branch already keys off direction correctly; the bug was only in the stop/target resolver.
 
+## Retained-bar resolution boundary
+- Watchers evaluate all retained completed bars in chronological order, skipping bars at or before `entry_epoch` (or `opened_at` fallback) to preserve the same-bar guard.
+- If a row reaches max hold but retained history starts after its entry, terminalize it as `unresolved` with `market_history_unavailable`/`market_history_truncated`, age, and max-hold metadata. Do not fabricate an expiry from an unobserved interval; unresolved rows stay out of performance and learning evidence.
+- **Why:** Databento’s in-memory retention is finite and restarts can leave a paper row older than the available tape; treating the latest close as an observed outcome would poison strategy comparison.
+- **How to apply:** Any future paper ledger or backfill must distinguish a real terminal bar from an uncovered history gap, and must expose the gap in watcher health.
+
 ## Dashboard read path
 - GET `/scalp-research` must DEEP-COPY the cached research collections (tested/library/best/worst/promotions) before augmenting with live-sim stats — otherwise the augmentation mutates the shared cache.

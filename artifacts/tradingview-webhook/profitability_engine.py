@@ -379,6 +379,46 @@ def resolve_bar_outcome(
     return None, None, None, None   # still open
 
 
+def resolve_single_leg_paper_bar(
+    direction: str,
+    bar_high: float,
+    bar_low: float,
+    entry: float,
+    stop: float,
+    target: float,
+) -> Optional[Tuple[str, str, float, float]]:
+    """Resolve a one-target paper trade using the canonical bar resolver.
+
+    Paper ledgers store a compact ``win`` / ``loss`` / ``expired`` result rather
+    than the richer ghost lifecycle status.  Keeping that translation here means
+    the scalp and dual paper ledgers cannot drift into different stop/target or
+    SHORT-R semantics.  ``None`` means the bar did not close the trade.
+
+    Returns ``(result, close_reason, exit_price, gross_r)``.  A stop-first
+    ambiguous bar is a loss because the canonical resolver returns the stop fill.
+    """
+    status, close_reason, exit_price, gross_r = resolve_bar_outcome(
+        direction=direction,
+        bar_high=bar_high,
+        bar_low=bar_low,
+        entry=entry,
+        stop=stop,
+        target1=target,
+        target2=None,
+        tp1_hit=False,
+        bars_held=0,
+        # Wall-clock max-hold policies belong to the paper-ledger watcher.  This
+        # helper is strictly a single market-bar decision.
+        max_hold_bars=2**31 - 1,
+    )
+    if status is None or close_reason is None or exit_price is None or gross_r is None:
+        return None
+    result = "expired" if status == STATUS_EXPIRED else (
+        "win" if float(gross_r) > 0 else "loss"
+    )
+    return result, close_reason, float(exit_price), round(float(gross_r), 4)
+
+
 # ---------------------------------------------------------------------------
 # Edge Ledger — aggregation (pure, operates on a list of closed-row dicts)
 # ---------------------------------------------------------------------------

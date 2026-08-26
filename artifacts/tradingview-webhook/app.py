@@ -35359,6 +35359,41 @@ def _tag_dynamic_paper_managed_trade(inst, plan, setup_key):
     return True
 
 
+def _fetch_completed_bars(instrument):
+    """Return a snapshot of completed Databento bars for ``instrument``.
+
+    The paper-simulation watchers need the retained history, not just the newest
+    bar: a target or stop may have been crossed and then left before the next
+    watcher cycle.  The Databento public store contains completed bars only, so
+    this helper deliberately does not synthesize a current bar or fetch from a
+    second market-data source.  FAIL-OPEN: an unavailable feed returns ``[]``.
+    """
+    try:
+        from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
+        raw_bars = list(DATABENTO_BARS_BY_INST.get(instrument) or [])
+        out = []
+        for raw in raw_bars:
+            try:
+                ts = raw.get("ts", raw.get("start"))
+                if hasattr(ts, "timestamp"):
+                    ts = ts.timestamp()
+                ts = float(ts) if ts is not None else None
+                high = float(raw["high"])
+                low = float(raw["low"])
+                close = float(raw["close"])
+                if ts is None or high < low:
+                    continue
+                out.append({
+                    "high": high, "low": low, "close": close, "start": ts,
+                })
+            except (KeyError, TypeError, ValueError):
+                continue
+        out.sort(key=lambda bar: bar["start"])
+        return out
+    except Exception:
+        return []
+
+
 def _fetch_latest_bar(instrument):
     """Return the most-recent completed bar for `instrument` from the Databento
     live-bar store. Used by the managed-trade watcher for stop/TP detection.
@@ -35366,17 +35401,8 @@ def _fetch_latest_bar(instrument):
     FAIL-OPEN: returns None when Databento is not running or has no bars yet.
     """
     try:
-        from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
-        bars = DATABENTO_BARS_BY_INST.get(instrument)
-        if not bars:
-            return None
-        bar = bars[-1]
-        return {
-            "high":  float(bar["high"]),
-            "low":   float(bar["low"]),
-            "close": float(bar["close"]),
-            "start": int(bar["ts"]),
-        }
+        bars = _fetch_completed_bars(instrument)
+        return bars[-1] if bars else None
     except Exception:
         return None
 
@@ -48435,6 +48461,7 @@ _SCALP_SIM_WATCH_HEALTH = {
     "last_skip_reason": None, "cycles_started": 0, "cycles_completed": 0,
     "cycles_skipped": 0, "cycles_failed": 0, "last_open_rows": 0,
     "last_closed_rows": 0, "last_missing_bar_count": 0,
+    "last_unresolved_rows": 0, "last_unresolved_reasons": {},
     "oldest_unresolved_age_hours": None,
 }
 
@@ -49809,33 +49836,36 @@ def _maybe_observe_scalp_live_sim(result, source="webhook"):
 
 
 def _scalp_sim_outcome(row, bar):
-    """Pure stop-first / then target resolver for ONE open paper trade against the
-    latest bar. Returns (result_label, exit_price, r_multiple) or None (no level
-    hit). Stop is checked before target (worst-case fill), exactly like the live
-    managed watcher's idempotent level checks."""
+    """Resolve one paper bar through the canonical profitability resolver.
+
+    Returns ``(result_label, exit_price, r_multiple)`` or ``None``.  The wrapper
+    keeps the legacy paper-ledger shape while the actual stop-first and SHORT-R
+    rules live in one shared pure implementation.
+    """
     high, low = bar.get("high"), bar.get("low")
     entry, stop, target = row.get("entry"), row.get("stop"), row.get("target")
     if None in (high, low, entry, stop, target):
         return None
-    risk = abs(entry - stop)
-    if risk <= 0:
+    try:
+        import profitability_engine as _pe  # noqa: PLC0415
+        resolved = _pe.resolve_single_leg_paper_bar(
+            direction=row.get("direction"),
+            bar_high=high,
+            bar_low=low,
+            entry=entry,
+            stop=stop,
+            target=target,
+        )
+        if resolved is None:
+            return None
+        result_label, _close_reason, exit_price, r_multiple = resolved
+        return result_label, exit_price, r_multiple
+    except Exception:
         return None
-    if row.get("direction") == "Long":
-        if low <= stop:
-            return ("loss", stop, round((stop - entry) / risk, 4))
-        if high >= target:
-            return ("win", target, round((target - entry) / risk, 4))
-    else:
-        # SHORT: stop is ABOVE entry (loss) and target BELOW entry (win), so R is
-        # measured as (entry - exit)/risk to keep losses negative and wins positive.
-        if high >= stop:
-            return ("loss", stop, round((entry - stop) / risk, 4))
-        if low <= target:
-            return ("win", target, round((entry - target) / risk, 4))
-    return None
 
 
-def _scalp_sim_close(row_id, result_label, exit_price, r_multiple):
+def _scalp_sim_close(row_id, result_label, exit_price, r_multiple,
+                     resolution_meta=None, status="closed"):
     """Atomically resolve one open paper trade. The conditional `WHERE status IN
     ('open','resolving')` IS the cross-instance status claim — only the first
     writer (dev OR prod) closes it; a concurrent watcher's UPDATE matches 0 rows
@@ -49849,9 +49879,11 @@ def _scalp_sim_close(row_id, result_label, exit_price, r_multiple):
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE scalp_strategy_sim_trades "
-                "SET status='closed', result=%s, exit_price=%s, r_multiple=%s, closed_at=now() "
+                "SET status=%s, result=%s, exit_price=%s, r_multiple=%s, "
+                "closed_at=now(), context=COALESCE(context, '{}'::jsonb) || %s::jsonb "
                 "WHERE id=%s AND status IN ('open','resolving')",
-                (result_label, exit_price, r_multiple, row_id))
+                (status, result_label, exit_price, r_multiple,
+                 json.dumps(resolution_meta or {}), row_id))
             claimed = (cur.rowcount == 1)
         conn.commit()
         return claimed
@@ -49869,26 +49901,113 @@ def _scalp_sim_close(row_id, result_label, exit_price, r_multiple):
             pass
 
 
+def _paper_sim_age_hours(row):
+    """Return the wall-clock age of a paper row, or ``None`` if unknown."""
+    opened_at = row.get("opened_at") if isinstance(row, dict) else None
+    if opened_at is None:
+        return None
+    try:
+        if not opened_at.tzinfo:
+            opened_at = opened_at.replace(tzinfo=timezone.utc)
+        return max(0.0, (now_utc() - opened_at).total_seconds() / 3600.0)
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _paper_sim_expiry(row, bar, max_hold_hours):
+    """Return a deterministic wall-clock expiry result for a valid paper row."""
+    age_hours = _paper_sim_age_hours(row)
+    close = bar.get("close") if isinstance(bar, dict) else None
+    entry, stop = row.get("entry"), row.get("stop")
+    if age_hours is None or age_hours < max_hold_hours or None in (close, entry, stop):
+        return None
+    try:
+        risk = abs(float(entry) - float(stop))
+        if risk <= 0:
+            return None
+        direction = row.get("direction")
+        if direction == "Long":
+            r_multiple = (float(close) - float(entry)) / risk
+        elif direction == "Short":
+            r_multiple = (float(entry) - float(close)) / risk
+        else:
+            return None
+        return "expired", round(float(close), 4), round(r_multiple, 4)
+    except (TypeError, ValueError, ZeroDivisionError):
+        return None
+
+
+def _paper_sim_history_gap(row, history):
+    """Whether retained bars are too recent to prove an old row's outcome."""
+    if not history:
+        return True
+    marker = row.get("entry_epoch")
+    if marker is None and row.get("opened_at") is not None:
+        try:
+            marker = row["opened_at"].timestamp()
+        except (AttributeError, TypeError, ValueError):
+            marker = None
+    try:
+        # Bars are one-minute completed bars.  A two-minute allowance covers the
+        # alert-to-bar boundary without pretending a multi-hour retention gap is
+        # observable.
+        return marker is not None and float(history[0]["start"]) > float(marker) + 120.0
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def _age_and_mark_scalp_unresolved(row, reason, unresolved_reasons=None):
+    """Terminalize an old scalp row when no trustworthy market outcome exists.
+
+    This is intentionally separate from ``expired``: an expiry has a real latest
+    bar and a deterministic close, while ``unresolved`` must never enter
+    expectancy or learning evidence.
+    """
+    age_hours = _paper_sim_age_hours(row)
+    if age_hours is None or age_hours < SCALP_SIM_MAX_HOLD_HOURS:
+        return False
+    meta = {
+        "resolution": "unresolved",
+        "resolution_health": {
+            "status": "unresolved",
+            "reason": reason,
+            "age_hours": round(age_hours, 3),
+            "max_hold_hours": SCALP_SIM_MAX_HOLD_HOURS,
+        },
+    }
+    marked = _scalp_sim_close(
+        row["id"], "unresolved", None, None, meta, status="unresolved"
+    )
+    if marked and unresolved_reasons is not None:
+        unresolved_reasons[reason] = unresolved_reasons.get(reason, 0) + 1
+    return marked
+
+
 def _watch_scalp_sim_trades():
-    """Resolve OPEN paper trades against the latest 1-minute bar (one fetch per
-    instrument per cycle) — stop-first then target, ±R only, with the SAME-BAR
-    guard (skip a bar that opened at/before entry so a fresh trade can't "instantly
-    fill" off its own bar). A stranded trade past SCALP_SIM_MAX_HOLD_HOURS is
-    resolved at the latest close as 'expired'. Writes ONLY to
-    scalp_strategy_sim_trades — never MANAGED_TRADES, strategy_trades,
-    _record_strategy_trade, or the money path. FAIL-OPEN."""
+    """Resolve OPEN paper trades against retained completed 1-minute bars.
+
+    Every eligible bar is evaluated chronologically through the shared
+    profitability resolver.  This closes stale rows whose stop/target was hit
+    between watcher cycles, while the same-bar guard prevents look-ahead fills.
+    Rows older than the wall-clock hold limit with no trustworthy bar outcome are
+    terminalized as ``unresolved`` with structured health metadata; they are not
+    learning evidence.
+    """
     if not SCALP_SIM_DB_READY:
         return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0,
+                "unresolved_rows": 0, "unresolved_reasons": {},
                 "oldest_unresolved_age_hours": None}
     conn = _learning_conn()
     if conn is None:
         return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0,
+                "unresolved_rows": 0, "unresolved_reasons": {},
                 "oldest_unresolved_age_hours": None}
     open_rows = []
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, symbol, direction, entry, stop, target, rr, entry_epoch, opened_at "
+                "SELECT id, symbol, direction, entry, stop, target, rr, entry_epoch, "
+                "opened_at, context "
                 "FROM scalp_strategy_sim_trades WHERE status IN ('open','resolving') "
                 "ORDER BY id ASC LIMIT 500")
             for r in cur.fetchall():
@@ -49899,7 +50018,8 @@ def _watch_scalp_sim_trades():
                     "target": float(r[5]) if r[5] is not None else None,
                     "rr": float(r[6]) if r[6] is not None else 1.0,
                     "entry_epoch": float(r[7]) if r[7] is not None else None,
-                    "opened_at": r[8]})
+                    "opened_at": r[8],
+                    "context": r[9] if len(r) > 9 and isinstance(r[9], dict) else {}})
     except Exception as exc:
         logger.warning("scalp live-sim watcher read failed: %s", exc)
     finally:
@@ -49909,6 +50029,7 @@ def _watch_scalp_sim_trades():
             pass
     if not open_rows:
         return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0,
+                "unresolved_rows": 0, "unresolved_reasons": {},
                 "oldest_unresolved_age_hours": None}
     oldest_age_hours = None
     for row in open_rows:
@@ -49924,42 +50045,78 @@ def _watch_scalp_sim_trades():
     bars = {}
     for inst in {r["symbol"] for r in open_rows}:
         try:
-            bars[inst] = _fetch_latest_bar(inst)
+            bars[inst] = _fetch_completed_bars(inst)
         except Exception:
-            bars[inst] = None
+            bars[inst] = []
     closed_rows = 0
     missing_bars = 0
+    unresolved_rows = 0
+    unresolved_reasons = {}
     for row in open_rows:
-        bar = bars.get(row["symbol"])
-        if not bar:
+        history = bars.get(row["symbol"]) or []
+        if not history:
             missing_bars += 1
+            if _age_and_mark_scalp_unresolved(
+                row, reason="market_bars_unavailable",
+                unresolved_reasons=unresolved_reasons,
+            ):
+                unresolved_rows += 1
             continue
-        bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
-        if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
-            continue                       # same-bar guard (no look-ahead self-fill)
-        outcome = _scalp_sim_outcome(row, bar)
-        if outcome is None:
-            # max-hold expiry — resolve a stranded paper trade at the latest close.
-            opened_at, cl = row.get("opened_at"), bar.get("close")
-            if opened_at is not None and cl is not None and row.get("stop") is not None:
+        if (_paper_sim_age_hours(row) or 0.0) >= SCALP_SIM_MAX_HOLD_HOURS \
+                and _paper_sim_history_gap(row, history):
+            if _age_and_mark_scalp_unresolved(
+                row, reason="market_history_truncated",
+                unresolved_reasons=unresolved_reasons,
+            ):
+                unresolved_rows += 1
+            continue
+        eligible = []
+        for bar in history:
+            bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
+            if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
+                continue                       # same-bar guard (no look-ahead self-fill)
+            if bar_start is not None and entry_epoch is None and row.get("opened_at") is not None:
                 try:
-                    oa = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=timezone.utc)
-                    aged = (now_utc() - oa).total_seconds() > SCALP_SIM_MAX_HOLD_HOURS * 3600
-                except Exception:
-                    aged = False
-                risk = abs(row["entry"] - row["stop"])
-                if aged and risk > 0:
-                    r = ((cl - row["entry"]) / risk if row["direction"] == "Long"
-                         else (row["entry"] - cl) / risk)
-                    outcome = ("expired", round(cl, 4), round(r, 4))
+                    opened_epoch = row["opened_at"].timestamp()
+                    if bar_start <= opened_epoch:
+                        continue
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            eligible.append(bar)
+        outcome = None
+        outcome_bar = None
+        for bar in eligible:
+            outcome = _scalp_sim_outcome(row, bar)
+            if outcome is not None:
+                outcome_bar = bar
+                break
+        latest = eligible[-1] if eligible else None
+        if outcome is None and latest is not None:
+            outcome = _scalp_sim_expiry(row, latest, SCALP_SIM_MAX_HOLD_HOURS)
+            outcome_bar = latest if outcome is not None else None
+        if outcome is None and not eligible:
+            if _age_and_mark_scalp_unresolved(
+                row, reason="no_post_entry_market_bar",
+                unresolved_reasons=unresolved_reasons,
+            ):
+                unresolved_rows += 1
+            continue
         if outcome is None:
             continue
-        if _scalp_sim_close(row["id"], outcome[0], outcome[1], outcome[2]):
+        meta = {
+            "resolution": "shared_market_bar_resolver",
+            "bar_start": outcome_bar.get("start") if outcome_bar else None,
+            "close_reason": ("expired" if outcome[0] == "expired" else
+                             "stop_or_target"),
+        }
+        if _scalp_sim_close(row["id"], outcome[0], outcome[1], outcome[2], meta):
             closed_rows += 1
     return {
         "open_rows": len(open_rows),
         "closed_rows": closed_rows,
         "missing_bars": missing_bars,
+        "unresolved_rows": unresolved_rows,
+        "unresolved_reasons": unresolved_reasons,
         "oldest_unresolved_age_hours": (
             round(oldest_age_hours, 3) if oldest_age_hours is not None else None
         ),
@@ -49994,6 +50151,12 @@ def _scalp_sim_watch_loop():
                     _SCALP_SIM_WATCH_HEALTH["last_open_rows"] = int(cycle.get("open_rows", 0))
                     _SCALP_SIM_WATCH_HEALTH["last_closed_rows"] = int(cycle.get("closed_rows", 0))
                     _SCALP_SIM_WATCH_HEALTH["last_missing_bar_count"] = int(cycle.get("missing_bars", 0))
+                    _SCALP_SIM_WATCH_HEALTH["last_unresolved_rows"] = int(
+                        cycle.get("unresolved_rows", 0)
+                    )
+                    _SCALP_SIM_WATCH_HEALTH["last_unresolved_reasons"] = dict(
+                        cycle.get("unresolved_reasons") or {}
+                    )
                     _SCALP_SIM_WATCH_HEALTH["oldest_unresolved_age_hours"] = cycle.get(
                         "oldest_unresolved_age_hours"
                     )
@@ -52960,6 +53123,14 @@ DUAL_SIM_WATCH_INTERVAL     = max(10, int(os.environ.get("DUAL_SIM_WATCH_INTERVA
 DUAL_SIM_OPEN_COOLDOWN_SECS = max(60, int(os.environ.get("DUAL_SIM_COOLDOWN_SECS", 300)))
 DUAL_SIM_MAX_HOLD_HOURS     = max(1, int(os.environ.get("DUAL_SIM_MAX_HOLD_HOURS", 12)))
 DUAL_SIM_MODES              = ("SCALP", "SWING")
+_DUAL_SIM_WATCH_HEALTH_LOCK = threading.Lock()
+_DUAL_SIM_WATCH_HEALTH = {
+    "last_started_at": None, "last_completed_at": None, "last_error": None,
+    "last_skip_reason": None, "cycles_started": 0, "cycles_completed": 0,
+    "cycles_skipped": 0, "cycles_failed": 0, "last_open_rows": 0,
+    "last_closed_rows": 0, "last_missing_bar_count": 0,
+    "last_unresolved_rows": 0, "last_unresolved_reasons": {},
+}
 # TEST trigger (default 0 == OFF ⇒ byte-identical). When > 0, the shadow observer ALSO
 # opens a paper trade for a mode whenever that mode's Edge Score clears this threshold,
 # even if the live gate said WAIT (structure/VWAP/zone not fully aligned). Purely for
@@ -53350,30 +53521,12 @@ def _maybe_observe_dual_mode_sim(result, source="webhook"):
 
 
 def _dual_sim_outcome(row, bar):
-    """Pure stop-first / then-target resolver for ONE open shadow trade against the
-    latest bar. Returns (result_label, exit_price, r_multiple) or None. Worst-case
-    fill (stop before target), identical to the scalp live-sim resolver."""
-    high, low = bar.get("high"), bar.get("low")
-    entry, stop, target = row.get("entry"), row.get("stop"), row.get("target")
-    if None in (high, low, entry, stop, target):
-        return None
-    risk = abs(entry - stop)
-    if risk <= 0:
-        return None
-    if row.get("direction") == "Long":
-        if low <= stop:
-            return ("loss", stop, round((stop - entry) / risk, 4))
-        if high >= target:
-            return ("win", target, round((target - entry) / risk, 4))
-    else:
-        if high >= stop:
-            return ("loss", stop, round((entry - stop) / risk, 4))
-        if low <= target:
-            return ("win", target, round((entry - target) / risk, 4))
-    return None
+    """Resolve a dual paper bar through the same resolver as scalp simulations."""
+    return _scalp_sim_outcome(row, bar)
 
 
-def _dual_sim_close(row_id, result_label, exit_price, r_multiple):
+def _dual_sim_close(row_id, result_label, exit_price, r_multiple,
+                    resolution_meta=None, status="closed"):
     """Atomically resolve one open shadow trade. The conditional `WHERE status IN
     ('open','resolving')` IS the cross-instance status claim — only the first writer
     closes it. Writes ONLY dual_sim_trades. FAIL-OPEN."""
@@ -53386,9 +53539,11 @@ def _dual_sim_close(row_id, result_label, exit_price, r_multiple):
         with conn.cursor() as cur:
             cur.execute(
                 "UPDATE dual_sim_trades "
-                "SET status='closed', result=%s, exit_price=%s, r_multiple=%s, closed_at=now() "
+                "SET status=%s, result=%s, exit_price=%s, r_multiple=%s, "
+                "closed_at=now(), context=COALESCE(context, '{}'::jsonb) || %s::jsonb "
                 "WHERE id=%s AND status IN ('open','resolving')",
-                (result_label, exit_price, r_multiple, row_id))
+                (status, result_label, exit_price, r_multiple,
+                 json.dumps(resolution_meta or {}), row_id))
             claimed = (cur.rowcount == 1)
         conn.commit()
         return claimed
@@ -53407,12 +53562,11 @@ def _dual_sim_close(row_id, result_label, exit_price, r_multiple):
 
 
 def _watch_dual_sim_trades():
-    """Resolve OPEN shadow trades against the latest 1-minute bar (one fetch per
-    instrument per cycle) — stop-first then target, ±R only, with the SAME-BAR guard
-    (skip a bar opened at/before entry so a fresh trade can't self-fill). A trade past
-    DUAL_SIM_MAX_HOLD_HOURS resolves at the latest close as 'expired'. Writes ONLY
-    dual_sim_trades — never MANAGED_TRADES, strategy_trades, or the money path.
-    FAIL-OPEN."""
+    """Resolve OPEN shadow trades against retained completed bars.
+
+    This remains a passive dual-mode ledger.  It writes only its own table and
+    never creates live trades or strategy-learning rows.
+    """
     if not DUAL_SIM_DB_READY:
         return
     conn = _learning_conn()
@@ -53422,7 +53576,8 @@ def _watch_dual_sim_trades():
     try:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT id, symbol, direction, entry, stop, target, rr, entry_epoch, opened_at "
+                "SELECT id, symbol, direction, entry, stop, target, rr, entry_epoch, "
+                "opened_at, context "
                 "FROM dual_sim_trades WHERE status IN ('open','resolving') "
                 "ORDER BY id ASC LIMIT 500")
             for r in cur.fetchall():
@@ -53433,7 +53588,8 @@ def _watch_dual_sim_trades():
                     "target": float(r[5]) if r[5] is not None else None,
                     "rr": float(r[6]) if r[6] is not None else 1.0,
                     "entry_epoch": float(r[7]) if r[7] is not None else None,
-                    "opened_at": r[8]})
+                    "opened_at": r[8],
+                    "context": r[9] if len(r) > 9 and isinstance(r[9], dict) else {}})
     except Exception as exc:
         logger.warning("dual-sim watcher read failed: %s", exc)
     finally:
@@ -53442,38 +53598,133 @@ def _watch_dual_sim_trades():
         except Exception:
             pass
     if not open_rows:
-        return
+        return {"open_rows": 0, "closed_rows": 0, "missing_bars": 0,
+                "unresolved_rows": 0, "unresolved_reasons": {},
+                "oldest_unresolved_age_hours": None}
+    oldest_age_hours = None
+    for row in open_rows:
+        age_hours = _paper_sim_age_hours(row)
+        if age_hours is not None:
+            oldest_age_hours = (
+                age_hours if oldest_age_hours is None
+                else max(oldest_age_hours, age_hours)
+            )
     bars = {}
     for inst in {r["symbol"] for r in open_rows}:
         try:
-            bars[inst] = _fetch_latest_bar(inst)
+            bars[inst] = _fetch_completed_bars(inst)
         except Exception:
-            bars[inst] = None
+            bars[inst] = []
+    closed_rows = 0
+    missing_bars = 0
+    unresolved_rows = 0
+    unresolved_reasons = {}
     for row in open_rows:
-        bar = bars.get(row["symbol"])
-        if not bar:
+        history = bars.get(row["symbol"]) or []
+        if not history:
+            missing_bars += 1
+            age_hours = _paper_sim_age_hours(row)
+            if age_hours is not None and age_hours >= DUAL_SIM_MAX_HOLD_HOURS:
+                meta = {
+                    "resolution": "unresolved",
+                    "resolution_health": {
+                        "status": "unresolved",
+                        "reason": "market_bars_unavailable",
+                        "age_hours": round(age_hours, 3),
+                        "max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
+                    },
+                }
+                if _dual_sim_close(
+                    row["id"], "unresolved", None, None, meta, status="unresolved"
+                ):
+                    unresolved_rows += 1
+                    unresolved_reasons["market_bars_unavailable"] = (
+                        unresolved_reasons.get("market_bars_unavailable", 0) + 1
+                    )
             continue
-        bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
-        if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
-            continue                       # same-bar guard (no look-ahead self-fill)
-        outcome = _dual_sim_outcome(row, bar)
-        if outcome is None:
-            # max-hold expiry — resolve a stranded shadow trade at the latest close.
-            opened_at, cl = row.get("opened_at"), bar.get("close")
-            if opened_at is not None and cl is not None and row.get("stop") is not None:
+        if (_paper_sim_age_hours(row) or 0.0) >= DUAL_SIM_MAX_HOLD_HOURS \
+                and _paper_sim_history_gap(row, history):
+            age_hours = _paper_sim_age_hours(row)
+            meta = {
+                "resolution": "unresolved",
+                "resolution_health": {
+                    "status": "unresolved",
+                    "reason": "market_history_truncated",
+                    "age_hours": round(age_hours, 3) if age_hours is not None else None,
+                    "max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
+                },
+            }
+            if _dual_sim_close(
+                row["id"], "unresolved", None, None, meta, status="unresolved"
+            ):
+                unresolved_rows += 1
+                unresolved_reasons["market_history_truncated"] = (
+                    unresolved_reasons.get("market_history_truncated", 0) + 1
+                )
+            continue
+        eligible = []
+        for bar in history:
+            bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
+            if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
+                continue
+            if bar_start is not None and entry_epoch is None and row.get("opened_at") is not None:
                 try:
-                    oa = opened_at if opened_at.tzinfo else opened_at.replace(tzinfo=timezone.utc)
-                    aged = (now_utc() - oa).total_seconds() > DUAL_SIM_MAX_HOLD_HOURS * 3600
-                except Exception:
-                    aged = False
-                risk = abs(row["entry"] - row["stop"])
-                if aged and risk > 0:
-                    r = ((cl - row["entry"]) / risk if row["direction"] == "Long"
-                         else (row["entry"] - cl) / risk)
-                    outcome = ("expired", round(cl, 4), round(r, 4))
+                    if bar_start <= row["opened_at"].timestamp():
+                        continue
+                except (AttributeError, TypeError, ValueError):
+                    pass
+            eligible.append(bar)
+        outcome = None
+        outcome_bar = None
+        for bar in eligible:
+            outcome = _dual_sim_outcome(row, bar)
+            if outcome is not None:
+                outcome_bar = bar
+                break
+        latest = eligible[-1] if eligible else None
+        if outcome is None and latest is not None:
+            outcome = _paper_sim_expiry(row, latest, DUAL_SIM_MAX_HOLD_HOURS)
+            outcome_bar = latest if outcome is not None else None
+        if outcome is None and not eligible:
+            age_hours = _paper_sim_age_hours(row)
+            if age_hours is not None and age_hours >= DUAL_SIM_MAX_HOLD_HOURS:
+                meta = {
+                    "resolution": "unresolved",
+                    "resolution_health": {
+                        "status": "unresolved",
+                        "reason": "no_post_entry_market_bar",
+                        "age_hours": round(age_hours, 3),
+                        "max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
+                    },
+                }
+                if _dual_sim_close(
+                    row["id"], "unresolved", None, None, meta, status="unresolved"
+                ):
+                    unresolved_rows += 1
+                    unresolved_reasons["no_post_entry_market_bar"] = (
+                        unresolved_reasons.get("no_post_entry_market_bar", 0) + 1
+                    )
+            continue
         if outcome is None:
             continue
-        _dual_sim_close(row["id"], outcome[0], outcome[1], outcome[2])
+        meta = {
+            "resolution": "shared_market_bar_resolver",
+            "bar_start": outcome_bar.get("start") if outcome_bar else None,
+            "close_reason": ("expired" if outcome[0] == "expired" else
+                             "stop_or_target"),
+        }
+        if _dual_sim_close(row["id"], outcome[0], outcome[1], outcome[2], meta):
+            closed_rows += 1
+    return {
+        "open_rows": len(open_rows),
+        "closed_rows": closed_rows,
+        "missing_bars": missing_bars,
+        "unresolved_rows": unresolved_rows,
+        "unresolved_reasons": unresolved_reasons,
+        "oldest_unresolved_age_hours": (
+            round(oldest_age_hours, 3) if oldest_age_hours is not None else None
+        ),
+    }
 
 
 def _dual_sim_watch_loop():
@@ -53481,14 +53732,50 @@ def _dual_sim_watch_loop():
     (DISCORD_LIVE_ENABLED) + flag ON + DB ready, single-flight via DUAL_SIM_WATCH_LOCK.
     FAIL-OPEN — any error just skips this cycle. Never touches the money path."""
     try:
-        if DUAL_MODE_SHADOW_SIM_ENABLED and DISCORD_LIVE_ENABLED and DUAL_SIM_DB_READY:
-            if DUAL_SIM_WATCH_LOCK.acquire(blocking=False):
-                try:
-                    _watch_dual_sim_trades()
-                finally:
-                    DUAL_SIM_WATCH_LOCK.release()
+        with _DUAL_SIM_WATCH_HEALTH_LOCK:
+            _DUAL_SIM_WATCH_HEALTH["cycles_started"] += 1
+            _DUAL_SIM_WATCH_HEALTH["last_started_at"] = now_utc().isoformat()
+        if not DUAL_MODE_SHADOW_SIM_ENABLED:
+            reason = "feature_disabled"
+        elif not DISCORD_LIVE_ENABLED:
+            reason = "not_live_instance"
+        elif not DUAL_SIM_DB_READY:
+            reason = "db_not_ready"
+        elif not DUAL_SIM_WATCH_LOCK.acquire(blocking=False):
+            reason = "cycle_already_running"
+        else:
+            reason = None
+            try:
+                cycle = _watch_dual_sim_trades() or {}
+                with _DUAL_SIM_WATCH_HEALTH_LOCK:
+                    _DUAL_SIM_WATCH_HEALTH["cycles_completed"] += 1
+                    _DUAL_SIM_WATCH_HEALTH["last_completed_at"] = now_utc().isoformat()
+                    _DUAL_SIM_WATCH_HEALTH["last_error"] = None
+                    _DUAL_SIM_WATCH_HEALTH["last_open_rows"] = int(cycle.get("open_rows", 0))
+                    _DUAL_SIM_WATCH_HEALTH["last_closed_rows"] = int(cycle.get("closed_rows", 0))
+                    _DUAL_SIM_WATCH_HEALTH["last_missing_bar_count"] = int(
+                        cycle.get("missing_bars", 0)
+                    )
+                    _DUAL_SIM_WATCH_HEALTH["last_unresolved_rows"] = int(
+                        cycle.get("unresolved_rows", 0)
+                    )
+                    _DUAL_SIM_WATCH_HEALTH["last_unresolved_reasons"] = dict(
+                        cycle.get("unresolved_reasons") or {}
+                    )
+            finally:
+                DUAL_SIM_WATCH_LOCK.release()
+        if reason:
+            with _DUAL_SIM_WATCH_HEALTH_LOCK:
+                changed = _DUAL_SIM_WATCH_HEALTH["last_skip_reason"] != reason
+                _DUAL_SIM_WATCH_HEALTH["cycles_skipped"] += 1
+                _DUAL_SIM_WATCH_HEALTH["last_skip_reason"] = reason
+            if changed:
+                logger.info("dual-sim watcher skipped: %s", reason)
     except Exception as exc:
         logger.warning("dual-sim watch loop error: %s", exc)
+        with _DUAL_SIM_WATCH_HEALTH_LOCK:
+            _DUAL_SIM_WATCH_HEALTH["cycles_failed"] += 1
+            _DUAL_SIM_WATCH_HEALTH["last_error"] = str(exc)[:180]
     finally:
         threading.Timer(DUAL_SIM_WATCH_INTERVAL, _dual_sim_watch_loop).start()
 
@@ -53524,7 +53811,8 @@ def _dual_sim_stats():
             pass
 
     def _blank():
-        return {"open": 0, "closed": 0, "wins": 0, "losses": 0, "r_list": [], "last_at": None}
+        return {"open": 0, "closed": 0, "unresolved": 0, "wins": 0,
+                "losses": 0, "r_list": [], "last_at": None}
 
     agg = {}      # mode -> bucket
     per_sym = {}  # (mode,symbol) -> bucket
@@ -53540,6 +53828,9 @@ def _dual_sim_stats():
                     per_sym.setdefault((mode, symbol), _blank())] + tier_buckets:
             if status in ("open", "resolving"):
                 bkt["open"] += 1
+                continue
+            if status == "unresolved" or result_label == "unresolved":
+                bkt["unresolved"] += 1
                 continue
             bkt["closed"] += 1
             if r_mult is not None:
@@ -53567,7 +53858,8 @@ def _dual_sim_stats():
                 mdd = min(mdd, cum - peak)
             dd = round(mdd, 2)
         return {"trades": a["closed"], "open": a["open"], "win_rate": win_rate,
-                "avg_r": avg_r, "net_r": net_r, "max_dd_r": dd, "last_at": a["last_at"]}
+                "unresolved": a["unresolved"], "avg_r": avg_r, "net_r": net_r,
+                "max_dd_r": dd, "last_at": a["last_at"]}
 
     for mode in DUAL_SIM_MODES:
         d = _summ(agg.get(mode) or _blank())
@@ -53610,7 +53902,7 @@ def _scalp_sim_stats():
             pass
     agg = {}
     for strategy_key, status, result_label, r_mult, fidelity, closed_at in rows:
-        a = agg.setdefault(strategy_key, {"open": 0, "closed": 0, "expired": 0,
+        a = agg.setdefault(strategy_key, {"open": 0, "closed": 0, "unresolved": 0, "expired": 0,
                                           "wins": 0, "losses": 0,
                                           "r_list": [], "fidelity": None,
                                           "last_at": None})
@@ -53618,6 +53910,9 @@ def _scalp_sim_stats():
             a["fidelity"] = fidelity
         if status in ("open", "resolving"):
             a["open"] += 1
+            continue
+        if status == "unresolved" or result_label == "unresolved":
+            a["unresolved"] += 1
             continue
         # Expired trades (max-hold timeout — no stop/target hit) are tracked
         # separately and excluded from every expectancy metric so they cannot
@@ -53651,6 +53946,7 @@ def _scalp_sim_stats():
                 mdd = min(mdd, cum - peak)
             dd = round(mdd, 2)
         out[key] = {"live_trades": a["closed"], "live_open": a["open"],
+                    "live_unresolved": a["unresolved"],
                     "live_expired": a["expired"],
                     "live_win_rate": win_rate, "live_avg_r": avg_r,
                     "live_net_r": net_r, "live_max_dd_r": dd,
@@ -85441,6 +85737,14 @@ def route_research_health():
             "live_instance": DISCORD_LIVE_ENABLED,
             "db_ready": SCALP_SIM_DB_READY,
             "max_hold_hours": SCALP_SIM_MAX_HOLD_HOURS,
+        }
+    with _DUAL_SIM_WATCH_HEALTH_LOCK:
+        out["dual_sim_watcher"] = {
+            **_DUAL_SIM_WATCH_HEALTH,
+            "enabled": DUAL_MODE_SHADOW_SIM_ENABLED,
+            "live_instance": DISCORD_LIVE_ENABLED,
+            "db_ready": DUAL_SIM_DB_READY,
+            "max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
         }
 
     return jsonify(out)
