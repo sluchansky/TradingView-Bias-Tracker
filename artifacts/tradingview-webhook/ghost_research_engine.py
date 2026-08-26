@@ -718,6 +718,8 @@ class GhostResearchEngine:
         instruments: List[str],
         max_variants: int = MAX_GHOST_VARIANTS_PER_OPPORTUNITY,
         dc_registry_fn: Optional[Callable] = None,
+        fvg_result_observe_fn: Optional[Callable] = None,
+        fvg_result_outcome_fn: Optional[Callable] = None,
     ) -> None:
         self._get_db       = get_db_fn
         self._get_can      = get_canonical_fn
@@ -729,6 +731,8 @@ class GhostResearchEngine:
         # Called at opportunity-freeze time (never at init) so DC being initialised
         # after GRE is safe. None = DC enrichment silently skipped (fail-open).
         self._dc_registry_fn: Optional[Callable] = dc_registry_fn
+        self._fvg_result_observe_fn = fvg_result_observe_fn
+        self._fvg_result_outcome_fn = fvg_result_outcome_fn
 
         # Per-instrument last-seen OrbEngine state (for transition detection)
         self._last_orb_state:  Dict[str, str] = {i: "" for i in instruments}
@@ -1683,6 +1687,24 @@ class GhostResearchEngine:
                        net_r=net_r,
                        extra={"result_id": result_id, "result": final_result,
                               "variant": rd.get("variant_name")})
+        if rd.get("_fvg_family") and self._fvg_result_outcome_fn is not None:
+            try:
+                self._fvg_result_outcome_fn({
+                    "result_id": result_id,
+                    "experiment_id": rd.get("experiment_id"),
+                    "opportunity_id": rd.get("opportunity_id"),
+                    "instrument": inst,
+                    "variant_name": rd.get("variant_name"),
+                    "result": final_result,
+                    "exit_reason": exit_reason,
+                    "exit_price": exit_price,
+                    "gross_r": gross_r,
+                    "net_r": net_r,
+                    "resolved_at": exit_ts,
+                    "ambiguous_bar": bool(ambiguous_bar),
+                })
+            except Exception as exc:
+                self._log.debug("GRE FVG outcome adapter (%s): %s", result_id, exc)
 
         # Trigger async evidence state refresh (off the hot path)
         exp_id = rd.get("experiment_id", "")
@@ -1824,6 +1846,7 @@ class GhostResearchEngine:
             return {
                 "gre_version":          GRE_VERSION,
                 "db_ready":             GhostResearchEngine.GRE_DB_READY,
+                "strategy":             STRATEGY_NAME,
                 "families":             [STRATEGY_FAMILY_ORB, STRATEGY_FAMILY_FVG],
                 "filter_family":        family,
                 "opportunities_today":  opp_row[0] if opp_row else 0,
@@ -2615,6 +2638,41 @@ class GhostResearchEngine:
                 None, planned_stop, planned_tp1, None, init_result,
             ))
             db.commit()
+
+            if self._fvg_result_observe_fn is not None:
+                try:
+                    self._fvg_result_observe_fn({
+                        "result_id": res_id,
+                        "experiment_id": exp_id,
+                        "opportunity_id": opp_id,
+                        "instrument": inst,
+                        "direction": direction,
+                        "variant_name": variant,
+                        "entry_rule": entry_rule,
+                        "planned_stop": planned_stop,
+                        "planned_tp1": planned_tp1,
+                        "pre_no_entry": bool(pre_no_entry),
+                    })
+                except Exception as exc:
+                    self._log.debug("GRE FVG observation adapter (%s): %s", res_id, exc)
+            if pre_no_entry and self._fvg_result_outcome_fn is not None:
+                try:
+                    self._fvg_result_outcome_fn({
+                        "result_id": res_id,
+                        "experiment_id": exp_id,
+                        "opportunity_id": opp_id,
+                        "instrument": inst,
+                        "variant_name": variant,
+                        "result": OutcomeResult.NO_ENTRY,
+                        "exit_reason": "PRE_FILTERED_NO_ENTRY",
+                        "exit_price": None,
+                        "gross_r": None,
+                        "net_r": None,
+                        "resolved_at": _now_utc(),
+                        "ambiguous_bar": False,
+                    })
+                except Exception as exc:
+                    self._log.debug("GRE FVG no-entry outcome adapter (%s): %s", res_id, exc)
 
             if init_status != ResultStatus.COMPLETED:
                 with self._lock:

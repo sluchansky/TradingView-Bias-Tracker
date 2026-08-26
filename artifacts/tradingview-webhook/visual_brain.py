@@ -67,6 +67,8 @@ _db_conn_fn  : Optional[Callable] = None
 _price_store : Optional[dict]     = None
 _vwap_store  : Optional[dict]     = None
 _bars_fn     : Optional[Callable] = None
+_research_observation_fn: Optional[Callable] = None
+_research_outcome_fn: Optional[Callable] = None
 
 # ── Cost tracking (resets at midnight ET) ────────────────────────────────────
 _COST_LOCK           = threading.Lock()
@@ -1005,7 +1007,13 @@ def _insert_observation(obs: dict, screenshot_path: Optional[str] = None) -> Opt
             ))
             row = cur.fetchone()
             conn.commit()
-            return row[0] if row else None
+            row_id = row[0] if row else None
+            if row_id is not None and _research_observation_fn is not None:
+                try:
+                    _research_observation_fn(row_id, dict(obs), cur_price)
+                except Exception as callback_exc:
+                    logger.debug("[VISUAL_BRAIN] research observation callback: %s", callback_exc)
+            return row_id
     except Exception as exc:
         logger.warning("[VISUAL_BRAIN] DB insert failed: %s", exc)
         try:
@@ -1223,6 +1231,11 @@ def _backfill_ghost_outcomes_inner() -> None:
                                 (row_id,)
                             )
                             conn2.commit()
+                            if _research_outcome_fn is not None:
+                                _research_outcome_fn(row_id, {
+                                    "outcome_resolved": True,
+                                    "reason": "missing_entry_price",
+                                })
                     except Exception:
                         pass
                     finally:
@@ -1257,6 +1270,11 @@ def _backfill_ghost_outcomes_inner() -> None:
                                 (row_id,)
                             )
                             conn2.commit()
+                            if _research_outcome_fn is not None:
+                                _research_outcome_fn(row_id, {
+                                    "outcome_resolved": True,
+                                    "reason": "non_actionable_observation",
+                                })
                     except Exception:
                         pass
                     finally:
@@ -1304,6 +1322,14 @@ def _backfill_ghost_outcomes_inner() -> None:
                             WHERE id=%s
                         """, (p1m, p3m, p5m, p10m, p15m, mfe, mae, row_id))
                         conn3.commit()
+                    if _research_outcome_fn is not None:
+                        _research_outcome_fn(row_id, {
+                            "outcome_resolved": True,
+                            "p1m": p1m, "p3m": p3m, "p5m": p5m,
+                            "p10m": p10m, "p15m": p15m,
+                            "mfe": mfe, "mae": mae,
+                            "reason": "forward_returns_complete",
+                        })
                     logger.debug("[VISUAL_BRAIN] ghost outcome resolved: id=%d p1m=%s p15m=%s",
                                  row_id, p1m, p15m)
                 except Exception as ue:
@@ -1445,6 +1471,8 @@ def start(
     price_store: Optional[dict] = None,
     vwap_store: Optional[dict] = None,
     bars_fn: Optional[Callable] = None,
+    research_observation_fn: Optional[Callable] = None,
+    research_outcome_fn: Optional[Callable] = None,
 ) -> None:
     """Start the Visual Brain worker.  Call once at boot if VISUAL_BRAIN_ENABLED.
 
@@ -1461,6 +1489,7 @@ def start(
                      DATABENTO_BARS_BY_INST.get() from app.py's __main__ globals.
     """
     global _db_conn_fn, _price_store, _vwap_store, _bars_fn
+    global _research_observation_fn, _research_outcome_fn
     if db_conn_fn is not None:
         _db_conn_fn = db_conn_fn
     if price_store is not None:
@@ -1469,6 +1498,10 @@ def start(
         _vwap_store = vwap_store
     if bars_fn is not None:
         _bars_fn = bars_fn
+    if research_observation_fn is not None:
+        _research_observation_fn = research_observation_fn
+    if research_outcome_fn is not None:
+        _research_outcome_fn = research_outcome_fn
 
     if not VISUAL_BRAIN_ENABLED:
         logger.info("[VISUAL_BRAIN] disabled (VISUAL_BRAIN_ENABLED not set) — byte-identical mode")

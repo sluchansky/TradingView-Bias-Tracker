@@ -151,3 +151,4 @@
 - [Fundamental awareness shadow context](fundamental-awareness-shadow-context.md) — scheduled US high-impact events reuse the cached calendar; two default-OFF flags are required and the context is never a money-path input.
 - [GitHub tag object transfer](github-tag-object-transfer.md) — a remote tag cannot reference a local-only commit; push the tag ref itself to transfer validated objects without moving a branch.
 - [Persistent market-student ledger](persistent-market-student-ledger.md) — consolidated research stays asynchronous, exact-ID-linked, immutable, manually promoted, and isolated from every money path.
+- [FVG result evidence identity](fvg-result-evidence-identity.md) — each FVG variant result is separate evidence; project and resolve it by exact result ID, not only the baseline opportunity.

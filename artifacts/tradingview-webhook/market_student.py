@@ -336,7 +336,7 @@ class MarketStudentLedger:
         self._observations: dict[str, dict[str, Any]] = {}
         self._outcomes: dict[str, dict[str, Any]] = {}
         self._theses: dict[tuple[str, str], dict[str, Any]] = {}
-        self._reconciliation: deque[dict[str, Any]] = deque(maxlen=1000)
+        self._reconciliation: deque[dict[str, Any]] = deque(maxlen=100000)
         self._last_wait: dict[tuple[str, str], tuple[str, float]] = {}
         self._last_alert: dict[str, dict[str, Any]] = {}
         self._stats = Counter()
@@ -387,6 +387,13 @@ class MarketStudentLedger:
                     "ORDER BY instrument, mode, updated_at DESC LIMIT 100"
                 )
                 theses = cur.fetchall() or []
+                cur.execute(
+                    "SELECT reconciliation_id, source_system, source_record_id, "
+                    "hypothesis_id, instrument, mode, provenance, matched "
+                    "FROM market_student_reconciliations "
+                    "ORDER BY created_at ASC LIMIT 100000"
+                )
+                reconciliations = cur.fetchall() or []
             with self._lock:
                 for row in observations:
                     self._observations[str(row[0])] = {
@@ -396,11 +403,16 @@ class MarketStudentLedger:
                         "payload": row[7] or {},
                     }
                 for row in hypotheses:
+                    observation = self._observations.get(str(row[1])) or {}
                     self._hypotheses[str(row[0])] = {
                         "hypothesis_id": row[0], "observation_id": row[1],
                         "instrument": row[2], "mode": row[3],
                         "contract": row[4] or {}, "created_at": _iso(row[5]),
+                        "source_system": observation.get("source_system"),
+                        "source_event_id": observation.get("source_event_id"),
                     }
+                    if observation:
+                        observation["hypothesis_id"] = row[0]
                 for row in outcomes:
                     self._outcomes[str(row[0])] = {
                         "outcome_id": row[0], "hypothesis_id": row[1],
@@ -415,14 +427,30 @@ class MarketStudentLedger:
                         "updated_at": _iso(row[4]),
                         "restored": True,
                     }
+                for row in reconciliations:
+                    self._reconciliation.append({
+                        "reconciliation_id": row[0],
+                        "source_system": row[1],
+                        "source_record_id": row[2],
+                        "hypothesis_id": row[3],
+                        "instrument": row[4],
+                        "mode": row[5],
+                        "provenance": row[6] or {},
+                        "matched": bool(row[7]),
+                    })
+                self._stats["reconciliation_matched"] = sum(
+                    bool(row[7]) for row in reconciliations
+                )
             self._stats["restored"] += (
-                len(observations) + len(hypotheses) + len(outcomes) + len(theses)
+                len(observations) + len(hypotheses) + len(outcomes) +
+                len(theses) + len(reconciliations)
             )
             return {
                 "observations": len(observations),
                 "hypotheses": len(hypotheses),
                 "outcomes": len(outcomes),
                 "theses": len(theses),
+                "reconciliations": len(reconciliations),
             }
         except Exception as exc:
             with self._lock:
@@ -471,9 +499,15 @@ class MarketStudentLedger:
             with conn.cursor() as cur:
                 for sql, params in statements:
                     cur.execute(sql, params)
+            conn.commit()
             self._stats["writes"] += len(statements)
             return True
         except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
             with self._lock:
                 self._last_error = f"write: {type(exc).__name__}"
                 self._stats["write_errors"] += 1
@@ -622,6 +656,7 @@ class MarketStudentLedger:
         cost_r: Any = None,
         net_r: Any = None,
         reason: str | None = None,
+        resolved_at: Any = None,
         provenance: Mapping[str, Any] | None = None,
     ) -> dict[str, Any] | None:
         status = str(status or "AMBIGUOUS").upper()
@@ -643,6 +678,7 @@ class MarketStudentLedger:
             if outcome_id in self._outcomes:
                 self._stats["duplicate_outcomes"] += 1
                 return None
+            resolved_at_iso = _iso(resolved_at) if resolved_at is not None else _now().isoformat()
             record = {
                 "outcome_id": outcome_id, "hypothesis_id": str(hypothesis_id),
                 "status": status, "reason": reason,
@@ -653,7 +689,7 @@ class MarketStudentLedger:
                     "cost_r": cost_r, "net_r": net_r,
                 },
                 "provenance": _jsonable(provenance or {}),
-                "resolved_at": _now().isoformat(),
+                "resolved_at": resolved_at_iso,
             }
             self._outcomes[outcome_id] = record
             self._stats["outcomes"] += 1
@@ -661,11 +697,12 @@ class MarketStudentLedger:
             (
                 """INSERT INTO market_student_outcomes
                    (outcome_id,hypothesis_id,status,normalized,source_values,
-                    provenance,reason)
-                   VALUES (%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s)
+                     provenance,reason,resolved_at)
+                   VALUES (%s,%s,%s,%s::jsonb,%s::jsonb,%s::jsonb,%s,%s)
                    ON CONFLICT (outcome_id) DO NOTHING""",
                 (outcome_id, str(hypothesis_id), status, _dump(normalized),
-                 _dump(record["source_values"]), _dump(record["provenance"]), reason),
+                  _dump(record["source_values"]), _dump(record["provenance"]), reason,
+                  resolved_at_iso),
             ),
         ])
         return dict(record)
@@ -762,6 +799,72 @@ class MarketStudentLedger:
             self._stats["alerts"] += 1
             return True
 
+    def claim_ready_alert(
+        self,
+        instrument: str,
+        mode: str,
+        record: Mapping[str, Any],
+    ) -> str | None:
+        """Atomically claim one READY notification in Postgres before delivery.
+
+        A claim is deliberately synchronous: an alert is never sent unless its
+        durable dedupe row committed first. Failed deliveries remain claimed and
+        visible for operator review; they are not automatically retried.
+        """
+        verdict = str((record.get("contract") or {}).get("deterministic_verdict") or "")
+        hypothesis_id = str(record.get("hypothesis_id") or "")
+        if is_wait(verdict) or not hypothesis_id:
+            return None
+        dedupe_key = _hash("alert", {
+            "instrument": str(instrument).upper(),
+            "mode": canonical_mode(mode),
+            "direction": (record.get("contract") or {}).get("direction"),
+            "fingerprint": record.get("fingerprint"),
+        })
+        if not self.persistence_enabled or not self.db_conn_fn:
+            with self._lock:
+                self._stats["alert_claim_unavailable"] += 1
+                self._last_error = "ready_alert_claim_persistence_unavailable"
+            return None
+        conn = None
+        try:
+            conn = self.db_conn_fn()
+            if conn is None:
+                raise RuntimeError("database unavailable")
+            with conn.cursor() as cur:
+                cur.execute(
+                    """INSERT INTO market_student_ready_alerts
+                       (dedupe_key,instrument,mode,hypothesis_id,delivered)
+                       VALUES (%s,%s,%s,%s,FALSE)
+                       ON CONFLICT (dedupe_key) DO NOTHING
+                       RETURNING dedupe_key""",
+                    (dedupe_key, str(instrument).upper(), canonical_mode(mode), hypothesis_id),
+                )
+                claimed = cur.fetchone()
+            conn.commit()
+            with self._lock:
+                if claimed:
+                    self._stats["alert_claims"] += 1
+                else:
+                    self._stats["alert_duplicates"] += 1
+            return dedupe_key if claimed else None
+        except Exception as exc:
+            if conn is not None:
+                try:
+                    conn.rollback()
+                except Exception:
+                    pass
+            with self._lock:
+                self._stats["alert_claim_errors"] += 1
+                self._last_error = f"ready_alert_claim: {type(exc).__name__}"
+            return None
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
     def health(self) -> dict[str, Any]:
         now = _now()
         with self._lock:
@@ -844,13 +947,19 @@ class MarketStudentLedger:
             outcomes_by_hypothesis = {
                 str(row.get("hypothesis_id")): row for row in self._outcomes.values()
             }
+            reconciled_hypothesis_ids = {
+                str(row.get("hypothesis_id"))
+                for row in self._reconciliation
+                if row.get("matched") and row.get("hypothesis_id")
+            }
             for hypothesis_id, row in self._hypotheses.items():
                 contract = row.get("contract") or {}
                 strategy = str(contract.get("strategy") or "UNKNOWN")
                 mode = str(row.get("mode") or contract.get("mode") or "SCALP")
                 group = groups.setdefault((mode, strategy), {
                     "mode": mode, "strategy": strategy, "closed": 0,
-                    "wins": 0, "losses": 0, "net_r": 0.0,
+                    "wins": 0, "losses": 0, "net_r": 0.0, "samples": [],
+                    "canonical": 0, "legacy_only": 0,
                 })
                 outcome = outcomes_by_hypothesis.get(str(hypothesis_id))
                 if not outcome or outcome.get("status") not in {"WIN", "LOSS"}:
@@ -861,22 +970,74 @@ class MarketStudentLedger:
                 value = _safe_float((outcome.get("normalized") or {}).get("normalized_net_r"))
                 if value is not None:
                     group["net_r"] += value
+                probability = _safe_float(contract.get("probability"))
+                if probability is not None and probability > 1:
+                    probability /= 100.0
+                source_system = str(row.get("source_system") or "")
+                reconciled = str(hypothesis_id) in reconciled_hypothesis_ids
+                group["canonical" if reconciled else "legacy_only"] += 1
+                group["samples"].append({
+                    "net_r": value,
+                    "win": outcome.get("status") == "WIN",
+                    "probability": probability,
+                    "resolved_at": outcome.get("resolved_at"),
+                    "source_system": source_system,
+                    "reconciled": reconciled,
+                })
             rows = []
             for group in groups.values():
                 closed = group["closed"]
                 expectancy = group["net_r"] / closed if closed else None
+                samples = sorted(group.pop("samples"), key=lambda x: str(x.get("resolved_at") or ""))
+                split = max(1, int(len(samples) * 0.7)) if samples else 0
+                oos = samples[split:] if len(samples) >= 4 else []
+                recent = samples[-20:]
+                calibration = [
+                    (float(x["probability"]) - (1.0 if x["win"] else 0.0)) ** 2
+                    for x in samples if x.get("probability") is not None
+                ]
+                equity = peak = drawdown = 0.0
+                for sample in samples:
+                    if sample.get("net_r") is None:
+                        continue
+                    equity += float(sample["net_r"])
+                    peak = max(peak, equity)
+                    drawdown = max(drawdown, peak - equity)
+                oos_expectancy = (
+                    sum(float(x["net_r"]) for x in oos if x.get("net_r") is not None) /
+                    max(1, sum(x.get("net_r") is not None for x in oos))
+                ) if oos else None
+                recent_expectancy = (
+                    sum(float(x["net_r"]) for x in recent if x.get("net_r") is not None) /
+                    max(1, sum(x.get("net_r") is not None for x in recent))
+                ) if recent else None
                 guards = {
                     "minimum_closed_sample": closed >= min_closed_sample,
-                    "out_of_sample_evidence": False,
-                    "calibration_available": False,
+                    "out_of_sample_evidence": bool(oos),
+                    "calibration_available": bool(calibration),
                     "positive_expectancy": expectancy is not None and expectancy > 0,
-                    "drawdown_reviewed": False,
+                    "drawdown_reviewed": bool(samples),
                     "manual_review_required": True,
                 }
                 rows.append({
                     **group,
                     "net_r": round(group["net_r"], 4),
                     "expectancy_r": round(expectancy, 4) if expectancy is not None else None,
+                    "recent_expectancy_r": round(recent_expectancy, 4) if recent_expectancy is not None else None,
+                    "out_of_sample": {
+                        "sample_count": len(oos),
+                        "expectancy_r": round(oos_expectancy, 4) if oos_expectancy is not None else None,
+                    },
+                    "calibration": {
+                        "sample_count": len(calibration),
+                        "brier_score": round(sum(calibration) / len(calibration), 4) if calibration else None,
+                    },
+                    "max_drawdown_r": round(drawdown, 4),
+                    "evidence": {
+                        "canonical_reconciled": group["canonical"],
+                        "legacy_unvalidated": group["legacy_only"],
+                        "complete_canonical": group["legacy_only"] == 0 and group["canonical"] == closed,
+                    },
                     "promotion_eligible": False,
                     "promotion_guards": guards,
                 })
@@ -894,12 +1055,30 @@ class MarketStudentLedger:
         with self._lock:
             return {
                 "alerts_emitted": int(self._stats["alerts"]),
+                "claims_committed": int(self._stats["alert_claims"]),
+                "claim_errors": int(self._stats["alert_claim_errors"]),
+                "claim_unavailable": int(self._stats["alert_claim_unavailable"]),
                 "duplicate_alerts_suppressed": int(self._stats["alert_duplicates"]),
                 "delivery_errors": int(self._stats["alert_delivery_errors"]),
                 "last_delivery_at": self._stats.get("last_alert_delivery_at"),
             }
 
-    def record_alert_delivery(self, delivered: bool) -> None:
+    def record_alert_delivery(
+        self,
+        delivered: bool,
+        *,
+        dedupe_key: str | None = None,
+        error: str | None = None,
+    ) -> None:
+        if dedupe_key and self.persistence_enabled:
+            self._write([(
+                """UPDATE market_student_ready_alerts
+                   SET delivered=%s, delivery_error=%s,
+                       delivered_at=CASE WHEN %s THEN NOW() ELSE delivered_at END
+                   WHERE dedupe_key=%s""",
+                (bool(delivered), None if delivered else str(error or "delivery_failed")[:200],
+                 bool(delivered), dedupe_key),
+            )])
         with self._lock:
             if delivered:
                 self._stats["alert_deliveries"] += 1

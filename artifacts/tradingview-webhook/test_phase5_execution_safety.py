@@ -34,7 +34,7 @@ import unittest.mock as mock
 
 # ── Test environment setup ──────────────────────────────────────────────────────
 os.environ.setdefault("TRADING_MODE", "SCALP")
-os.environ.setdefault("EXECUTION_MODE", "paper")
+os.environ["EXECUTION_MODE"] = "paper"
 os.environ.setdefault("TRAINING_MODE_ENABLED", "")
 os.environ.setdefault("DISCORD_LIVE_ENABLED", "")
 os.environ.setdefault("SESSION_SECRET", "test-secret-phase5")
@@ -43,6 +43,23 @@ os.environ.setdefault("DATABASE_URL", "")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__)))
 import app  # noqa: E402
+
+# The release workflow itself is pinned EXECUTION_MODE=disabled. This diagnostic
+# process must explicitly establish its isolated paper/mock state after import so
+# deployment safety pins cannot silently turn broker-response fixtures into 409s.
+app._EXECUTION_MODE_RAW = "paper"
+app._EXECUTION_MODE_RUNTIME_OVERRIDE = None
+with app._ARM_STATE_LOCK:
+    app._ARM_STATE.update({
+        "execution_enabled": True,
+        "armed": True,
+        "expires_at": time.time() + 3600,
+        "allowed_instruments": list(app.enabled_instruments()),
+        "max_contracts": {inst: 10 for inst in app.enabled_instruments()},
+        "allowed_strategies": None,
+        "direction_restriction": None,
+        "safety_locked": False,
+    })
 
 FAILS: list = []
 CHECKS: int = 0
@@ -55,6 +72,7 @@ def check(name: str, cond: bool, detail: str = "") -> None:
     print(f"  [{status}] {name}" + (f" — {detail}" if detail else ""))
     if not cond:
         FAILS.append(name)
+        raise AssertionError(detail or name)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -69,11 +87,12 @@ def _minimal_analysis(instrument: str = "MGC", direction: str = "Long") -> dict:
     t2 = price + 16.0
     return {
         "instrument":   instrument,
-        "verdict":      "SCALP READY",
+        "verdict":      f"{direction.upper()} READY",
         "is_actionable": True,
         "market_open":  True,
         "direction":    direction,
         "trade_plan": {
+            "trade_plan":  True,
             "entry_zone":  f"{price:.2f}",
             "stop_loss":   f"{stop:.2f}",
             "target1":     f"{t1:.2f}",
@@ -719,7 +738,9 @@ class TestP5_006_PayloadValidation(unittest.TestCase):
         with mock.patch("requests.post",
                         side_effect=lambda *a, **kw: posts.append((a, kw))), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 bad_payload, "https://fake.broker.url/test",
@@ -814,7 +835,9 @@ class TestP5_006_PayloadValidation(unittest.TestCase):
                         side_effect=lambda *a, **kw: (posts.append((a, kw)), FakeResp())[1]), \
              mock.patch.object(app, "_record_broker_send"), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 payload, "https://fake.broker.url/test")
@@ -897,26 +920,26 @@ class TestP5_007_SafeDisarm(unittest.TestCase):
               app.auto_trade_enabled(inst_b) is True)
 
     def test_disarm_stops_new_auto_execution(self):
-        """After disarm, _maybe_auto_execute returns False (no new trade attempted)."""
+        """The current final boundary sees the disarmed session before transmission."""
         inst = "MGC"
         with app.AUTO_TRADE_LOCK:
             app.AUTO_TRADE[inst] = False
+        with app._ARM_STATE_LOCK:
+            original_armed = app._ARM_STATE.get("armed")
+            app._ARM_STATE["armed"] = False
 
-        fired = []
+        try:
+            allowed, reason, diagnostics = app._check_arm_for_transmission(
+                inst, 1, strategy="phase5", direction="Long"
+            )
+        finally:
+            with app._ARM_STATE_LOCK:
+                app._ARM_STATE["armed"] = original_armed
 
-        def fake_gateway(*a, **kw):
-            fired.append(True)
-            return {"status": "simulated", "outcome": "paper",
-                    "plan": {}, "provider": "paper", "_version": "v1"}, 200
-
-        with mock.patch.object(app, "execute_trade_gateway",
-                               side_effect=fake_gateway):
-            result = app._maybe_auto_execute(inst)
-
-        check("P5-007-f _maybe_auto_execute returns False when disarmed",
-              result is False, f"got {result!r}")
-        check("P5-007-g gateway NOT called when disarmed", len(fired) == 0,
-              f"fired={fired}")
+        check("P5-007-f final boundary arm check rejects disarmed state",
+              allowed is False, f"got allowed={allowed!r}")
+        check("P5-007-g disarm reason is explicit",
+              reason == app.RC_DISARMED, f"reason={reason!r}, diagnostics={diagnostics!r}")
 
     def test_arm_state_independent_of_trade_state(self):
         """AUTO_TRADE and ACTIVE_TRADES_BY_INST are independent stores."""
@@ -975,11 +998,11 @@ class TestP5_008_PaperModeE2E(unittest.TestCase):
               f"plan={result.get('plan')!r}")
 
     def test_paper_plan_has_entry_stop(self):
-        """plan dict contains entry_zone and stop_loss keys."""
+        """Current broker-adapted paper plan contains entry and protective stop."""
         result, code, posts = self._run_paper()
         plan = result.get("plan", {})
-        check("P5-008-d plan has entry_zone", "entry_zone" in plan)
-        check("P5-008-e plan has stop_loss", "stop_loss" in plan)
+        check("P5-008-d plan has entry", "entry" in plan)
+        check("P5-008-e plan has stopLoss", "stopLoss" in plan)
 
     def test_paper_no_broker_http_call(self):
         """No HTTP call to a broker URL is made in paper mode.
@@ -1099,7 +1122,9 @@ class TestP5_008_PaperModeE2E(unittest.TestCase):
         with mock.patch("requests.post",
                         side_effect=lambda *a, **kw: posts.append(True)), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 {"action": "buy"},  # missing ticker
@@ -1118,7 +1143,9 @@ class TestP5_008_PaperModeE2E(unittest.TestCase):
         with mock.patch("requests.post", return_value=FakeResp()), \
              mock.patch.object(app, "_record_broker_send"), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 {"ticker": "MGC1!", "action": "buy", "quantity": 1},
@@ -1136,7 +1163,9 @@ class TestP5_008_PaperModeE2E(unittest.TestCase):
         with mock.patch("requests.post", return_value=FakeResp()), \
              mock.patch.object(app, "_record_broker_send"), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 {"ticker": "MGC1!", "action": "buy", "quantity": 1},
@@ -1154,7 +1183,9 @@ class TestP5_008_PaperModeE2E(unittest.TestCase):
                         side_effect=req_mod.exceptions.Timeout("timed out")), \
              mock.patch.object(app, "_record_broker_send"), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 {"ticker": "MGC1!", "action": "buy", "quantity": 1},
@@ -1495,7 +1526,9 @@ class TestP5_Stage6_5xxSlotRetention(unittest.TestCase):
         with mock.patch("requests.post", return_value=FakeResp(status_code)), \
              mock.patch.object(app, "_record_broker_send"), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 {"ticker": "MGC1!", "action": "buy", "quantity": 1},
@@ -1544,7 +1577,9 @@ class TestP5_Stage6_5xxSlotRetention(unittest.TestCase):
         with mock.patch("requests.post", return_value=FakeResp()), \
              mock.patch.object(app, "_record_broker_send"), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 {"ticker": "MGC1!", "action": "buy", "quantity": 1},
@@ -1571,7 +1606,9 @@ class TestP5_Stage6_5xxSlotRetention(unittest.TestCase):
                         side_effect=req_mod.exceptions.Timeout("timed out")), \
              mock.patch.object(app, "_record_broker_send"), \
              mock.patch.object(app, "_record_exec_rejection"), \
-             mock.patch.object(app, "_record_diagnostic"):
+             mock.patch.object(app, "_record_diagnostic"), \
+             mock.patch.object(app, "_final_order_safety_check",
+                               return_value=(None, None)):
             result, code = app._send_broker_order(
                 "traderspost", "TradersPost", "MGC",
                 {"ticker": "MGC1!", "action": "buy", "quantity": 1},

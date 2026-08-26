@@ -12391,6 +12391,105 @@ _MARKET_STUDENT = MarketStudentLedger(
     enabled=MARKET_STUDENT_ENABLED,
 )
 
+
+def _market_student_observe_visual(row_id, observation, entry_price):
+    """Copy one exact Visual Brain row into the research ledger."""
+    if not MARKET_STUDENT_ENABLED or row_id is None:
+        return None
+    action = str((observation or {}).get("action") or "WAIT").upper()
+    direction = "Long" if action == "LONG_WATCH" else "Short" if action == "SHORT_WATCH" else "Neutral"
+    result = {
+        "verdict": ("%s READY" % direction.upper()) if direction != "Neutral" else "WAIT",
+        "strict_direction": direction,
+        "confidence": (observation or {}).get("confidence"),
+        "strategy_key": "VISUAL_BRAIN",
+        "strategy_version": "visual-brain-v1",
+        "source_event_id": str(row_id),
+        "market_student_context": {
+            "visual_brain_observation_id": row_id,
+            "action": action,
+            "market_state": (observation or {}).get("market_state"),
+            "entry_price_at_observation": entry_price,
+        },
+    }
+    row = _MARKET_STUDENT.observe(
+        result, (observation or {}).get("instrument"), "INTRADAY_TREND",
+        source_timestamp=(observation or {}).get("timestamp"),
+        source_system="visual_brain", source_event_id=str(row_id), force=True,
+    )
+    if row:
+        _MARKET_STUDENT.reconcile(
+            source_system="visual_brain", source_record_id=str(row_id),
+            hypothesis_id=row["hypothesis_id"],
+            instrument=str((observation or {}).get("instrument") or "").upper(),
+            mode="INTRADAY_TREND",
+            provenance={"legacy_table": "visual_brain_observations"},
+        )
+    return row
+
+
+def _market_student_resolve_visual(row_id, outcome):
+    """Attach Visual Brain forward-return completion by exact database row ID."""
+    return _MARKET_STUDENT.record_outcome_by_source(
+        "visual_brain", str(row_id), status="RESOLVED",
+        reason=str((outcome or {}).get("reason") or "outcome_resolved"),
+        provenance=dict(outcome or {}),
+    )
+
+
+def _market_student_observe_gre_fvg_result(record):
+    """Project one exact GRE FVG experiment result into the research ledger."""
+    result_id = str((record or {}).get("result_id") or "")
+    instrument = str((record or {}).get("instrument") or "").upper()
+    if not result_id or instrument not in ASSETS:
+        return None
+    direction = str((record or {}).get("direction") or "Neutral")
+    observation = {
+        "verdict": ("%s READY" % direction.upper()) if direction in ("Long", "Short") else "WAIT",
+        "strict_direction": direction,
+        "strategy_key": "FVG_REVISIT:%s" % str((record or {}).get("variant_name") or "UNKNOWN"),
+        "strategy_version": "FVG_RESEARCH_BASELINE_V1",
+        "source_event_id": result_id,
+        "trade_plan": {
+            "stop": (record or {}).get("planned_stop"),
+            "target": (record or {}).get("planned_tp1"),
+        },
+        "market_student_context": dict(record or {}),
+    }
+    row = _MARKET_STUDENT.observe(
+        observation, instrument, "SCALP",
+        source_system="gre_fvg_result", source_event_id=result_id, force=True,
+    )
+    if row:
+        _MARKET_STUDENT.reconcile(
+            source_system="gre_fvg_result", source_record_id=result_id,
+            hypothesis_id=row["hypothesis_id"], instrument=instrument, mode="SCALP",
+            provenance={
+                "legacy_table": "ghost_experiment_results",
+                "experiment_id": (record or {}).get("experiment_id"),
+                "opportunity_id": (record or {}).get("opportunity_id"),
+            },
+        )
+    return row
+
+
+def _market_student_resolve_gre_fvg_result(record):
+    """Attach one GRE FVG terminal row by its exact result_id."""
+    raw_result = str((record or {}).get("result") or "").upper()
+    status = raw_result if raw_result in (
+        "WIN", "LOSS", "BREAKEVEN", "NO_ENTRY", "EXPIRED",
+    ) else "AMBIGUOUS"
+    return _MARKET_STUDENT.record_outcome_by_source(
+        "gre_fvg_result", str((record or {}).get("result_id") or ""),
+        status=status,
+        exit_price=(record or {}).get("exit_price"),
+        net_r=(record or {}).get("net_r"),
+        reason=(record or {}).get("exit_reason") or raw_result or "fvg_result_completed",
+        resolved_at=(record or {}).get("resolved_at"),
+        provenance=dict(record or {}),
+    )
+
+
 def get_db_connection():
     """Return a new psycopg2 connection to the shared DB, or None on failure.
 
@@ -12423,6 +12522,8 @@ def _check_market_student_db_ready():
             cur.execute("SELECT 1 FROM market_student_outcomes LIMIT 1")
             cur.fetchone()
             cur.execute("SELECT 1 FROM market_student_reconciliations LIMIT 1")
+            cur.fetchone()
+            cur.execute("SELECT 1 FROM market_student_ready_alerts LIMIT 1")
             cur.fetchone()
         MARKET_STUDENT_DB_READY = True
         _MARKET_STUDENT.configure(persistence_enabled=True)
@@ -31692,10 +31793,10 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
             if (
                 _student_record
                 and MARKET_STUDENT_READY_ALERTS_ENABLED
-                and _MARKET_STUDENT.meaningful_ready_transition(
+            ):
+                _student_alert_claim = _MARKET_STUDENT.claim_ready_alert(
                     active_ticker, _eff_mode, _student_record
                 )
-            ):
                 _student_contract = _student_record.get("contract") or {}
                 _student_msg = (
                     "🧠 **MARKET STUDENT READY SETUP**\n"
@@ -31707,8 +31808,12 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                     "Research alert only — no order was created."
                 )
 
-                def _send_student_alert(msg=_student_msg, inst=active_ticker):
+                def _send_student_alert(
+                    msg=_student_msg, inst=active_ticker,
+                    claim_key=_student_alert_claim,
+                ):
                     delivered = False
+                    delivery_error = None
                     try:
                         _student_url = os.environ.get("DISCORD_WEBHOOK_URL", "")
                         if _student_url:
@@ -31716,13 +31821,21 @@ def full_analysis(current_price_override=None, ticker_override=None, cooldown_ac
                                 _student_url, json={"content": msg}, timeout=5
                             )
                             delivered = _student_resp.status_code in (200, 204)
-                    except Exception:
+                            if not delivered:
+                                delivery_error = "http_%s" % _student_resp.status_code
+                        else:
+                            delivery_error = "webhook_unavailable"
+                    except Exception as exc:
                         delivered = False
-                    _MARKET_STUDENT.record_alert_delivery(delivered)
+                        delivery_error = type(exc).__name__
+                    _MARKET_STUDENT.record_alert_delivery(
+                        delivered, dedupe_key=claim_key, error=delivery_error
+                    )
                     if not delivered:
                         logger.debug("Market Student READY alert delivery failed for %s", inst)
 
-                _enqueue_slow(_send_student_alert)
+                if _student_alert_claim:
+                    _enqueue_slow(_send_student_alert)
     except Exception as _student_exc:
         logger.debug("Market Student observe (%s): %s", active_ticker, _student_exc)
 
@@ -38863,11 +38976,44 @@ def _save_thesis_snapshot(result, inst, notebook):
                        (instrument, phase, direction, confidence, edge_score,
                         thesis_text, expected_move, invalidation_text,
                         reasons, vwap_side, cvd_dir, structure_bias)
-                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
+                       VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                       RETURNING id""",
                     (inst, phase, direction, confidence, edge, thesis, expected,
                      invalid, psycopg2.extras.Json(reasons),
                      vwap_side, cvd_dir, struct))
+                thesis_row = cur.fetchone()
             conn.commit()
+            if thesis_row:
+                source_id = str(thesis_row[0])
+                student_result = {
+                    "verdict": "WAIT" if direction == "Neutral" else "%s READY" % direction.upper(),
+                    "strict_direction": direction,
+                    "confidence": confidence,
+                    "strategy_key": "THESIS_TRACKER",
+                    "strategy_version": "thesis-tracker-v1",
+                    "source_event_id": source_id,
+                    "market_student_context": {
+                        "thesis_snapshot_id": thesis_row[0],
+                        "phase": phase,
+                        "edge_score": edge,
+                        "thesis": thesis,
+                        "expected_move": expected,
+                        "invalidation_text": invalid,
+                    },
+                }
+                student_row = _MARKET_STUDENT.observe(
+                    student_result, inst, "INTRADAY_TREND",
+                    source_timestamp=now_utc().isoformat(),
+                    source_system="thesis_tracker",
+                    source_event_id=source_id, force=True,
+                )
+                if student_row:
+                    _MARKET_STUDENT.reconcile(
+                        source_system="thesis_tracker", source_record_id=source_id,
+                        hypothesis_id=student_row["hypothesis_id"],
+                        instrument=inst, mode="INTRADAY_TREND",
+                        provenance={"legacy_table": "thesis_snapshots"},
+                    )
             logger.debug("thesis_snapshot saved: %s %s %d%%", inst, direction, confidence)
         except Exception as exc:
             logger.debug("thesis_snapshot insert fail-open: %s", exc)
@@ -38982,6 +39128,15 @@ def _thesis_commit_update(conn, row_id, outcome, signals, lesson, reflection):
                    WHERE id=%s""",
                 (outcome, psycopg2.extras.Json(signals),
                  str(lesson)[:600], psycopg2.extras.Json(reflection), row_id))
+        _MARKET_STUDENT.record_outcome_by_source(
+            "thesis_tracker", str(row_id), status=str(outcome or "AMBIGUOUS").upper(),
+            reason="thesis_tracker_resolution",
+            provenance={
+                "signals": list(signals or []),
+                "lesson": str(lesson)[:600],
+                "reflection": reflection if isinstance(reflection, dict) else {},
+            },
+        )
     except Exception as exc:
         logger.debug("_thesis_commit_update fail: %s", exc)
 
@@ -41051,6 +41206,39 @@ def _ensure_managed_paper_journal(mt):
         ):
             return False
         mt["paper_journal_activated"] = True
+    if source == "paper":
+        student_mode = "SWING" if mt.get("is_swing") else "SCALP"
+        student_result = {
+            "verdict": "%s READY" % str(mt.get("direction") or "").upper(),
+            "strict_direction": mt.get("direction"),
+            "confidence": mt.get("trade_strength"),
+            "strategy_key": (mt.get("learning_ctx") or {}).get("strategy_key")
+                            or "MANAGED_DISPLAY_PAPER",
+            "strategy_version": "managed-paper-v1",
+            "source_event_id": str(iid),
+            "trade_plan": {
+                "entry": mt.get("entry"),
+                "stop": mt.get("initial_stop") or mt.get("stop"),
+                "target": mt.get("tp1"),
+                "target2": mt.get("tp2"),
+            },
+            "market_student_context": {
+                "native_journal_internal_trade_id": str(iid),
+                "paper_only": True,
+            },
+        }
+        student_row = _MARKET_STUDENT.observe(
+            student_result, instrument, student_mode,
+            source_timestamp=mt.get("registered_at") or now_utc().isoformat(),
+            source_system="managed_paper", source_event_id=str(iid), force=True,
+        )
+        if student_row:
+            _MARKET_STUDENT.reconcile(
+                source_system="managed_paper", source_record_id=str(iid),
+                hypothesis_id=student_row["hypothesis_id"],
+                instrument=instrument, mode=student_mode,
+                provenance={"legacy_table": "native_journal", "paper_only": True},
+            )
     # Keep the independent SWING recovery snapshot aware of the paper journal
     # identity. The native-journal loader also reconciles boot ordering, but this
     # makes a later SWING-only recovery retain the exact close target.
@@ -41085,6 +41273,24 @@ def _close_managed_paper_journal(mt):
         pnl_dollars=mt.get("pnl_dollars"),
         actual_exit=mt.get("exit_price"),
     )
+    if outcome_ok:
+        r_multiple = mt.get("r_multiple")
+        try:
+            r_value = float(r_multiple)
+        except (TypeError, ValueError):
+            r_value = None
+        status = (
+            "WIN" if r_value is not None and r_value > 0
+            else "LOSS" if r_value is not None and r_value < 0
+            else "BREAKEVEN" if r_value == 0
+            else "AMBIGUOUS"
+        )
+        _MARKET_STUDENT.record_outcome_by_source(
+            "managed_paper", str(iid), status=status,
+            exit_price=mt.get("exit_price"), net_r=r_value,
+            reason=mt.get("result_label") or mt.get("outcome"),
+            provenance={"native_journal_internal_trade_id": str(iid), "paper_only": True},
+        )
     if not (terminal_intent_ok or outcome_ok):
         logger.warning("managed paper terminal outcome not durable for %s; will retry",
                        mt.get("instrument") or mt.get("symbol") or "unknown")
@@ -41119,6 +41325,12 @@ def _cancel_managed_paper_journal(mt):
         },
         source="operator",
     )
+    if lifecycle_ok:
+        _MARKET_STUDENT.record_outcome_by_source(
+            "managed_paper", str(iid), status="AMBIGUOUS",
+            reason="operator_stopped_tracking",
+            provenance={"native_journal_internal_trade_id": str(iid), "paper_only": True},
+        )
     native_terminal_ok = bool(state_ok or lifecycle_ok)
     if native_terminal_ok:
         mt["_paper_cancel_native_confirmed"] = True
@@ -49886,6 +50098,22 @@ def _scalp_sim_close(row_id, result_label, exit_price, r_multiple,
                  json.dumps(resolution_meta or {}), row_id))
             claimed = (cur.rowcount == 1)
         conn.commit()
+        if claimed:
+            source_id = str((resolution_meta or {}).get("source_record_id") or "")
+            if source_id:
+                normalized_status = (
+                    "AMBIGUOUS" if status == "unresolved"
+                    else "EXPIRED" if str(result_label).lower() == "expired"
+                    else "WIN" if float(r_multiple or 0) > 0
+                    else "LOSS" if float(r_multiple or 0) < 0
+                    else "BREAKEVEN"
+                )
+                _MARKET_STUDENT.record_outcome_by_source(
+                    "scalp_live_sim", source_id,
+                    status=normalized_status, exit_price=exit_price,
+                    net_r=r_multiple, reason=str(result_label),
+                    provenance={"legacy_row_id": row_id, **(resolution_meta or {})},
+                )
         return claimed
     except Exception as exc:
         logger.warning("scalp live-sim close failed: %s", exc)
@@ -50108,6 +50336,7 @@ def _watch_scalp_sim_trades():
             "bar_start": outcome_bar.get("start") if outcome_bar else None,
             "close_reason": ("expired" if outcome[0] == "expired" else
                              "stop_or_target"),
+            "source_record_id": (row.get("context") or {}).get("legacy_sim_key"),
         }
         if _scalp_sim_close(row["id"], outcome[0], outcome[1], outcome[2], meta):
             closed_rows += 1
@@ -53546,6 +53775,22 @@ def _dual_sim_close(row_id, result_label, exit_price, r_multiple,
                  json.dumps(resolution_meta or {}), row_id))
             claimed = (cur.rowcount == 1)
         conn.commit()
+        if claimed:
+            source_id = str((resolution_meta or {}).get("source_record_id") or "")
+            if source_id:
+                normalized_status = (
+                    "AMBIGUOUS" if status == "unresolved"
+                    else "EXPIRED" if str(result_label).lower() == "expired"
+                    else "WIN" if float(r_multiple or 0) > 0
+                    else "LOSS" if float(r_multiple or 0) < 0
+                    else "BREAKEVEN"
+                )
+                _MARKET_STUDENT.record_outcome_by_source(
+                    "dual_mode_sim", source_id,
+                    status=normalized_status, exit_price=exit_price,
+                    net_r=r_multiple, reason=str(result_label),
+                    provenance={"legacy_row_id": row_id, **(resolution_meta or {})},
+                )
         return claimed
     except Exception as exc:
         logger.warning("dual-sim close failed: %s", exc)
@@ -53712,6 +53957,7 @@ def _watch_dual_sim_trades():
             "bar_start": outcome_bar.get("start") if outcome_bar else None,
             "close_reason": ("expired" if outcome[0] == "expired" else
                              "stop_or_target"),
+            "source_record_id": (row.get("context") or {}).get("legacy_sim_key"),
         }
         if _dual_sim_close(row["id"], outcome[0], outcome[1], outcome[2], meta):
             closed_rows += 1
@@ -89835,6 +90081,8 @@ if __name__ == "__main__":
                 # Lazy getter: returns DecisionRegistry when available (initialised
                 # after GRE at boot, so must be resolved at call time not at init).
                 dc_registry_fn   = lambda: globals().get("_DECISION_REGISTRY"),
+                fvg_result_observe_fn = _market_student_observe_gre_fvg_result,
+                fvg_result_outcome_fn = _market_student_resolve_gre_fvg_result,
             )
             globals()["_GHOST_RESEARCH_ENGINE"] = _GHOST_RESEARCH_ENGINE
             _GHOST_RESEARCH_ENGINE.boot()
@@ -89937,6 +90185,8 @@ if __name__ == "__main__":
             price_store=AUTO_PRICE_BY_TICKER,
             vwap_store=VWAP_BY_TICKER,
             bars_fn=lambda inst: list(_dbb_for_vb.DATABENTO_BARS_BY_INST.get(inst, [])),
+            research_observation_fn=_market_student_observe_visual,
+            research_outcome_fn=_market_student_resolve_visual,
         )
     except Exception as _vb_boot_exc:
         logger.warning("[VISUAL_BRAIN] boot error (non-critical, fail-open): %s", _vb_boot_exc)

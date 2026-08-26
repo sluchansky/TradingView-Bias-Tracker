@@ -1357,6 +1357,65 @@ class TestGetHealth(unittest.TestCase):
         self.assertFalse(h["db_ready"])
 
 
+class TestFvgMarketStudentAdapters(unittest.TestCase):
+    def _engine(self, observed, resolved):
+        db = FakeDB()
+        db.set_rows([("inserted",)])
+        engine = GhostResearchEngine(
+            get_db_fn=lambda: db,
+            get_canonical_fn=lambda inst: _canonical(),
+            get_bars_fn=lambda inst: [],
+            re_event_fn=MagicMock(),
+            instruments=INSTRUMENTS,
+            fvg_result_observe_fn=observed.append,
+            fvg_result_outcome_fn=resolved.append,
+        )
+        engine._db = db
+        return engine
+
+    def test_pre_filtered_result_is_observed_and_resolved_by_exact_result_id(self):
+        observed, resolved = [], []
+        engine = self._engine(observed, resolved)
+        ok = engine._insert_fvg_experiment_and_result(
+            "opp-1", "MNQ", "Long", "TREND_REQUIRED",
+            20900.0, 21200.0, "FVG_ZONE_TOUCH", {}, {}, pre_no_entry=True,
+        )
+        self.assertTrue(ok)
+        self.assertEqual(len(observed), 1)
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(observed[0]["result_id"], resolved[0]["result_id"])
+        self.assertEqual(resolved[0]["result"], OutcomeResult.NO_ENTRY)
+
+    def test_active_result_completion_uses_the_same_exact_result_id(self):
+        observed, resolved = [], []
+        engine = self._engine(observed, resolved)
+        result_id = "fvg-result-exact"
+        engine._open_results[result_id] = {
+            "result_id": result_id,
+            "experiment_id": "exp-1",
+            "opportunity_id": "opp-1",
+            "instrument": "MNQ",
+            "direction": "Long",
+            "variant_name": "BASELINE",
+            "entry_price": 21000.0,
+            "stop_price": 20900.0,
+            "tp1_price": 21200.0,
+            "cost_r": 0.0,
+            "mfe_r": 1.0,
+            "mae_r": -0.2,
+            "bars_held": 4,
+            "_fvg_family": True,
+        }
+        engine._complete_experiment(
+            result_id, exit_price=21200.0, exit_reason="TP1_HIT",
+            result=OutcomeResult.WIN, exit_ts="2026-08-26T18:00:00+00:00",
+            tp1_hit=True,
+        )
+        self.assertEqual(len(resolved), 1)
+        self.assertEqual(resolved[0]["result_id"], result_id)
+        self.assertEqual(resolved[0]["result"], OutcomeResult.WIN)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Run
 # ══════════════════════════════════════════════════════════════════════════════
