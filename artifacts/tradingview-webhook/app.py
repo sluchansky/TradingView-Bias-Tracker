@@ -35472,39 +35472,122 @@ def _tag_dynamic_paper_managed_trade(inst, plan, setup_key):
     return True
 
 
-def _fetch_completed_bars(instrument):
+def _normalize_completed_bar(raw):
+    """Normalize one completed OHLC bar to the paper-resolver wire shape."""
+    if not isinstance(raw, dict):
+        return None
+    try:
+        ts = raw.get("ts", raw.get("start"))
+        if hasattr(ts, "timestamp"):
+            ts = ts.timestamp()
+        ts = float(ts) if ts is not None else None
+        high = float(raw["high"])
+        low = float(raw["low"])
+        close = float(raw["close"])
+        if ts is None or high < low:
+            return None
+        session_id = raw.get("capture_session_id")
+        session_started = raw.get("capture_session_started_at")
+        if hasattr(session_started, "timestamp"):
+            session_started = session_started.timestamp()
+        session_started = (
+            float(session_started) if session_started is not None else None
+        )
+        sequence = raw.get("capture_sequence")
+        sequence = int(sequence) if sequence is not None else None
+        return {
+            "high": high,
+            "low": low,
+            "close": close,
+            "start": ts,
+            "capture_session_id": str(session_id) if session_id else None,
+            "capture_session_started_at": session_started,
+            "capture_sequence": sequence,
+        }
+    except (KeyError, TypeError, ValueError, OverflowError):
+        return None
+
+
+def _fetch_persisted_completed_bars(instrument):
+    """Read the bounded durable paper-simulation bar window.
+
+    This is the only restart bridge used by the paper watchers. It reads the
+    same completed Databento bars that were observed live before restart; it
+    never calls a historical API and never manufactures a current bar.
+    """
+    if not globals().get("PAPER_SIM_BARS_DB_READY", False):
+        return []
+    retention_hours = globals().get("PAPER_SIM_BAR_RETENTION_HOURS")
+    if retention_hours is None:
+        return []
+    conn = _learning_conn()
+    if conn is None:
+        return []
+    rows = []
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT EXTRACT(EPOCH FROM bar_start), high, low, close, "
+                "capture_session_id, EXTRACT(EPOCH FROM capture_session_started_at), "
+                "capture_sequence "
+                "FROM paper_sim_market_bars "
+                "WHERE instrument=%s "
+                "AND bar_start >= now() - (%s * INTERVAL '1 hour') "
+                "ORDER BY bar_start ASC",
+                (instrument, retention_hours),
+            )
+            rows = cur.fetchall()
+    except Exception as exc:
+        logger.warning("paper-sim durable bar read failed for %s: %s", instrument, exc)
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    out = []
+    for row in rows:
+        if not isinstance(row, (tuple, list)) or len(row) < 7:
+            continue
+        normalized = _normalize_completed_bar({
+            "start": row[0], "high": row[1], "low": row[2], "close": row[3],
+            "capture_session_id": row[4],
+            "capture_session_started_at": row[5],
+            "capture_sequence": row[6],
+        })
+        if normalized is not None:
+            out.append(normalized)
+    return out
+
+
+def _fetch_completed_bars(instrument, include_durable=True):
     """Return a snapshot of completed Databento bars for ``instrument``.
 
     The paper-simulation watchers need the retained history, not just the newest
     bar: a target or stop may have been crossed and then left before the next
-    watcher cycle.  The Databento public store contains completed bars only, so
-    this helper deliberately does not synthesize a current bar or fetch from a
-    second market-data source.  FAIL-OPEN: an unavailable feed returns ``[]``.
+    watcher cycle. Durable rows are exact completed Databento bars captured by
+    this service before restart. This helper deliberately does not synthesize a
+    current bar or fetch from a second market-data source. FAIL-OPEN: unavailable
+    persistence still returns the in-memory completed bars.
     """
+    raw_bars = []
     try:
         from databento_brain import DATABENTO_BARS_BY_INST  # noqa: PLC0415
         raw_bars = list(DATABENTO_BARS_BY_INST.get(instrument) or [])
-        out = []
-        for raw in raw_bars:
-            try:
-                ts = raw.get("ts", raw.get("start"))
-                if hasattr(ts, "timestamp"):
-                    ts = ts.timestamp()
-                ts = float(ts) if ts is not None else None
-                high = float(raw["high"])
-                low = float(raw["low"])
-                close = float(raw["close"])
-                if ts is None or high < low:
-                    continue
-                out.append({
-                    "high": high, "low": low, "close": close, "start": ts,
-                })
-            except (KeyError, TypeError, ValueError):
-                continue
-        out.sort(key=lambda bar: bar["start"])
-        return out
     except Exception:
-        return []
+        raw_bars = []
+    by_start = {}
+    if include_durable:
+        for bar in _fetch_persisted_completed_bars(instrument):
+            by_start[bar["start"]] = bar
+    for raw in raw_bars:
+        if not isinstance(raw, dict) or raw.get("capture_kind") != "live_completed":
+            continue
+        normalized = _normalize_completed_bar(raw)
+        if normalized is not None:
+            # The live in-memory copy wins an overlap because it can carry the
+            # newest completed bar before its asynchronous durable insert lands.
+            by_start[normalized["start"]] = normalized
+    return [by_start[key] for key in sorted(by_start)]
 
 
 def _fetch_latest_bar(instrument):
@@ -35514,7 +35597,9 @@ def _fetch_latest_bar(instrument):
     FAIL-OPEN: returns None when Databento is not running or has no bars yet.
     """
     try:
-        bars = _fetch_completed_bars(instrument)
+        # Managed positions need the newest bar from this live process only.
+        # Replaying a durable pre-restart bar here could fabricate a local close.
+        bars = _fetch_completed_bars(instrument, include_durable=False)
         return bars[-1] if bars else None
     except Exception:
         return None
@@ -50165,23 +50250,90 @@ def _paper_sim_expiry(row, bar, max_hold_hours):
         return None
 
 
-def _paper_sim_history_gap(row, history):
-    """Whether retained bars are too recent to prove an old row's outcome."""
-    if not history:
-        return True
-    marker = row.get("entry_epoch")
-    if marker is None and row.get("opened_at") is not None:
+def _paper_sim_entry_marker(row):
+    marker = row.get("entry_epoch") if isinstance(row, dict) else None
+    if marker is None and isinstance(row, dict) and row.get("opened_at") is not None:
         try:
             marker = row["opened_at"].timestamp()
         except (AttributeError, TypeError, ValueError):
             marker = None
     try:
-        # Bars are one-minute completed bars.  A two-minute allowance covers the
-        # alert-to-bar boundary without pretending a multi-hour retention gap is
-        # observable.
-        return marker is not None and float(history[0]["start"]) > float(marker) + 120.0
-    except (KeyError, TypeError, ValueError):
-        return True
+        return float(marker) if marker is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _paper_sim_trusted_history(row, history):
+    """Return the contiguous post-entry prefix and an optional break reason.
+
+    Databento can legitimately have quiet minutes with no bar, so timestamp gaps
+    are not evidence loss. Capture-session sequence gaps are: they prove a
+    completed bar was observed but not retained. A reconnect starts a new capture
+    session and therefore cannot bridge an unobserved restart/disconnect interval.
+    """
+    marker = _paper_sim_entry_marker(row)
+    if marker is None:
+        return [], "market_history_marker_unavailable"
+    eligible = []
+    latest_pre_entry = None
+    for bar in history or []:
+        try:
+            if float(bar["start"]) <= marker:
+                latest_pre_entry = bar
+                continue
+        except (KeyError, TypeError, ValueError):
+            return eligible, "market_history_continuity_unavailable"
+        eligible.append(bar)
+    if not eligible:
+        return [], None
+
+    trusted = []
+    prior_session = None
+    prior_sequence = None
+    for bar in eligible:
+        session_id = bar.get("capture_session_id")
+        session_started = bar.get("capture_session_started_at")
+        sequence = bar.get("capture_sequence")
+        try:
+            session_started = float(session_started)
+            sequence = int(sequence)
+        except (TypeError, ValueError):
+            return trusted, "market_history_continuity_unavailable"
+        if not session_id or sequence < 1:
+            return trusted, "market_history_continuity_unavailable"
+        if not trusted:
+            if session_started > marker:
+                return [], "market_history_session_started_after_entry"
+            if sequence == 1:
+                # The capture session began before entry and this is its first
+                # observed completed bar, so there is no missing predecessor.
+                pass
+            elif not isinstance(latest_pre_entry, dict):
+                return [], "market_history_entry_boundary_unavailable"
+            else:
+                boundary_session = latest_pre_entry.get("capture_session_id")
+                boundary_sequence = latest_pre_entry.get("capture_sequence")
+                try:
+                    boundary_sequence = int(boundary_sequence)
+                except (TypeError, ValueError):
+                    return [], "market_history_entry_boundary_unavailable"
+                if (
+                    boundary_session != session_id
+                    or sequence != boundary_sequence + 1
+                ):
+                    return [], "market_history_entry_boundary_discontinuous"
+        elif session_id != prior_session or sequence != prior_sequence + 1:
+            return trusted, "market_history_discontinuous"
+        trusted.append(bar)
+        prior_session = session_id
+        prior_sequence = sequence
+    return trusted, None
+
+
+def _paper_sim_history_gap(row, history):
+    """Compatibility predicate for any untrusted post-entry history boundary."""
+    _trusted, reason = _paper_sim_trusted_history(row, history)
+    return reason is not None
 
 
 def _age_and_mark_scalp_unresolved(row, reason, unresolved_reasons=None):
@@ -50290,27 +50442,7 @@ def _watch_scalp_sim_trades():
             ):
                 unresolved_rows += 1
             continue
-        if (_paper_sim_age_hours(row) or 0.0) >= SCALP_SIM_MAX_HOLD_HOURS \
-                and _paper_sim_history_gap(row, history):
-            if _age_and_mark_scalp_unresolved(
-                row, reason="market_history_truncated",
-                unresolved_reasons=unresolved_reasons,
-            ):
-                unresolved_rows += 1
-            continue
-        eligible = []
-        for bar in history:
-            bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
-            if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
-                continue                       # same-bar guard (no look-ahead self-fill)
-            if bar_start is not None and entry_epoch is None and row.get("opened_at") is not None:
-                try:
-                    opened_epoch = row["opened_at"].timestamp()
-                    if bar_start <= opened_epoch:
-                        continue
-                except (AttributeError, TypeError, ValueError):
-                    pass
-            eligible.append(bar)
+        eligible, continuity_reason = _paper_sim_trusted_history(row, history)
         outcome = None
         outcome_bar = None
         for bar in eligible:
@@ -50319,6 +50451,13 @@ def _watch_scalp_sim_trades():
                 outcome_bar = bar
                 break
         latest = eligible[-1] if eligible else None
+        if outcome is None and continuity_reason is not None:
+            if _age_and_mark_scalp_unresolved(
+                row, reason=continuity_reason,
+                unresolved_reasons=unresolved_reasons,
+            ):
+                unresolved_rows += 1
+            continue
         if outcome is None and latest is not None:
             outcome = _scalp_sim_expiry(row, latest, SCALP_SIM_MAX_HOLD_HOURS)
             outcome_bar = latest if outcome is not None else None
@@ -53375,6 +53514,162 @@ DUAL_SIM_DISPLAY_TIERS     = (70, 80, 90)
 _DUAL_SIM_COOLDOWN          = {}                  # (mode,inst,direction) -> monotonic ts
 _DUAL_SIM_COOLDOWN_LOCK     = threading.Lock()
 
+# Durable completed-bar retention shared by both paper ledgers. The configured
+# window is clamped so it can never be shorter than either max-hold horizon,
+# plus a one-hour boundary/restart buffer. App code performs only DML; schema is
+# applied to development out-of-band and reaches production via Publish diff.
+PAPER_SIM_BAR_RETENTION_BUFFER_HOURS = max(
+    1.0, float(os.environ.get("PAPER_SIM_BAR_RETENTION_BUFFER_HOURS", "1"))
+)
+_PAPER_SIM_BAR_REQUIRED_HOURS = (
+    max(SCALP_SIM_MAX_HOLD_HOURS, DUAL_SIM_MAX_HOLD_HOURS)
+    + PAPER_SIM_BAR_RETENTION_BUFFER_HOURS
+)
+PAPER_SIM_BAR_RETENTION_HOURS = max(
+    _PAPER_SIM_BAR_REQUIRED_HOURS,
+    float(os.environ.get(
+        "PAPER_SIM_BAR_RETENTION_HOURS",
+        str(_PAPER_SIM_BAR_REQUIRED_HOURS),
+    )),
+)
+PAPER_SIM_BARS_DB_READY = False
+_PAPER_SIM_BAR_HEALTH_LOCK = threading.Lock()
+_PAPER_SIM_BAR_HEALTH = {
+    "last_persisted_at": None,
+    "last_persisted_instrument": None,
+    "last_persisted_bar_start": None,
+    "persisted_this_process": 0,
+    "persist_failures": 0,
+    "last_error": None,
+}
+
+
+def _paper_sim_bar_history_health():
+    with _PAPER_SIM_BAR_HEALTH_LOCK:
+        return {
+            **_PAPER_SIM_BAR_HEALTH,
+            "db_ready": bool(PAPER_SIM_BARS_DB_READY),
+            "source": "databento_completed_bars",
+            "retention_hours": PAPER_SIM_BAR_RETENTION_HOURS,
+            "required_hours": _PAPER_SIM_BAR_REQUIRED_HOURS,
+            "scalp_max_hold_hours": SCALP_SIM_MAX_HOLD_HOURS,
+            "dual_max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
+            "current_bar_fabrication": False,
+            "historical_api_fallback": False,
+        }
+
+
+def _check_paper_sim_bars_db_ready():
+    """Probe durable completed-bar storage without running DDL."""
+    global PAPER_SIM_BARS_DB_READY
+    PAPER_SIM_BARS_DB_READY = False
+    if not LEARNING_DB_ENABLED:
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1 FROM paper_sim_market_bars LIMIT 1")
+            cur.fetchone()
+        PAPER_SIM_BARS_DB_READY = True
+        logger.info(
+            "paper-sim completed-bar retention ready (window=%.1fh, required=%.1fh)",
+            PAPER_SIM_BAR_RETENTION_HOURS,
+            _PAPER_SIM_BAR_REQUIRED_HOURS,
+        )
+        return True
+    except Exception as exc:
+        with _PAPER_SIM_BAR_HEALTH_LOCK:
+            _PAPER_SIM_BAR_HEALTH["last_error"] = str(exc)[:180]
+        logger.warning(
+            "paper-sim completed-bar retention unavailable; restart recovery "
+            "degrades to explicit unresolved outcomes: %s", exc
+        )
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
+def _persist_completed_paper_sim_bar(instrument, bar):
+    """Persist one exact live completed Databento bar and prune the old window.
+
+    Registered on DatabentoBrain's bounded downstream worker. A failure records
+    health and returns False; it never delays intake, retries with fabricated
+    data, or changes either paper/live decision path.
+    """
+    if not PAPER_SIM_BARS_DB_READY or not isinstance(bar, dict):
+        return False
+    inst = str(instrument or "").upper().strip()
+    try:
+        start = float(bar.get("ts", bar.get("start")))
+        capture_session_id = str(bar["capture_session_id"])
+        capture_session_started_at = datetime.fromtimestamp(
+            float(bar["capture_session_started_at"]), tz=timezone.utc
+        )
+        capture_sequence = int(bar["capture_sequence"])
+        open_ = float(bar["open"])
+        high = float(bar["high"])
+        low = float(bar["low"])
+        close = float(bar["close"])
+        volume = max(0, int(bar.get("volume") or 0))
+        if (
+            not inst or not capture_session_id or capture_sequence < 1
+            or high < low
+            or not (low <= open_ <= high and low <= close <= high)
+        ):
+            return False
+        bar_start = datetime.fromtimestamp(start, tz=timezone.utc)
+    except (KeyError, TypeError, ValueError, OverflowError, OSError):
+        return False
+    conn = _learning_conn()
+    if conn is None:
+        return False
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO paper_sim_market_bars "
+                "(instrument, bar_start, open, high, low, close, volume, source, "
+                "capture_session_id, capture_session_started_at, capture_sequence) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,'databento_live_completed',%s,%s,%s) "
+                "ON CONFLICT (instrument, bar_start) DO NOTHING",
+                (
+                    inst, bar_start, open_, high, low, close, volume,
+                    capture_session_id, capture_session_started_at, capture_sequence,
+                ),
+            )
+            cur.execute(
+                "DELETE FROM paper_sim_market_bars "
+                "WHERE bar_start < now() - (%s * INTERVAL '1 hour')",
+                (PAPER_SIM_BAR_RETENTION_HOURS,),
+            )
+        conn.commit()
+        with _PAPER_SIM_BAR_HEALTH_LOCK:
+            _PAPER_SIM_BAR_HEALTH["last_persisted_at"] = now_utc().isoformat()
+            _PAPER_SIM_BAR_HEALTH["last_persisted_instrument"] = inst
+            _PAPER_SIM_BAR_HEALTH["last_persisted_bar_start"] = bar_start.isoformat()
+            _PAPER_SIM_BAR_HEALTH["persisted_this_process"] += 1
+            _PAPER_SIM_BAR_HEALTH["last_error"] = None
+        return True
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        with _PAPER_SIM_BAR_HEALTH_LOCK:
+            _PAPER_SIM_BAR_HEALTH["persist_failures"] += 1
+            _PAPER_SIM_BAR_HEALTH["last_error"] = str(exc)[:180]
+        logger.warning("paper-sim completed-bar persist failed for %s: %s", inst, exc)
+        return False
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
 
 def _check_dual_sim_db_ready():
     """Probe dual_sim_trades (no DDL) and set DUAL_SIM_DB_READY. FAIL-OPEN: a
@@ -53887,38 +54182,7 @@ def _watch_dual_sim_trades():
                         unresolved_reasons.get("market_bars_unavailable", 0) + 1
                     )
             continue
-        if (_paper_sim_age_hours(row) or 0.0) >= DUAL_SIM_MAX_HOLD_HOURS \
-                and _paper_sim_history_gap(row, history):
-            age_hours = _paper_sim_age_hours(row)
-            meta = {
-                "resolution": "unresolved",
-                "resolution_health": {
-                    "status": "unresolved",
-                    "reason": "market_history_truncated",
-                    "age_hours": round(age_hours, 3) if age_hours is not None else None,
-                    "max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
-                },
-            }
-            if _dual_sim_close(
-                row["id"], "unresolved", None, None, meta, status="unresolved"
-            ):
-                unresolved_rows += 1
-                unresolved_reasons["market_history_truncated"] = (
-                    unresolved_reasons.get("market_history_truncated", 0) + 1
-                )
-            continue
-        eligible = []
-        for bar in history:
-            bar_start, entry_epoch = bar.get("start"), row.get("entry_epoch")
-            if bar_start is not None and entry_epoch is not None and bar_start <= entry_epoch:
-                continue
-            if bar_start is not None and entry_epoch is None and row.get("opened_at") is not None:
-                try:
-                    if bar_start <= row["opened_at"].timestamp():
-                        continue
-                except (AttributeError, TypeError, ValueError):
-                    pass
-            eligible.append(bar)
+        eligible, continuity_reason = _paper_sim_trusted_history(row, history)
         outcome = None
         outcome_bar = None
         for bar in eligible:
@@ -53927,6 +54191,26 @@ def _watch_dual_sim_trades():
                 outcome_bar = bar
                 break
         latest = eligible[-1] if eligible else None
+        if outcome is None and continuity_reason is not None:
+            age_hours = _paper_sim_age_hours(row)
+            if age_hours is not None and age_hours >= DUAL_SIM_MAX_HOLD_HOURS:
+                meta = {
+                    "resolution": "unresolved",
+                    "resolution_health": {
+                        "status": "unresolved",
+                        "reason": continuity_reason,
+                        "age_hours": round(age_hours, 3),
+                        "max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
+                    },
+                }
+                if _dual_sim_close(
+                    row["id"], "unresolved", None, None, meta, status="unresolved"
+                ):
+                    unresolved_rows += 1
+                    unresolved_reasons[continuity_reason] = (
+                        unresolved_reasons.get(continuity_reason, 0) + 1
+                    )
+            continue
         if outcome is None and latest is not None:
             outcome = _paper_sim_expiry(row, latest, DUAL_SIM_MAX_HOLD_HOURS)
             outcome_bar = latest if outcome is not None else None
@@ -85983,6 +86267,7 @@ def route_research_health():
             "live_instance": DISCORD_LIVE_ENABLED,
             "db_ready": SCALP_SIM_DB_READY,
             "max_hold_hours": SCALP_SIM_MAX_HOLD_HOURS,
+            "market_history": _paper_sim_bar_history_health(),
         }
     with _DUAL_SIM_WATCH_HEALTH_LOCK:
         out["dual_sim_watcher"] = {
@@ -85991,6 +86276,7 @@ def route_research_health():
             "live_instance": DISCORD_LIVE_ENABLED,
             "db_ready": DUAL_SIM_DB_READY,
             "max_hold_hours": DUAL_SIM_MAX_HOLD_HOURS,
+            "market_history": _paper_sim_bar_history_health(),
         }
 
     return jsonify(out)
@@ -89893,6 +90179,7 @@ if __name__ == "__main__":
         # side effect. The persisted catalog remains readable for research UI.
         _check_scalp_sim_db_ready()                # probe scalp_strategy_sim_trades (no DDL; created via DB tool/publish diff) — PAPER LIVE-SIM, RESEARCH/DISPLAY-ONLY
         _check_dual_sim_db_ready()                 # probe dual_sim_trades (no DDL; created via DB tool/publish diff) — DUAL-MODE SHADOW SIM, DISPLAY-ONLY (walled off from money path)
+        _check_paper_sim_bars_db_ready()           # probe bounded Databento completed-bar retention (no DDL; apply db_paper_sim_market_bars_schema.sql)
         _check_micro_ghost_db_ready()              # probe micro_scalp_ghost_trades (no DDL; created via DB tool/publish diff) — MICRO SCALP GHOST ledger, DISPLAY-ONLY
         _check_ghost_obs_db_ready()                # probe ghost_observations (no DDL; created via DB tool/publish diff) — PROFITABILITY ENGINE PHASE 1, RESEARCH/DISPLAY-ONLY
         _check_ghost_coordinator_db_ready()        # probe additive coordinator tables (no DDL; apply db_ghost_coordinator_schema.sql)
@@ -89992,6 +90279,7 @@ if __name__ == "__main__":
             _DATABENTO_BRAIN.register_bar_close_callback(_databento_bar_scan)
             _DATABENTO_BRAIN.register_structure_signal_callback(_databento_structure_trigger)
             _DATABENTO_BRAIN.register_tick_callback(_databento_tick_broadcast)
+            _DATABENTO_BRAIN.register_completed_bar_callback(_persist_completed_paper_sim_bar)
             _DATABENTO_BRAIN.register_bar_close_callback(_fvg_bar_close)  # FVG engine (shadow/display-only)
             logger.info("DatabentoBrain: initialized and started")
         except Exception as _db_exc:

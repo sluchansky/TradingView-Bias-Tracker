@@ -577,11 +577,21 @@ class DatabentoBrain:
         self._warmup_started_at: dict[str, str | None] = {
             i: None for i in DB_SYMBOLS
         }
+        # A capture session is one uninterrupted live dispatcher generation.
+        # Sequence gaps make dropped persistence callbacks detectable after a
+        # restart; reconnects intentionally start a new, non-joinable session.
+        self._capture_session_id = uuid.uuid4().hex
+        self._capture_session_started_at = time.time()
+        self._completed_bar_sequence: dict[str, int] = {i: 0 for i in DB_SYMBOLS}
         self._warmup_lock = threading.RLock()
         self._suppress_replay_signals = False
         # Bar-close callbacks: called after every completed 1m bar per instrument.
         # Registered by app.py to trigger proactive scanning without polling.
         self._bar_close_callbacks: list = []
+        # Completed-bar observers receive the immutable public OHLCV snapshot,
+        # not just the close price. They share the bounded downstream handoff so
+        # persistence can never block authoritative market-data intake.
+        self._completed_bar_callbacks: list = []
         # Structure-signal callbacks: called for every BOS/CHOCH/CONFIRMATION alert.
         # Registered by app.py to enqueue a scored webhook analysis without a TV hit.
         self._structure_signal_callbacks: list = []
@@ -831,6 +841,15 @@ class DatabentoBrain:
         Called from the ordered record worker — fn must be fast or dispatch its own thread."""
         self._bar_close_callbacks.append(fn)
 
+    def register_completed_bar_callback(self, fn) -> None:
+        """Register a callable(inst: str, bar: dict) for live completed bars.
+
+        Historical warm-up replay is deliberately excluded: durable consumers
+        retain bars observed by this service rather than turning startup backfill
+        into a second outcome source.
+        """
+        self._completed_bar_callbacks.append(fn)
+
     def register_structure_signal_callback(self, fn) -> None:
         """Register a callable(inst: str, alert_type: str, price: float) invoked
         whenever _inject_alert fires a BOS, CHOCH, or CONFIRMATION alert.
@@ -983,6 +1002,9 @@ class DatabentoBrain:
             self._dispatch_generation += 1
             generation = self._dispatch_generation
             self._active_dispatch_generation = generation
+            self._capture_session_id = uuid.uuid4().hex
+            self._capture_session_started_at = time.time()
+            self._completed_bar_sequence = {i: 0 for i in DB_SYMBOLS}
             self._record_queue = queue.Queue(maxsize=RECORD_QUEUE_MAX)
             self._record_worker_stop = threading.Event()
             self._downstream_queue = queue.Queue(maxsize=DOWNSTREAM_QUEUE_MAX)
@@ -1180,9 +1202,9 @@ class DatabentoBrain:
         if unsupported:
             return
 
-    def _enqueue_downstream(self, fn, inst: str, price: float, generation: int) -> None:
+    def _enqueue_downstream(self, fn, inst: str, payload: Any, generation: int) -> None:
         """Handoff one post-state observer without blocking authoritative intake."""
-        item = (fn, inst, price, generation)
+        item = (fn, inst, payload, generation)
         with self._dispatch_lock:
             downstream_queue = self._downstream_queue
             if downstream_queue is None:
@@ -1218,14 +1240,14 @@ class DatabentoBrain:
         """Run observers in order, fenced to the live session that queued them."""
         while not stop.is_set():
             try:
-                fn, inst, price, item_generation = downstream_queue.get(timeout=0.25)
+                fn, inst, payload, item_generation = downstream_queue.get(timeout=0.25)
             except queue.Empty:
                 continue
             started = time.monotonic()
             try:
                 if item_generation != self._active_dispatch_generation or stop.is_set():
                     continue
-                fn(inst, price)
+                fn(inst, payload)
                 elapsed_ms = (time.monotonic() - started) * 1000.0
                 name = getattr(fn, "__name__", fn.__class__.__name__)
                 with self._dispatch_lock:
@@ -2105,6 +2127,16 @@ class DatabentoBrain:
             "sell_volume":  bar.get("sell_volume", 0),
             "cvd_snapshot": self._cvd_acc[inst],   # session cumulative at bar close
         }
+        if replay:
+            pub["capture_kind"] = "historical_replay"
+        else:
+            self._completed_bar_sequence[inst] += 1
+            pub.update({
+                "capture_kind": "live_completed",
+                "capture_session_id": self._capture_session_id,
+                "capture_session_started_at": self._capture_session_started_at,
+                "capture_sequence": self._completed_bar_sequence[inst],
+            })
         if vwap is not None: pub["vwap"] = vwap
         if atr  is not None: pub["atr"]  = atr
         DATABENTO_BARS_BY_INST[inst].append(pub)
@@ -2173,6 +2205,21 @@ class DatabentoBrain:
         # never fan out a startup callback as though the last closed historical
         # bar were a newly actionable live event.
         if not replay:
+            for _cb in self._completed_bar_callbacks:
+                with self._dispatch_lock:
+                    downstream_ready = (
+                        self._downstream_queue is not None
+                        and self._record_worker is not None
+                    )
+                    generation = self._active_dispatch_generation
+                payload = dict(pub)
+                if downstream_ready:
+                    self._enqueue_downstream(_cb, inst, payload, generation)
+                else:
+                    try:
+                        _cb(inst, payload)
+                    except Exception:
+                        pass
             for _cb in self._bar_close_callbacks:
                 # Observers can include database writes and analysis.  They are
                 # queued after all authoritative state/detectors are complete,
