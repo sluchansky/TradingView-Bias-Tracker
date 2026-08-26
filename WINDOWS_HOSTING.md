@@ -20,6 +20,7 @@ The production bot source is primarily:
 The validated source branch is `replit-dev`. For a recovery, check out the
 specific reviewed commit recorded with the backup/validation record, then verify
 the worktree is clean before starting the bot.
+
 ## 1. Install prerequisites
 
 Install these from their official installers:
@@ -176,7 +177,6 @@ http://127.0.0.1:8000/dashboard
 Use the local `DASHBOARD_PASSWORD`. If `DATABENTO_ENABLED=0`, a disabled-data
 response is expected. Do not interpret that as a broker or strategy failure.
 
-
 ## 7. Coordinated React dashboard (recommended local UI)
 
 The React dashboard must not be started with `pnpm dev` by itself: its `/api/*`
@@ -258,7 +258,7 @@ pnpm --filter @workspace/home run build
 pnpm --filter @workspace/api-server run typecheck
 pnpm --filter @workspace/api-server run build
 
-# Full workspace typecheck (includes libraries, scripts, and all artifacts)
+# Release gate: full workspace typecheck (includes libraries, scripts, and all artifacts)
 pnpm run typecheck
 ```
 
@@ -266,7 +266,11 @@ This is a native PowerShell install: it does not require Git Bash, MSYS2, or
 `--ignore-scripts`. The checked-in lockfile includes the Linux/Replit and
 Windows x64 native packages needed by esbuild, Rollup, Lightning CSS, and
 Tailwind. The API workspace development script is also Node-launched rather
-than relying on a POSIX `export` command.
+than relying on a POSIX `export` command. The root `pnpm run typecheck` command
+is the authoritative release check; the project-level commands above are
+diagnostic checks for the two Windows dashboard services and do not replace
+the full workspace gate.
+
 ## 8. Stop and restart
 
 Stop the foreground bot with `Ctrl+C`. Restart it with the same command:
@@ -299,6 +303,7 @@ settings are verified:
    external webhook traffic.
 
 Do not enable automatic live execution as part of startup setup.
+
 ## Replit-specific dependencies and blockers
 
 The Flask bot itself can run locally, but the following current features are
