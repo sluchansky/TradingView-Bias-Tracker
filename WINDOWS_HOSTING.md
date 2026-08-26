@@ -251,10 +251,15 @@ corepack enable
 # The repository pins pnpm 10.26.1 in package.json.
 corepack prepare pnpm@10.26.1 --activate
 pnpm install --frozen-lockfile
+
+# Project-level checks for the Windows dashboard services
 pnpm --filter @workspace/home run typecheck
 pnpm --filter @workspace/home run build
 pnpm --filter @workspace/api-server run typecheck
 pnpm --filter @workspace/api-server run build
+
+# Full workspace typecheck (includes libraries, scripts, and all artifacts)
+pnpm run typecheck
 ```
 
 This is a native PowerShell install: it does not require Git Bash, MSYS2, or

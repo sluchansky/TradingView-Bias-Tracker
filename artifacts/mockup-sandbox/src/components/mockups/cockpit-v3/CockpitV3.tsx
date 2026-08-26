@@ -1058,7 +1058,7 @@ export function CockpitV3() {
                 gap: "8px",
               }}
             >
-              <Label>Gate breakdown — {activeTicker}</Label>
+              <Label>{`Gate breakdown — ${activeTicker}`}</Label>
               <div style={{ height: "12px" }} />
               {diagItems.length === 0 ? (
                 <div style={{ fontSize: "12px", color: C.textFaint }}>
