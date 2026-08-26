@@ -4660,6 +4660,194 @@ const TrainingStat: React.FC<{ label: string; value: React.ReactNode; color?: st
   </div>
 );
 
+type PaperSimUnresolvedRow = {
+  id: number;
+  ledger: 'scalp' | 'dual';
+  strategy_key?: string | null;
+  mode?: string | null;
+  instrument?: string | null;
+  direction?: string | null;
+  unresolved_reason?: string | null;
+  unresolved_age_hours?: number | null;
+  max_hold_hours?: number | null;
+  unresolved_at?: string | null;
+  resolution_audit?: JsonRecord[];
+  reprocess_available?: boolean;
+  reprocess_blocked_reason?: string | null;
+};
+
+const PaperSimulationRepairPanel: React.FC<{ authHeader: string }> = ({ authHeader }) => {
+  const [rows, setRows] = React.useState<PaperSimUnresolvedRow[]>([]);
+  const [loading, setLoading] = React.useState(true);
+  const [repairAvailable, setRepairAvailable] = React.useState(true);
+  const [selectedKey, setSelectedKey] = React.useState('');
+  const [barsText, setBarsText] = React.useState('');
+  const [submitting, setSubmitting] = React.useState(false);
+  const [message, setMessage] = React.useState<{ text: string; ok: boolean } | null>(null);
+
+  const load = React.useCallback(async () => {
+    setLoading(true);
+    try {
+      const response = await getReadOnlyJson('/api/paper-sim/unresolved?limit=50', authHeader);
+      setRows(Array.isArray(response?.rows) ? response.rows as PaperSimUnresolvedRow[] : []);
+      setRepairAvailable(response?.reprocess_available !== false);
+    } finally {
+      setLoading(false);
+    }
+  }, [authHeader]);
+
+  React.useEffect(() => {
+    load();
+    const id = window.setInterval(load, 30_000);
+    return () => window.clearInterval(id);
+  }, [load]);
+
+  const selected = rows.find(row => `${row.ledger}:${row.id}` === selectedKey) ?? null;
+
+  const reprocess = async () => {
+    if (!selected) return;
+    let bars: unknown[] | null = null;
+    if (barsText.trim()) {
+      try {
+        const parsed = JSON.parse(barsText);
+        const parsedBars = Array.isArray(parsed) ? parsed : (parsed as JsonRecord)?.bars;
+        if (!Array.isArray(parsedBars) || parsedBars.length === 0) throw new Error('empty bars');
+        bars = parsedBars;
+      } catch {
+        setMessage({ ok: false, text: 'Paste a non-empty JSON array of verified historical-bar references.' });
+        return;
+      }
+    }
+    if (!window.confirm(
+      bars
+        ? `Reprocess ${selected.ledger} paper simulation #${selected.id} with ${bars.length} server-verified historical references? This changes only the research simulation row.`
+        : `Fetch the bounded Databento historical window and reprocess ${selected.ledger} paper simulation #${selected.id}? This changes only the research simulation row.`
+    )) return;
+    setSubmitting(true);
+    setMessage(null);
+    try {
+      const response = await fetch('/api/paper-sim/reprocess', {
+        method: 'POST',
+        credentials: 'include',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(authHeader ? { Authorization: authHeader } : {}),
+        },
+        body: JSON.stringify(bars ? {
+          ledger: selected.ledger,
+          id: selected.id,
+          verified: true,
+          source: 'databento_historical_verified',
+          bars,
+        } : {
+          ledger: selected.ledger,
+          id: selected.id,
+          fetch_verified_history: true,
+        }),
+      });
+      const result = await response.json().catch(() => ({})) as JsonRecord;
+      if (!response.ok || result.ok !== true) {
+        setMessage({ ok: false, text: safeStr(result.error, 'Historical reprocess was rejected.') });
+      } else if (result.processed === true) {
+        setMessage({ ok: true, text: `Resolved as ${safeStr(result.result)}. Original unresolved audit preserved.` });
+        setBarsText('');
+        setSelectedKey('');
+      } else if (result.idempotent === true) {
+        setMessage({ ok: true, text: 'This verified history batch was already processed; no duplicate write was made.' });
+      } else {
+        setMessage({ ok: false, text: `Still unresolved: ${safeStr(result.reason, 'no deterministic outcome')}. The attempt was recorded once.` });
+      }
+      await load();
+    } catch {
+      setMessage({ ok: false, text: 'Could not reach the paper-simulation repair endpoint.' });
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Panel
+      title="Unresolved paper simulations"
+      badge={<Badge label={!repairAvailable ? 'STORE UNAVAILABLE' : rows.length ? `${rows.length} REVIEW` : 'CLEAR'} color={!repairAvailable || rows.length ? T.amber : T.green} />}
+    >
+      <div style={{ padding: 12 }}>
+        <div style={{ marginBottom: 10, padding: '7px 9px', borderRadius: 6, background: `${T.cyan}0d`, border: `1px solid ${T.cyan}25`, color: T.txtMuted, fontSize: 9.5 }}>
+          Research-only repair. Submitted items are references only: the server loads price and continuity data from its persisted verified Databento history, writes only the selected simulation row, and preserves the original unresolved audit.
+        </div>
+        {!repairAvailable && (
+          <div style={{ marginBottom: 10, padding: '7px 9px', borderRadius: 6, background: `${T.amber}10`, border: `1px solid ${T.amber}35`, color: T.amber, fontSize: 9.5 }}>
+            Repair is unavailable until the verified historical-bar store is present and healthy. Review metadata remains read-only.
+          </div>
+        )}
+        {loading ? (
+          <div style={{ color: T.txtMuted, fontSize: 10 }}>Loading unresolved simulations…</div>
+        ) : rows.length === 0 ? (
+          <div style={{ color: T.green, fontSize: 10 }}>No unresolved paper simulations need operator review.</div>
+        ) : (
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+            {rows.map(row => {
+              const key = `${row.ledger}:${row.id}`;
+              const selectedRow = selectedKey === key;
+              const age = safeNum(row.unresolved_age_hours);
+              const maxHold = safeNum(row.max_hold_hours);
+              return (
+                <div key={key} style={{ border: `1px solid ${selectedRow ? `${T.cyan}55` : T.border}`, borderRadius: 7, background: selectedRow ? `${T.cyan}08` : T.panelAlt }}>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setSelectedKey(selectedRow ? '' : key);
+                      setBarsText('');
+                      setMessage(null);
+                    }}
+                    style={{ width: '100%', padding: '8px 10px', border: 0, background: 'transparent', color: T.txtSec, cursor: 'pointer', textAlign: 'left' }}
+                  >
+                    <div style={{ display: 'flex', justifyContent: 'space-between', gap: 10, marginBottom: 4 }}>
+                      <strong style={{ fontSize: 10, color: T.txtPri }}>
+                        {row.ledger.toUpperCase()} #{row.id} · {safeStr(row.instrument)} {safeStr(row.direction)}
+                      </strong>
+                      <span style={{ color: T.txtMuted, fontSize: 9 }}>{fmtAge(row.unresolved_at)}</span>
+                    </div>
+                    <div style={{ display: 'flex', flexWrap: 'wrap', gap: 10, fontSize: 9 }}>
+                      <span><span style={{ color: T.txtMuted }}>Reason:</span> <span style={{ color: T.amber }}>{safeStr(row.unresolved_reason)}</span></span>
+                      <span><span style={{ color: T.txtMuted }}>Age at resolution:</span> {age == null ? '—' : `${age.toFixed(2)}h`}</span>
+                      <span><span style={{ color: T.txtMuted }}>Max hold:</span> {maxHold == null ? '—' : `${maxHold}h`}</span>
+                      <span><span style={{ color: T.txtMuted }}>Audit:</span> {Array.isArray(row.resolution_audit) ? row.resolution_audit.length : 0} event(s)</span>
+                    </div>
+                  </button>
+                  {selectedRow && (
+                    <div style={{ borderTop: `1px solid ${T.border}`, padding: 10 }}>
+                      <div style={{ color: T.txtMuted, fontSize: 9, marginBottom: 6 }}>
+                        Leave this blank to fetch the bounded Databento historical window now. Or paste references from an already completed verified backfill. Server-held OHLC and capture continuity remain authoritative.
+                      </div>
+                      <textarea
+                        value={barsText}
+                        onChange={event => setBarsText(event.target.value)}
+                        placeholder='[{"instrument":"MGC","start":"2026-08-26T13:31:00Z","source":"databento_historical_verified","capture_kind":"historical_verified"}]'
+                        rows={5}
+                        style={{ width: '100%', boxSizing: 'border-box', resize: 'vertical', padding: 8, borderRadius: 6, border: `1px solid ${T.borderMid}`, background: T.bg, color: T.txtSec, fontFamily: T.mono, fontSize: 9 }}
+                      />
+                      <div style={{ display: 'flex', justifyContent: 'flex-end', marginTop: 7 }}>
+                        <button type="button" disabled={!repairAvailable || submitting} onClick={reprocess} style={{ padding: '6px 10px', borderRadius: 6, border: `1px solid ${T.cyan}55`, background: `${T.cyan}18`, color: T.cyan, cursor: submitting ? 'wait' : 'pointer', opacity: !repairAvailable || submitting ? 0.5 : 1, fontSize: 9.5, fontWeight: 700 }}>
+                          {submitting ? 'REPROCESSING…' : barsText.trim() ? 'REPROCESS VERIFIED REFERENCES' : 'FETCH DATABENTO & REPROCESS'}
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
+        )}
+        {message && (
+          <div role="status" style={{ marginTop: 9, padding: '7px 9px', borderRadius: 6, background: `${message.ok ? T.green : T.amber}12`, color: message.ok ? T.green : T.amber, fontSize: 9.5 }}>
+            {message.text}
+          </div>
+        )}
+      </div>
+    </Panel>
+  );
+};
+
 const CanonicalEvidenceHealthPanel: React.FC<{
   mode: string;
   health: JsonRecord | null;
@@ -5162,6 +5350,9 @@ const TrainingInfrastructurePanel: React.FC<{ authHeader: string }> = ({ authHea
         <TrainingStat label="Edge ledger" value={edge.table_ready === true ? 'READY' : 'PENDING'} color={edge.table_ready === true ? T.green : T.amber} />
         <TrainingStat label="Coordinator" value={coordinator.enabled === true ? 'INTAKE ON' : 'OFF'} color={coordinator.enabled === true ? T.cyan : T.txtMuted} />
         <TrainingStat label="Fan-out" value={coordinator.fanout_enabled === true ? 'ON' : 'OFF'} color={coordinator.fanout_enabled === true ? T.red : T.green} />
+      </div>
+      <div style={{ marginBottom: 10 }}>
+        <PaperSimulationRepairPanel authHeader={authHeader} />
       </div>
       <Panel title="Persistent Market Student" badge={<Badge label={student.money_path === 'isolated' ? 'RESEARCH ONLY' : 'PENDING'} color={student.money_path === 'isolated' ? T.green : T.amber} />}>
         <div style={{ padding: 12, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(0, 1fr))', gap: 8 }}>

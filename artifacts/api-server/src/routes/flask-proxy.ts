@@ -308,6 +308,12 @@ export const BOT1_ROUTES = [
   // dashboard-auth OPEN_PATHS). GET = cached research view; POST = trigger recompute.
   // Walled off from the live money path — new strategies never auto-trade live.
   "/scalp-research",
+  // Paper-simulation review/repair (owner-only; RESEARCH-ONLY). The queue reads
+  // unresolved rows from the two isolated sim ledgers. Reprocess accepts only
+  // server-validated historical Databento bars and never reaches live/learning
+  // ledgers.
+  "/paper-sim/unresolved",
+  "/paper-sim/reprocess",
   // AutoSearch — Karpathy-style hypothesis training loop (owner-only;
   // RESEARCH/DISPLAY-ONLY; NOT in dashboard-auth OPEN_PATHS). Generate hypotheses
   // from trade history, score historically, ghost-validate forward, manually promote

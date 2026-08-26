@@ -9,6 +9,7 @@ import queue
 import contextlib
 import copy
 import json
+import hashlib
 from collections import deque
 from datetime import datetime, timezone, timedelta, date
 from zoneinfo import ZoneInfo
@@ -48839,6 +48840,42 @@ SCALP_SIM_MIN_LIVE_PROMO  = max(1, int(os.environ.get("SCALP_SIM_MIN_LIVE_PROMO"
 _SCALP_SIM_COOLDOWN       = {}                  # (strategy_key,inst,direction) -> monotonic ts
 _SCALP_SIM_COOLDOWN_LOCK  = threading.Lock()
 
+# Operator repair is deliberately narrower than the live watcher.  A repair
+# batch must be explicitly identified as a verified historical Databento
+# backfill and must carry the same capture identity/sequence metadata used by
+# the durable live-bar resolver.  This is a research-only write to the
+# originating simulation row; it never enters the live or learning ledgers.
+PAPER_SIM_HISTORICAL_SOURCE = "databento_historical_verified"
+PAPER_SIM_REPAIR_MAX_BARS = max(
+    1, int(os.environ.get("PAPER_SIM_REPAIR_MAX_BARS", "10000"))
+)
+PAPER_SIM_HISTORICAL_LAG_HOURS = max(
+    1.0, float(os.environ.get("PAPER_SIM_HISTORICAL_LAG_HOURS", "5"))
+)
+_PAPER_SIM_REPAIR_LEDGER = {
+    "scalp": {
+        "table": "scalp_strategy_sim_trades",
+        "ready": "SCALP_SIM_DB_READY",
+        "max_hold": "SCALP_SIM_MAX_HOLD_HOURS",
+        "strategy_field": "strategy_key",
+        "outcome": "_scalp_sim_outcome",
+    },
+    "dual": {
+        "table": "dual_sim_trades",
+        "ready": "DUAL_SIM_DB_READY",
+        "max_hold": "DUAL_SIM_MAX_HOLD_HOURS",
+        "strategy_field": "mode",
+        "outcome": "_dual_sim_outcome",
+    },
+}
+
+
+class _VerifiedHistoricalBatch:
+    """Server-only carrier; request JSON can never construct this authority."""
+
+    def __init__(self, bars):
+        self.bars = tuple(copy.deepcopy(bars))
+
 
 def _check_scalp_sim_db_ready():
     """Probe scalp_strategy_sim_trades (no DDL) and set SCALP_SIM_DB_READY. FAIL-
@@ -50334,6 +50371,725 @@ def _paper_sim_history_gap(row, history):
     """Compatibility predicate for any untrusted post-entry history boundary."""
     _trusted, reason = _paper_sim_trusted_history(row, history)
     return reason is not None
+
+
+def _paper_sim_historical_epoch(value):
+    """Normalize a historical-bar timestamp to epoch seconds without guessing."""
+    if isinstance(value, datetime):
+        dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    if isinstance(value, str):
+        raw = value.strip()
+        if not raw:
+            return None
+        try:
+            return datetime.fromisoformat(raw.replace("Z", "+00:00")).timestamp()
+        except (TypeError, ValueError, OverflowError):
+            return None
+    try:
+        return float(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def _validate_verified_historical_bars(payload, instrument=None):
+    """Validate references to a server-persisted historical backfill.
+
+    Client-supplied OHLC is never authoritative.  Each item must identify an
+    exact bar previously stored by the server with verified Databento
+    provenance.  The database loader below supplies all price and continuity
+    fields used for resolution.
+
+    Returns ``(references, None)`` when valid, or ``([], reason)``.
+    """
+    if not isinstance(payload, dict) or payload.get("verified") is not True:
+        return [], "historical_bars_not_verified"
+    if payload.get("source") != PAPER_SIM_HISTORICAL_SOURCE:
+        return [], "historical_bar_source_not_verified"
+    raw_bars = payload.get("bars")
+    if not isinstance(raw_bars, list) or not raw_bars:
+        return [], "historical_bars_missing"
+    if len(raw_bars) > PAPER_SIM_REPAIR_MAX_BARS:
+        return [], "historical_bars_limit_exceeded"
+    expected_inst = str(instrument or "").strip().upper() or None
+    references = []
+    seen_starts = set()
+    for raw in raw_bars:
+        if not isinstance(raw, dict):
+            return [], "historical_bar_invalid"
+        if raw.get("source") != PAPER_SIM_HISTORICAL_SOURCE:
+            return [], "historical_bar_source_not_verified"
+        if raw.get("capture_kind") != "historical_verified":
+            return [], "historical_bar_not_historical"
+        raw_inst = str(raw.get("instrument") or raw.get("symbol") or "").strip().upper()
+        if not raw_inst:
+            return [], "historical_bar_instrument_missing"
+        if expected_inst and raw_inst != expected_inst:
+            return [], "historical_bar_instrument_mismatch"
+        start = _paper_sim_historical_epoch(raw.get("start", raw.get("ts")))
+        if start is None:
+            return [], "historical_bar_invalid"
+        start_key = round(start, 6)
+        if start_key in seen_starts:
+            return [], "historical_bar_duplicate"
+        seen_starts.add(start_key)
+        references.append({
+            "instrument": raw_inst,
+            "start": float(start),
+            "capture_kind": "historical_verified",
+            "source": PAPER_SIM_HISTORICAL_SOURCE,
+        })
+    references.sort(key=lambda bar: bar["start"])
+    return references, None
+
+
+def _load_server_verified_historical_bars(cur, payload, instrument):
+    """Load authoritative OHLC/continuity data for validated bar references."""
+    references, error = _validate_verified_historical_bars(payload, instrument)
+    if error:
+        return [], error
+    starts = [
+        datetime.fromtimestamp(item["start"], tz=timezone.utc)
+        for item in references
+    ]
+    cur.execute(
+        "SELECT instrument, bar_start, open, high, low, close, volume, source, "
+        "capture_session_id, capture_session_started_at, capture_sequence "
+        "FROM paper_sim_market_bars "
+        "WHERE instrument=%s AND source=%s AND bar_start = ANY(%s) "
+        "ORDER BY bar_start ASC",
+        (str(instrument).upper(), PAPER_SIM_HISTORICAL_SOURCE, starts),
+    )
+    stored = cur.fetchall()
+    if len(stored) != len(references):
+        return [], "historical_bar_not_server_verified"
+    bars = []
+    for raw in stored:
+        (
+            stored_inst, bar_start, open_, high, low, close, volume, source,
+            session_id, session_started, sequence,
+        ) = raw
+        if (
+            str(stored_inst).upper() != str(instrument).upper()
+            or source != PAPER_SIM_HISTORICAL_SOURCE
+        ):
+            return [], "historical_bar_not_server_verified"
+        start = _paper_sim_historical_epoch(bar_start)
+        session_started_epoch = _paper_sim_historical_epoch(session_started)
+        try:
+            bar = {
+                "instrument": str(stored_inst).upper(),
+                "start": float(start),
+                "open": float(open_),
+                "high": float(high),
+                "low": float(low),
+                "close": float(close),
+                "volume": max(0, int(volume or 0)),
+                "source": source,
+                "capture_kind": "historical_verified",
+                "capture_session_id": str(session_id),
+                "capture_session_started_at": float(session_started_epoch),
+                "capture_sequence": int(sequence),
+            }
+        except (TypeError, ValueError, OverflowError):
+            return [], "historical_bar_server_record_invalid"
+        if (
+            start is None or session_started_epoch is None
+            or not bar["capture_session_id"] or bar["capture_sequence"] < 1
+            or bar["high"] < bar["low"]
+            or not (
+                bar["low"] <= bar["open"] <= bar["high"]
+                and bar["low"] <= bar["close"] <= bar["high"]
+            )
+        ):
+            return [], "historical_bar_server_record_invalid"
+        bars.append(bar)
+    if [round(bar["start"], 6) for bar in bars] != [
+        round(item["start"], 6) for item in references
+    ]:
+        return [], "historical_bar_reference_mismatch"
+    return bars, None
+
+
+def _paper_sim_download_verified_history(
+    instrument, start_epoch, end_epoch, historical_client=None
+):
+    """Fetch Databento OHLCV and immutably persist a verified repair backfill."""
+    if not PAPER_SIM_BARS_DB_READY:
+        return [], "verified_historical_bar_store_unavailable"
+    try:
+        from databento_brain import DB_DATASET, DB_SYMBOLS  # noqa: PLC0415
+        import databento as _db  # noqa: PLC0415
+        inst = str(instrument or "").upper().strip()
+        symbol = DB_SYMBOLS.get(inst)
+        start_epoch = float(start_epoch)
+        end_epoch = float(end_epoch)
+    except (TypeError, ValueError, OverflowError, ImportError):
+        return [], "historical_backfill_request_invalid"
+    if not symbol or end_epoch <= start_epoch:
+        return [], "historical_backfill_request_invalid"
+    if end_epoch - start_epoch > 7 * 24 * 3600:
+        return [], "historical_backfill_range_too_large"
+    if historical_client is None:
+        api_key = os.environ.get("DATABENTO_API_KEY", "").strip()
+        if not api_key:
+            return [], "databento_historical_unavailable"
+        historical_client = _db.Historical(key=api_key)
+    start_dt = datetime.fromtimestamp(start_epoch, tz=timezone.utc)
+    end_dt = datetime.fromtimestamp(end_epoch, tz=timezone.utc)
+    try:
+        store = historical_client.timeseries.get_range(
+            dataset=DB_DATASET,
+            symbols=[symbol],
+            schema="ohlcv-1m",
+            stype_in="continuous",
+            start=start_dt.isoformat(),
+            end=end_dt.isoformat(),
+        )
+        df = store.to_df(
+            price_type="float", pretty_ts=True, map_symbols=True, tz="UTC"
+        )
+    except Exception as exc:
+        logger.warning("paper-sim Databento historical fetch failed for %s: %s", inst, exc)
+        return [], "databento_historical_fetch_failed"
+    records = []
+    for ts_idx, row in df.iterrows():
+        try:
+            bar_start = ts_idx.to_pydatetime() if hasattr(ts_idx, "to_pydatetime") else ts_idx
+            if not isinstance(bar_start, datetime):
+                bar_start = datetime.fromtimestamp(float(ts_idx) / 1e9, tz=timezone.utc)
+            elif not bar_start.tzinfo:
+                bar_start = bar_start.replace(tzinfo=timezone.utc)
+            bar_epoch = bar_start.timestamp()
+            open_ = float(row.get("open"))
+            high = float(row.get("high"))
+            low = float(row.get("low"))
+            close = float(row.get("close"))
+            volume = max(0, int(row.get("volume") or 0))
+        except (TypeError, ValueError, OverflowError, OSError):
+            return [], "databento_historical_record_invalid"
+        if (
+            bar_epoch < start_epoch or bar_epoch >= end_epoch
+            or not all(math.isfinite(value) for value in (open_, high, low, close))
+            or high < low or open_ <= 0 or close <= 0
+            or not (low <= open_ <= high and low <= close <= high)
+        ):
+            return [], "databento_historical_record_invalid"
+        records.append((bar_start.astimezone(timezone.utc), open_, high, low, close, volume))
+    records.sort(key=lambda item: item[0])
+    if not records:
+        return [], "databento_historical_no_bars"
+    if len(records) > PAPER_SIM_REPAIR_MAX_BARS:
+        return [], "historical_bars_limit_exceeded"
+    if any(records[i][0] >= records[i + 1][0] for i in range(len(records) - 1)):
+        return [], "databento_historical_record_order_invalid"
+    # Identity must remain stable as the historical API's lag window advances.
+    # The same repair can therefore append later bars without conflicting with
+    # already-verified prefix rows from an earlier attempt.
+    session_key = f"{inst}|{symbol}|{start_dt.isoformat()}"
+    session_id = "db-hist-" + hashlib.sha256(session_key.encode("utf-8")).hexdigest()[:32]
+    expected_bars = [
+        {
+            "instrument": inst,
+            "start": bar_start.timestamp(),
+            "open": open_,
+            "high": high,
+            "low": low,
+            "close": close,
+            "volume": volume,
+            "source": PAPER_SIM_HISTORICAL_SOURCE,
+            "capture_kind": "historical_verified",
+            "capture_session_id": session_id,
+            "capture_session_started_at": start_epoch,
+            "capture_sequence": sequence,
+        }
+        for sequence, (bar_start, open_, high, low, close, volume)
+        in enumerate(records, start=1)
+    ]
+    conn = _learning_conn()
+    if conn is None:
+        return [], "db_unavailable"
+    try:
+        with conn.cursor() as cur:
+            cur.executemany(
+                "INSERT INTO paper_sim_market_bars "
+                "(instrument, bar_start, open, high, low, close, volume, source, "
+                "capture_session_id, capture_session_started_at, capture_sequence) "
+                "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) "
+                "ON CONFLICT (instrument, bar_start) DO NOTHING",
+                [
+                    (
+                        inst, bar_start, open_, high, low, close, volume,
+                        PAPER_SIM_HISTORICAL_SOURCE, session_id, start_dt, sequence,
+                    )
+                    for sequence, (bar_start, open_, high, low, close, volume)
+                    in enumerate(records, start=1)
+                ],
+            )
+            references = [
+                {
+                    "instrument": inst,
+                    "start": bar["start"],
+                    "source": PAPER_SIM_HISTORICAL_SOURCE,
+                    "capture_kind": "historical_verified",
+                }
+                for bar in expected_bars
+            ]
+            persisted_bars, persisted_error = _load_server_verified_historical_bars(
+                cur,
+                {
+                    "verified": True,
+                    "source": PAPER_SIM_HISTORICAL_SOURCE,
+                    "bars": references,
+                },
+                inst,
+            )
+            if persisted_error or persisted_bars != expected_bars:
+                raise ValueError("historical_backfill_persistence_conflict")
+        conn.commit()
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("paper-sim verified historical persist failed for %s: %s", inst, exc)
+        return [], "historical_backfill_persist_failed"
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    return _VerifiedHistoricalBatch(persisted_bars), None
+
+
+def _paper_sim_prepare_verified_backfill(ledger, row_id):
+    """Fetch the bounded historical interval needed by one unresolved row."""
+    cfg = _PAPER_SIM_REPAIR_LEDGER.get(ledger)
+    if cfg is None:
+        return None, "invalid_ledger", 400
+    if not PAPER_SIM_BARS_DB_READY:
+        return None, "verified_historical_bar_store_unavailable", 503
+    conn = _learning_conn()
+    if conn is None:
+        return None, "db_unavailable", 503
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT symbol, status, entry_epoch, opened_at "
+                "FROM %s WHERE id=%%s" % cfg["table"],
+                (row_id,),
+            )
+            raw = cur.fetchone()
+    except Exception as exc:
+        logger.warning("paper-sim backfill row read failed (%s/%s): %s", ledger, row_id, exc)
+        return None, "paper_sim_backfill_prepare_failed", 500
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+    if not raw:
+        return None, "paper_sim_not_found", 404
+    instrument, status, entry_epoch, opened_at = raw
+    if status != "unresolved":
+        return None, "paper_sim_already_resolved", 409
+    marker = _paper_sim_historical_epoch(entry_epoch)
+    if marker is None:
+        marker = _paper_sim_historical_epoch(opened_at)
+    if marker is None:
+        return None, "market_history_marker_unavailable", 422
+    start_epoch = marker - 60.0
+    desired_end = marker + float(globals().get(cfg["max_hold"], 0) or 0) * 3600 + 60.0
+    available_end = now_utc().timestamp() - PAPER_SIM_HISTORICAL_LAG_HOURS * 3600
+    end_epoch = min(desired_end, available_end)
+    if end_epoch <= marker:
+        return None, "databento_historical_window_not_available_yet", 409
+    batch, error = _paper_sim_download_verified_history(
+        instrument, start_epoch, end_epoch
+    )
+    if error:
+        return None, error, 503 if "unavailable" in error else 422
+    return batch, None, 200
+
+
+def _paper_sim_repair_fingerprint(bars):
+    """Stable identity for idempotent reprocess attempts."""
+    encoded = json.dumps(
+        bars, sort_keys=True, separators=(",", ":"), ensure_ascii=True
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _paper_sim_context(value):
+    if isinstance(value, dict):
+        return copy.deepcopy(value)
+    try:
+        decoded = json.loads(value) if isinstance(value, str) else value
+        return copy.deepcopy(decoded) if isinstance(decoded, dict) else {}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+
+
+def _paper_sim_iso(value):
+    return value.isoformat() if hasattr(value, "isoformat") else value
+
+
+def _paper_sim_unresolved_view(row, ledger, max_hold_hours):
+    """Project one unresolved sim row into a research-safe operator contract."""
+    context = _paper_sim_context(row.get("context"))
+    health = context.get("resolution_health")
+    health = health if isinstance(health, dict) else {}
+    audit = context.get("resolution_audit")
+    audit = audit if isinstance(audit, list) else []
+    age = health.get("age_hours")
+    if age is None:
+        age = _paper_sim_age_hours(row)
+    try:
+        age = round(float(age), 3) if age is not None else None
+    except (TypeError, ValueError):
+        age = None
+    return {
+        "id": row.get("id"),
+        "ledger": ledger,
+        "strategy_key": row.get("strategy_key"),
+        "mode": row.get("mode"),
+        "instrument": row.get("symbol"),
+        "direction": row.get("direction"),
+        "entry": row.get("entry"),
+        "stop": row.get("stop"),
+        "target": row.get("target"),
+        "opened_at": _paper_sim_iso(row.get("opened_at")),
+        "unresolved_at": _paper_sim_iso(row.get("closed_at")),
+        "unresolved_reason": health.get("reason") or "unknown",
+        "unresolved_age_hours": age,
+        "max_hold_hours": max_hold_hours,
+        "resolution_health": health,
+        "resolution_audit": audit,
+        "reprocess_attempts": len([
+            item for item in audit
+            if isinstance(item, dict) and item.get("event") == "reprocess"
+        ]),
+        "research_only": True,
+        "reprocess_available": bool(PAPER_SIM_BARS_DB_READY),
+        "reprocess_blocked_reason": (
+            None if PAPER_SIM_BARS_DB_READY
+            else "verified_historical_bar_store_unavailable"
+        ),
+    }
+
+
+def _paper_sim_unresolved_rows(ledger="all", instrument=None, limit=50):
+    """Read unresolved rows from only the two paper-simulation ledgers."""
+    ledgers = (
+        list(_PAPER_SIM_REPAIR_LEDGER)
+        if ledger == "all" else [ledger]
+    )
+    rows = []
+    for name in ledgers:
+        cfg = _PAPER_SIM_REPAIR_LEDGER[name]
+        if not bool(globals().get(cfg["ready"], False)):
+            continue
+        conn = _learning_conn()
+        if conn is None:
+            continue
+        try:
+            with conn.cursor() as cur:
+                if name == "scalp":
+                    cur.execute(
+                        "SELECT id, strategy_key, symbol, direction, status, entry, "
+                        "stop, target, rr, opened_at, closed_at, context "
+                        "FROM scalp_strategy_sim_trades "
+                        "WHERE status='unresolved' "
+                        "AND (%s IS NULL OR symbol=%s) "
+                        "ORDER BY closed_at DESC NULLS LAST, id DESC LIMIT %s",
+                        (instrument, instrument, limit),
+                    )
+                    cols = (
+                        "id", "strategy_key", "symbol", "direction", "status",
+                        "entry", "stop", "target", "rr", "opened_at",
+                        "closed_at", "context",
+                    )
+                else:
+                    cur.execute(
+                        "SELECT id, mode, symbol, direction, status, entry, stop, "
+                        "target, rr, opened_at, closed_at, context "
+                        "FROM dual_sim_trades "
+                        "WHERE status='unresolved' "
+                        "AND (%s IS NULL OR symbol=%s) "
+                        "ORDER BY closed_at DESC NULLS LAST, id DESC LIMIT %s",
+                        (instrument, instrument, limit),
+                    )
+                    cols = (
+                        "id", "mode", "symbol", "direction", "status", "entry",
+                        "stop", "target", "rr", "opened_at", "closed_at",
+                        "context",
+                    )
+                for raw in cur.fetchall():
+                    row = dict(zip(cols, raw))
+                    for key in ("entry", "stop", "target", "rr"):
+                        if row.get(key) is not None:
+                            try:
+                                row[key] = float(row[key])
+                            except (TypeError, ValueError):
+                                row[key] = None
+                    rows.append(_paper_sim_unresolved_view(
+                        row, name, int(globals().get(cfg["max_hold"], 0) or 0)
+                    ))
+        except Exception as exc:
+            logger.warning("paper-sim unresolved read failed (%s): %s", name, exc)
+        finally:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    rows.sort(key=lambda row: str(row.get("unresolved_at") or ""), reverse=True)
+    return rows[:limit]
+
+
+def _paper_sim_reprocess_unresolved(ledger, row_id, payload):
+    """Safely reprocess one terminal row using verified historical bars only.
+
+    This function intentionally does not call either ``*_sim_close`` helper:
+    those normal watcher helpers also publish an outcome to the Market Student
+    learning ledger.  Repair is a research correction and must remain isolated.
+    """
+    cfg = _PAPER_SIM_REPAIR_LEDGER.get(ledger)
+    if cfg is None:
+        return {"ok": False, "status_code": 400, "error": "invalid_ledger"}
+    try:
+        row_id = int(row_id)
+    except (TypeError, ValueError):
+        return {"ok": False, "status_code": 400, "error": "invalid_id"}
+    if not bool(globals().get(cfg["ready"], False)):
+        return {"ok": False, "status_code": 503, "error": "paper_sim_db_not_ready"}
+    if not PAPER_SIM_BARS_DB_READY:
+        return {
+            "ok": False, "status_code": 503,
+            "error": "verified_historical_bar_store_unavailable",
+            "research_only": True,
+        }
+    if isinstance(payload, dict) and payload.get("fetch_verified_history") is True:
+        prepared, prepare_error, prepare_status = _paper_sim_prepare_verified_backfill(
+            ledger, row_id
+        )
+        if prepare_error:
+            return {
+                "ok": False, "status_code": prepare_status,
+                "error": prepare_error, "research_only": True,
+            }
+        payload = prepared
+
+    conn = _learning_conn()
+    if conn is None:
+        return {"ok": False, "status_code": 503, "error": "db_unavailable"}
+    try:
+        with conn.cursor() as cur:
+            if ledger == "scalp":
+                cur.execute(
+                    "SELECT id, strategy_key, symbol, direction, status, entry, stop, "
+                    "target, rr, entry_epoch, opened_at, closed_at, context "
+                    "FROM scalp_strategy_sim_trades WHERE id=%s FOR UPDATE",
+                    (row_id,),
+                )
+                cols = (
+                    "id", "strategy_key", "symbol", "direction", "status", "entry",
+                    "stop", "target", "rr", "entry_epoch", "opened_at",
+                    "closed_at", "context",
+                )
+            else:
+                cur.execute(
+                    "SELECT id, mode, symbol, direction, status, entry, stop, target, "
+                    "rr, entry_epoch, opened_at, closed_at, context "
+                    "FROM dual_sim_trades WHERE id=%s FOR UPDATE",
+                    (row_id,),
+                )
+                cols = (
+                    "id", "mode", "symbol", "direction", "status", "entry", "stop",
+                    "target", "rr", "entry_epoch", "opened_at", "closed_at",
+                    "context",
+                )
+            raw = cur.fetchone()
+            if not raw:
+                conn.rollback()
+                return {"ok": False, "status_code": 404, "error": "paper_sim_not_found"}
+            row = dict(zip(cols, raw))
+            if row.get("status") != "unresolved":
+                conn.rollback()
+                return {
+                    "ok": True, "id": row_id, "ledger": ledger,
+                    "status": row.get("status"), "processed": False,
+                    "idempotent": True, "research_only": True,
+                }
+            if isinstance(payload, _VerifiedHistoricalBatch):
+                bars, validation_error = list(payload.bars), None
+            else:
+                bars, validation_error = _load_server_verified_historical_bars(
+                    cur, payload, row.get("symbol")
+                )
+            if validation_error:
+                conn.rollback()
+                return {
+                    "ok": False, "status_code": 422, "error": validation_error,
+                    "id": row_id, "ledger": ledger, "research_only": True,
+                }
+            context = _paper_sim_context(row.get("context"))
+            fingerprint = _paper_sim_repair_fingerprint(bars)
+            audit = context.get("resolution_audit")
+            audit = list(audit) if isinstance(audit, list) else []
+            health = context.get("resolution_health")
+            health = health if isinstance(health, dict) else {}
+            if not any(
+                isinstance(item, dict)
+                and item.get("event") == "unresolved_terminalized"
+                for item in audit
+            ):
+                audit.insert(0, {
+                    "event": "unresolved_terminalized",
+                    "status": "unresolved",
+                    "reason": health.get("reason") or "unknown",
+                    "age_hours": health.get("age_hours"),
+                    "max_hold_hours": health.get("max_hold_hours"),
+                    "at": _paper_sim_iso(row.get("closed_at")),
+                })
+            if any(
+                isinstance(item, dict)
+                and item.get("event") == "reprocess"
+                and item.get("fingerprint") == fingerprint
+                for item in audit
+            ):
+                conn.rollback()
+                return {
+                    "ok": True, "id": row_id, "ledger": ledger,
+                    "status": "unresolved", "processed": False,
+                    "idempotent": True, "research_only": True,
+                }
+
+            sim_row = {
+                **row,
+                "entry": float(row["entry"]) if row.get("entry") is not None else None,
+                "stop": float(row["stop"]) if row.get("stop") is not None else None,
+                "target": float(row["target"]) if row.get("target") is not None else None,
+            }
+            trusted, continuity_reason = _paper_sim_trusted_history(sim_row, bars)
+            outcome = None
+            outcome_bar = None
+            outcome_fn = globals()[cfg["outcome"]]
+            for bar in trusted:
+                outcome = outcome_fn(sim_row, bar)
+                if outcome is not None:
+                    outcome_bar = bar
+                    break
+            if outcome is None and continuity_reason is None and trusted:
+                marker = _paper_sim_entry_marker(sim_row)
+                max_hold_hours = int(globals().get(cfg["max_hold"], 0) or 0)
+                required_terminal_epoch = (
+                    marker + max_hold_hours * 3600 if marker is not None else None
+                )
+                last_verified_epoch = _paper_sim_historical_epoch(
+                    trusted[-1].get("start")
+                )
+                if (
+                    required_terminal_epoch is not None
+                    and last_verified_epoch is not None
+                    and last_verified_epoch >= required_terminal_epoch
+                ):
+                    outcome = _paper_sim_expiry(
+                        sim_row, trusted[-1], max_hold_hours
+                    )
+                    outcome_bar = trusted[-1] if outcome is not None else None
+            outcome_reason = continuity_reason or (
+                "no_post_entry_market_bar" if not trusted
+                else (
+                    "historical_window_incomplete"
+                    if (
+                        _paper_sim_entry_marker(sim_row) is not None
+                        and _paper_sim_historical_epoch(trusted[-1].get("start"))
+                        < _paper_sim_entry_marker(sim_row)
+                        + int(globals().get(cfg["max_hold"], 0) or 0) * 3600
+                    )
+                    else "no_deterministic_outcome"
+                )
+            )
+            attempt = {
+                "event": "reprocess",
+                "at": now_utc().isoformat(),
+                "source": PAPER_SIM_HISTORICAL_SOURCE,
+                "fingerprint": fingerprint,
+                "bar_count": len(bars),
+                "trusted_bar_count": len(trusted),
+                "result": outcome[0] if outcome else None,
+                "reason": outcome_reason if outcome is None else "resolved",
+                "bar_start": outcome_bar.get("start") if outcome_bar else None,
+            }
+            audit.append(attempt)
+            context["resolution_audit"] = audit
+            context["last_reprocess"] = attempt
+            if outcome is None:
+                cur.execute(
+                    "UPDATE %s SET context=COALESCE(context, '{}'::jsonb) || "
+                    "%%s::jsonb WHERE id=%%s AND status='unresolved'" % cfg["table"],
+                    (json.dumps({
+                        "resolution_audit": audit, "last_reprocess": attempt,
+                    }), row_id),
+                )
+                if cur.rowcount != 1:
+                    conn.rollback()
+                    return {
+                        "ok": True, "id": row_id, "ledger": ledger,
+                        "status": "unresolved", "processed": False,
+                        "idempotent": True, "research_only": True,
+                    }
+                conn.commit()
+                return {
+                    "ok": True, "id": row_id, "ledger": ledger,
+                    "status": "unresolved", "processed": False,
+                    "reason": outcome_reason, "trusted_bar_count": len(trusted),
+                    "research_only": True,
+                }
+            cur.execute(
+                "UPDATE %s SET status='closed', result=%%s, exit_price=%%s, "
+                "r_multiple=%%s, closed_at=now(), "
+                "context=COALESCE(context, '{}'::jsonb) || %%s::jsonb "
+                "WHERE id=%%s AND status='unresolved'" % cfg["table"],
+                (
+                    outcome[0], outcome[1], outcome[2],
+                    json.dumps({
+                        "resolution": "verified_historical_reprocess",
+                        "resolution_audit": audit,
+                        "last_reprocess": attempt,
+                    }),
+                    row_id,
+                ),
+            )
+            if cur.rowcount != 1:
+                conn.rollback()
+                return {
+                    "ok": True, "id": row_id, "ledger": ledger,
+                    "status": "closed", "processed": False,
+                    "idempotent": True, "research_only": True,
+                }
+        conn.commit()
+        return {
+            "ok": True, "id": row_id, "ledger": ledger, "status": "closed",
+            "processed": True, "result": outcome[0], "exit_price": outcome[1],
+            "r_multiple": outcome[2], "trusted_bar_count": len(trusted),
+            "research_only": True,
+        }
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("paper-sim historical reprocess failed (%s/%s): %s", ledger, row_id, exc)
+        return {
+            "ok": False, "status_code": 500, "error": "paper_sim_reprocess_failed",
+            "research_only": True,
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _age_and_mark_scalp_unresolved(row, reason, unresolved_reasons=None):
@@ -86280,6 +87036,71 @@ def route_research_health():
         }
 
     return jsonify(out)
+
+
+@app.route("/paper-sim/unresolved", methods=["GET"])
+def route_paper_sim_unresolved():
+    """Research-only queue of terminal paper simulations needing review.
+
+    This route reads only the two paper-simulation ledgers.  It never exposes
+    live positions or learning rows, and the returned repair metadata is
+    derived from the row's immutable resolution context.
+    """
+    raw_ledger = request.args.get("ledger", "all").strip().lower()
+    ledger_aliases = {
+        "all": "all", "scalp": "scalp", "scalp_live_sim": "scalp",
+        "dual": "dual", "dual_sim": "dual",
+    }
+    ledger = ledger_aliases.get(raw_ledger)
+    if ledger is None:
+        return jsonify({
+            "ok": False, "error": "ledger must be scalp, dual, or all",
+            "research_only": True,
+        }), 400
+    try:
+        limit = max(1, min(100, int(request.args.get("limit", "50"))))
+    except (TypeError, ValueError):
+        limit = 50
+    instrument = request.args.get("instrument", "").strip().upper() or None
+    rows = _paper_sim_unresolved_rows(ledger, instrument, limit)
+    return jsonify({
+        "ok": True,
+        "research_only": True,
+        "rows": rows,
+        "count": len(rows),
+        "limit": limit,
+        "ledger": ledger,
+        "historical_source": PAPER_SIM_HISTORICAL_SOURCE,
+        "verification_required": True,
+        "reprocess_available": bool(PAPER_SIM_BARS_DB_READY),
+        "reprocess_blocked_reason": (
+            None if PAPER_SIM_BARS_DB_READY
+            else "verified_historical_bar_store_unavailable"
+        ),
+        "note": (
+            "Rows are terminal unresolved paper simulations. Repair accepts "
+            "only references to server-persisted verified historical bars and "
+            "never writes live or learning ledgers."
+        ),
+    })
+
+
+@app.route("/paper-sim/reprocess", methods=["POST"])
+def route_paper_sim_reprocess():
+    """Guarded, idempotent repair for one unresolved research paper row."""
+    payload = request.get_json(silent=True)
+    if not isinstance(payload, dict):
+        return jsonify({
+            "ok": False, "error": "JSON body required", "research_only": True,
+        }), 400
+    ledger = str(payload.get("ledger") or "").strip().lower()
+    ledger = {
+        "scalp_live_sim": "scalp", "scalp": "scalp",
+        "dual_sim": "dual", "dual": "dual",
+    }.get(ledger, ledger)
+    result = _paper_sim_reprocess_unresolved(ledger, payload.get("id"), payload)
+    status_code = int(result.pop("status_code", 200))
+    return jsonify(result), status_code
 
 
 @app.route("/market-student/health", methods=["GET"])

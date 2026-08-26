@@ -9,4 +9,8 @@ Paper outcomes may use durable history only when every completed Databento bar f
 
 Historical startup replay is never paper-resolution evidence, and durable pre-restart bars are never used as the latest bar for managed/live positions. A discontinuity may still preserve a terminal outcome proven before the gap; otherwise the row stays open until max hold and then becomes explicitly unresolved.
 
-**How to apply:** Any paper ledger that reads retained bars must carry capture-session identity and monotonic sequence metadata, prove the entry boundary, stop evaluation at the first discontinuity, and expose missing coverage as health—not fabricate an expiry or fetch a second source.
+The only exception is explicit operator repair of a terminal unresolved paper row. That path may request a bounded Databento Historical backfill, but client-supplied OHLC is never evidence: the server must fetch or reload persisted verified records, keep the original unresolved audit, and write only the originating paper ledger.
+
+**Why:** A client-controlled “verified” label can turn fabricated prices into research outcomes, while the normal paper close helpers also publish learning evidence. Server-owned provenance and a direct isolated update prevent both failures.
+
+**How to apply:** Restart recovery must stay live-capture-only. Operator repair must fail closed when the verified store or Databento history is unavailable, use exact server-held continuity metadata, fingerprint authoritative bars for idempotency, and never call live execution or learning-ledger writers.
