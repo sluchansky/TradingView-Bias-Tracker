@@ -190,6 +190,51 @@ def test_dual_watcher_reuses_scalp_shared_outcome_and_same_bar_guard():
 
 
 @pytest.mark.parametrize(
+    "watcher_name, ready_name",
+    [
+        ("_watch_scalp_sim_trades", "SCALP_SIM_DB_READY"),
+        ("_watch_dual_sim_trades", "DUAL_SIM_DB_READY"),
+    ],
+)
+def test_paper_resolution_stays_out_of_live_and_managed_trade_boundaries(
+    watcher_name, ready_name
+):
+    """Settling either paper ledger must remain a paper-only side effect."""
+    row = _row(
+        opened_at=datetime.now(timezone.utc) - timedelta(minutes=2),
+        entry_epoch=1000.0,
+    )
+    conn = _db_for_rows([row])
+    conn.cursor.return_value.rowcount = 1
+    history = [
+        _captured_bar(1001, high=111, low=99, close=108, sequence=1),
+    ]
+
+    with patch.object(app, ready_name, True), \
+         patch.object(app, "_learning_conn", return_value=conn), \
+         patch.object(app, "_fetch_completed_bars", return_value=history), \
+         patch.object(app, "_send_broker_order") as broker_send, \
+         patch.object(app, "execute_trade_gateway") as gateway, \
+         patch.object(app, "_execute_trade_gateway_inner") as gateway_inner, \
+         patch.object(app, "_register_managed_trade") as managed_open, \
+         patch.object(app, "_close_managed_trade") as managed_close, \
+         patch.object(app, "_record_strategy_trade") as strategy_write, \
+         patch.object(
+             app._MARKET_STUDENT, "record_outcome_by_source"
+         ) as learning_write:
+        cycle = getattr(app, watcher_name)()
+
+    assert cycle["closed_rows"] == 1
+    broker_send.assert_not_called()
+    gateway.assert_not_called()
+    gateway_inner.assert_not_called()
+    managed_open.assert_not_called()
+    managed_close.assert_not_called()
+    strategy_write.assert_not_called()
+    learning_write.assert_not_called()
+
+
+@pytest.mark.parametrize(
     "watcher_name, ready_name, max_hold_name",
     [
         ("_watch_scalp_sim_trades", "SCALP_SIM_DB_READY", "SCALP_SIM_MAX_HOLD_HOURS"),

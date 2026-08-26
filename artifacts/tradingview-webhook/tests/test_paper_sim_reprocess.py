@@ -6,6 +6,7 @@ from unittest.mock import MagicMock, patch
 
 import app
 import pandas as pd
+import pytest
 
 
 def _verified_payload(bars):
@@ -33,7 +34,8 @@ def _bar(start, sequence, *, high=104.0, low=98.0, close=101.0):
 
 
 class _RepairDB:
-    def __init__(self):
+    def __init__(self, ledger="scalp"):
+        self.ledger = ledger
         self.status = "unresolved"
         self.updates = []
         self.commits = 0
@@ -98,11 +100,15 @@ class _RepairCursor:
 
     def execute(self, query, params=()):
         normalized = " ".join(query.split())
-        if normalized.startswith("SELECT id, strategy_key"):
+        if normalized.startswith("SELECT id, strategy_key") or \
+                normalized.startswith("SELECT id, mode"):
             opened = datetime.now(timezone.utc) - timedelta(hours=48)
             closed = datetime.now(timezone.utc) - timedelta(hours=40)
             self._row = (
-                7, "vwap_pullback_continuation", "MGC", "Long",
+                7,
+                "vwap_pullback_continuation"
+                if self.database.ledger == "scalp" else "SCALP",
+                "MGC", "Long",
                 self.database.status, 100.0, 95.0, 110.0, 2.0,
                 1000.0, opened, closed, dict(self.database.context),
             )
@@ -110,7 +116,8 @@ class _RepairCursor:
         if normalized.startswith("SELECT instrument, bar_start"):
             self._rows = list(self.database.server_bars)
             return
-        if normalized.startswith("UPDATE scalp_strategy_sim_trades"):
+        if normalized.startswith("UPDATE scalp_strategy_sim_trades") or \
+                normalized.startswith("UPDATE dual_sim_trades"):
             assert "WHERE id=%s AND status='unresolved'" in normalized
             if self.database.status != "unresolved":
                 self.rowcount = 0
@@ -365,3 +372,49 @@ def test_reprocess_is_idempotent_preserves_audit_and_never_writes_learning():
     assert '"event": "reprocess"' in context_json
     market_student_write.assert_not_called()
     broker_write.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "ledger, ready_name",
+    [
+        ("scalp", "SCALP_SIM_DB_READY"),
+        ("dual", "DUAL_SIM_DB_READY"),
+    ],
+)
+def test_reprocess_stays_out_of_live_and_managed_trade_boundaries(
+    ledger, ready_name
+):
+    """A verified retry in either paper ledger cannot create a live trade."""
+    database = _RepairDB(ledger)
+    payload = _verified_payload([
+        _bar(999, 1),
+        _bar(1001, 2, high=111.0, low=99.0, close=108.0),
+    ])
+
+    with patch.object(app, ready_name, True), \
+         patch.object(app, "PAPER_SIM_BARS_DB_READY", True), \
+         patch.object(app, "_learning_conn", side_effect=database.connect), \
+         patch.object(app, "_send_broker_order") as broker_send, \
+         patch.object(app, "execute_trade_gateway") as gateway, \
+         patch.object(app, "_execute_trade_gateway_inner") as gateway_inner, \
+         patch.object(app, "_register_managed_trade") as managed_open, \
+         patch.object(app, "_close_managed_trade") as managed_close, \
+         patch.object(app, "_record_strategy_trade") as strategy_write, \
+         patch.object(
+             app._MARKET_STUDENT, "record_outcome_by_source"
+         ) as learning_write:
+        first = app._paper_sim_reprocess_unresolved(ledger, 7, payload)
+        second = app._paper_sim_reprocess_unresolved(ledger, 7, payload)
+
+    assert first["ok"] is True
+    assert first["processed"] is True
+    assert first["research_only"] is True
+    assert second["ok"] is True
+    assert second["idempotent"] is True
+    broker_send.assert_not_called()
+    gateway.assert_not_called()
+    gateway_inner.assert_not_called()
+    managed_open.assert_not_called()
+    managed_close.assert_not_called()
+    strategy_write.assert_not_called()
+    learning_write.assert_not_called()
