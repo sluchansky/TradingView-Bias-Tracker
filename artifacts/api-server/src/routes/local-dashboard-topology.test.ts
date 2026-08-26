@@ -96,10 +96,35 @@ describe("local dashboard topology", () => {
     );
     expect(launcher).toContain('SetEnvironmentVariable("FLASK_PORT", "$FlaskPort"');
     expect(launcher).toContain('"LOCAL_API_PROXY_TARGET", "http://127.0.0.1:$ApiPort"');
+    expect(launcher).toContain("windows-local-proxy.mjs");
     expect(index).toContain("resolveFlaskPort(process.env.FLASK_PORT)");
     expect(index).toContain("createLiveBotRouter");
     expect(vite).toContain("LOCAL_API_PROXY_TARGET");
     expect(vite).toContain('proxy:');
+  });
+
+  it("keeps the PowerShell install path native and locks both supported toolchains", () => {
+    const rootPackage = readFileSync(resolve(root, "package.json"), "utf8");
+    const apiPackage = readFileSync(
+      resolve(root, "artifacts/api-server/package.json"),
+      "utf8",
+    );
+    const workspace = readFileSync(resolve(root, "pnpm-workspace.yaml"), "utf8");
+    const lockfile = readFileSync(resolve(root, "pnpm-lock.yaml"), "utf8");
+
+    expect(rootPackage).toContain('"packageManager": "pnpm@10.26.1"');
+    expect(rootPackage).toContain('node ./scripts/check-pnpm-install.mjs');
+    expect(rootPackage).not.toContain("sh -c");
+    expect(apiPackage).toContain('"dev": "node ./dev.mjs"');
+    expect(apiPackage).not.toContain("export NODE_ENV");
+    expect(workspace).not.toContain("esbuild>@esbuild/win32-x64");
+    expect(workspace).not.toContain("lightningcss>lightningcss-win32-x64-msvc");
+    expect(workspace).not.toContain("oxide>@tailwindcss/oxide-win32-x64-msvc");
+    expect(workspace).not.toContain("rollup>@rollup/rollup-win32-x64-msvc");
+    expect(lockfile).toContain("'@esbuild/win32-x64@0.27.3'");
+    expect(lockfile).toContain("'@rollup/rollup-win32-x64-msvc@4.62.4'");
+    expect(lockfile).toContain("'@tailwindcss/oxide-win32-x64-msvc@4.3.0'");
+    expect(lockfile).toContain("lightningcss-win32-x64-msvc@1.32.0");
   });
 
   it("documents the coordinated startup instead of directing Windows users to Vite alone", () => {
