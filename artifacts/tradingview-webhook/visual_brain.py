@@ -805,8 +805,17 @@ def analyze_visual_market(
     if not api_key:
         raise RuntimeError("AI_INTEGRATIONS_OPENAI_API_KEY not set")
 
-    from openai import OpenAI  # noqa: PLC0415
-    client = OpenAI(api_key=api_key, base_url=base_url)
+    from openai import DefaultHttpxClient, OpenAI  # noqa: PLC0415
+    # Visual Brain is a local observation worker.  Give its OpenAI client an
+    # isolated transport so broken Windows proxy/CA environment variables do
+    # not redirect or break the request.  TLS verification remains enabled;
+    # this only disables HTTPX's environment-based proxy/certificate lookup.
+    http_client = DefaultHttpxClient(verify=True, trust_env=False)
+    client = OpenAI(
+        api_key=api_key,
+        base_url=base_url,
+        http_client=http_client,
+    )
 
     now_utc = datetime.now(timezone.utc).isoformat()
     history_text = _build_history_text(recent_history)
@@ -846,63 +855,66 @@ def analyze_visual_market(
     ]
 
     last_exc = None
-    for attempt in range(2):
-        try:
-            resp = client.chat.completions.create(
-                model=_VB_MODEL,
-                max_completion_tokens=_VB_MAX_TOKENS,
-                messages=[
-                    {"role": "system", "content": _get_system_prompt(instrument)},
-                    {"role": "user",   "content": user_content},
-                ],
-            )
-            usage = resp.usage
-            in_tok  = usage.prompt_tokens     if usage else 0
-            out_tok = usage.completion_tokens if usage else 0
-            _record_cost(in_tok, out_tok)
-            logger.info(
-                "[VISUAL_BRAIN] model=%s in_tok=%d out_tok=%d est_cost=$%.5f attempt=%d",
-                _VB_MODEL, in_tok, out_tok,
-                in_tok * _COST_PER_INPUT_TOK + out_tok * _COST_PER_OUTPUT_TOK,
-                attempt + 1,
-            )
-
-            raw = resp.choices[0].message.content or ""
-            # Strip markdown fences if model adds them despite instructions
-            raw = raw.strip()
-            if raw.startswith("```"):
-                raw = raw.split("```")[1]
-                if raw.startswith("json"):
-                    raw = raw[4:]
-                raw = raw.strip()
-
-            obs = json.loads(raw)
-            ok, reason = _validate_observation(obs)
-            if not ok:
-                raise ValueError(f"Schema violation: {reason}")
-            obs["timestamp"] = now_utc   # authoritative server timestamp
-            obs["instrument"] = instrument
-            # Phase 1 Central Ghost Coordinator: Visual Brain stays explicitly
-            # non-trade-like.  It contributes only a deduped telemetry event,
-            # never a direction/entry/stop/target observation.
+    try:
+        for attempt in range(2):
             try:
-                import ghost_coordinator as _gc  # noqa: PLC0415
-                event_id = "%s|%s|%s" % (instrument, now_utc, obs.get("market_state", "UNKNOWN"))
-                if os.getenv("CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED", "0").lower() in ("true", "1", "yes", "on"):
-                    _gc.route_observational_event("visual_brain", event_id)
-                else:
-                    _gc.record_observational_event("visual_brain", event_id)
-            except Exception:
-                pass
-            return obs
+                resp = client.chat.completions.create(
+                    model=_VB_MODEL,
+                    max_completion_tokens=_VB_MAX_TOKENS,
+                    messages=[
+                        {"role": "system", "content": _get_system_prompt(instrument)},
+                        {"role": "user",   "content": user_content},
+                    ],
+                )
+                usage = resp.usage
+                in_tok  = usage.prompt_tokens     if usage else 0
+                out_tok = usage.completion_tokens if usage else 0
+                _record_cost(in_tok, out_tok)
+                logger.info(
+                    "[VISUAL_BRAIN] model=%s in_tok=%d out_tok=%d est_cost=$%.5f attempt=%d",
+                    _VB_MODEL, in_tok, out_tok,
+                    in_tok * _COST_PER_INPUT_TOK + out_tok * _COST_PER_OUTPUT_TOK,
+                    attempt + 1,
+                )
 
-        except Exception as exc:
-            last_exc = exc
-            logger.warning("[VISUAL_BRAIN] analyze attempt %d failed: %s", attempt + 1, exc)
-            if attempt == 0:
-                time.sleep(1)
+                raw = resp.choices[0].message.content or ""
+                # Strip markdown fences if model adds them despite instructions
+                raw = raw.strip()
+                if raw.startswith("```"):
+                    raw = raw.split("```")[1]
+                    if raw.startswith("json"):
+                        raw = raw[4:]
+                    raw = raw.strip()
 
-    raise RuntimeError(f"analyze_visual_market failed after 2 attempts: {last_exc}")
+                obs = json.loads(raw)
+                ok, reason = _validate_observation(obs)
+                if not ok:
+                    raise ValueError(f"Schema violation: {reason}")
+                obs["timestamp"] = now_utc   # authoritative server timestamp
+                obs["instrument"] = instrument
+                # Phase 1 Central Ghost Coordinator: Visual Brain stays explicitly
+                # non-trade-like.  It contributes only a deduped telemetry event,
+                # never a direction/entry/stop/target observation.
+                try:
+                    import ghost_coordinator as _gc  # noqa: PLC0415
+                    event_id = "%s|%s|%s" % (instrument, now_utc, obs.get("market_state", "UNKNOWN"))
+                    if os.getenv("CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED", "0").lower() in ("true", "1", "yes", "on"):
+                        _gc.route_observational_event("visual_brain", event_id)
+                    else:
+                        _gc.record_observational_event("visual_brain", event_id)
+                except Exception:
+                    pass
+                return obs
+
+            except Exception as exc:
+                last_exc = exc
+                logger.warning("[VISUAL_BRAIN] analyze attempt %d failed: %s", attempt + 1, exc)
+                if attempt == 0:
+                    time.sleep(1)
+
+        raise RuntimeError(f"analyze_visual_market failed after 2 attempts: {last_exc}")
+    finally:
+        http_client.close()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
