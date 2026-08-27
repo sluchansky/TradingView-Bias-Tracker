@@ -115,6 +115,49 @@ def _bars() -> list[dict]:
     ]
 
 
+def _report_record(
+    *,
+    instrument: str,
+    session: str,
+    candidate_cost: float = 0.001,
+) -> dict:
+    return {
+        "cycle_id": f"{instrument}:{session}:{time.time_ns()}",
+        "instrument": instrument,
+        "session": session,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "baseline": {
+            "api_calls": 1,
+            "success": True,
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "estimated_cost_usd": 0.01,
+            "retry_count": 0,
+            "failures": [],
+        },
+        "candidate": {
+            "name": "local-shadow",
+            "model": "local-shadow",
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "retry_count": 0,
+            "estimated_cost_usd": candidate_cost,
+            "schema_valid": True,
+            "response_received": True,
+            "error_type": None,
+        },
+        "policies": {
+            "no_new_bar_image": {"would_call": False, "reasons": ["unchanged"]},
+            "deterministic_events": {"would_call": False, "reasons": ["unchanged"]},
+            "max_staleness_heartbeat": {
+                "would_call": True,
+                "heartbeat_used": True,
+                "reasons": ["max_staleness_reached"],
+            },
+        },
+    }
+
+
 class VisualBrainBenchmarkTests(unittest.TestCase):
     def tearDown(self) -> None:
         module = sys.modules.get("visual_brain")
@@ -517,6 +560,112 @@ class VisualBrainBenchmarkTests(unittest.TestCase):
         )
         self.assertEqual(result["action"], "LONG_WATCH")
         self.assertEqual(vb.get_benchmark_report()["counters"]["cycles"], 0)
+
+    def test_report_compares_representative_sample_by_instrument_and_session(self):
+        vb = _load_vb(benchmark=True, candidate=True)
+        records = [
+            _report_record(
+                instrument="MNQ" if index % 2 == 0 else "MGC",
+                session="NY_OPEN" if index % 3 else "OVERNIGHT",
+            )
+            for index in range(30)
+        ]
+        with vb._BENCHMARK_LOCK:
+            vb._BENCHMARK_RECENT.extend(records)
+
+        report = vb.get_benchmark_report(limit=100)
+
+        self.assertTrue(report["sample"]["representative"])
+        self.assertEqual(report["sample"]["cycles"], 30)
+        self.assertEqual(set(report["by_instrument"]), {"MGC", "MNQ"})
+        self.assertEqual(set(report["by_session"]), {"NY_OPEN", "OVERNIGHT"})
+        self.assertEqual(report["rollup"]["baseline"]["api_calls"], 30)
+        self.assertEqual(report["rollup"]["candidate"]["paired_cycles"], 30)
+        self.assertEqual(report["rollup"]["candidate"]["schema_valid_rate"], 1.0)
+        self.assertEqual(
+            report["rollup"]["projected"]["no_new_bar_image"]["avoided_calls"],
+            30,
+        )
+        self.assertEqual(report["rollup"]["heartbeat_usage"], 30)
+        self.assertEqual(
+            report["advisory"]["decision"], "NO_AUTOMATIC_ROLLOUT"
+        )
+        self.assertEqual(report["advisory"]["confidence"], "medium")
+        self.assertEqual(
+            report["advisory"]["recommendation"],
+            "review_shadow_policy_before_any_staged_change",
+        )
+
+    def test_report_filters_session_and_refuses_small_sample_rollout(self):
+        vb = _load_vb(benchmark=True)
+        with vb._BENCHMARK_LOCK:
+            vb._BENCHMARK_RECENT.extend([
+                _report_record(instrument="MNQ", session="NY_OPEN"),
+                _report_record(instrument="MGC", session="OVERNIGHT"),
+            ])
+
+        report = vb.get_benchmark_report(limit=100, session="NY_OPEN")
+
+        self.assertEqual(report["sample"]["cycles"], 1)
+        self.assertEqual(report["sample"]["sessions"], ["NY_OPEN"])
+        self.assertEqual(report["advisory"]["confidence"], "low")
+        self.assertEqual(
+            report["advisory"]["recommendation"],
+            "continue_read_only_collection",
+        )
+        self.assertFalse(report["advisory"]["representative_sample"])
+
+    def test_candidate_comparison_uses_only_paired_baseline_cycles(self):
+        vb = _load_vb(benchmark=True, candidate=True)
+        paired = _report_record(instrument="MNQ", session="NY_OPEN")
+        unpaired = _report_record(instrument="MGC", session="OVERNIGHT")
+        unpaired["candidate"] = {"enabled": True, "scheduled": False, "skipped": "busy"}
+        unpaired["baseline"].update({
+            "api_calls": 3,
+            "retry_count": 2,
+            "estimated_cost_usd": 0.50,
+            "failures": [{"error_category": "schema"}],
+        })
+        with vb._BENCHMARK_LOCK:
+            vb._BENCHMARK_RECENT.extend([paired, unpaired])
+
+        rollup = vb.get_benchmark_report(limit=100)["rollup"]
+
+        self.assertEqual(rollup["baseline"]["estimated_cost_usd"], 0.51)
+        self.assertEqual(rollup["paired_baseline"]["estimated_cost_usd"], 0.01)
+        self.assertEqual(rollup["comparisons"]["cost_savings_usd"], 0.009)
+        self.assertEqual(rollup["comparisons"]["cost_reduction_rate"], 0.9)
+        self.assertEqual(rollup["comparisons"]["retry_delta_per_call"], 0.0)
+        self.assertEqual(rollup["baseline"]["schema_valid_rate"], 1.0)
+        self.assertEqual(rollup["baseline"]["schema_failures"], 1)
+
+    def test_candidate_advisory_requires_cross_instrument_session_pairs(self):
+        vb = _load_vb(benchmark=True, candidate=True)
+        records = []
+        for index in range(30):
+            record = _report_record(
+                instrument="MNQ" if index < 20 else "MGC",
+                session="NY_OPEN" if index < 20 else "OVERNIGHT",
+            )
+            if index >= 20:
+                record["candidate"] = {
+                    "enabled": True,
+                    "scheduled": False,
+                    "skipped": "busy",
+                }
+            records.append(record)
+        with vb._BENCHMARK_LOCK:
+            vb._BENCHMARK_RECENT.extend(records)
+
+        report = vb.get_benchmark_report(limit=100)
+
+        self.assertTrue(report["sample"]["representative"])
+        self.assertEqual(report["rollup"]["candidate"]["paired_cycles"], 20)
+        self.assertEqual(report["rollup"]["candidate"]["instruments"], ["MNQ"])
+        self.assertEqual(report["rollup"]["candidate"]["sessions"], ["NY_OPEN"])
+        self.assertFalse(report["advisory"]["representative_sample"])
+        gaps = " ".join(report["advisory"]["evidence_gaps"])
+        self.assertIn("paired candidate results must cover", gaps)
 
     def test_read_only_route_and_proxy_are_registered(self):
         app_source = (ROOT / "app.py").read_text()

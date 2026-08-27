@@ -156,6 +156,7 @@ def _benchmark_empty_counters() -> dict:
         "candidate_schema_failures": 0,
         "candidate_input_tokens": 0,
         "candidate_output_tokens": 0,
+        "candidate_retries": 0,
         "candidate_cost_usd": 0.0,
         "candidate_errors": {},
         "projected": {
@@ -318,6 +319,24 @@ def _benchmark_semantic_snapshot(snapshot: Optional[dict]) -> dict:
     return projected
 
 
+def _benchmark_session_label(snapshot: Optional[dict]) -> str:
+    """Return a bounded session label without exposing the native snapshot."""
+    if not isinstance(snapshot, dict):
+        return "unknown"
+    for key in ("session", "session_state", "market_session"):
+        value = snapshot.get(key)
+        if isinstance(value, dict):
+            value = (
+                value.get("label")
+                or value.get("name")
+                or value.get("session")
+                or value.get("state")
+            )
+        if value is not None and str(value).strip():
+            return str(value).strip().upper()[:64]
+    return "unknown"
+
+
 def _benchmark_event_reasons(previous_semantic: dict, current_semantic: dict) -> list[str]:
     labels = {
         "structure": "structure/BOS/CHOCH",
@@ -465,6 +484,7 @@ def _benchmark_begin_cycle(instrument: str) -> Optional[dict]:
         "prepared": False,
         "market_context": {},
         "deterministic_snapshot": {},
+        "session": "unknown",
         "recent_history": [],
         "previous_state": None,
         "screenshot_bytes": None,
@@ -496,6 +516,7 @@ def _benchmark_prepare_cycle(
             "image_fingerprint": image_fp,
             "market_context": _safe_copy(market_context or {}),
             "deterministic_snapshot": _safe_copy(deterministic_snapshot),
+            "session": _benchmark_session_label(deterministic_snapshot),
             "previous_state": _safe_copy(previous_state),
             "recent_history": _safe_copy(recent_history),
             "screenshot_bytes": bytes(screenshot_bytes) if screenshot_bytes else None,
@@ -664,6 +685,7 @@ def _normalize_candidate_result(candidate_name: str, result: Any) -> dict:
         "model": result.get("model", candidate_name),
         "input_tokens": int(result.get("input_tokens") or 0),
         "output_tokens": int(result.get("output_tokens") or 0),
+        "retry_count": max(0, int(result.get("retry_count") or 0)),
         "schema_valid": bool(result.get("schema_valid", False)),
         "response_received": bool(result.get("response_received", True)),
         "error_type": None,
@@ -691,6 +713,7 @@ def _aggregate_candidate_result_locked(candidate: dict) -> None:
     counters["candidate_schema_failures"] += int(candidate.get("error_type") == "schema")
     counters["candidate_input_tokens"] += int(candidate.get("input_tokens") or 0)
     counters["candidate_output_tokens"] += int(candidate.get("output_tokens") or 0)
+    counters["candidate_retries"] += int(candidate.get("retry_count") or 0)
     counters["candidate_cost_usd"] += float(candidate.get("estimated_cost_usd") or 0)
     if candidate.get("error_type"):
         errors = counters["candidate_errors"]
@@ -837,6 +860,7 @@ def _benchmark_finish_cycle(cycle: Optional[dict]) -> None:
         record = {
             "cycle_id": cycle["cycle_id"],
             "instrument": cycle["instrument"],
+            "session": cycle.get("session", "unknown"),
             "timestamp": datetime.fromtimestamp(
                 cycle["started_at"], timezone.utc
             ).isoformat(),
@@ -942,24 +966,406 @@ def _benchmark_finish_cycle(cycle: Optional[dict]) -> None:
             _BENCHMARK_OPEN_CYCLES.discard(cycle["cycle_id"])
 
 
-def get_benchmark_report(limit: int = 50, instrument: Optional[str] = None) -> dict:
+_BENCHMARK_MIN_REPRESENTATIVE_CYCLES = 30
+_BENCHMARK_MIN_REPRESENTATIVE_INSTRUMENTS = 2
+_BENCHMARK_MIN_REPRESENTATIVE_SESSIONS = 2
+_BENCHMARK_MIN_CANDIDATE_PAIRS = 20
+
+
+def _benchmark_rate(numerator: int, denominator: int) -> Optional[float]:
+    if denominator <= 0:
+        return None
+    return round(float(numerator) / float(denominator), 4)
+
+
+def _benchmark_empty_rollup() -> dict:
+    return {
+        "cycles": 0,
+        "instruments": [],
+        "sessions": [],
+        "baseline": {
+            "api_calls": 0,
+            "calls": 0,
+            "completed_runs": 0,
+            "successes": 0,
+            "failures": 0,
+            "retries": 0,
+            "schema_valid_calls": 0,
+            "schema_failures": 0,
+            "schema_valid_rate": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        },
+        "candidate": {
+            "paired_cycles": 0,
+            "calls": 0,
+            "instruments": [],
+            "sessions": [],
+            "successes": 0,
+            "failures": 0,
+            "retries": 0,
+            "schema_valid_calls": 0,
+            "schema_failures": 0,
+            "schema_valid_rate": None,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "estimated_cost_usd": 0.0,
+        },
+        "paired_baseline": {
+            "completed_runs": 0,
+            "api_calls": 0,
+            "successes": 0,
+            "failures": 0,
+            "retries": 0,
+            "schema_valid_rate": None,
+            "estimated_cost_usd": 0.0,
+        },
+        "projected": {},
+        "heartbeat_usage": 0,
+        "comparisons": {
+            "cost_savings_usd": None,
+            "cost_reduction_rate": None,
+            "schema_validity_delta": None,
+            "retry_delta_per_call": None,
+        },
+    }
+
+
+def _benchmark_rollup(cycles: list[dict]) -> dict:
+    """Summarize bounded records without recomputing or changing any state."""
+    result = _benchmark_empty_rollup()
+    instruments = set()
+    sessions = set()
+    candidate_instruments = set()
+    candidate_sessions = set()
+    policy_names = (
+        "no_new_bar_image",
+        "deterministic_events",
+        "max_staleness_heartbeat",
+    )
+    result["projected"] = {
+        name: {"would_call": 0, "would_skip": 0, "avoided_calls": 0}
+        for name in policy_names
+    }
+
+    for record in cycles:
+        if not isinstance(record, dict):
+            continue
+        result["cycles"] += 1
+        instrument = str(record.get("instrument") or "unknown").upper()
+        session = str(record.get("session") or "unknown").upper()
+        instruments.add(instrument)
+        sessions.add(session)
+
+        baseline = record.get("baseline") or {}
+        baseline_rollup = result["baseline"]
+        calls = max(0, int(baseline.get("api_calls") or 0))
+        successes = int(bool(baseline.get("success")))
+        completed_runs = int(calls > 0)
+        retries = max(0, int(baseline.get("retry_count") or max(0, calls - 1)))
+        schema_failures = sum(
+            1
+            for failure in (baseline.get("failures") or [])
+            if isinstance(failure, dict) and failure.get("error_category") == "schema"
+        )
+        baseline_rollup["api_calls"] += calls
+        baseline_rollup["calls"] += calls
+        baseline_rollup["completed_runs"] += completed_runs
+        baseline_rollup["successes"] += successes
+        baseline_rollup["failures"] += int(not successes and calls > 0)
+        baseline_rollup["retries"] += retries
+        baseline_rollup["schema_valid_calls"] += successes
+        baseline_rollup["schema_failures"] += schema_failures
+        baseline_rollup["input_tokens"] += int(baseline.get("input_tokens") or 0)
+        baseline_rollup["output_tokens"] += int(baseline.get("output_tokens") or 0)
+        baseline_rollup["estimated_cost_usd"] += float(
+            baseline.get("estimated_cost_usd") or 0
+        )
+
+        candidate = record.get("candidate") or {}
+        # A scheduled/skipped marker is not a paired observation.  Only count
+        # normalized results, so late candidates do not inflate quality rates.
+        candidate_observed = (
+            "schema_valid" in candidate and "response_received" in candidate
+        )
+        if candidate_observed:
+            candidate_rollup = result["candidate"]
+            paired_baseline = result["paired_baseline"]
+            candidate_instruments.add(instrument)
+            candidate_sessions.add(session)
+            candidate_rollup["paired_cycles"] += 1
+            candidate_rollup["calls"] += 1
+            candidate_ok = bool(
+                candidate.get("schema_valid")
+                and candidate.get("response_received")
+                and not candidate.get("error_type")
+            )
+            candidate_rollup["successes"] += int(candidate_ok)
+            candidate_rollup["failures"] += int(not candidate_ok)
+            candidate_rollup["retries"] += max(
+                0, int(candidate.get("retry_count") or 0)
+            )
+            candidate_rollup["schema_valid_calls"] += int(
+                bool(candidate.get("schema_valid"))
+            )
+            candidate_rollup["schema_failures"] += int(
+                not bool(candidate.get("schema_valid"))
+            )
+            candidate_rollup["input_tokens"] += int(
+                candidate.get("input_tokens") or 0
+            )
+            candidate_rollup["output_tokens"] += int(
+                candidate.get("output_tokens") or 0
+            )
+            candidate_rollup["estimated_cost_usd"] += float(
+                candidate.get("estimated_cost_usd") or 0
+            )
+            paired_baseline["completed_runs"] += completed_runs
+            paired_baseline["api_calls"] += calls
+            paired_baseline["successes"] += successes
+            paired_baseline["failures"] += int(not successes and calls > 0)
+            paired_baseline["retries"] += retries
+            paired_baseline["estimated_cost_usd"] += float(
+                baseline.get("estimated_cost_usd") or 0
+            )
+
+        policies = record.get("policies") or {}
+        for policy_name in policy_names:
+            policy = policies.get(policy_name) or {}
+            if not isinstance(policy, dict):
+                continue
+            would_call = bool(policy.get("would_call"))
+            projected = result["projected"][policy_name]
+            projected["would_call"] += int(would_call)
+            projected["would_skip"] += int(not would_call)
+            projected["avoided_calls"] += calls if not would_call else 0
+            if (
+                policy_name == "max_staleness_heartbeat"
+                and policy.get("heartbeat_used")
+            ):
+                result["heartbeat_usage"] += 1
+
+    result["instruments"] = sorted(instruments)
+    result["sessions"] = sorted(sessions)
+    result["candidate"]["instruments"] = sorted(candidate_instruments)
+    result["candidate"]["sessions"] = sorted(candidate_sessions)
+    result["baseline"]["schema_valid_rate"] = _benchmark_rate(
+        result["baseline"]["successes"],
+        result["baseline"]["completed_runs"],
+    )
+    result["candidate"]["schema_valid_rate"] = _benchmark_rate(
+        result["candidate"]["schema_valid_calls"],
+        result["candidate"]["paired_cycles"],
+    )
+    result["paired_baseline"]["schema_valid_rate"] = _benchmark_rate(
+        result["paired_baseline"]["successes"],
+        result["paired_baseline"]["completed_runs"],
+    )
+    for side in ("baseline", "candidate", "paired_baseline"):
+        result[side]["estimated_cost_usd"] = round(
+            float(result[side]["estimated_cost_usd"]), 8
+        )
+
+    baseline_cost = result["paired_baseline"]["estimated_cost_usd"]
+    candidate_cost = result["candidate"]["estimated_cost_usd"]
+    paired = result["candidate"]["paired_cycles"]
+    if paired:
+        result["comparisons"] = {
+            "cost_savings_usd": round(baseline_cost - candidate_cost, 8),
+            "cost_reduction_rate": (
+                None
+                if baseline_cost <= 0
+                else round((baseline_cost - candidate_cost) / baseline_cost, 4)
+            ),
+            "schema_validity_delta": (
+                None
+                if result["paired_baseline"]["schema_valid_rate"] is None
+                or result["candidate"]["schema_valid_rate"] is None
+                else round(
+                    result["candidate"]["schema_valid_rate"]
+                    - result["paired_baseline"]["schema_valid_rate"],
+                    4,
+                )
+            ),
+            "retry_delta_per_call": round(
+                (
+                    result["candidate"]["retries"] / max(1, paired)
+                    - result["paired_baseline"]["retries"] / max(1, paired)
+                ),
+                4,
+            ),
+        }
+    return result
+
+
+def _benchmark_advisory(
+    cycles: list[dict],
+    overall: dict,
+    *,
+    candidate_enabled: bool,
+) -> dict:
+    """Create a conservative report-only recommendation."""
+    instruments = set(overall.get("instruments") or [])
+    sessions = {
+        session for session in (overall.get("sessions") or []) if session != "UNKNOWN"
+    }
+    evidence_gaps = []
+    if len(cycles) < _BENCHMARK_MIN_REPRESENTATIVE_CYCLES:
+        evidence_gaps.append(
+            f"need at least {_BENCHMARK_MIN_REPRESENTATIVE_CYCLES} cycles"
+        )
+    if len(instruments) < _BENCHMARK_MIN_REPRESENTATIVE_INSTRUMENTS:
+        evidence_gaps.append(
+            f"need at least {_BENCHMARK_MIN_REPRESENTATIVE_INSTRUMENTS} instruments"
+        )
+    if len(sessions) < _BENCHMARK_MIN_REPRESENTATIVE_SESSIONS:
+        evidence_gaps.append(
+            f"need at least {_BENCHMARK_MIN_REPRESENTATIVE_SESSIONS} labeled sessions"
+        )
+
+    if not VISUAL_BRAIN_BENCHMARK_ENABLED:
+        return {
+            "decision": "NO_AUTOMATIC_ROLLOUT",
+            "recommendation": "keep_current_cadence",
+            "confidence": "none",
+            "confidence_score": 0.0,
+            "representative_sample": False,
+            "evidence_gaps": ["benchmark is disabled"],
+            "reason": "Read-only evidence collection is disabled.",
+            "required_guard": "retain max_staleness_heartbeat for any future policy",
+        }
+
+    if candidate_enabled:
+        candidate = overall["candidate"]
+        candidate_instruments = set(candidate.get("instruments") or [])
+        candidate_sessions = {
+            item
+            for item in (candidate.get("sessions") or [])
+            if item != "UNKNOWN"
+        }
+        if candidate["paired_cycles"] < _BENCHMARK_MIN_CANDIDATE_PAIRS:
+            evidence_gaps.append(
+                f"need at least {_BENCHMARK_MIN_CANDIDATE_PAIRS} paired candidate results"
+            )
+        if len(candidate_instruments) < _BENCHMARK_MIN_REPRESENTATIVE_INSTRUMENTS:
+            evidence_gaps.append(
+                "paired candidate results must cover at least "
+                f"{_BENCHMARK_MIN_REPRESENTATIVE_INSTRUMENTS} instruments"
+            )
+        if len(candidate_sessions) < _BENCHMARK_MIN_REPRESENTATIVE_SESSIONS:
+            evidence_gaps.append(
+                "paired candidate results must cover at least "
+                f"{_BENCHMARK_MIN_REPRESENTATIVE_SESSIONS} labeled sessions"
+            )
+
+    representative = not evidence_gaps
+    projected = overall.get("projected") or {}
+    best_policy = None
+    if projected:
+        best_policy = max(
+            projected,
+            key=lambda name: projected[name].get("avoided_calls", 0),
+        )
+
+    if not representative:
+        return {
+            "decision": "NO_AUTOMATIC_ROLLOUT",
+            "recommendation": "continue_read_only_collection",
+            "confidence": "low",
+            "confidence_score": 0.25,
+            "representative_sample": False,
+            "evidence_gaps": evidence_gaps,
+            "reason": "The sample is not yet representative enough to change paid-call cadence.",
+            "recommended_policy": best_policy,
+            "required_guard": "retain max_staleness_heartbeat for any future policy",
+        }
+
+    candidate = overall["candidate"]
+    candidate_rate = candidate.get("schema_valid_rate")
+    cost_reduction = (overall.get("comparisons") or {}).get("cost_reduction_rate")
+    if candidate_enabled and (
+        candidate_rate is None
+        or candidate_rate < 0.99
+        or cost_reduction is None
+        or cost_reduction <= 0
+    ):
+        return {
+            "decision": "NO_AUTOMATIC_ROLLOUT",
+            "recommendation": "keep_gpt_5_4_and_continue_shadow_comparison",
+            "confidence": "medium",
+            "confidence_score": 0.65,
+            "representative_sample": True,
+            "evidence_gaps": [
+                "candidate must sustain >=99% schema validity and lower cost"
+            ],
+            "reason": "A cheaper candidate has not met the minimum quality and cost bar.",
+            "recommended_policy": best_policy,
+            "required_guard": "retain max_staleness_heartbeat for any future policy",
+        }
+
+    return {
+        "decision": "NO_AUTOMATIC_ROLLOUT",
+        "recommendation": "review_shadow_policy_before_any_staged_change",
+        "confidence": "medium",
+        "confidence_score": 0.75,
+        "representative_sample": True,
+        "evidence_gaps": [
+            "semantic equivalence and downstream usefulness still require human review"
+        ],
+        "reason": (
+            "The sample supports a human review of the highest-avoidance policy, "
+            "but does not authorize changing production cadence."
+        ),
+        "recommended_policy": best_policy,
+        "required_guard": "retain max_staleness_heartbeat for any future policy",
+    }
+
+
+def get_benchmark_report(
+    limit: int = 50,
+    instrument: Optional[str] = None,
+    session: Optional[str] = None,
+) -> dict:
     """Return bounded shadow benchmark telemetry; never recomputes market state."""
     limit = max(1, min(int(limit), _BENCHMARK_HISTORY_LIMIT))
     with _BENCHMARK_LOCK:
         recent = list(_BENCHMARK_RECENT)
         if instrument:
-            recent = [item for item in recent if item.get("instrument") == instrument.upper()]
+            recent = [
+                item for item in recent
+                if item.get("instrument") == instrument.upper()
+            ]
+        if session:
+            recent = [
+                item for item in recent
+                if item.get("session") == session.upper()
+            ]
         recent = recent[-limit:]
         counters = _safe_copy(_BENCHMARK_COUNTERS)
     counters["baseline_cost_usd"] = round(float(counters.get("baseline_cost_usd") or 0), 8)
     counters["candidate_cost_usd"] = round(float(counters.get("candidate_cost_usd") or 0), 8)
+    overall = _benchmark_rollup(recent)
+    by_instrument = {
+        instrument_name: _benchmark_rollup(
+            [item for item in recent if item.get("instrument") == instrument_name]
+        )
+        for instrument_name in overall["instruments"]
+    }
+    by_session = {
+        session_name: _benchmark_rollup(
+            [item for item in recent if item.get("session") == session_name]
+        )
+        for session_name in overall["sessions"]
+    }
+    candidate_enabled = (
+        VISUAL_BRAIN_BENCHMARK_ENABLED
+        and VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED
+    )
     return {
         "ok": True,
         "enabled": VISUAL_BRAIN_BENCHMARK_ENABLED,
-        "candidate_enabled": (
-            VISUAL_BRAIN_BENCHMARK_ENABLED
-            and VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED
-        ),
+        "candidate_enabled": candidate_enabled,
         "candidate_model": VISUAL_BRAIN_BENCHMARK_CANDIDATE_MODEL,
         "candidate_pricing_per_million": {
             "input_usd": VISUAL_BRAIN_BENCHMARK_CANDIDATE_INPUT_COST_PER_MILLION,
@@ -968,6 +1374,30 @@ def get_benchmark_report(limit: int = 50, instrument: Optional[str] = None) -> d
         "max_staleness_seconds": VISUAL_BRAIN_BENCHMARK_MAX_STALENESS_SECONDS,
         "image_hamming_max": VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX,
         "counters": counters,
+        "sample": {
+            "scope": "bounded_recent_cycles",
+            "cycle_limit": limit,
+            "cycles": overall["cycles"],
+            "instruments": overall["instruments"],
+            "sessions": overall["sessions"],
+            "representative": (
+                overall["cycles"] >= _BENCHMARK_MIN_REPRESENTATIVE_CYCLES
+                and len(overall["instruments"])
+                >= _BENCHMARK_MIN_REPRESENTATIVE_INSTRUMENTS
+                and len(
+                    [
+                        item for item in overall["sessions"]
+                        if item != "UNKNOWN"
+                    ]
+                ) >= _BENCHMARK_MIN_REPRESENTATIVE_SESSIONS
+            ),
+        },
+        "rollup": overall,
+        "by_instrument": by_instrument,
+        "by_session": by_session,
+        "advisory": _benchmark_advisory(
+            recent, overall, candidate_enabled=candidate_enabled
+        ),
         "recent_cycles": recent,
     }
 

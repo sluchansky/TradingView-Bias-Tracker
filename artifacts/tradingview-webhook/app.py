@@ -88346,8 +88346,13 @@ def route_visual_brain_benchmark():
     try:
         import visual_brain as _vb  # noqa: PLC0415
         inst = request.args.get("instrument")
+        session = request.args.get("session")
         limit = min(max(int(request.args.get("limit", "50")), 1), 200)
-        return jsonify(_vb.get_benchmark_report(limit=limit, instrument=inst))
+        return jsonify(_vb.get_benchmark_report(
+            limit=limit,
+            instrument=inst,
+            session=session,
+        ))
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
