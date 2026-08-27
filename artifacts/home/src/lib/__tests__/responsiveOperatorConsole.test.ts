@@ -30,6 +30,13 @@ describe('mobile operator console layout contract', () => {
     expect(cockpit).not.toContain('className="cockpit-diagnostics-panel" style={{\n            width: "6px"');
     expect(cockpit).toContain('className="cockpit-trade-ticket"');
     expect(cockpit).toContain('className="cockpit-overlay"');
+    expect(cockpit).toContain('className="cockpit-primary-verdict"');
+    expect(cockpit).toContain('Diagnostic / score context');
+    expect(cockpit).toContain('Required blocker');
+    expect(cockpit).toContain('className="cockpit-login-card"');
+    expect(mainBrain).toContain('className="mb-login-card"');
+    expect(css).toContain('font-size: clamp(42px, 15vw, 64px)');
+    expect(css).toContain('.cockpit-login-card input');
     expect(css).toContain('grid-template-columns: repeat(2, minmax(0, 1fr))');
     expect(css).toContain('z-index: 10000 !important');
   });

@@ -13877,8 +13877,8 @@ const MainBrainLoginScreen: React.FC<{ onSubmit: (password: string) => Promise<b
   };
 
   return (
-    <div style={{ position:'fixed', inset:0, zIndex:10000, minHeight:'100vh', display:'flex', alignItems:'center', justifyContent:'center', background:T.bg, color:T.txtPri, fontFamily:"'Inter',system-ui,sans-serif", padding:20 }}>
-      <form onSubmit={event => { event.preventDefault(); void attemptLogin(); }} style={{ position:'relative', zIndex:1, width:'min(360px, 100%)', display:'flex', flexDirection:'column', gap:14, background:T.panel, border:`1px solid ${T.border}`, borderRadius:12, padding:28, boxShadow:'0 24px 80px rgba(0,0,0,.34)' }}>
+    <div className="mb-login-overlay" style={{ position:'fixed', inset:0, zIndex:10000, minHeight:'100dvh', display:'flex', alignItems:'center', justifyContent:'center', background:T.bg, color:T.txtPri, fontFamily:"'Inter',system-ui,sans-serif", padding:20 }}>
+      <form className="mb-login-card" onSubmit={event => { event.preventDefault(); void attemptLogin(); }} style={{ position:'relative', zIndex:1, width:'min(360px, 100%)', display:'flex', flexDirection:'column', gap:14, background:T.panel, border:`1px solid ${T.border}`, borderRadius:12, padding:28, boxShadow:'0 24px 80px rgba(0,0,0,.34)', boxSizing:'border-box' }}>
         <div style={{ fontSize:28, lineHeight:1 }}>🧠</div>
         <div>
           <div style={{ fontSize:14, fontWeight:800, color:T.txtPri, letterSpacing:'.06em' }}>MAIN BRAIN ACCESS</div>
@@ -13887,9 +13887,9 @@ const MainBrainLoginScreen: React.FC<{ onSubmit: (password: string) => Promise<b
         <input type="text" value="admin" readOnly autoComplete="username" tabIndex={-1} aria-hidden="true" style={{ display:'none' }} />
         <input ref={inputRef} type="password" value={password} onChange={event => { setPassword(event.target.value); setError(''); }}
           name="dashboard-password" placeholder="Dashboard password" autoComplete="current-password" aria-invalid={Boolean(error)}
-          style={{ width:'100%', boxSizing:'border-box', background:T.panelAlt, border:`1px solid ${error ? T.red : T.border}`, borderRadius:7, padding:'11px 12px', color:T.txtPri, outline:'none', fontSize:13 }} />
+          style={{ width:'100%', minHeight:44, boxSizing:'border-box', background:T.panelAlt, border:`1px solid ${error ? T.red : T.border}`, borderRadius:7, padding:'11px 12px', color:T.txtPri, outline:'none', fontSize:13 }} />
         {error && <div role="alert" style={{ color:T.red, fontSize:11 }}>{error}</div>}
-        <button data-testid="main-brain-login-submit" type="button" onClick={() => { void attemptLogin(); }} disabled={checking} style={{ background:`${T.cyan}20`, border:`1px solid ${T.cyan}55`, color:T.cyan, borderRadius:7, padding:'10px 14px', cursor:checking?'wait':'pointer', fontWeight:800, fontSize:12, opacity:checking ? .65 : 1 }}>
+        <button data-testid="main-brain-login-submit" type="button" onClick={() => { void attemptLogin(); }} disabled={checking} style={{ minHeight:44, background:`${T.cyan}20`, border:`1px solid ${T.cyan}55`, color:T.cyan, borderRadius:7, padding:'10px 14px', cursor:checking?'wait':'pointer', fontWeight:800, fontSize:12, opacity:checking ? .65 : 1 }}>
           {checking ? 'Checking…' : 'Connect'}
         </button>
       </form>
@@ -15919,15 +15919,19 @@ export default function MainBrain() {
         @media (max-width: 768px) {
           .mb-grid-3, .mb-grid-2, .mb-training-stats, .mb-verdict-row { grid-template-columns: 1fr !important; }
           .mb-desktop-sidenav { display: none !important; }
-          .mb-mobile-menu-toggle { width:36px; height:36px; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; border-radius:8px; border:1px solid ${T.borderMid}; color:${T.cyan}; background:${T.cyan}12; cursor:pointer; font-size:20px; line-height:1; }
+          .mb-mobile-menu-toggle { width:44px; height:44px; display:inline-flex; align-items:center; justify-content:center; flex-shrink:0; border-radius:8px; border:1px solid ${T.borderMid}; color:${T.cyan}; background:${T.cyan}12; cursor:pointer; font-size:20px; line-height:1; }
           .mb-main-header { min-height:58px !important; height:auto !important; padding:8px 12px !important; gap:8px !important; flex-wrap:wrap; }
           .mb-header-brand { min-width:0; }
           .mb-header-context, .mb-header-page-nav { display:none !important; }
           .mb-header-actions { gap:6px !important; margin-left:auto !important; }
           .mb-header-actions > span { display:none; }
-          .mb-header-actions button { padding:7px 9px !important; min-height:34px; }
+          .mb-header-actions button { padding:8px 10px !important; min-height:44px; min-width:44px; }
           .mb-main-content { padding:12px 12px 28px !important; }
           .mb-main-footer { padding:10px 12px calc(10px + env(safe-area-inset-bottom)) !important; gap:4px; align-items:flex-start !important; flex-direction:column; }
+          .mb-panel, .mb-verdict-row, .mb-main-content { min-width:0; overflow-wrap:anywhere; }
+          .mb-login-overlay { padding:max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom)) !important; }
+          .mb-login-card { width:100% !important; max-width:360px; padding:22px 18px !important; }
+          .mb-login-card input, .mb-login-card button { min-height:44px; }
         }
         @media (prefers-reduced-motion: reduce) {
           * { transition: none !important; animation: none !important; }

@@ -19,6 +19,7 @@ Covers:
 import unittest
 import uuid
 import json
+from datetime import datetime, timezone
 from unittest.mock import patch, MagicMock, call
 
 
@@ -113,6 +114,39 @@ class TestNJBootProbe(unittest.TestCase):
             app._boot_native_journal_table()
         mock_lc.assert_not_called()
         self.assertFalse(app.NJ_DB_READY)
+
+
+class TestNJStaleSubmissionClassification(unittest.TestCase):
+    """Submission-only rows become inert without invented fills or outcomes."""
+
+    def setUp(self):
+        import app
+        self.app = app
+        self.app.NJ_DB_READY = True
+
+    def tearDown(self):
+        self.app.NJ_DB_READY = False
+
+    def test_marks_only_old_rows_without_fill_or_terminal_evidence(self):
+        cursor = MagicMock()
+        cursor.rowcount = 2
+        conn = MagicMock()
+        conn.cursor.return_value.__enter__.return_value = cursor
+        with patch.object(self.app, "_learning_conn", return_value=conn):
+            self.assertEqual(self.app._nj_classify_stale_submitted_rows(), 2)
+
+        sql = cursor.execute.call_args.args[0]
+        params = cursor.execute.call_args.args[1]
+        self.assertIn("lifecycle_status = 'STATUS_UNKNOWN'", sql)
+        self.assertIn("review_status = 'NEEDS_REVIEW'", sql)
+        self.assertIn("outcome IS NULL", sql)
+        self.assertIn("? 'avg_entry'", sql)
+        self.assertIn("'POSITION_OPENED'", sql)
+        self.assertEqual(params[2], self.app._NJ_STALE_SUBMITTED_HOURS)
+        self.assertNotIn("actual_exit", params[0])
+        self.assertNotIn("net_pnl", params[0])
+        self.assertNotIn("realized_r", params[0])
+        conn.commit.assert_called_once()
 
 
 class TestNJCreateFromSnapshot(unittest.TestCase):
@@ -1390,9 +1424,15 @@ class TestManagedPaperJournalBridge(unittest.TestCase):
         self.assertTrue(recovered["closed"])
         self.assertTrue(recovered["_paper_terminal_pending"])
         with patch.object(self.app, "_fetch_latest_bar", return_value=None), \
-             patch.object(self.app, "_close_managed_paper_journal", return_value=True):
+             patch.object(self.app, "_close_managed_paper_journal", return_value=True), \
+             patch.object(self.app, "_send_outcome_update") as notify, \
+             patch.object(self.app, "_apply_outcome_to_journal") as legacy, \
+             patch.object(self.app, "_record_strategy_trade") as record:
             self.app._watch_managed_trades()
         self.assertNotIn("_paper_terminal_pending", recovered)
+        notify.assert_called_once()
+        legacy.assert_called_once()
+        record.assert_called_once()
 
     def test_boot_stop_retry_stays_inert_until_native_row_confirms(self):
         """A boot-time cancel outage remains retryable without another restart."""
@@ -1440,6 +1480,79 @@ class TestManagedPaperJournalBridge(unittest.TestCase):
         self.assertNotIn("outcome", mt)
         notify.assert_not_called()
         record.assert_not_called()
+
+    def test_fenced_terminal_intent_also_waits_for_exact_native_outcome(self):
+        """An intent fence alone cannot release legacy or learning side effects."""
+        mt = self._managed_trade("MNQ")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "mfe": 0.0,
+            "mae": 0.0,
+        })
+
+        def failed_exact_close(trade):
+            trade["_paper_terminal_fenced"] = True
+            return False
+
+        with patch.object(
+            self.app, "_close_managed_paper_journal",
+            side_effect=failed_exact_close,
+        ), patch.object(self.app, "_send_outcome_update") as notify, \
+             patch.object(self.app, "_apply_outcome_to_journal") as legacy, \
+             patch.object(self.app, "_record_strategy_trade") as record:
+            self.assertFalse(
+                self.app._close_managed_trade(mt, "Win", "Win (TP1)", 110.0)
+            )
+
+        self.assertFalse(mt.get("closed"))
+        self.assertTrue(mt.get("_paper_terminal_pending"))
+        self.assertEqual(mt["_paper_terminal_retry"], {
+            "outcome": "Win",
+            "result_label": "Win (TP1)",
+            "exit_price": 110.0,
+        })
+        self.assertNotIn("outcome", mt)
+        notify.assert_not_called()
+        legacy.assert_not_called()
+        record.assert_not_called()
+
+    def test_fenced_terminal_retry_replays_original_close_then_side_effects(self):
+        mt = self._managed_trade("MNQ")
+        mt.update({
+            "native_journal_internal_trade_id": str(uuid.uuid4()),
+            "native_journal_source": "paper",
+            "mfe": 0.0,
+            "mae": 0.0,
+        })
+        outcomes = iter((False, True))
+        with patch.object(
+            self.app, "_nj_set_outcome", side_effect=lambda *a, **k: next(outcomes)
+        ) as set_outcome, patch.object(
+            self.app, "_save_managed_paper_terminal_intent", return_value=True
+        ), patch.object(self.app, "_send_outcome_update") as notify, \
+             patch.object(self.app, "_apply_outcome_to_journal") as legacy, \
+             patch.object(self.app, "_record_strategy_trade") as record, \
+             patch.object(self.app, "_fetch_latest_bar", return_value=None):
+            self.assertFalse(
+                self.app._close_managed_trade(mt, "Win", "Win (TP1)", 110.0)
+            )
+            self.app.MANAGED_TRADES_BY_KEY[mt["key"]] = mt
+            self.app._watch_managed_trades()
+
+        self.assertEqual(set_outcome.call_count, 2)
+        self.assertEqual(set_outcome.call_args.args[1]["managed_result"], "Win")
+        self.assertEqual(set_outcome.call_args.kwargs["actual_exit"], 110.0)
+        self.assertTrue(mt["closed"])
+        self.assertEqual(mt["outcome"], "Win")
+        self.assertEqual(mt["result_label"], "Win (TP1)")
+        self.assertEqual(mt["exit_price"], 110.0)
+        self.assertNotIn("_paper_terminal_pending", mt)
+        self.assertNotIn("_paper_terminal_retry", mt)
+        notify.assert_called_once()
+        legacy.assert_called_once()
+        record.assert_called_once()
+
 
     def test_swing_paper_state_restores_its_thesis_lifecycle(self):
         """A rehydrated SWING keeps the dispatcher and once-only thesis flags."""
@@ -1663,6 +1776,19 @@ class TestManagedPaperJournalBridge(unittest.TestCase):
              patch.object(self.app, "_post_management_update") as retry_post:
             self.app._watch_managed_trades()
         retry_post.assert_not_called()
+
+
+class TestCanonicalAnalyticsSessions(unittest.TestCase):
+    def test_learning_and_trade_management_share_dst_aware_et_buckets(self):
+        import app
+        winter = datetime(2026, 1, 15, 14, 45, tzinfo=timezone.utc)
+        summer = datetime(2026, 7, 15, 13, 45, tzinfo=timezone.utc)
+        self.assertEqual(app._learning_session_name(winter), "09:30-10:30")
+        self.assertEqual(app._learning_session_name(summer), "09:30-10:30")
+        self.assertEqual(
+            app._trade_mgmt_session_name(winter),
+            app._learning_session_name(winter),
+        )
 
 
 if __name__ == "__main__":

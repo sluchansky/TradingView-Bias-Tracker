@@ -613,7 +613,7 @@
   #cockpit-nav a {
     flex: 0 0 auto;
     min-width: 44px;
-    min-height: 42px;
+    min-height: 44px;
   }
 
   #cockpit-brain-decision {
@@ -631,10 +631,26 @@
     min-width: 0;
   }
 
+  .cockpit-primary-verdict {
+    max-width: 100%;
+    font-size: clamp(42px, 15vw, 64px) !important;
+    letter-spacing: -0.055em !important;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+  }
+
+  #cockpit-key-rows,
+  #cockpit-key-rows * {
+    min-width: 0;
+    overflow-wrap: anywhere;
+  }
+
   .cockpit-diagnostics-panel {
     width: min(100%, 420px) !important;
     max-width: 100%;
     border-left: 0 !important;
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
   }
 
   #cockpit-diagnostics button {
@@ -643,6 +659,23 @@
 
   .cockpit-overlay {
     z-index: 10000 !important;
+  }
+
+  .cockpit-login-overlay {
+    padding: max(16px, env(safe-area-inset-top)) 16px max(16px, env(safe-area-inset-bottom));
+    box-sizing: border-box;
+  }
+
+  .cockpit-login-card {
+    width: 100% !important;
+    max-width: 360px;
+    padding: 28px 20px !important;
+    box-sizing: border-box;
+  }
+
+  .cockpit-login-card input,
+  .cockpit-login-card button {
+    min-height: 44px;
   }
 
   .cockpit-trade-ticket {

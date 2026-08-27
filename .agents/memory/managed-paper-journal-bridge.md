@@ -65,7 +65,9 @@ pointing at a row that never existed.
 exit, P&L, R, and close metadata), not just open-state recovery fields. Test
 close-write outages across both a live-process retry and a restart, and fault-inject
 gateway creation before accepting any linkage behavior. Cache-fenced stops likewise
-stay inert and retry native cancellation until it confirms terminal state.
+stay inert and retry native cancellation until it confirms terminal state. A terminal
+retry must re-enter the full finalization path after exact-row confirmation so deferred
+legacy mirrors, notifications, and learning effects run once rather than being lost.
 
 PAPER management must not advance while its recoverable journal state is unconfirmed:
 creation/linkage plus state persistence are prerequisites to watcher evaluation, and a

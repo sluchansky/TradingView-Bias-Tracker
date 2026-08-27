@@ -1,4 +1,5 @@
 import { useState, useEffect, useCallback, useRef } from "react";
+import { matchesRequiredBlocker } from "../lib/blockerSemantics";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 type TradePlan = {
@@ -438,15 +439,25 @@ export default function Cockpit() {
   const freshness = safeStr(data?.data_feed?.overall_freshness) ?? "—";
   const execMode  = safeStr(data?.execution_mode)?.replace(/_/g, " ") ?? "—";
 
-  // Seven gate indicators (Section 2)
+  const gateDebug = (data?.gate_debug && typeof data.gate_debug === "object") ? data.gate_debug : null;
+  const blockerText = [
+    data?.strict_reason,
+    gateDebug?.blocked_by,
+    gateDebug?.reason,
+  ].filter(Boolean).join(" ").toLowerCase();
+  const isRequiredBlocker = (...terms: Array<string | undefined>) =>
+    matchesRequiredBlocker(blockerText, ...terms);
+
+  // Decision conditions: only the backend-named blocker is styled as required.
+  // Missing score components remain diagnostic instead of looking like hard gates.
   const gateItems = [
-    { label: "BOS",    ok: data?.confluences?.bos },
-    { label: "CHOCH",  ok: data?.confluences?.choch },
-    { label: "VWAP",   ok: data?.confluences?.vwap },
-    { label: "CVD",    ok: data?.confluences?.cvd_confirmed },
-    { label: "Volume", ok: data?.confluences?.volume_confirmed },
-    { label: "Zone",   ok: data?.confluences?.zone_confirmed },
-    { label: "Sweep",  ok: data?.confluences?.liquidity_sweep },
+    { label: "BOS",    ok: data?.confluences?.bos,             required: isRequiredBlocker("structure", "bos") },
+    { label: "CHOCH",  ok: data?.confluences?.choch,           required: isRequiredBlocker("structure", "choch") },
+    { label: "VWAP",   ok: data?.confluences?.vwap,             required: isRequiredBlocker("vwap") },
+    { label: "CVD",    ok: data?.confluences?.cvd_confirmed,    required: isRequiredBlocker("cvd") },
+    { label: "Volume", ok: data?.confluences?.volume_confirmed, required: isRequiredBlocker("volume") },
+    { label: "Zone",   ok: data?.confluences?.zone_confirmed,   required: isRequiredBlocker("zone", "location") },
+    { label: "Sweep",  ok: data?.confluences?.liquidity_sweep, required: isRequiredBlocker("sweep") },
   ];
 
   // Section 5 — Learning & History
@@ -454,10 +465,9 @@ export default function Cockpit() {
     ? data!.market_events_timeline!.slice(0, 12) : [];
 
   // Section 4 — Diagnostics drawer (raw/diagnostic fields, behind control)
-  const gateDebug = (data?.gate_debug && typeof data.gate_debug === "object") ? data.gate_debug : null;
   const diagItems = (() => {
     if (!data) return [];
-    const items: { label: string; value: string; sub: string }[] = [];
+    const items: { label: string; value: string; sub: string; required?: boolean }[] = [];
     items.push({ label: "Edge score", value: `${edge} / ${edgeMax}`, sub: brain?.score.grade ? `${brain.score.grade} grade` : "" });
     items.push({ label: "Direction (raw)", value: data.strict_direction ?? "—", sub: "" });
     items.push({ label: "Bull score", value: `${data.bullish_score ?? 0}`, sub: "directional confidence" });
@@ -477,7 +487,10 @@ export default function Cockpit() {
         items.push({
           label: keyLabels[k] ?? k.replace(/_/g, " "),
           value: v === true ? "PASS" : v === false ? "FAIL" : String(v),
-          sub: "",
+          sub: v === false
+            ? (isRequiredBlocker(k, keyLabels[k]?.toLowerCase()) ? "Required blocker" : "Diagnostic / score context")
+            : "",
+          required: v === false && isRequiredBlocker(k, keyLabels[k]?.toLowerCase()),
         });
       }
     }
@@ -634,7 +647,7 @@ export default function Cockpit() {
         {/* Primary verdict + score + grade + direction */}
         <div style={{ marginBottom: "24px" }}>
           {/* Verdict headline — single primary display */}
-          <div id="primary-verdict" style={{
+          <div id="primary-verdict" className="cockpit-primary-verdict" style={{
             fontSize: "76px", fontWeight: 800, color: verdictColor,
             letterSpacing: "-4px", lineHeight: 0.95, textShadow: verdictGlow,
             marginBottom: "20px", userSelect: "none",
@@ -773,18 +786,18 @@ export default function Cockpit() {
           <Label>Market structure</Label>
         </div>
 
-        {/* Seven gate indicators */}
+        {/* Decision conditions */}
         <div id="gate-checklist" style={{ marginTop: "8px", marginBottom: "10px", display: "flex", flexWrap: "wrap", gap: "5px" }}>
           {gateItems.map(g => (
             <div key={g.label} style={{
               display: "flex", alignItems: "center", gap: "3px",
               fontSize: "10px", fontWeight: 700, letterSpacing: "0.3px",
               padding: "3px 7px", borderRadius: "6px",
-              background: g.ok === true ? "rgba(34,197,94,0.08)" : g.ok === false ? "rgba(239,68,68,0.06)" : "rgba(255,255,255,0.02)",
-              border: `1px solid ${g.ok === true ? "rgba(34,197,94,0.2)" : g.ok === false ? "rgba(239,68,68,0.15)" : C.border}`,
-              color: g.ok === true ? C.green : g.ok === false ? "#f87171" : C.textDim,
+              background: g.ok === true ? "rgba(34,197,94,0.08)" : g.required ? "rgba(239,68,68,0.06)" : "rgba(255,255,255,0.02)",
+              border: `1px solid ${g.ok === true ? "rgba(34,197,94,0.2)" : g.required ? "rgba(239,68,68,0.15)" : C.border}`,
+              color: g.ok === true ? C.green : g.required ? "#f87171" : C.textDim,
             }}>
-              <span>{g.ok === true ? "✓" : g.ok === false ? "✗" : "·"}</span>
+              <span>{g.ok === true ? "✓" : g.required ? "✗" : "·"}</span>
               <span>{g.label}</span>
             </div>
           ))}
@@ -971,7 +984,7 @@ export default function Cockpit() {
                   {data ? "No gate data." : "Loading..."}
                 </div>
               ) : diagItems.map(item => {
-                const isFail = item.value === "FAIL" || item.value === "false";
+                const isFail = item.required === true;
                 return (
                   <div key={item.label} style={{
                     padding: "13px 16px", background: "rgba(255,255,255,0.02)",
@@ -1062,12 +1075,12 @@ export default function Cockpit() {
 
       {/* ── LOGIN OVERLAY ───────────────────────────────────────────────────────── */}
       {showLogin && (
-        <div style={{
+        <div className="cockpit-login-overlay" style={{
           position: "fixed", inset: 0, zIndex: 100,
           display: "flex", alignItems: "center", justifyContent: "center",
           background: "rgba(7,7,13,0.96)", backdropFilter: "blur(12px)", WebkitBackdropFilter: "blur(12px)",
         }}>
-          <div style={{
+          <div className="cockpit-login-card" style={{
             background: C.surface, border: `1px solid ${C.borderMid}`,
             borderRadius: "20px", padding: "40px 36px", width: "320px",
             display: "flex", flexDirection: "column", gap: "0px",
@@ -1082,6 +1095,7 @@ export default function Cockpit() {
               <input
                 type="password"
                 autoFocus
+                autoComplete="current-password"
                 placeholder="Dashboard password"
                 value={loginInput}
                 onChange={e => { setLoginInput(e.target.value); setLoginErr(false); }}

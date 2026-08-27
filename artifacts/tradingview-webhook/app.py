@@ -15734,14 +15734,15 @@ def _learning_conn():
 
 
 def _learning_session_name(dt_utc=None):
-    """Map an instant to its ET trading session: Asia(18–02) / London(02–08) /
-    New York(08–16); 'Off-hours' between 16–18 ET. Never raises."""
+    """Canonical ET analytics bucket used by persisted learning records."""
     try:
-        h = (dt_utc or now_utc()).astimezone(ET_TZ).hour
-        if 8 <= h < 16:        return "New York"
-        if 2 <= h < 8:         return "London"
-        if h >= 18 or h < 2:   return "Asia"
-        return "Off-hours"
+        import gate_effectiveness as _ge_session  # noqa: PLC0415
+        dt = dt_utc or now_utc()
+        if isinstance(dt, str):
+            dt = datetime.fromisoformat(dt.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return _ge_session._et_session_bucket(dt)
     except Exception:
         return "Unknown"
 
@@ -35621,11 +35622,26 @@ def _watch_managed_trades():
         bars[inst] = _fetch_latest_bar(inst)
     for mt in active:
         if mt.get("_paper_terminal_pending"):
-            # A terminal PAPER outcome was observed, but neither its exact-row
-            # close nor the durable terminal fence succeeded yet. Retry only the
-            # persistence bridge; never evaluate, notify, or book it again.
-            if _close_managed_paper_journal(mt):
-                mt.pop("_paper_terminal_pending", None)
+            # Replay the original terminal observation through the full close
+            # path. That path keeps every side effect behind the exact Native
+            # Journal write and releases them once, after persistence succeeds.
+            retry = mt.pop("_paper_terminal_retry", None)
+            if not isinstance(retry, dict):
+                retry = {
+                    "outcome": mt.get("outcome"),
+                    "result_label": mt.get("result_label"),
+                    "exit_price": mt.get("exit_price"),
+                }
+            mt.pop("_paper_terminal_pending", None)
+            mt["closed"] = False
+            mt.setdefault("mfe", 0.0)
+            mt.setdefault("mae", 0.0)
+            _close_managed_trade(
+                mt,
+                retry.get("outcome"),
+                retry.get("result_label"),
+                retry.get("exit_price"),
+            )
             continue
         if mt.get("_paper_cancel_pending"):
             # A failed stop request remains locally inert until the durable
@@ -36231,29 +36247,11 @@ def _trade_mgmt_outcome_booleans(mt):
 
 
 def _trade_mgmt_session_name(dt_utc=None):
-    """Coarse ET trading-session bucket for grouping closed trades (DISPLAY only)."""
+    """Canonical ET bucket for closed-trade analytics (DISPLAY only)."""
     try:
-        if isinstance(dt_utc, str):
-            dt_utc = datetime.fromisoformat(dt_utc)
-        if dt_utc is None:
-            dt_utc = now_utc()
-        if dt_utc.tzinfo is None:
-            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
-        et = dt_utc.astimezone(ET_TZ)
-        m = et.hour * 60 + et.minute
-        if m < 4 * 60:               # 00:00–04:00 ET
-            return "Overnight"
-        if m < 9 * 60 + 30:          # 04:00–09:30 ET
-            return "Pre-Market"
-        if m < 11 * 60:              # 09:30–11:00 ET
-            return "Open"
-        if m < 14 * 60:              # 11:00–14:00 ET
-            return "Midday"
-        if m < 16 * 60:              # 14:00–16:00 ET
-            return "Afternoon"
-        return "After-Hours"
+        return _learning_session_name(dt_utc)
     except Exception:
-        return "Other"
+        return "Unknown"
 
 
 def _compute_trade_mgmt_metrics(mt):
@@ -36416,14 +36414,27 @@ def _close_managed_trade(mt, outcome, result_label, exit_price):
             logger.debug("managed paper-journal close unavailable: %s", exc)
             paper_close_ok = False
         if not paper_close_ok:
-            if mt.get("_paper_terminal_fenced"):
+            # A durable terminal intent prevents restart resurrection, but it is
+            # not an exact Native Journal outcome. Roll back every in-memory
+            # close mutation and defer all legacy mirrors, notifications,
+            # learning writes, and display side effects until the exact row
+            # update succeeds.
+            terminal_intent_fenced = bool(mt.get("_paper_terminal_fenced"))
+            mt.clear()
+            mt.update(pre_close_state)
+            if terminal_intent_fenced:
+                mt["_paper_terminal_fenced"] = True
                 mt["_paper_terminal_pending"] = True
-            else:
-                mt.clear()
-                mt.update(pre_close_state)
-                logger.warning("managed paper terminal outcome paused for %s; no durable fence",
-                               mt.get("instrument") or mt.get("symbol") or "unknown")
-                return False
+                mt["_paper_terminal_retry"] = {
+                    "outcome": outcome,
+                    "result_label": result_label,
+                    "exit_price": exit_price,
+                }
+            logger.warning(
+                "managed paper terminal outcome paused for %s; exact Native Journal write pending",
+                mt.get("instrument") or mt.get("symbol") or "unknown",
+            )
+            return False
 
     # ── Trade-management analytics sidecar (DISPLAY/ANALYTICS; flag-gated) ──
     # Computes MFE/MAE booleans + commission impact + the oversized-loss flag from the
@@ -40394,6 +40405,9 @@ _NJ_VALID_STATUSES = frozenset({
 _NJ_TERMINAL_OUTCOMES = frozenset({
     "CLOSED", "REJECTED", "CANCELED", "STATUS_UNKNOWN",
 })
+_NJ_STALE_SUBMITTED_HOURS = max(
+    1, int(os.environ.get("NJ_STALE_SUBMITTED_HOURS", "24"))
+)
 
 # ── Phase B: valid event-type and override-reason vocabularies ─────────────────
 _NJ_VALID_EVENT_TYPES = frozenset({
@@ -40491,6 +40505,89 @@ def _boot_native_journal_table():
         except Exception:
             pass
         logger.warning("native_journal table NOT ready: %s — native journal disabled", exc)
+
+
+def _nj_classify_stale_submitted_rows():
+    """Quarantine stale submission-only rows without fabricating an outcome."""
+    if not NJ_DB_READY:
+        return 0
+    conn = _learning_conn()
+    if conn is None:
+        return 0
+    reason = "stale_submission_without_fill_or_terminal_evidence"
+    event = {
+        "event_id": "stale-submitted-reconciliation",
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z",
+        "event_type": "BROKER_RECONCILIATION",
+        "old_value": {"lifecycle_status": "SUBMITTED"},
+        "new_value": {"lifecycle_status": "STATUS_UNKNOWN"},
+        "source": "system_auto",
+        "reason_code": "STALE_SUBMISSION",
+        "reason": reason,
+        "automated": True,
+        "operator_id": None,
+        "metadata": {"outcome_fabricated": False},
+    }
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                """UPDATE native_journal
+                   SET lifecycle_status = 'STATUS_UNKNOWN',
+                       review_status = 'NEEDS_REVIEW',
+                       learning_eligible = FALSE,
+                       learning_blocked_reason = 'unresolved_status',
+                       execution = COALESCE(execution, '{}'::jsonb)
+                         || %s::jsonb,
+                       management_events = COALESCE(management_events, '[]'::jsonb)
+                         || %s::jsonb,
+                       updated_at = NOW()
+                   WHERE lifecycle_status = 'SUBMITTED'
+                     AND created_at < NOW() - (%s * INTERVAL '1 hour')
+                     AND outcome IS NULL
+                     AND NOT (
+                       COALESCE(execution, '{}'::jsonb) ? 'avg_entry'
+                       OR COALESCE(execution, '{}'::jsonb) ? 'fill_prices'
+                       OR COALESCE(execution, '{}'::jsonb) ? 'filled_at'
+                     )
+                     AND NOT EXISTS (
+                       SELECT 1
+                       FROM jsonb_array_elements(
+                         COALESCE(management_events, '[]'::jsonb)
+                       ) AS e
+                       WHERE e->>'event_type' IN (
+                         'POSITION_OPENED', 'TARGET_HIT', 'PARTIAL_EXIT',
+                         'POSITION_CLOSED', 'ORDER_REJECTED'
+                       )
+                     )""",
+                (
+                    json.dumps({
+                        "reconciliation_status": "STATUS_UNKNOWN",
+                        "reconciliation_reason": reason,
+                    }),
+                    json.dumps([event]),
+                    _NJ_STALE_SUBMITTED_HOURS,
+                ),
+            )
+            count = cur.rowcount
+        conn.commit()
+        if count:
+            logger.warning(
+                "native_journal quarantined %s stale SUBMITTED row(s) as STATUS_UNKNOWN",
+                count,
+            )
+        return count
+    except Exception as exc:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        logger.warning("native_journal stale-submission reconciliation failed: %s", exc)
+        return 0
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
 
 
 def _nj_create_from_snapshot(snapshot, *, link_edge_ledger=True):
@@ -41464,13 +41561,21 @@ def _load_managed_paper_trades_from_db():
                         terminal_payload = terminal_intent.get("terminal_outcome")
                         if isinstance(terminal_payload, dict):
                             terminal_mt.update(terminal_payload)
-                        terminal_mt["closed"] = True
-                        if not _close_managed_paper_journal(terminal_mt):
+                        terminal_mt["closed"] = False
+                        terminal_mt.setdefault("mfe", 0.0)
+                        terminal_mt.setdefault("mae", 0.0)
+                        terminal_mt["_paper_terminal_fenced"] = True
+                        _close_managed_trade(
+                            terminal_mt,
+                            terminal_mt.get("outcome"),
+                            terminal_mt.get("result_label"),
+                            terminal_mt.get("exit_price"),
+                        )
+                        if terminal_mt.get("_paper_terminal_pending"):
                             # The independent fence is durable, but the exact
                             # native row is not terminal yet. Retain this closed
                             # trade solely for the inert watcher retry.
-                            terminal_mt["_paper_terminal_pending"] = True
-                            terminal_mt["_paper_terminal_fenced"] = True
+                            terminal_mt["closed"] = True
                             MANAGED_TRADES_BY_KEY[terminal_mt["key"]] = terminal_mt
                 continue
             stop_intent = _load_managed_paper_stop_intent(internal_trade_id)
@@ -51272,6 +51377,7 @@ def _scalp_sim_watch_loop():
                     _SCALP_SIM_WATCH_HEALTH["cycles_completed"] += 1
                     _SCALP_SIM_WATCH_HEALTH["last_completed_at"] = now_utc().isoformat()
                     _SCALP_SIM_WATCH_HEALTH["last_error"] = None
+                    _SCALP_SIM_WATCH_HEALTH["last_skip_reason"] = None
                     _SCALP_SIM_WATCH_HEALTH["last_open_rows"] = int(cycle.get("open_rows", 0))
                     _SCALP_SIM_WATCH_HEALTH["last_closed_rows"] = int(cycle.get("closed_rows", 0))
                     _SCALP_SIM_WATCH_HEALTH["last_missing_bar_count"] = int(cycle.get("missing_bars", 0))
@@ -55037,6 +55143,7 @@ def _dual_sim_watch_loop():
                     _DUAL_SIM_WATCH_HEALTH["cycles_completed"] += 1
                     _DUAL_SIM_WATCH_HEALTH["last_completed_at"] = now_utc().isoformat()
                     _DUAL_SIM_WATCH_HEALTH["last_error"] = None
+                    _DUAL_SIM_WATCH_HEALTH["last_skip_reason"] = None
                     _DUAL_SIM_WATCH_HEALTH["last_open_rows"] = int(cycle.get("open_rows", 0))
                     _DUAL_SIM_WATCH_HEALTH["last_closed_rows"] = int(cycle.get("closed_rows", 0))
                     _DUAL_SIM_WATCH_HEALTH["last_missing_bar_count"] = int(
@@ -91054,6 +91161,7 @@ if __name__ == "__main__":
         _restore_execution_enabled_from_db()       # restore execution_enabled from last enable/disable audit record (fail-open; safe default=False)
         _boot_snapshots_table()                    # probe internal_trade_snapshots (no DDL; created via DB tool/publish diff) — immutable send-time context for TradeZella matching
         _boot_native_journal_table()               # probe native_journal (no DDL; created via DB tool/publish diff) — canonical per-trade journal record (Phase A)
+        _nj_classify_stale_submitted_rows()        # old submission-only rows become inert/review-required; never invent fills or outcomes
         _load_managed_paper_trades_from_db()       # rehydrate open display-paper managed trades (INERT; native journal probe first)
         # FVG Engine boot probe — no DDL; fvg_zones table created via DB tool / publish schema-diff.
         # SHADOW/DISPLAY-ONLY. FAIL-OPEN: if the table is missing, _DB_READY stays False and
@@ -91118,12 +91226,14 @@ if __name__ == "__main__":
                 vwap_override_grace_min    = VWAP_OVERRIDE_GRACE_MIN,
                 now_utc_fn                 = now_utc,
             )
-            _DATABENTO_BRAIN.start()
+            # Attach completed-bar consumers before ingestion starts so the
+            # first startup bars cannot be missed by persistence or scanners.
             _DATABENTO_BRAIN.register_bar_close_callback(_databento_bar_scan)
             _DATABENTO_BRAIN.register_structure_signal_callback(_databento_structure_trigger)
             _DATABENTO_BRAIN.register_tick_callback(_databento_tick_broadcast)
             _DATABENTO_BRAIN.register_completed_bar_callback(_persist_completed_paper_sim_bar)
             _DATABENTO_BRAIN.register_bar_close_callback(_fvg_bar_close)  # FVG engine (shadow/display-only)
+            _DATABENTO_BRAIN.start()
             logger.info("DatabentoBrain: initialized and started")
         except Exception as _db_exc:
             logger.error("DatabentoBrain: failed to start — %s", _db_exc)
@@ -91282,10 +91392,11 @@ if __name__ == "__main__":
         threading.Thread(target=_main_brain_resolver_loop, name="main-brain-resolver", daemon=True).start()  # resolve pending WAIT hypotheses (display-only)
         if DISCORD_LIVE_ENABLED and SCALP_RESEARCH_DB_READY:
             threading.Thread(target=_recompute_scalp_research, name="scalp-research-warm", daemon=True).start()  # warm the research cache (LIVE instance only; single-flight, throttled, never in the gate path)
-        if SCALP_LIVE_SIM_ENABLED and DISCORD_LIVE_ENABLED and SCALP_SIM_DB_READY:
-            threading.Timer(0, _scalp_sim_watch_loop).start()  # PAPER live-sim watcher (LIVE instance only; default-OFF flag; resolves paper trades into a SEPARATE table, never the money path)
-        if DUAL_MODE_SHADOW_SIM_ENABLED and DISCORD_LIVE_ENABLED and DUAL_SIM_DB_READY:
-            threading.Timer(0, _dual_sim_watch_loop).start()
+        # Start both diagnostic lifecycles unconditionally; each loop self-gates
+        # before touching its ledger. This makes disabled, non-live, DB-unready,
+        # and actively-cycling states distinguishable in health output.
+        threading.Timer(0, _scalp_sim_watch_loop).start()
+        threading.Timer(0, _dual_sim_watch_loop).start()
         if training_mode_enabled():
             threading.Timer(0, _training_grade_watch_loop).start()  # BOT TRAINING grade watcher (flag-on/prod only; self-gated on DB-ready; resolves the training ledger via stop-first sim, never the money path)
     # Unconditional, time-based Discord senders run on the LIVE (prod) instance only.

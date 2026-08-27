@@ -22,6 +22,7 @@ import os
 import threading
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
+from zoneinfo import ZoneInfo
 
 logger = logging.getLogger(__name__)
 
@@ -160,9 +161,8 @@ def _et_session_bucket(dt_utc: datetime) -> str:
     """Return a canonical ET trading session bucket label.
 
     All reports and cohort selectors call this single function to prevent
-    dashboard disagreements.  Uses UTC-4 (EDT) as a stable approximation
-    of ET; during EST the bucket labels remain correct even though times
-    shift by one hour — acceptably close for session-level analytics.
+    dashboard disagreements. Uses America/New_York so EDT/EST boundaries are
+    represented correctly.
 
     Buckets (Phase 9):
         Overnight       — before 08:00 ET
@@ -176,7 +176,9 @@ def _et_session_bucket(dt_utc: datetime) -> str:
         Evening         — 17:00+
     """
     try:
-        et = dt_utc.astimezone(timezone(timedelta(hours=-4)))  # approximate EDT
+        if dt_utc.tzinfo is None:
+            dt_utc = dt_utc.replace(tzinfo=timezone.utc)
+        et = dt_utc.astimezone(ZoneInfo("America/New_York"))
         h = et.hour + et.minute / 60.0
         if h < 8.0:
             return "Overnight"
@@ -253,7 +255,9 @@ def _classify_shadow_cohort(info: dict, gate_verdict: str, mode: str,
 
         # Cohort B — volume gate blocks during late-morning window
         try:
-            et = now.astimezone(timezone(timedelta(hours=-4)))
+            if now.tzinfo is None:
+                now = now.replace(tzinfo=timezone.utc)
+            et = now.astimezone(ZoneInfo("America/New_York"))
             et_h = et.hour + et.minute / 60.0
         except Exception:
             et_h = -1.0
