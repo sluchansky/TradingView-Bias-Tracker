@@ -164,6 +164,9 @@ export const BOT1_ROUTES = [
   "/diagnostics",
   "/diagnostics-live",
   "/decision-trace",
+  // 09:30 ORB shadow status — display-only snapshots for the global alert dock.
+  "/orb/status",
+  "/orb/status/:inst",
   // Auto-Trade Settings page + its JSON API (owner-only runtime per-asset safety
   // controls; NOT in dashboard-auth OPEN_PATHS so Basic Auth + CSRF apply).
   "/auto-trade-settings",

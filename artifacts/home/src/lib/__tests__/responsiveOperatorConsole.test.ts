@@ -26,6 +26,8 @@ describe('mobile operator console layout contract', () => {
     expect(chart).toContain('className="lmc-plot"');
     expect(chart).toContain('className="lmc-selector"');
     expect(cockpit).toContain('className="cockpit-diagnostics-panel"');
+    expect(cockpit).toContain('className="cockpit-protection-dot"');
+    expect(cockpit).not.toContain('className="cockpit-diagnostics-panel" style={{\n            width: "6px"');
     expect(cockpit).toContain('className="cockpit-trade-ticket"');
     expect(cockpit).toContain('className="cockpit-overlay"');
     expect(css).toContain('grid-template-columns: repeat(2, minmax(0, 1fr))');

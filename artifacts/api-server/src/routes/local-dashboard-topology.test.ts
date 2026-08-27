@@ -20,6 +20,11 @@ describe("local dashboard topology", () => {
     expect(BOT1_ROUTES).toContain("/main-brain/tick-stream-token");
   });
 
+  it("keeps the ORB status routes in the live proxy whitelist", () => {
+    expect(BOT1_ROUTES).toContain("/orb/status");
+    expect(BOT1_ROUTES).toContain("/orb/status/:inst");
+  });
+
   it("uses the hosted Flask port by default and validates local overrides", () => {
     expect(DEFAULT_FLASK_PORT).toBe(8000);
     expect(resolveFlaskPort(undefined)).toBe(8000);

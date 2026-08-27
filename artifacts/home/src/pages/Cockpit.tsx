@@ -858,7 +858,7 @@ export default function Cockpit() {
 
         {/* Prop-account protection dot */}
         <div id="prop-protection" style={{ display: "flex", alignItems: "center", gap: "7px" }}>
-          <div className="cockpit-diagnostics-panel" style={{
+          <div className="cockpit-protection-dot" style={{
             width: "6px", height: "6px", borderRadius: "50%",
             background: !propEnabled ? "#4b5563" : propSafe ? C.green : "#f97316",
             boxShadow: propEnabled && propSafe ? "0 0 6px rgba(34,197,94,0.5)" : "none",
