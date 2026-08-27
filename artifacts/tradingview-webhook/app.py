@@ -235,18 +235,20 @@ EVAL_METRICS_LOCK = threading.Lock()   # guards append (worker) vs snapshot (/ev
 # Guarded by COUNTERS_LOCK, which is NEVER nested inside EVAL_METRICS_LOCK.
 COUNTERS = {
     "webhooks_received":      0,   # every inbound POST /webhook (any type)
-    "evaluations_run":        0,   # every recorded evaluation (webhook + heartbeat)
+    "evaluations_run":        0,   # open-market evals since start (webhook + heartbeat)
     "ready_setups_detected":  0,   # deduped: non-READY -> READY transitions only
     "alerts_sent":            0,   # live-card / tiered alerts actually dispatched
     "duplicates_ignored":     0,   # inbound POSTs flagged duplicate within cooldown
     "signals_passed_filters": 0,   # webhook (non-duplicate) evals with a READY verdict
     "signals_rejected":       0,   # webhook (non-duplicate) evals with a WAIT verdict
     "wait_reasons_breakdown": {},  # raw failed-gate name -> count (WAIT verdicts + duplicates)
-    "rejection_reasons":      {},  # canonical reason -> count (req 6; condition-level on WAIT)
+    "hard_blocker_reasons":   {},  # real failed_conditions, webhook/non-duplicate only
+    "rejection_reasons":      {},  # legacy raw condition-gap counts; NOT necessarily hard gates
 }
-# Canonical rejection-reason keys (req 6). Counted per WAIT eval from gate_debug so
-# the operator sees, broken out, which individual conditions are holding setups back
-# (the raw wait_reasons_breakdown lumps the SCALP confirmations into one bucket).
+# Legacy raw condition-gap keys. These expose absent context even when a mode does
+# not require that condition (for example SCALP zone_valid). They must never be
+# presented as actual hard blockers; hard_blocker_reasons is the authoritative
+# observability projection of gate_debug.failed_conditions.
 # NOTE: "session_filter" is intentionally never incremented — the trading session is
 # a +10 BONUS, never a hard gate, so it can never reject a setup; it is shown at 0 so
 # the operator can SEE that session is not the bottleneck (it is not a filter).
@@ -254,6 +256,11 @@ REJECTION_REASON_KEYS = (
     "zone_valid", "vwap_confirmed", "structure_confirmed", "location",
     "volume_unconfirmed", "cvd_conflict", "volatility_block", "edge_score_low",
     "conflicting_structure", "session_filter", "cooldown_duplicate",
+)
+HARD_BLOCKER_REASON_KEYS = (
+    "zone_valid", "vwap_confirmed", "structure_confirmed", "location",
+    "volume_unconfirmed", "cvd_conflict", "volatility_block", "edge_score_low",
+    "conflicting_structure", "confirmations_missing",
 )
 COUNTERS_LOCK = threading.Lock()
 # Per-instrument last verdict (was it READY?) so ready_setups_detected counts a
@@ -10403,9 +10410,9 @@ def evaluate_strict_setup(current_price, ticker, vwap, vwap_status,
     location_short = bool(near_vwap or _within(nearest_supply))
 
     # ── READY-gate configuration (mode-tunable). SWING keeps zone, VWAP & structure
-    #    as hard gates with edge>=80. SCALP READY = edge>=60 AND a valid fresh zone
-    #    (hard) AND structure (hard) AND VWAP confirmation (hard) AND volume_ok
-    #    (fail-open). location & CVD-conflict are SOFT Edge penalties in SCALP (see
+    #    as hard gates with edge>=80. SCALP demotes zone to score/context and requires
+    #    edge>=60, structure, VWAP confirmation, and volume_ok (fail-open).
+    #    location & CVD-conflict are SOFT Edge penalties in SCALP (see
     #    _edge_modifiers / GATE_SOFT_MODIFIERS), never hard blocks. ──
     ready_threshold      = cfg("EDGE_READY_THRESHOLD")        # actionable floor (EARLY)
     full_ready_threshold = cfg("EDGE_FULL_READY_THRESHOLD")   # full-READY floor
@@ -44845,6 +44852,7 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         # ── Context ──
         "instrument":           instrument,
         "verdict":              (a or {}).get("verdict"),
+        "marketOpen":           (a or {}).get("market_open"),
         # ── Per-signal latency view (additive aliases) ──
         "direction":            direction,
         "setupType":            setup_type,
@@ -44859,11 +44867,14 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
         "alertLevel":           alert_level,
         "edgeScore":            gd.get("edge_score"),
         "edgeOk":               gd.get("edge_ok"),
-        "zoneValid":            gd.get("zone_valid"),
+        "zoneValid":            gd.get("zoneValid"),
+        "zoneStrictValid":      gd.get("zone_valid"),
+        "zoneRequired":         gd.get("require_zone"),
         "confirmationsPassed":  gd.get("confirmations_passed"),
         "confirmationsNeeded":  gd.get("confirmations_needed"),
         "readyThreshold":       gd.get("ready_threshold"),
         "gateBlockers":         blockers,
+        "hardBlockers":         list(gd.get("failed_conditions") or []),
         # ── Expanded WAIT diagnostics (additive; surfaced on the Diagnostics page) ──
         "trigger":              trigger,
         "vwapConfirmed":        gd.get("vwap_confirmed"),
@@ -44932,16 +44943,23 @@ def _record_eval_metrics(a, webhook_received_at, eval_started_at, eval_finished_
                 for _fc in (gd.get("failed_conditions") or []):
                     COUNTERS["wait_reasons_breakdown"][_fc] = \
                         COUNTERS["wait_reasons_breakdown"].get(_fc, 0) + 1
-                # Canonical, broken-out rejection reasons (req 6). Scoped to genuine
-                # inbound signals (webhook, non-duplicate) so this cleanly decomposes
-                # the signals_rejected funnel bucket; duplicates are tallied as
-                # cooldown_duplicate in the webhook() dedup path instead. Counted at
-                # the CONDITION level (not just the active hard gate) so SCALP
-                # confirmation gaps (vwap/structure/candle) are visible even when the
-                # raw wait_reasons_breakdown lumps them into "confirmations(N<M)".
-                # session_filter is deliberately NEVER bumped: the trading session is
-                # a +10 bonus, never a gate, so it can never reject a setup.
                 if trigger == "webhook" and not is_duplicate:
+                    # Actual hard blockers come only from the strict evaluator's
+                    # failed_conditions. This intentionally excludes SCALP raw
+                    # context gaps such as zone_valid when that mode does not
+                    # require the condition.
+                    _hard = COUNTERS["hard_blocker_reasons"]
+                    for _fc in (gd.get("failed_conditions") or []):
+                        _hk = ("edge_score_low" if str(_fc).startswith("edge_score")
+                               else "confirmations_missing"
+                               if str(_fc).startswith("confirmations(")
+                               else str(_fc))
+                        _hard[_hk] = _hard.get(_hk, 0) + 1
+
+                    # Backward-compatible raw condition-gap telemetry. These
+                    # counters describe missing context and are not gate authority.
+                    # session_filter is deliberately never bumped because the
+                    # session is a score bonus, not a gate.
                     _rr = COUNTERS["rejection_reasons"]
                     def _bump_rr(_k):
                         _rr[_k] = _rr.get(_k, 0) + 1
@@ -62031,12 +62049,14 @@ def get_diagnostics():
 
 # ── Live Diagnostics page ────────────────────────────────────────────────────
 # Static HTML (no server-side templating: no %-formatting, no triple-quote
-# collisions). All data is fetched client-side from /api/eval-metrics every 1s.
+# collisions). The page uses /api/eval-metrics behind the normal Express proxy
+# and /eval-metrics when opened directly on Flask for local diagnostics.
 DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="icon" href="data:,">
 <title>Diagnostics - AI Trading Partner</title>
 <style>
   *{box-sizing:border-box;margin:0;padding:0}
@@ -62068,9 +62088,10 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <body>
 <a class="back" href="/api/dashboard">&larr; Back to dashboard</a>
 <h1>Diagnostics</h1>
-<div class="sub">Per-evaluation timing &amp; volatility for the last <span id="cap">100</span> scored alerts &middot; auto-refresh 1s &middot; <span id="updated" class="muted"></span></div>
+<div class="sub">Per-evaluation timing &amp; volatility for the last <span id="cap">100</span> recorded evaluations (webhook + heartbeat) &middot; auto-refresh 1s &middot; <span id="updated" class="muted"></span></div>
 <div class="verdict-row" id="verdict-row"></div>
 <div class="cards" id="summary"></div>
+<div class="sub" id="scope-note">Counts are loading.</div>
 <div class="wrap">
 <table>
 <thead><tr>
@@ -62081,7 +62102,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 <th>AI Notes ms</th><th>Screenshot ms</th><th>Journal ms</th>
 <th>Alert Sent</th><th>Alert Delay ms</th>
 <th>ATR</th><th>Base ATR</th><th>Mult</th><th>Threshold</th><th>Vol Decision</th>
-<th>Alert Level</th><th>Edge</th><th>Confirms</th><th>Gate Blockers</th>
+<th>Alert Level</th><th>Edge</th><th>Confirms</th><th>Hard Gate Blockers</th>
 <th>Sent?</th><th>Cooldown Left ms</th><th>Suppressed</th>
 <th>Event Start</th><th>Sweep</th><th>CHOCH</th><th>Displacement</th>
 <th>Early Alert</th><th>Ready Alert</th><th>Delay s</th><th>Waited Close</th>
@@ -62091,7 +62112,7 @@ DIAGNOSTICS_LIVE_HTML = """<!DOCTYPE html>
 </table>
 </div>
 <script>
-var BASE='/api';
+var BASE=(window.location.pathname.indexOf('/api/')===0)?'/api':'';
 function ms(v){return (v===null||v===undefined)?'-':Number(v).toFixed(1);}
 function num(v){return (v===null||v===undefined)?'-':Number(v).toFixed(2);}
 function intOrDash(v){return (v===null||v===undefined)?'-':Number(v).toFixed(0);}
@@ -62160,11 +62181,14 @@ async function refresh(){
   u.textContent='updated '+new Date().toLocaleTimeString('en-US',{hour12:false});
   var st=data.stats||{};
   var c=st.counters||{};
+  var scopes=st.evaluationScopes||{};
+  var win=scopes.recordedWindow||{};
   var sess=st.session||{};
   var wrb=c.wait_reasons_breakdown||{};
   var wrbTop=Object.keys(wrb).sort(function(a,b){return wrb[b]-wrb[a];}).slice(0,5)
               .map(function(k){return k+' ('+wrb[k]+')';}).join(', ')||'-';
   var rr=c.rejection_reasons||{};
+  var hb=c.hard_blocker_reasons||{};
   var rrLabel={zone_valid:'zone_valid',vwap_confirmed:'vwap_confirmed',
     structure_confirmed:'structure_confirmed',location:'location',
     volume_unconfirmed:'volume',cvd_conflict:'cvd_conflict',
@@ -62173,6 +62197,8 @@ async function refresh(){
     session_filter:'session(bonus,n/a)'};
   var rrKeys=Object.keys(rrLabel).sort(function(a,b){return (rr[b]||0)-(rr[a]||0);});
   var rrTxt=rrKeys.map(function(k){return rrLabel[k]+' ('+(rr[k]||0)+')';}).join(', ');
+  var hbKeys=Object.keys(hb).sort(function(a,b){return (hb[b]||0)-(hb[a]||0);});
+  var hbTxt=hbKeys.map(function(k){return k+' ('+(hb[k]||0)+')';}).join(', ')||'-';
   var sum=document.getElementById('summary');
   var vr=document.getElementById('verdict-row');
   var e=evals.length?evals[0]:null;
@@ -62186,8 +62212,11 @@ async function refresh(){
     card('Latest WAIT reason', e?(ready?'\u2014 ready \u2014':(e.waitReason||e.gateBlockers||'-')):'-', 'sm '+(ready?'good':'warn'));
   sum.innerHTML=
     card('Webhooks received', (c.webhooks_received!=null?c.webhooks_received:'-'), 'muted')+
-    card('Evaluations run', (c.evaluations_run!=null?c.evaluations_run:'-'), 'muted')+
-    card('READY setups', (c.ready_setups_detected!=null?c.ready_setups_detected:'-'), (c.ready_setups_detected>0?'good':'muted'))+
+    card('Evaluations since start (heartbeat-inclusive)', (c.evaluations_run!=null?c.evaluations_run:'-'), 'muted')+
+    card('READY transitions since start', (c.ready_setups_detected!=null?c.ready_setups_detected:'-'), (c.ready_setups_detected>0?'good':'muted'))+
+    card('Heartbeat evals (current window)', (win.heartbeat_evaluations!=null?win.heartbeat_evaluations:'-'), 'muted')+
+    card('Webhook evals (current window)', (win.webhook_evaluations!=null?win.webhook_evaluations:'-'), 'muted')+
+    card('Candidate evals (current window)', (win.candidate_evaluations!=null?win.candidate_evaluations:'-'), 'muted')+
     card('Alerts sent', (c.alerts_sent!=null?c.alerts_sent:'-'), (c.alerts_sent>0?'good':'muted'))+
     card('Last webhook', sinceTxt, (staleWh?'warn':'good'))+
     card('Eval frequency', (st.evaluationFrequencySeconds!=null?('every '+st.evaluationFrequencySeconds+'s'):'-'), (st.evalHeartbeatEnabled?'good':'bad'))+
@@ -62200,11 +62229,17 @@ async function refresh(){
     card('Setup states', setupStateTxt(st.setupStates), 'sm '+(setupStateCls(st.setupStates)))+
     card('Dedup cooldown', (st.signalDedupCooldownSec!=null?(st.signalDedupCooldownSec+'s'):'-'), 'sm muted')+
     card('Session', (sess.window||'-'), 'sm '+(sess.preferred?'good':'muted'))+
-    card('Top WAIT reasons', wrbTop, 'sm muted')+
-    card('Rejection reasons (condition gaps)', rrTxt, 'sm muted');
+    card('Hard blockers (non-duplicate webhooks)', hbTxt, 'sm muted')+
+    card('WAIT observations (heartbeat-inclusive)', wrbTop, 'sm muted')+
+    card('Raw context gaps (not necessarily blockers)', rrTxt, 'sm muted');
+  var scopeNote=document.getElementById('scope-note');
+  if(scopeNote){
+    scopeNote.textContent='Current table: '+(win.recorded_evaluations!=null?win.recorded_evaluations:evals.length)+
+      ' recorded evaluations; completed-bar opportunity IDs are not tracked here. Use Research Coordinator for durable unique opportunities.';
+  }
   var rows=document.getElementById('rows');
   if(!evals.length){
-    rows.innerHTML='<tr><td class="empty" colspan="47">No evaluations yet - waiting for the next webhook.</td></tr>';
+    rows.innerHTML='<tr><td class="empty" colspan="47">No evaluations yet - waiting for the next webhook or heartbeat.</td></tr>';
     return;
   }
   // READY setups float to the top (they are the actionable rows); the heartbeat
@@ -62727,6 +62762,70 @@ def lb_thesis_obs():
     })
 
 
+def _eval_metrics_scope_summary(snapshot):
+    """Classify the bounded diagnostics window without inventing opportunities.
+
+    The evaluation ring has no stable completed-bar/opportunity identity, so this
+    helper reports exact trigger/candidate/verdict counts only. Durable unique
+    opportunity accounting remains owned by the research coordinator.
+    """
+    summary = {
+        "recorded_evaluations": 0,
+        "heartbeat_evaluations": 0,
+        "webhook_evaluations": 0,
+        "nonduplicate_webhook_evaluations": 0,
+        "duplicate_webhook_evaluations": 0,
+        "candidate_evaluations": 0,
+        "actionable_evaluations": 0,
+        "wait_evaluations": 0,
+        "market_closed_rows": 0,
+        "by_instrument": {},
+    }
+
+    def _slot():
+        return {
+            "recorded_evaluations": 0,
+            "heartbeat_evaluations": 0,
+            "webhook_evaluations": 0,
+            "nonduplicate_webhook_evaluations": 0,
+            "candidate_evaluations": 0,
+            "actionable_evaluations": 0,
+            "wait_evaluations": 0,
+        }
+
+    for row in snapshot:
+        if not isinstance(row, dict):
+            continue
+        trigger = str(row.get("trigger") or "webhook").lower()
+        inst = instrument_of(row.get("instrument")) if row.get("instrument") else "UNKNOWN"
+        inst_summary = summary["by_instrument"].setdefault(inst or "UNKNOWN", _slot())
+        for target in (summary, inst_summary):
+            target["recorded_evaluations"] += 1
+        if trigger == "heartbeat":
+            summary["heartbeat_evaluations"] += 1
+            inst_summary["heartbeat_evaluations"] += 1
+        elif trigger == "webhook":
+            summary["webhook_evaluations"] += 1
+            inst_summary["webhook_evaluations"] += 1
+            if row.get("isDuplicate"):
+                summary["duplicate_webhook_evaluations"] += 1
+            else:
+                summary["nonduplicate_webhook_evaluations"] += 1
+                inst_summary["nonduplicate_webhook_evaluations"] += 1
+        if row.get("direction") in ("Long", "Short"):
+            summary["candidate_evaluations"] += 1
+            inst_summary["candidate_evaluations"] += 1
+        if is_actionable(str(row.get("verdict") or row.get("decision") or "")):
+            summary["actionable_evaluations"] += 1
+            inst_summary["actionable_evaluations"] += 1
+        else:
+            summary["wait_evaluations"] += 1
+            inst_summary["wait_evaluations"] += 1
+        if row.get("marketOpen") is False:
+            summary["market_closed_rows"] += 1
+    return summary
+
+
 @app.route("/eval-metrics", methods=["GET"])
 def get_eval_metrics():
     """Owner-only JSON feed of the last EVAL_METRICS_MAX scored evaluations
@@ -62739,6 +62838,11 @@ def get_eval_metrics():
     with EVAL_METRICS_LOCK:
         snapshot = list(EVAL_METRICS)
     with COUNTERS_LOCK:
+        hard_blockers = dict(COUNTERS["hard_blocker_reasons"])
+        raw_condition_gaps = {
+            _k: COUNTERS["rejection_reasons"].get(_k, 0)
+            for _k in REJECTION_REASON_KEYS
+        }
         counters = {
             "webhooks_received":      COUNTERS["webhooks_received"],
             "evaluations_run":        COUNTERS["evaluations_run"],
@@ -62748,13 +62852,16 @@ def get_eval_metrics():
             "signals_passed_filters": COUNTERS["signals_passed_filters"],
             "signals_rejected":       COUNTERS["signals_rejected"],
             "wait_reasons_breakdown": dict(COUNTERS["wait_reasons_breakdown"]),
-            # Canonical rejection reasons (req 6): always expose all keys (0 default)
-            # so the operator sees the full checklist, incl. session_filter pinned at
-            # 0 (bonus, never a gate). conflicting_structure is surfaced too.
-            "rejection_reasons":      {
-                _k: COUNTERS["rejection_reasons"].get(_k, 0)
-                for _k in REJECTION_REASON_KEYS
+            "hard_blocker_reasons":   {
+                **{_k: hard_blockers.get(_k, 0) for _k in HARD_BLOCKER_REASON_KEYS},
+                **{_k: _v for _k, _v in hard_blockers.items()
+                   if _k not in HARD_BLOCKER_REASON_KEYS},
             },
+            # Compatibility key retained for existing consumers. It is now paired
+            # with an explicit raw_condition_gaps alias and semantics below so it
+            # cannot be mistaken for strict gate authority.
+            "rejection_reasons":      raw_condition_gaps,
+            "raw_condition_gaps":     raw_condition_gaps,
         }
         # Trim + count the rolling last-hour timestamp windows under the same lock.
         while _WEBHOOK_TS and _WEBHOOK_TS[0] < _hour_ago:
@@ -62768,6 +62875,7 @@ def get_eval_metrics():
     _durs = [r.get("evaluationDurationMs") for r in snapshot
              if isinstance(r.get("evaluationDurationMs"), (int, float))]
     avg_processing_ms = round(sum(_durs) / len(_durs), 3) if _durs else None
+    window_scope = _eval_metrics_scope_summary(snapshot)
     # Per-instrument setup-state snapshot (display-only; strip internal datetimes).
     with STATE_LOCK:
         setup_states = {
@@ -62798,6 +62906,35 @@ def get_eval_metrics():
         "signalDedupCooldownMGCSec":  signal_dedup_cooldown_sec("MGC"),
         "setupStateTtlSec":           SETUP_STATE_TTL_SEC,
         "setupStates":                setup_states,
+        "evaluationScopes": {
+            "cumulativeSinceProcessStart": {
+                "evaluationsRun": counters["evaluations_run"],
+                "includesHeartbeat": True,
+                "excludesMarketClosed": True,
+                "readySetupsAreTransitions": True,
+            },
+            "recordedWindow": window_scope,
+            "signalFunnelSinceProcessStart": {
+                "nonDuplicateWebhookOnly": True,
+                "passed": counters["signals_passed_filters"],
+                "rejected": counters["signals_rejected"],
+            },
+            "completedBarOpportunities": {
+                "available": False,
+                "count": None,
+                "reason": "eval_metrics_has_no_stable_completed_bar_opportunity_id",
+                "authoritativeSource": "/research-coordinator-report",
+            },
+        },
+        "counterSemantics": {
+            "evaluations_run": "open-market webhook and heartbeat evaluations since process start",
+            "ready_setups_detected": "non-READY to READY transitions since process start",
+            "signals_passed_filters": "non-duplicate webhook evaluations with actionable verdicts",
+            "signals_rejected": "non-duplicate webhook evaluations with non-actionable verdicts",
+            "hard_blocker_reasons": "strict failed_conditions on non-duplicate webhook WAIT evaluations",
+            "raw_condition_gaps": "missing context signals; may include conditions not required by the active mode",
+            "wait_reasons_breakdown": "heartbeat-inclusive strict WAIT observations plus duplicate diagnostics",
+        },
     }
     return jsonify({
         "evaluations": snapshot[::-1],
@@ -62811,7 +62948,7 @@ def get_eval_metrics():
 def diagnostics_live():
     """Owner-only (dashboard password, enforced by the Express proxy) live
     Diagnostics page: per-evaluation timing + volatility metrics for the last
-    100 scored alerts, auto-refreshing every second from /eval-metrics."""
+    100 recorded evaluations, auto-refreshing every second from /eval-metrics."""
     return Response(DIAGNOSTICS_LIVE_HTML, mimetype="text/html")
 
 

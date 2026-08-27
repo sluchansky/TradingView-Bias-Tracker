@@ -39,8 +39,8 @@ def _short_setup_alerts():
     so the strict zone gate (mitigated AND reaction) is INVALID."""
     ts = app.now_utc().isoformat()
     return [
-        {"alert_type": "BOS SUPPLY",        "instrument": "MGC", "ticker": "MGC", "timestamp": ts},
         {"alert_type": "CHOCH SUPPLY",      "instrument": "MGC", "ticker": "MGC", "timestamp": ts},
+        {"alert_type": "BOS SUPPLY",        "instrument": "MGC", "ticker": "MGC", "timestamp": ts},
         {"alert_type": "MGC BEARISH SWEEP", "instrument": "MGC", "ticker": "MGC", "timestamp": ts},
     ]
 
@@ -48,9 +48,14 @@ def _short_setup_alerts():
 def _eval_short(mode, mitigated_near=False):
     saved_mode = app.TRADING_MODE
     saved_flag = dict(app.MITIGATED_FLAG_BY_TICKER)
+    saved_rvol = dict(app.RVOL_BY_TICKER)
     saved_fn = app.is_near_mitigated_zone
     app.TRADING_MODE = mode
     app.MITIGATED_FLAG_BY_TICKER.clear()
+    # The state-aware structure cycle allocates one active structure component,
+    # not additive BOS+CHOCH points. Supply explicit fresh RVOL confirmation so
+    # this fixture reaches the threshold and continues to isolate zone behavior.
+    app.RVOL_BY_TICKER["MGC"] = {"value": 2.0}
     if mitigated_near:
         app.MITIGATED_FLAG_BY_TICKER["MGC"] = True
         app.is_near_mitigated_zone = lambda price, ticker: (True, None)
@@ -66,6 +71,8 @@ def _eval_short(mode, mitigated_near=False):
         app.is_near_mitigated_zone = saved_fn
         app.MITIGATED_FLAG_BY_TICKER.clear()
         app.MITIGATED_FLAG_BY_TICKER.update(saved_flag)
+        app.RVOL_BY_TICKER.clear()
+        app.RVOL_BY_TICKER.update(saved_rvol)
 
 
 # ── Config flip ─────────────────────────────────────────────────────────────
