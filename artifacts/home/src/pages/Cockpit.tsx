@@ -504,10 +504,9 @@ export default function Cockpit() {
       WebkitFontSmoothing: "antialiased",
       // Desktop: fixed 3-column × 2-row grid; Mobile: 2-column × 3-row, scrollable
       ...(isMobile ? {
-        display: "grid",
-        gridTemplateColumns: "56px 1fr",
-        gridTemplateRows: "auto auto 92px",
-        minHeight: "100vh",
+        display: "flex",
+        flexDirection: "column",
+        minHeight: "100dvh",
       } : {
         display: "grid",
         gridTemplateColumns: "56px 1fr 228px",
@@ -525,7 +524,7 @@ export default function Cockpit() {
         paddingTop: "14px", paddingBottom: "14px", gap: "4px",
         ...(isMobile ? { position: "sticky", top: 0, zIndex: 10 } : {}),
       }}>
-        <div style={{
+        <div className="cockpit-brand" style={{
           width: "32px", height: "32px",
           background: "linear-gradient(135deg, #6366f1 0%, #818cf8 100%)",
           borderRadius: "9px", display: "flex", alignItems: "center", justifyContent: "center",
@@ -558,7 +557,7 @@ export default function Cockpit() {
           );
         })}
 
-        <div style={{ flex: 1 }} />
+        <div className="cockpit-spacer" style={{ flex: 1 }} />
         {[
           { emoji: "⚙️", label: "Diag",  action: () => setDrawerOpen(true) },
           { emoji: "🚀", label: "Exec",  action: () => setTradeOpen(true) },
@@ -573,7 +572,7 @@ export default function Cockpit() {
           </button>
         ))}
         {/* Page navigation — Brain / Dashboard / Engine */}
-        <div style={{ width: "100%", borderTop: `1px solid ${C.border}`, paddingTop: 6, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
+        <div className="cockpit-page-links" style={{ width: "100%", borderTop: `1px solid ${C.border}`, paddingTop: 6, display: "flex", flexDirection: "column", alignItems: "center", gap: 2 }}>
           {([
             { href: "/",            emoji: "🧠", label: "Brain"  },
             { href: "/dashboard",   emoji: "📊", label: "Dash"   },
@@ -859,7 +858,7 @@ export default function Cockpit() {
 
         {/* Prop-account protection dot */}
         <div id="prop-protection" style={{ display: "flex", alignItems: "center", gap: "7px" }}>
-          <div style={{
+          <div className="cockpit-diagnostics-panel" style={{
             width: "6px", height: "6px", borderRadius: "50%",
             background: !propEnabled ? "#4b5563" : propSafe ? C.green : "#f97316",
             boxShadow: propEnabled && propSafe ? "0 0 6px rgba(34,197,94,0.5)" : "none",
@@ -943,12 +942,12 @@ export default function Cockpit() {
 
       {/* ── SECTION 4: DIAGNOSTICS DRAWER (collapsed by default) ──────────────── */}
       {drawerOpen && (
-        <div id="cockpit-diagnostics" style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex" }}>
+        <div id="cockpit-diagnostics" className="cockpit-overlay" style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex" }}>
           <div onClick={() => setDrawerOpen(false)} style={{
             flex: 1, background: "rgba(0,0,0,0.55)",
             backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)",
           }} />
-          <div style={{
+          <div className="cockpit-diagnostics-panel" style={{
             width: "360px", background: C.surfaceHigh,
             borderLeft: `1px solid ${C.borderMid}`,
             display: "flex", flexDirection: "column", overflowY: "auto",
@@ -1000,12 +999,12 @@ export default function Cockpit() {
 
       {/* ── TRADE TICKET ───────────────────────────────────────────────────────── */}
       {tradeOpen && (
-        <div style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "flex-end" }}>
+        <div className="cockpit-overlay" style={{ position: "fixed", inset: 0, zIndex: 50, display: "flex", alignItems: "flex-end" }}>
           <div onClick={() => setTradeOpen(false)} style={{
             position: "absolute", inset: 0, background: "rgba(0,0,0,0.55)",
             backdropFilter: "blur(6px)", WebkitBackdropFilter: "blur(6px)",
           }} />
-          <div style={{
+          <div className="cockpit-trade-ticket" style={{
             position: "relative", width: "100%", background: C.surfaceHigh,
             borderTop: `1px solid ${C.borderMid}`, padding: "28px 40px",
             display: "flex", gap: "32px", alignItems: "flex-start", flexWrap: "wrap",

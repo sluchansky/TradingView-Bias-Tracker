@@ -409,13 +409,13 @@ function useMainBrain(ticker: string): MainBrainState & { refresh: () => void } 
 
 // ── Reusable components ───────────────────────────────────────────────────────
 const Panel: React.FC<{ title: string; badge?: React.ReactNode; right?: React.ReactNode; children: React.ReactNode; style?: React.CSSProperties; id?: string }> = ({ title, badge, right, children, style, id }) => (
-  <section id={id} style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10, overflow:'hidden', ...style }} aria-label={title}>
-    <div style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 14px', borderBottom:`1px solid ${T.border}`, background:'rgba(255,255,255,0.015)' }}>
+  <section id={id} className="mb-panel" style={{ background: T.panel, border: `1px solid ${T.border}`, borderRadius: 10, overflow:'hidden', ...style }} aria-label={title}>
+    <div className="mb-panel-header" style={{ display:'flex', alignItems:'center', gap:8, padding:'10px 14px', borderBottom:`1px solid ${T.border}`, background:'rgba(255,255,255,0.015)' }}>
       <span style={{ fontSize:10, fontWeight:700, letterSpacing:'0.1em', textTransform:'uppercase', color:T.txtSec, flex:1 }}>{title}</span>
       {badge}
       {right}
     </div>
-    <div style={{ padding:'12px 14px' }}>{children}</div>
+    <div className="mb-panel-body" style={{ padding:'12px 14px' }}>{children}</div>
   </section>
 );
 
@@ -875,7 +875,7 @@ const MarketStrip: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   ];
 
   return (
-    <div style={{ display:'flex', gap:8, overflowX:'auto', paddingBottom:2 }} role="region" aria-label="Market state strip">
+    <div className="mb-market-strip-items" style={{ display:'flex', gap:8, overflowX:'auto', paddingBottom:2 }} role="region" aria-label="Market state strip">
       {cards.map(c => (
         <div key={c.label} style={{
           flexShrink:0, background:T.panel, border:`1px solid ${T.border}`, borderRadius:8,
@@ -12986,7 +12986,7 @@ const JournalFullPage: React.FC = () => {
   };
 
   return (
-    <div style={{ background: T.panel, borderRadius: 10, border: `1px solid ${T.border}`,
+    <div className="mb-journal-page" style={{ background: T.panel, borderRadius: 10, border: `1px solid ${T.border}`,
       padding: 16, minHeight: 400 }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 10 }}>
         <div style={{ fontSize: 13, fontWeight: 700, color: T.txtPri, letterSpacing: '0.04em' }}>
@@ -13721,7 +13721,7 @@ const Header: React.FC<{
       </div>
 
       {/* Instrument selector */}
-      <div style={{ marginLeft:16 }}>
+      <div className="mb-header-tickers" style={{ marginLeft:16 }}>
         {(['MGC', 'MNQ', 'MES', 'MYM'] as const).map(t => (
           <button key={t} onClick={() => setTicker(t)} aria-pressed={ticker === t} style={{
             background: ticker === t ? `${T.cyan}20` : 'transparent',
@@ -14789,7 +14789,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
       </div>
 
       {/* ═══════════════════════ TRADE PLAN + SCANNER ═════════════════════ */}
-      <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
+      <div className="mb-grid-2" style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginBottom: 10 }}>
 
         {/* Trade Plan */}
         <div style={{ ...card, marginBottom: 0 }}>

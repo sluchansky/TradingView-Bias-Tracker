@@ -382,3 +382,297 @@
     inset: -1px;
   }
 }
+
+/* Phone operator-console contract.
+ * These rules are scoped to the two responsive operator surfaces so the
+ * desktop information density and all existing action wiring stay unchanged.
+ */
+@media (max-width: 768px) {
+  html, body, #root {
+    min-width: 0;
+    max-width: 100%;
+    overflow-x: hidden;
+  }
+
+  button, a, input, select, textarea {
+    -webkit-tap-highlight-color: transparent;
+  }
+
+  .mb-shell {
+    min-height: 100dvh !important;
+    width: 100%;
+  }
+
+  .mb-main-area,
+  .mb-main-content {
+    min-width: 0 !important;
+    width: 100%;
+  }
+
+  .mb-main-content {
+    overscroll-behavior-x: none;
+  }
+
+  .mb-main-header {
+    padding-top: max(8px, env(safe-area-inset-top)) !important;
+  }
+
+  .mb-mobile-menu-toggle {
+    min-width: 44px !important;
+    min-height: 44px !important;
+  }
+
+  .mb-header-brand {
+    flex: 1 1 auto;
+  }
+
+  .mb-header-tickers {
+    order: 3;
+    flex: 1 1 100%;
+    min-width: 0;
+    margin: 0 !important;
+    display: flex;
+    gap: 5px;
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+
+  .mb-header-tickers::-webkit-scrollbar,
+  .lmc-selector::-webkit-scrollbar,
+  .lmc-overlays::-webkit-scrollbar {
+    display: none;
+  }
+
+  .mb-header-tickers button {
+    flex: 1 0 56px;
+    min-height: 38px;
+    margin-right: 0 !important;
+  }
+
+  .mb-header-actions {
+    flex-shrink: 0;
+  }
+
+  .mb-header-actions button {
+    min-height: 40px !important;
+  }
+
+  .mb-panel {
+    min-width: 0;
+  }
+
+  .mb-panel-header {
+    min-height: 44px;
+    padding: 10px 12px !important;
+  }
+
+  .mb-panel-body {
+    padding: 10px 12px !important;
+    min-width: 0;
+  }
+
+  .mb-market-strip {
+    overflow: visible !important;
+  }
+
+  .mb-market-strip-items {
+    display: grid !important;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    overflow: visible !important;
+    gap: 6px !important;
+    padding: 6px !important;
+  }
+
+  .mb-market-strip-items > div {
+    min-width: 0 !important;
+    padding: 8px 6px !important;
+  }
+
+  .mb-verdict-row,
+  .mb-grid-2,
+  .mb-grid-3,
+  .mb-training-stats {
+    min-width: 0;
+  }
+
+  #execution-arm-control button,
+  .mb-panel button {
+    min-height: 38px;
+  }
+
+  .mb-journal-page {
+    padding: 12px !important;
+    overflow: hidden;
+  }
+
+  .mb-journal-page table {
+    display: block;
+    width: max-content !important;
+    min-width: 560px;
+    max-width: none;
+    overflow-x: auto;
+  }
+
+  .mb-journal-page table th,
+  .mb-journal-page table td {
+    min-height: 32px;
+  }
+
+  .mb-main-footer {
+    padding-bottom: max(10px, env(safe-area-inset-bottom)) !important;
+  }
+
+  /* LiveMarketChart uses inline sizing for desktop; these named hooks keep
+     its controls and plot usable without changing the data subscription. */
+  .mb-live-market-chart {
+    min-width: 0;
+  }
+
+  .lmc-header {
+    flex-wrap: wrap;
+    padding: 8px 10px !important;
+  }
+
+  .lmc-title {
+    flex: 1 1 150px;
+    min-width: 0;
+  }
+
+  .lmc-selector,
+  .lmc-overlays {
+    flex: 1 1 100%;
+    min-width: 0;
+    overflow-x: auto;
+    scrollbar-width: none;
+    padding-bottom: 2px;
+  }
+
+  .lmc-selector button,
+  .lmc-overlays button,
+  .lmc-header > button {
+    min-height: 36px;
+    flex: 0 0 auto;
+  }
+
+  .lmc-plot {
+    height: 260px !important;
+  }
+
+  .mb-live-market-chart [role="status"] {
+    padding: 12px !important;
+  }
+
+  /* Cockpit becomes a single readable column on phones; its nav remains the
+     same set of controls, just horizontally scrollable at the top. */
+  #cockpit-root {
+    display: flex !important;
+    flex-direction: column !important;
+    min-height: 100dvh !important;
+    height: auto !important;
+    overflow: visible !important;
+  }
+
+  #cockpit-nav {
+    position: sticky !important;
+    top: 0 !important;
+    z-index: 10;
+    width: 100% !important;
+    min-height: 62px;
+    flex: 0 0 auto;
+    flex-direction: row !important;
+    align-items: center !important;
+    overflow-x: auto;
+    overflow-y: hidden;
+    padding: max(8px, env(safe-area-inset-top)) 10px 8px !important;
+    border-right: 0 !important;
+    border-bottom: 1px solid rgba(255,255,255,0.08) !important;
+    scrollbar-width: none;
+  }
+
+  #cockpit-nav::-webkit-scrollbar {
+    display: none;
+  }
+
+  #cockpit-nav > div:first-child {
+    margin: 0 6px 0 0 !important;
+  }
+
+  .cockpit-page-links {
+    width: auto !important;
+    border-top: 0 !important;
+    border-left: 1px solid rgba(255,255,255,0.08);
+    padding: 0 0 0 6px !important;
+    flex-direction: row !important;
+  }
+
+  .cockpit-spacer {
+    flex: 1 0 8px !important;
+  }
+
+  #cockpit-nav button,
+  #cockpit-nav a {
+    flex: 0 0 auto;
+    min-width: 44px;
+    min-height: 42px;
+  }
+
+  #cockpit-brain-decision {
+    width: 100%;
+    min-width: 0;
+    padding: 16px 14px 24px !important;
+    overflow: visible !important;
+  }
+
+  #cockpit-brain-decision > div:first-child {
+    margin-bottom: 20px !important;
+  }
+
+  #cockpit-brain-decision > div {
+    min-width: 0;
+  }
+
+  .cockpit-diagnostics-panel {
+    width: min(100%, 420px) !important;
+    max-width: 100%;
+    border-left: 0 !important;
+  }
+
+  #cockpit-diagnostics button {
+    min-height: 44px;
+  }
+
+  .cockpit-overlay {
+    z-index: 10000 !important;
+  }
+
+  .cockpit-trade-ticket {
+    max-height: 88dvh;
+    overflow-y: auto;
+    padding: 18px 14px max(18px, env(safe-area-inset-bottom)) !important;
+    gap: 16px !important;
+  }
+
+  .cockpit-trade-ticket > div:first-child {
+    min-width: 0 !important;
+  }
+
+  .cockpit-trade-ticket > div:first-child > div:nth-child(2) {
+    grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
+  }
+
+  .cockpit-trade-ticket > div:last-child {
+    width: 100%;
+    padding-top: 0 !important;
+  }
+
+  .cockpit-trade-ticket > div:last-child button {
+    width: 100%;
+    min-height: 46px;
+  }
+
+  #cockpit-root footer {
+    min-height: 112px;
+    padding-bottom: max(12px, env(safe-area-inset-bottom)) !important;
+    overflow-x: auto !important;
+  }
+}

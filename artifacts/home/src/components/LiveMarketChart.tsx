@@ -1029,7 +1029,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
 
   // ── Render ────────────────────────────────────────────────────────────────
   return (
-    <div ref={wrapRef} style={{
+    <div ref={wrapRef} className="mb-live-market-chart" style={{
       background: T.surface,
       border: `1px solid ${T.border}`,
       borderRadius: 8,
@@ -1037,12 +1037,12 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
       marginBottom: 12,
     }}>
       {/* Header */}
-      <div style={{
+      <div className="lmc-header" style={{
         display: "flex", alignItems: "center", gap: 8,
         padding: "6px 12px",
         borderBottom: collapsed ? "none" : `1px solid ${T.border}`,
       }}>
-        <span
+        <span className="lmc-title"
           onClick={() => setCollapsed(c => !c)}
           style={{
             fontSize: 10, fontWeight: 700, letterSpacing: "0.1em",
@@ -1069,7 +1069,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
         {!collapsed && (
           <>
             {/* Instrument selector */}
-            <div style={{ display: "flex", gap: 3 }}>
+            <div className="lmc-selector" style={{ display: "flex", gap: 3 }}>
               {INSTRUMENTS.map(inst => (
                 <button key={inst} onClick={() => handleInstrument(inst)} style={{
                   fontSize: 10, padding: "2px 7px", borderRadius: 3, cursor: "pointer",
@@ -1099,7 +1099,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
             </div>
 
             {/* Overlay toggles */}
-            <div style={{ display: "flex", gap: 4 }}>
+            <div className="lmc-overlays" style={{ display: "flex", gap: 4 }}>
               <OverlayToggle label="VWAP"      active={showVwap}      onClick={() => setShowVwap(v => !v)} />
               <OverlayToggle label="TRADE"     active={showTrade}     onClick={() => setShowTrade(v => !v)} />
               <OverlayToggle label="STRUCTURE" active={showStructure} onClick={() => setShowStructure(v => !v)} />
@@ -1133,6 +1133,7 @@ export const LiveMarketChart: React.FC<LiveMarketChartProps> = ({
           <div style={{ position: "relative" }}>
             <div
               ref={containerRef}
+              className="lmc-plot"
               style={{
                 width: "100%",
                 height: chartH,
