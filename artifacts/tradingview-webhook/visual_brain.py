@@ -20,12 +20,15 @@ Instruments: VISUAL_BRAIN_SYMBOL=MNQ,MGC  (comma-separated; default MNQ and MGC)
 from __future__ import annotations
 
 import base64
+import copy
+import hashlib
 import io
 import json
 import logging
 import os
 import threading
 import time
+from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Optional
 
@@ -46,6 +49,36 @@ _VB_HISTORY_LIMIT      = 10                       # last N state transitions pas
 _VB_SCREENSHOT_TIMEOUT = 30                       # seconds per Playwright capture
 _CHART_BARS_LOOKBACK   = 60                       # bars sent to chart renderer
 _VB_OPENAI_TIMEOUT_SECONDS = 20
+VISUAL_BRAIN_BENCHMARK_ENABLED = os.getenv(
+    "VISUAL_BRAIN_BENCHMARK_ENABLED", "false"
+).lower() in ("true", "1", "yes", "on")
+VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED = os.getenv(
+    "VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED", "false"
+).lower() in ("true", "1", "yes", "on")
+VISUAL_BRAIN_BENCHMARK_CANDIDATE_MODEL = os.getenv(
+    "VISUAL_BRAIN_BENCHMARK_CANDIDATE_MODEL", "gpt-4o-mini"
+)
+VISUAL_BRAIN_BENCHMARK_CANDIDATE_INPUT_COST_PER_MILLION = max(
+    0.0,
+    float(os.getenv(
+        "VISUAL_BRAIN_BENCHMARK_CANDIDATE_INPUT_COST_PER_MILLION", "0.15"
+    )),
+)
+VISUAL_BRAIN_BENCHMARK_CANDIDATE_OUTPUT_COST_PER_MILLION = max(
+    0.0,
+    float(os.getenv(
+        "VISUAL_BRAIN_BENCHMARK_CANDIDATE_OUTPUT_COST_PER_MILLION", "0.60"
+    )),
+)
+VISUAL_BRAIN_BENCHMARK_MAX_STALENESS_SECONDS = max(
+    60,
+    int(os.getenv("VISUAL_BRAIN_BENCHMARK_MAX_STALENESS_SECONDS", "1800")),
+)
+VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX = max(
+    0,
+    int(os.getenv("VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX", "3")),
+)
+_BENCHMARK_HISTORY_LIMIT = 200
 
 # ── Module-level state ────────────────────────────────────────────────────────
 VB_DB_READY          = False
@@ -69,6 +102,7 @@ _vwap_store  : Optional[dict]     = None
 _bars_fn     : Optional[Callable] = None
 _research_observation_fn: Optional[Callable] = None
 _research_outcome_fn: Optional[Callable] = None
+_benchmark_state_fn: Optional[Callable] = None
 
 # ── Cost tracking (resets at midnight ET) ────────────────────────────────────
 _COST_LOCK           = threading.Lock()
@@ -80,6 +114,862 @@ _vb_cost_reset_day   : Optional[str] = None   # "YYYY-MM-DD" in ET
 # Vision input ≈ $0.15/1M; output ≈ $0.60/1M
 _COST_PER_INPUT_TOK  = 0.00000015
 _COST_PER_OUTPUT_TOK = 0.00000060
+
+# ── Shadow benchmark state ──────────────────────────────────────────────────
+# This state is deliberately in-memory.  It is never read by the evaluator,
+# persistence, alerts, Market Student, coordinator, execution, risk, or broker
+# paths.  A future local Windows VLM can register a runner in the same namespace
+# without changing the canonical OpenAI observer.
+_BENCHMARK_LOCK = threading.RLock()
+_BENCHMARK_LAST_BY_INST: dict = {}
+_BENCHMARK_RECENT: deque = deque(maxlen=_BENCHMARK_HISTORY_LIMIT)
+_BENCHMARK_CANDIDATE_RUNNERS: dict[str, Callable] = {}
+_BENCHMARK_PENDING_CANDIDATES: dict = {}
+_BENCHMARK_ACTIVE_CANDIDATES: set[str] = set()
+_BENCHMARK_OPEN_CYCLES: set[str] = set()
+_BENCHMARK_COUNTERS: dict = {}
+_BENCHMARK_LOCAL = threading.local()
+_BENCHMARK_MAX_CANDIDATE_RUNNERS = 8
+_BENCHMARK_MAX_INSTRUMENTS = 16
+_BENCHMARK_MAX_PENDING_CANDIDATES = 50
+_BENCHMARK_MAX_ACTIVE_CANDIDATES = 4
+
+
+def _benchmark_empty_counters() -> dict:
+    return {
+        "cycles": 0,
+        "baseline_api_calls": 0,
+        "baseline_successes": 0,
+        "baseline_failures": 0,
+        "baseline_retries": 0,
+        "baseline_schema_failures": 0,
+        "baseline_input_tokens": 0,
+        "baseline_output_tokens": 0,
+        "baseline_cost_usd": 0.0,
+        "candidate_calls": 0,
+        "candidate_scheduled": 0,
+        "candidate_skipped_busy": 0,
+        "candidate_start_failures": 0,
+        "candidate_late_or_evicted_results": 0,
+        "candidate_successes": 0,
+        "candidate_failures": 0,
+        "candidate_schema_failures": 0,
+        "candidate_input_tokens": 0,
+        "candidate_output_tokens": 0,
+        "candidate_cost_usd": 0.0,
+        "candidate_errors": {},
+        "projected": {
+            "no_new_bar_image": {"would_call": 0, "would_skip": 0, "avoided_calls": 0},
+            "deterministic_events": {"would_call": 0, "would_skip": 0, "avoided_calls": 0},
+            "max_staleness_heartbeat": {"would_call": 0, "would_skip": 0, "avoided_calls": 0},
+        },
+        "trigger_reasons": {},
+        "heartbeat_usage": 0,
+        "image_suppression": {"exact": 0, "near_identical": 0, "no_new_bar": 0},
+        "input_errors": 0,
+        "last_cycle_at": None,
+        "last_baseline_success_at": None,
+        "max_observed_staleness_seconds": None,
+    }
+
+
+def _benchmark_reset_state() -> None:
+    """Reset only in-memory benchmark state; intended for isolated tests."""
+    global _BENCHMARK_COUNTERS
+    with _BENCHMARK_LOCK:
+        _BENCHMARK_LAST_BY_INST.clear()
+        _BENCHMARK_RECENT.clear()
+        _BENCHMARK_PENDING_CANDIDATES.clear()
+        _BENCHMARK_ACTIVE_CANDIDATES.clear()
+        _BENCHMARK_OPEN_CYCLES.clear()
+        _BENCHMARK_COUNTERS = _benchmark_empty_counters()
+
+
+_BENCHMARK_COUNTERS = _benchmark_empty_counters()
+
+
+def register_benchmark_candidate(name: str, runner: Callable) -> None:
+    """Register an optional shadow candidate runner.
+
+    `runner(payload)` receives an immutable-by-convention payload containing the
+    exact screenshot bytes and deterministic context used by the baseline cycle.
+    Its return value is telemetry only.  This interface intentionally also fits a
+    local Windows VLM adapter; registering a runner never enables it.
+    """
+    candidate_name = str(name or "").strip()
+    if not candidate_name or not callable(runner):
+        raise ValueError("candidate name and callable runner are required")
+    with _BENCHMARK_LOCK:
+        if (
+            candidate_name not in _BENCHMARK_CANDIDATE_RUNNERS
+            and len(_BENCHMARK_CANDIDATE_RUNNERS) >= _BENCHMARK_MAX_CANDIDATE_RUNNERS
+        ):
+            raise RuntimeError("benchmark candidate registry is full")
+        _BENCHMARK_CANDIDATE_RUNNERS[candidate_name] = runner
+
+
+def unregister_benchmark_candidate(name: str) -> None:
+    """Remove a previously registered shadow candidate runner."""
+    with _BENCHMARK_LOCK:
+        _BENCHMARK_CANDIDATE_RUNNERS.pop(str(name or "").strip(), None)
+
+
+def _stable_json(value: Any) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+    except Exception:
+        return repr(value)
+
+
+def _stable_hash(value: Any) -> str:
+    return hashlib.sha256(_stable_json(value).encode("utf-8")).hexdigest()
+
+
+def _safe_copy(value: Any) -> Any:
+    try:
+        return copy.deepcopy(value)
+    except Exception:
+        return value
+
+
+def _completed_bar_fingerprint(bars: list[dict]) -> Optional[str]:
+    """Return an identity for the latest completed native bar."""
+    if not bars:
+        return None
+    last = bars[-1] or {}
+    epoch = _bar_epoch(last)
+    if epoch is not None:
+        return f"{epoch:.6f}"
+    fields = {
+        key: last.get(key)
+        for key in ("open", "high", "low", "close", "volume")
+    }
+    return _stable_hash(fields) if any(v is not None for v in fields.values()) else None
+
+
+def _image_fingerprint(image_bytes: Optional[bytes]) -> dict:
+    """Return exact and small perceptual fingerprints without persisting pixels."""
+    if not image_bytes:
+        return {"sha256": None, "ahash": None}
+    result = {"sha256": hashlib.sha256(image_bytes).hexdigest(), "ahash": None}
+    try:
+        from PIL import Image  # noqa: PLC0415
+        image = Image.open(io.BytesIO(image_bytes)).convert("L")
+        image.thumbnail((16, 16))
+        pixels = list(image.getdata())
+        if pixels:
+            mean = sum(pixels) / len(pixels)
+            bits = "".join("1" if px >= mean else "0" for px in pixels)
+            result["ahash"] = f"{int(bits, 2):0{len(bits) // 4}x}"
+    except Exception:
+        # Exact hashing remains useful if optional image decoding is unavailable.
+        pass
+    return result
+
+
+def _hamming_distance(left: Optional[str], right: Optional[str]) -> Optional[int]:
+    if not left or not right:
+        return None
+    try:
+        return (int(left, 16) ^ int(right, 16)).bit_count()
+    except (TypeError, ValueError):
+        return None
+
+
+def _drop_volatile_fields(value: Any) -> Any:
+    """Normalize deterministic state while ignoring transport timestamps."""
+    if isinstance(value, dict):
+        return {
+            key: _drop_volatile_fields(item)
+            for key, item in sorted(value.items())
+            if key not in {"ts", "timestamp", "updated_at", "observed_at"}
+        }
+    if isinstance(value, (list, tuple)):
+        return [_drop_volatile_fields(item) for item in value]
+    if isinstance(value, float):
+        return round(value, 4)
+    return value
+
+
+def _benchmark_semantic_snapshot(snapshot: Optional[dict]) -> dict:
+    """Project only meaningful deterministic event families for comparison."""
+    if not isinstance(snapshot, dict):
+        return {}
+    families = {
+        "structure": (
+            "structure", "structure_event", "bos", "choch", "structure_state",
+        ),
+        "vwap_levels": (
+            "vwap", "levels", "session_levels", "nearest_supply", "nearest_demand",
+        ),
+        "thesis_ready_blockers": (
+            "thesis", "ready", "verdict", "blockers", "setup_state",
+        ),
+        "volatility": ("volatility", "atr", "volatility_state"),
+        "volume": ("volume", "rvol", "volume_spike", "cvd"),
+        "session": ("session", "session_state"),
+        "recovery": ("recovery", "recovery_events", "data_health"),
+    }
+    projected = {}
+    for family, keys in families.items():
+        values = {key: snapshot[key] for key in keys if key in snapshot}
+        if values:
+            projected[family] = _drop_volatile_fields(values)
+    return projected
+
+
+def _benchmark_event_reasons(previous_semantic: dict, current_semantic: dict) -> list[str]:
+    labels = {
+        "structure": "structure/BOS/CHOCH",
+        "vwap_levels": "VWAP/level",
+        "thesis_ready_blockers": "thesis/READY/blocker",
+        "volatility": "volatility",
+        "volume": "volume",
+        "session": "session",
+        "recovery": "recovery",
+    }
+    reasons = []
+    for family, current in current_semantic.items():
+        previous = previous_semantic.get(family)
+        if previous != current:
+            prefix = "available" if previous is None else "changed"
+            reasons.append(f"{labels.get(family, family)} {prefix}")
+    return reasons
+
+
+def compute_benchmark_trigger_policies(
+    previous_state: Optional[dict],
+    *,
+    completed_bar_fingerprint: Optional[str],
+    image_fingerprint: Optional[dict],
+    deterministic_snapshot: Optional[dict],
+    now_epoch: Optional[float] = None,
+    max_staleness_seconds: Optional[int] = None,
+) -> dict:
+    """Pure telemetry calculation for the three proposed call policies.
+
+    The result is intentionally detached from `_vb_tick()`'s decision to call
+    the canonical evaluator.  It answers what each policy *would* have done.
+    """
+    previous = previous_state if isinstance(previous_state, dict) else {}
+    image = image_fingerprint if isinstance(image_fingerprint, dict) else {}
+    previous_image = previous.get("image_fingerprint") or {}
+    previous_bar = previous.get("completed_bar_fingerprint")
+    new_bar = bool(completed_bar_fingerprint and completed_bar_fingerprint != previous_bar)
+    exact_duplicate = bool(
+        image.get("sha256")
+        and image.get("sha256") == previous_image.get("sha256")
+    )
+    distance = _hamming_distance(image.get("ahash"), previous_image.get("ahash"))
+    near_duplicate = bool(
+        not exact_duplicate
+        and distance is not None
+        and distance <= VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX
+    )
+    policy_one_reasons = []
+    if not completed_bar_fingerprint:
+        policy_one_reasons.append("no_new_completed_bar")
+    elif not new_bar:
+        policy_one_reasons.append("no_new_completed_bar")
+    if exact_duplicate:
+        policy_one_reasons.append("exact_image_duplicate")
+    elif near_duplicate:
+        policy_one_reasons.append("near_identical_image")
+    policy_one_call = bool(
+        completed_bar_fingerprint
+        and new_bar
+        and not exact_duplicate
+        and not near_duplicate
+    )
+    if not previous and completed_bar_fingerprint and image.get("sha256"):
+        policy_one_call = True
+        policy_one_reasons = ["initial_observation"]
+
+    current_semantic = _benchmark_semantic_snapshot(deterministic_snapshot)
+    previous_semantic = previous.get("semantic_snapshot") or {}
+    event_reasons = _benchmark_event_reasons(previous_semantic, current_semantic)
+    event_signature = _stable_hash({
+        "semantic": current_semantic,
+        "reasons": event_reasons,
+    }) if event_reasons else None
+    coalesced = bool(
+        event_signature and event_signature == previous.get("last_event_signature")
+    )
+    policy_two_call = bool(event_reasons and not coalesced)
+    if coalesced:
+        event_reasons = [*event_reasons, "coalesced_duplicate_event"]
+
+    now = float(now_epoch if now_epoch is not None else time.time())
+    last_baseline_at = previous.get("last_baseline_at")
+    try:
+        staleness = max(0.0, now - float(last_baseline_at)) if last_baseline_at is not None else None
+    except (TypeError, ValueError):
+        staleness = None
+    threshold = max(
+        60,
+        int(
+            max_staleness_seconds
+            if max_staleness_seconds is not None
+            else VISUAL_BRAIN_BENCHMARK_MAX_STALENESS_SECONDS
+        ),
+    )
+    policy_three_call = last_baseline_at is None or (
+        staleness is not None and staleness >= threshold
+    )
+
+    return {
+        "no_new_bar_image": {
+            "would_call": policy_one_call,
+            "would_skip": not policy_one_call,
+            "reasons": policy_one_reasons,
+            "new_completed_bar": new_bar,
+            "exact_image_duplicate": exact_duplicate,
+            "near_identical_image": near_duplicate,
+            "image_hamming_distance": distance,
+        },
+        "deterministic_events": {
+            "would_call": policy_two_call,
+            "would_skip": not policy_two_call,
+            "reasons": event_reasons,
+            "event_signature": event_signature,
+            "coalesced": coalesced,
+            "semantic_fingerprint": _stable_hash(current_semantic),
+        },
+        "max_staleness_heartbeat": {
+            "would_call": policy_three_call,
+            "would_skip": not policy_three_call,
+            "reasons": (
+                ["first_cycle"] if last_baseline_at is None
+                else ["max_staleness_reached"] if policy_three_call else ["within_staleness_budget"]
+            ),
+            "staleness_seconds": round(staleness, 3) if staleness is not None else None,
+            "max_staleness_seconds": threshold,
+            "heartbeat_used": policy_three_call,
+        },
+    }
+
+
+def _benchmark_begin_cycle(instrument: str) -> Optional[dict]:
+    if not VISUAL_BRAIN_BENCHMARK_ENABLED:
+        return None
+    with _BENCHMARK_LOCK:
+        previous = _safe_copy(_BENCHMARK_LAST_BY_INST.get(instrument) or {})
+    return {
+        "instrument": instrument,
+        "started_at": time.time(),
+        "cycle_id": f"{instrument}:{time.time_ns()}",
+        "previous": previous,
+        "baseline_attempts": [],
+        "baseline_failures": [],
+        "candidate": None,
+        "prepared": False,
+        "market_context": {},
+        "deterministic_snapshot": {},
+        "recent_history": [],
+        "previous_state": None,
+        "screenshot_bytes": None,
+    }
+
+
+def _benchmark_prepare_cycle(
+    cycle: Optional[dict],
+    *,
+    bars: list[dict],
+    screenshot_bytes: Optional[bytes],
+    market_context: dict,
+    previous_state: Optional[dict],
+    recent_history: list[dict],
+) -> None:
+    if cycle is None:
+        return
+    try:
+        deterministic_snapshot = {}
+        if _benchmark_state_fn is not None:
+            deterministic_snapshot = _benchmark_state_fn(cycle["instrument"]) or {}
+            if not isinstance(deterministic_snapshot, dict):
+                deterministic_snapshot = {}
+        image_fp = _image_fingerprint(screenshot_bytes)
+        bar_fp = _completed_bar_fingerprint(bars)
+        cycle.update({
+            "prepared": True,
+            "completed_bar_fingerprint": bar_fp,
+            "image_fingerprint": image_fp,
+            "market_context": _safe_copy(market_context or {}),
+            "deterministic_snapshot": _safe_copy(deterministic_snapshot),
+            "previous_state": _safe_copy(previous_state),
+            "recent_history": _safe_copy(recent_history),
+            "screenshot_bytes": bytes(screenshot_bytes) if screenshot_bytes else None,
+        })
+        cycle["policies"] = compute_benchmark_trigger_policies(
+            cycle["previous"],
+            completed_bar_fingerprint=bar_fp,
+            image_fingerprint=image_fp,
+            deterministic_snapshot=deterministic_snapshot,
+            now_epoch=cycle["started_at"],
+        )
+        cycle["context_fingerprint"] = _stable_hash(cycle["market_context"])
+    except Exception as exc:
+        cycle["input_error"] = type(exc).__name__
+        cycle["policies"] = {}
+
+
+def _benchmark_current_cycle() -> Optional[dict]:
+    if not VISUAL_BRAIN_BENCHMARK_ENABLED:
+        return None
+    return getattr(_BENCHMARK_LOCAL, "cycle", None)
+
+
+def _benchmark_record_baseline_attempt(
+    attempt: int,
+    input_tokens: int,
+    output_tokens: int,
+) -> Optional[dict]:
+    cycle = _benchmark_current_cycle()
+    if cycle is None:
+        return None
+    record = {
+        "attempt": attempt,
+        "input_tokens": int(input_tokens or 0),
+        "output_tokens": int(output_tokens or 0),
+        "estimated_cost_usd": round(
+            int(input_tokens or 0) * _COST_PER_INPUT_TOK
+            + int(output_tokens or 0) * _COST_PER_OUTPUT_TOK,
+            8,
+        ),
+        "model": _VB_MODEL,
+        "ok": False,
+        "error_category": None,
+    }
+    cycle["baseline_attempts"].append(record)
+    return record
+
+
+def _benchmark_record_baseline_failure(exc: Exception) -> None:
+    cycle = _benchmark_current_cycle()
+    if cycle is None:
+        return
+    text = str(exc).lower()
+    category = "schema" if (
+        "schema" in text or "json" in text or isinstance(exc, ValueError)
+    ) else "transport" if any(
+        token in text for token in ("timeout", "connection", "api")
+    ) else "unknown"
+    cycle["baseline_failures"].append({
+        "error_type": type(exc).__name__,
+        "error_category": category,
+    })
+
+
+def _build_analysis_messages(
+    screenshot_bytes: bytes,
+    previous_state: Optional[dict],
+    recent_history: list[dict],
+    instrument: str,
+    market_context: Optional[dict],
+    now_utc: str,
+) -> list[dict]:
+    """Build the canonical prompt payload shared by baseline and candidates."""
+    history_text = _build_history_text(recent_history)
+    prev_summary = ""
+    if previous_state:
+        prev_summary = (
+            f"Previous observation: bias={previous_state.get('bias')} "
+            f"state={previous_state.get('market_state')} "
+            f"event={previous_state.get('last_event')} "
+            f"action={previous_state.get('action')} "
+            f"conf={previous_state.get('confidence')}%\n"
+            f"Previous summary: {previous_state.get('summary', '')}"
+        )
+    b64_img = base64.b64encode(screenshot_bytes).decode()
+    context_text = json.dumps(market_context or {}, separators=(",", ":"), sort_keys=True)
+    user_content = [
+        {
+            "type": "text",
+            "text": (
+                f"Instrument: {instrument}\n"
+                f"Current UTC time: {now_utc}\n\n"
+                f"--- PREVIOUS STATE ---\n{prev_summary or 'First observation.'}\n\n"
+                f"--- STATE HISTORY (newest last) ---\n{history_text}\n\n"
+                f"--- NATIVE MULTI-TIMEFRAME CONTEXT ---\n{context_text}\n\n"
+                "Analyze the native context and attached chart image. Respond with ONLY the JSON object."
+            ),
+        },
+        {
+            "type": "image_url",
+            "image_url": {
+                "url": f"data:image/jpeg;base64,{b64_img}",
+                "detail": "auto",
+            },
+        },
+    ]
+    return [
+        {"role": "system", "content": _get_system_prompt(instrument)},
+        {"role": "user", "content": user_content},
+    ]
+
+
+def _run_openai_benchmark_candidate(payload: dict) -> dict:
+    """Run an explicitly enabled cheaper multimodal candidate in isolation."""
+    api_key = os.getenv("AI_INTEGRATIONS_OPENAI_API_KEY", "")
+    base_url = os.getenv("AI_INTEGRATIONS_OPENAI_BASE_URL", "https://api.openai.com/v1")
+    if not api_key:
+        raise RuntimeError("AI_INTEGRATIONS_OPENAI_API_KEY not set")
+    from openai import OpenAI  # noqa: PLC0415
+    http_client = httpx.Client(
+        trust_env=False,
+        timeout=_VB_OPENAI_TIMEOUT_SECONDS,
+        verify=True,
+    )
+    client = OpenAI(api_key=api_key, base_url=base_url, http_client=http_client)
+    try:
+        messages = _build_analysis_messages(
+            payload["screenshot_bytes"],
+            payload["previous_state"],
+            payload["recent_history"],
+            payload["instrument"],
+            payload["market_context"],
+            payload["prompt_timestamp"],
+        )
+        response = client.chat.completions.create(
+            model=VISUAL_BRAIN_BENCHMARK_CANDIDATE_MODEL,
+            max_completion_tokens=_VB_MAX_TOKENS,
+            messages=messages,
+        )
+        usage = response.usage
+        content = (response.choices[0].message.content or "").strip()
+        parsed = None
+        schema_valid = False
+        try:
+            parsed = json.loads(content)
+            schema_valid, _ = _validate_observation(parsed)
+        except Exception:
+            schema_valid = False
+        return {
+            "model": VISUAL_BRAIN_BENCHMARK_CANDIDATE_MODEL,
+            "input_tokens": int(usage.prompt_tokens if usage else 0),
+            "output_tokens": int(usage.completion_tokens if usage else 0),
+            "schema_valid": schema_valid,
+            "response_received": bool(content),
+            "output_type": type(parsed).__name__ if parsed is not None else None,
+        }
+    finally:
+        http_client.close()
+
+
+def _normalize_candidate_result(candidate_name: str, result: Any) -> dict:
+    if not isinstance(result, dict):
+        result = {"response_received": True, "output_type": type(result).__name__}
+    candidate = {
+        "name": candidate_name,
+        "model": result.get("model", candidate_name),
+        "input_tokens": int(result.get("input_tokens") or 0),
+        "output_tokens": int(result.get("output_tokens") or 0),
+        "schema_valid": bool(result.get("schema_valid", False)),
+        "response_received": bool(result.get("response_received", True)),
+        "error_type": None,
+    }
+    if not candidate["schema_valid"]:
+        candidate["error_type"] = "schema"
+    candidate["estimated_cost_usd"] = round(
+        (
+            candidate["input_tokens"]
+            * VISUAL_BRAIN_BENCHMARK_CANDIDATE_INPUT_COST_PER_MILLION
+            + candidate["output_tokens"]
+            * VISUAL_BRAIN_BENCHMARK_CANDIDATE_OUTPUT_COST_PER_MILLION
+        ) / 1_000_000.0,
+        8,
+    )
+    return candidate
+
+
+def _aggregate_candidate_result_locked(candidate: dict) -> None:
+    counters = _BENCHMARK_COUNTERS
+    counters["candidate_calls"] += 1
+    candidate_ok = not candidate.get("error_type") and candidate.get("response_received")
+    counters["candidate_successes"] += int(candidate_ok)
+    counters["candidate_failures"] += int(not candidate_ok)
+    counters["candidate_schema_failures"] += int(candidate.get("error_type") == "schema")
+    counters["candidate_input_tokens"] += int(candidate.get("input_tokens") or 0)
+    counters["candidate_output_tokens"] += int(candidate.get("output_tokens") or 0)
+    counters["candidate_cost_usd"] += float(candidate.get("estimated_cost_usd") or 0)
+    if candidate.get("error_type"):
+        errors = counters["candidate_errors"]
+        key = str(candidate["error_type"])
+        if key not in errors and len(errors) >= 16:
+            key = "other"
+        errors[key] = errors.get(key, 0) + 1
+
+
+def _apply_candidate_result_locked(record: dict, candidate: dict) -> None:
+    """Attach one completed candidate result while `_BENCHMARK_LOCK` is held."""
+    record["candidate"] = _safe_copy(candidate)
+    _aggregate_candidate_result_locked(candidate)
+
+
+def _record_async_candidate_result(cycle_id: str, candidate: dict) -> None:
+    with _BENCHMARK_LOCK:
+        for record in reversed(_BENCHMARK_RECENT):
+            if record.get("cycle_id") == cycle_id:
+                _apply_candidate_result_locked(record, candidate)
+                return
+        if cycle_id not in _BENCHMARK_OPEN_CYCLES:
+            _aggregate_candidate_result_locked(candidate)
+            _BENCHMARK_COUNTERS["candidate_late_or_evicted_results"] += 1
+            return
+        if len(_BENCHMARK_PENDING_CANDIDATES) >= _BENCHMARK_MAX_PENDING_CANDIDATES:
+            _BENCHMARK_PENDING_CANDIDATES.pop(
+                next(iter(_BENCHMARK_PENDING_CANDIDATES)), None
+            )
+        _BENCHMARK_PENDING_CANDIDATES[cycle_id] = _safe_copy(candidate)
+
+
+def _paired_candidate_worker(
+    cycle_id: str,
+    instrument: str,
+    candidate_name: str,
+    runner: Optional[Callable],
+    payload: dict,
+) -> None:
+    """Run outside the canonical worker so a hung candidate cannot block cadence."""
+    try:
+        try:
+            raw_result = (
+                runner(payload) if runner
+                else _run_openai_benchmark_candidate(payload)
+            )
+            candidate = _normalize_candidate_result(candidate_name, raw_result)
+        except Exception as exc:
+            candidate = {
+                "name": candidate_name,
+                "model": candidate_name,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "estimated_cost_usd": 0.0,
+                "schema_valid": False,
+                "response_received": False,
+                "error_type": type(exc).__name__,
+            }
+        _record_async_candidate_result(cycle_id, candidate)
+    finally:
+        with _BENCHMARK_LOCK:
+            _BENCHMARK_ACTIVE_CANDIDATES.discard(instrument)
+
+
+def _run_paired_benchmark_candidate(cycle: Optional[dict]) -> None:
+    """Schedule best-effort candidate measurement; baseline never waits for it."""
+    if cycle is None or not VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED:
+        return
+    if not cycle.get("screenshot_bytes"):
+        return
+    candidate_name = os.getenv("VISUAL_BRAIN_BENCHMARK_CANDIDATE", "openai-cheap")
+    with _BENCHMARK_LOCK:
+        runner = _BENCHMARK_CANDIDATE_RUNNERS.get(candidate_name)
+        busy = (
+            cycle["instrument"] in _BENCHMARK_ACTIVE_CANDIDATES
+            or len(_BENCHMARK_ACTIVE_CANDIDATES) >= _BENCHMARK_MAX_ACTIVE_CANDIDATES
+        )
+        if not busy:
+            _BENCHMARK_ACTIVE_CANDIDATES.add(cycle["instrument"])
+            _BENCHMARK_OPEN_CYCLES.add(cycle["cycle_id"])
+    if busy:
+        cycle["candidate"] = {
+            "enabled": True,
+            "scheduled": False,
+            "skipped": "busy",
+            "name": candidate_name,
+        }
+        return
+    payload = {
+        "instrument": cycle["instrument"],
+        "screenshot_bytes": bytes(cycle["screenshot_bytes"]),
+        "market_context": _safe_copy(cycle.get("market_context") or {}),
+        "previous_state": _safe_copy(cycle.get("previous_state")),
+        "recent_history": _safe_copy(cycle.get("recent_history") or []),
+        "prompt_timestamp": cycle.get("prompt_timestamp") or datetime.now(timezone.utc).isoformat(),
+        "context_fingerprint": cycle.get("context_fingerprint"),
+        "image_fingerprint": _safe_copy(cycle.get("image_fingerprint") or {}),
+    }
+    cycle["candidate"] = {
+        "enabled": True,
+        "scheduled": True,
+        "name": candidate_name,
+        "model": (
+            VISUAL_BRAIN_BENCHMARK_CANDIDATE_MODEL
+            if runner is None else candidate_name
+        ),
+    }
+    worker = threading.Thread(
+        target=_paired_candidate_worker,
+        args=(cycle["cycle_id"], cycle["instrument"], candidate_name, runner, payload),
+        daemon=True,
+    )
+    try:
+        worker.start()
+    except Exception:
+        with _BENCHMARK_LOCK:
+            _BENCHMARK_ACTIVE_CANDIDATES.discard(cycle["instrument"])
+            _BENCHMARK_OPEN_CYCLES.discard(cycle["cycle_id"])
+        cycle["candidate"] = {
+            "enabled": True,
+            "scheduled": False,
+            "skipped": "start_failure",
+            "name": candidate_name,
+        }
+
+
+def _benchmark_finish_cycle(cycle: Optional[dict]) -> None:
+    """Aggregate one cycle into bounded read-only in-memory telemetry."""
+    if cycle is None:
+        return
+    try:
+        attempts = cycle.get("baseline_attempts") or []
+        baseline_calls = len(attempts)
+        baseline_success = any(bool(item.get("ok")) for item in attempts)
+        baseline_input = sum(int(item.get("input_tokens") or 0) for item in attempts)
+        baseline_output = sum(int(item.get("output_tokens") or 0) for item in attempts)
+        baseline_cost = sum(float(item.get("estimated_cost_usd") or 0) for item in attempts)
+        baseline_failures = cycle.get("baseline_failures") or []
+        schema_failures = sum(
+            1 for item in baseline_failures if item.get("error_category") == "schema"
+        )
+        candidate = cycle.get("candidate") or {}
+        policies = cycle.get("policies") or {}
+        record = {
+            "cycle_id": cycle["cycle_id"],
+            "instrument": cycle["instrument"],
+            "timestamp": datetime.fromtimestamp(
+                cycle["started_at"], timezone.utc
+            ).isoformat(),
+            "completed_bar_fingerprint": cycle.get("completed_bar_fingerprint"),
+            "image_fingerprint": _safe_copy(cycle.get("image_fingerprint") or {}),
+            "context_fingerprint": cycle.get("context_fingerprint"),
+            "deterministic_fingerprint": (
+                (policies.get("deterministic_events") or {}).get("semantic_fingerprint")
+            ),
+            "policies": _safe_copy(policies),
+            "baseline": {
+                "model": _VB_MODEL,
+                "api_calls": baseline_calls,
+                "success": baseline_success,
+                "input_tokens": baseline_input,
+                "output_tokens": baseline_output,
+                "estimated_cost_usd": round(baseline_cost, 8),
+                "retry_count": max(0, baseline_calls - 1),
+                "failures": _safe_copy(baseline_failures),
+            },
+            "candidate": _safe_copy(candidate) if candidate else {
+                "enabled": False,
+            },
+        }
+        with _BENCHMARK_LOCK:
+            counters = _BENCHMARK_COUNTERS
+            counters["cycles"] += 1
+            counters["baseline_api_calls"] += baseline_calls
+            counters["baseline_successes"] += int(baseline_success)
+            counters["baseline_failures"] += len(baseline_failures)
+            counters["baseline_retries"] += max(0, baseline_calls - 1)
+            counters["baseline_schema_failures"] += schema_failures
+            counters["baseline_input_tokens"] += baseline_input
+            counters["baseline_output_tokens"] += baseline_output
+            counters["baseline_cost_usd"] += baseline_cost
+            if candidate.get("scheduled"):
+                counters["candidate_scheduled"] += 1
+            elif candidate.get("skipped") == "busy":
+                counters["candidate_skipped_busy"] += 1
+            elif candidate.get("skipped") == "start_failure":
+                counters["candidate_start_failures"] += 1
+            if cycle.get("input_error"):
+                counters["input_errors"] += 1
+            for policy_name, policy in policies.items():
+                if not isinstance(policy, dict):
+                    continue
+                called = bool(policy.get("would_call"))
+                counters["projected"][policy_name]["would_call"] += int(called)
+                counters["projected"][policy_name]["would_skip"] += int(not called)
+                counters["projected"][policy_name]["avoided_calls"] += (
+                    baseline_calls if not called else 0
+                )
+                for reason in policy.get("reasons") or []:
+                    reasons = counters["trigger_reasons"]
+                    reasons[reason] = reasons.get(reason, 0) + 1
+            image_policy = policies.get("no_new_bar_image") or {}
+            if image_policy.get("exact_image_duplicate"):
+                counters["image_suppression"]["exact"] += 1
+            if image_policy.get("near_identical_image"):
+                counters["image_suppression"]["near_identical"] += 1
+            if "no_new_completed_bar" in (image_policy.get("reasons") or []):
+                counters["image_suppression"]["no_new_bar"] += 1
+            heartbeat = policies.get("max_staleness_heartbeat") or {}
+            if heartbeat.get("heartbeat_used"):
+                counters["heartbeat_usage"] += 1
+                if heartbeat.get("staleness_seconds") is not None:
+                    observed = float(heartbeat["staleness_seconds"])
+                    prior_max = counters["max_observed_staleness_seconds"]
+                    counters["max_observed_staleness_seconds"] = round(
+                        max(observed, float(prior_max or 0)), 3
+                    )
+            counters["last_cycle_at"] = record["timestamp"]
+            if baseline_success:
+                counters["last_baseline_success_at"] = record["timestamp"]
+            _BENCHMARK_RECENT.append(record)
+            pending_candidate = _BENCHMARK_PENDING_CANDIDATES.pop(
+                cycle["cycle_id"], None
+            )
+            if pending_candidate is not None:
+                _apply_candidate_result_locked(record, pending_candidate)
+            if (
+                cycle["instrument"] not in _BENCHMARK_LAST_BY_INST
+                and len(_BENCHMARK_LAST_BY_INST) >= _BENCHMARK_MAX_INSTRUMENTS
+            ):
+                _BENCHMARK_LAST_BY_INST.pop(next(iter(_BENCHMARK_LAST_BY_INST)), None)
+            _BENCHMARK_LAST_BY_INST[cycle["instrument"]] = {
+                "completed_bar_fingerprint": cycle.get("completed_bar_fingerprint"),
+                "image_fingerprint": _safe_copy(cycle.get("image_fingerprint") or {}),
+                "semantic_snapshot": _benchmark_semantic_snapshot(
+                    cycle.get("deterministic_snapshot")
+                ),
+                "last_event_signature": (
+                    (policies.get("deterministic_events") or {}).get("event_signature")
+                ),
+                "last_baseline_at": cycle["started_at"] if baseline_success else (
+                    cycle["previous"].get("last_baseline_at")
+                ),
+            }
+    except Exception as exc:
+        logger.debug("[VISUAL_BRAIN] benchmark aggregation failed: %s", exc)
+    finally:
+        with _BENCHMARK_LOCK:
+            _BENCHMARK_OPEN_CYCLES.discard(cycle["cycle_id"])
+
+
+def get_benchmark_report(limit: int = 50, instrument: Optional[str] = None) -> dict:
+    """Return bounded shadow benchmark telemetry; never recomputes market state."""
+    limit = max(1, min(int(limit), _BENCHMARK_HISTORY_LIMIT))
+    with _BENCHMARK_LOCK:
+        recent = list(_BENCHMARK_RECENT)
+        if instrument:
+            recent = [item for item in recent if item.get("instrument") == instrument.upper()]
+        recent = recent[-limit:]
+        counters = _safe_copy(_BENCHMARK_COUNTERS)
+    counters["baseline_cost_usd"] = round(float(counters.get("baseline_cost_usd") or 0), 8)
+    counters["candidate_cost_usd"] = round(float(counters.get("candidate_cost_usd") or 0), 8)
+    return {
+        "ok": True,
+        "enabled": VISUAL_BRAIN_BENCHMARK_ENABLED,
+        "candidate_enabled": (
+            VISUAL_BRAIN_BENCHMARK_ENABLED
+            and VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED
+        ),
+        "candidate_model": VISUAL_BRAIN_BENCHMARK_CANDIDATE_MODEL,
+        "candidate_pricing_per_million": {
+            "input_usd": VISUAL_BRAIN_BENCHMARK_CANDIDATE_INPUT_COST_PER_MILLION,
+            "output_usd": VISUAL_BRAIN_BENCHMARK_CANDIDATE_OUTPUT_COST_PER_MILLION,
+        },
+        "max_staleness_seconds": VISUAL_BRAIN_BENCHMARK_MAX_STALENESS_SECONDS,
+        "image_hamming_max": VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX,
+        "counters": counters,
+        "recent_cycles": recent,
+    }
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -842,58 +1732,38 @@ def analyze_visual_market(
     )
 
     now_utc = datetime.now(timezone.utc).isoformat()
-    history_text = _build_history_text(recent_history)
-    prev_summary = ""
-    if previous_state:
-        prev_summary = (
-            f"Previous observation: bias={previous_state.get('bias')} "
-            f"state={previous_state.get('market_state')} "
-            f"event={previous_state.get('last_event')} "
-            f"action={previous_state.get('action')} "
-            f"conf={previous_state.get('confidence')}%\n"
-            f"Previous summary: {previous_state.get('summary', '')}"
-        )
-
-    b64_img = base64.b64encode(screenshot_bytes).decode()
-    context_text = json.dumps(market_context or {}, separators=(",", ":"), sort_keys=True)
-
-    user_content = [
-        {
-            "type": "text",
-            "text": (
-                f"Instrument: {instrument}\n"
-                f"Current UTC time: {now_utc}\n\n"
-                f"--- PREVIOUS STATE ---\n{prev_summary or 'First observation.'}\n\n"
-                f"--- STATE HISTORY (newest last) ---\n{history_text}\n\n"
-                f"--- NATIVE MULTI-TIMEFRAME CONTEXT ---\n{context_text}\n\n"
-                "Analyze the native context and attached chart image. Respond with ONLY the JSON object."
-            ),
-        },
-        {
-            "type": "image_url",
-            "image_url": {
-                "url": f"data:image/jpeg;base64,{b64_img}",
-                "detail": "auto",  # auto = model chooses resolution; avoids refusing dense charts
-            },
-        },
-    ]
+    cycle = _benchmark_current_cycle()
+    if cycle is not None:
+        cycle["prompt_timestamp"] = now_utc
+    messages = _build_analysis_messages(
+        screenshot_bytes, previous_state, recent_history, instrument,
+        market_context, now_utc,
+    )
 
     last_exc = None
     try:
         for attempt in range(2):
+            attempt_record = _benchmark_record_baseline_attempt(
+                attempt + 1, 0, 0
+            )
             try:
                 resp = client.chat.completions.create(
                     model=_VB_MODEL,
                     max_completion_tokens=_VB_MAX_TOKENS,
-                    messages=[
-                        {"role": "system", "content": _get_system_prompt(instrument)},
-                        {"role": "user",   "content": user_content},
-                    ],
+                    messages=messages,
                 )
                 usage = resp.usage
                 in_tok  = usage.prompt_tokens     if usage else 0
                 out_tok = usage.completion_tokens if usage else 0
                 _record_cost(in_tok, out_tok)
+                if attempt_record is not None:
+                    attempt_record["input_tokens"] = int(in_tok or 0)
+                    attempt_record["output_tokens"] = int(out_tok or 0)
+                    attempt_record["estimated_cost_usd"] = round(
+                        int(in_tok or 0) * _COST_PER_INPUT_TOK
+                        + int(out_tok or 0) * _COST_PER_OUTPUT_TOK,
+                        8,
+                    )
                 logger.info(
                     "[VISUAL_BRAIN] model=%s in_tok=%d out_tok=%d est_cost=$%.5f attempt=%d",
                     _VB_MODEL, in_tok, out_tok,
@@ -928,9 +1798,18 @@ def analyze_visual_market(
                         _gc.record_observational_event("visual_brain", event_id)
                 except Exception:
                     pass
+                if attempt_record is not None:
+                    attempt_record["ok"] = True
                 return obs
 
             except Exception as exc:
+                if attempt_record is not None:
+                    text = str(exc).lower()
+                    attempt_record["error_category"] = (
+                        "schema" if "schema" in text or "json" in text
+                        else "unknown"
+                    )
+                _benchmark_record_baseline_failure(exc)
                 last_exc = exc
                 logger.warning("[VISUAL_BRAIN] analyze attempt %d failed: %s", attempt + 1, exc)
                 if attempt == 0:
@@ -1353,6 +2232,9 @@ def _backfill_ghost_outcomes_inner() -> None:
 # ─────────────────────────────────────────────────────────────────────────────
 
 _VB_TIMERS: dict = {}   # instrument → active threading.Timer
+_VB_TIMER_LOCK = threading.RLock()
+_VB_START_LOCK = threading.Lock()
+_VB_STARTED = False
 _BACKFILL_RUNNING = False   # guards against concurrent backfill threads
 
 
@@ -1373,8 +2255,10 @@ def _vb_tick(instrument: str = "MNQ") -> None:
     if not VISUAL_BRAIN_ENABLED:
         return   # disabled → true no-op; no timer accumulated
 
+    benchmark_cycle = _benchmark_begin_cycle(instrument)
     try:
         screenshot_bytes: Optional[bytes] = None
+        bars_for_benchmark: list[dict] = []
 
         # ── Capture ──────────────────────────────────────────────────────────
         # Screenshots are ephemeral analysis inputs — they are NOT persisted to
@@ -1384,7 +2268,8 @@ def _vb_tick(instrument: str = "MNQ") -> None:
         market_context = {}
         try:
             if _bars_fn is not None:
-                market_context = _build_market_context(_bars_fn(instrument), instrument)
+                bars_for_benchmark = list(_bars_fn(instrument) or [])
+                market_context = _build_market_context(bars_for_benchmark, instrument)
         except Exception as context_exc:
             logger.warning("[VISUAL_BRAIN] market context failed: %s", context_exc)
         try:
@@ -1393,6 +2278,14 @@ def _vb_tick(instrument: str = "MNQ") -> None:
             logger.warning("[VISUAL_BRAIN] screenshot failed: %s", cap_exc)
 
         if not screenshot_bytes:
+            _benchmark_prepare_cycle(
+                benchmark_cycle,
+                bars=bars_for_benchmark,
+                screenshot_bytes=None,
+                market_context=market_context,
+                previous_state=None,
+                recent_history=[],
+            )
             logger.warning("[VISUAL_BRAIN] skipping cycle — no screenshot")
             return   # finally → _schedule_next() fires exactly once
 
@@ -1405,7 +2298,18 @@ def _vb_tick(instrument: str = "MNQ") -> None:
             _cached_prev = _LAST_OBSERVATION_BY_INST.get(instrument)
             prev_state = dict(_cached_prev) if _cached_prev else None
 
+        _benchmark_prepare_cycle(
+            benchmark_cycle,
+            bars=bars_for_benchmark,
+            screenshot_bytes=screenshot_bytes,
+            market_context=market_context,
+            previous_state=prev_state,
+            recent_history=recent_history,
+        )
+
         # ── Analyze ──────────────────────────────────────────────────────────
+        if benchmark_cycle is not None:
+            _BENCHMARK_LOCAL.cycle = benchmark_cycle
         try:
             obs = analyze_visual_market(
                 screenshot_bytes=screenshot_bytes,
@@ -1417,6 +2321,9 @@ def _vb_tick(instrument: str = "MNQ") -> None:
         except Exception as analyze_exc:
             logger.warning("[VISUAL_BRAIN] analysis failed: %s", analyze_exc)
             return   # finally → _schedule_next() fires exactly once
+        finally:
+            if benchmark_cycle is not None:
+                _BENCHMARK_LOCAL.cycle = None
 
         # Keep the deterministic context with the observation so the dashboard
         # can show the actual HTF inputs even when the model chooses WAIT.
@@ -1439,10 +2346,15 @@ def _vb_tick(instrument: str = "MNQ") -> None:
         # ── Ghost outcome backfill (non-blocking) ────────────────────────────
         threading.Thread(target=_backfill_ghost_outcomes, daemon=True).start()
 
+        # Optional paired candidate runs only after the canonical observation is
+        # persisted and cached. It has no path back into the baseline result.
+        _run_paired_benchmark_candidate(benchmark_cycle)
+
     except Exception as exc:
         logger.error("[VISUAL_BRAIN] tick error (trading engine unaffected): %s", exc)
 
     finally:
+        _benchmark_finish_cycle(benchmark_cycle)
         # Single reschedule point — always reached, never duplicated.
         _schedule_next(instrument)
 
@@ -1462,8 +2374,12 @@ def _schedule_next(instrument: str = "MNQ", delay: Optional[float] = None) -> No
     interval = delay if delay is not None else float(VISUAL_BRAIN_INTERVAL)
     t = threading.Timer(interval, _vb_tick, args=(instrument,))
     t.daemon = True
-    t.start()
-    _VB_TIMERS[instrument] = t
+    with _VB_TIMER_LOCK:
+        prior = _VB_TIMERS.get(instrument)
+        if prior is not None and prior.is_alive():
+            prior.cancel()
+        _VB_TIMERS[instrument] = t
+        t.start()
 
 
 def start(
@@ -1473,6 +2389,7 @@ def start(
     bars_fn: Optional[Callable] = None,
     research_observation_fn: Optional[Callable] = None,
     research_outcome_fn: Optional[Callable] = None,
+    benchmark_state_fn: Optional[Callable] = None,
 ) -> None:
     """Start the Visual Brain worker.  Call once at boot if VISUAL_BRAIN_ENABLED.
 
@@ -1488,8 +2405,8 @@ def start(
         bars_fn:     callable(instrument: str) → list[dict] wrapping
                      DATABENTO_BARS_BY_INST.get() from app.py's __main__ globals.
     """
-    global _db_conn_fn, _price_store, _vwap_store, _bars_fn
-    global _research_observation_fn, _research_outcome_fn
+    global _db_conn_fn, _price_store, _vwap_store, _bars_fn, _VB_STARTED
+    global _research_observation_fn, _research_outcome_fn, _benchmark_state_fn
     if db_conn_fn is not None:
         _db_conn_fn = db_conn_fn
     if price_store is not None:
@@ -1502,10 +2419,17 @@ def start(
         _research_observation_fn = research_observation_fn
     if research_outcome_fn is not None:
         _research_outcome_fn = research_outcome_fn
+    if benchmark_state_fn is not None:
+        _benchmark_state_fn = benchmark_state_fn
 
     if not VISUAL_BRAIN_ENABLED:
         logger.info("[VISUAL_BRAIN] disabled (VISUAL_BRAIN_ENABLED not set) — byte-identical mode")
         return
+    with _VB_START_LOCK:
+        if _VB_STARTED:
+            logger.info("[VISUAL_BRAIN] start ignored — observer already scheduled")
+            return
+        _VB_STARTED = True
     _log_openai_transport_diagnostic()
     logger.info("[VISUAL_BRAIN] enabled — instruments: %s  interval=%ds",
                 ", ".join(_VB_SYMBOLS), VISUAL_BRAIN_INTERVAL)

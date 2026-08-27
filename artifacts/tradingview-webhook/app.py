@@ -88335,6 +88335,23 @@ def route_visual_brain_cost():
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 500
 
+
+@app.route("/visual-brain/benchmark", methods=["GET"])
+def route_visual_brain_benchmark():
+    """Read-only in-memory Visual Brain cost-policy benchmark telemetry.
+
+    The benchmark is shadow-only and never recomputes analysis or reads/writes a
+    money-path store. Auth + CSRF are enforced at the Express /api edge.
+    """
+    try:
+        import visual_brain as _vb  # noqa: PLC0415
+        inst = request.args.get("instrument")
+        limit = min(max(int(request.args.get("limit", "50")), 1), 200)
+        return jsonify(_vb.get_benchmark_report(limit=limit, instrument=inst))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/visual-brain/all-status", methods=["GET"])
 def route_visual_brain_all_status():
     """All active Visual Brain instrument observations in one call (DISPLAY/SHADOW-ONLY).
@@ -91281,6 +91298,78 @@ if __name__ == "__main__":
     # Dependencies are injected from this __main__ module so visual_brain.py
     # never needs `import app`, which would create a duplicate module with empty
     # globals, breaking DB connections and price stores.
+    def _visual_brain_benchmark_state(inst):
+        """Read existing deterministic state for shadow trigger telemetry only."""
+        instrument = str(inst or "").upper()
+        structure_event = None
+        for record in reversed(list(ALERT_HISTORY)):
+            if not isinstance(record, dict) or record.get("canonical") is False:
+                continue
+            record_inst = str(record.get("instrument") or "").upper()
+            if record_inst and record_inst != instrument:
+                continue
+            alert_type = str(record.get("alert_type") or "").upper()
+            if any(token in alert_type for token in ("BOS", "CHOCH", "HH", "HL", "LH", "LL")):
+                structure_event = {
+                    "type": alert_type,
+                    "price": record.get("price"),
+                    "timestamp": record.get("timestamp"),
+                    "source": record.get("source"),
+                }
+                break
+
+        with THESIS_LOCK:
+            thesis = dict(THESIS_BY_INST.get(instrument) or {})
+        with STATE_LOCK:
+            setup_state = dict(SETUP_STATE.get(instrument) or {})
+        ready_snapshot = dict(LAST_READY_BY_TICKER.get(instrument) or {})
+        blockers = (
+            setup_state.get("blockers")
+            or ready_snapshot.get("strict_missing")
+            or ready_snapshot.get("missing")
+            or ready_snapshot.get("blockers")
+            or []
+        )
+        if isinstance(blockers, str):
+            blockers = [blockers]
+        return {
+            "instrument": instrument,
+            "structure_event": structure_event,
+            "vwap": dict(VWAP_BY_TICKER.get(instrument) or {}),
+            "levels": {
+                "nearest_supply": ready_snapshot.get("nearest_supply"),
+                "nearest_demand": ready_snapshot.get("nearest_demand"),
+            },
+            "thesis": {
+                key: thesis.get(key)
+                for key in ("status", "direction", "confidence", "reason")
+                if key in thesis
+            },
+            "ready": bool(_READY_STATE_BY_INST.get(instrument, False)),
+            "blockers": list(blockers) if isinstance(blockers, (list, tuple, set)) else [],
+            "setup_state": {
+                key: setup_state.get(key)
+                for key in ("state", "status", "reason")
+                if key in setup_state
+            },
+            "volatility": dict(VOLATILITY_BY_TICKER.get(instrument) or {}),
+            "volume": {
+                "rvol": dict(RVOL_BY_TICKER.get(instrument) or {}),
+                "volume_spike": dict(VOLUME_SPIKE_BY_TICKER.get(instrument) or {}),
+                "cvd": dict(CVD_BY_TICKER.get(instrument) or {}),
+            },
+            "session": (
+                ready_snapshot.get("session")
+                or setup_state.get("session")
+                or thesis.get("session")
+            ),
+            "recovery": {
+                "price_available": bool(AUTO_PRICE_BY_TICKER.get(instrument)),
+                "vwap_available": bool(VWAP_BY_TICKER.get(instrument)),
+                "volatility_available": bool(VOLATILITY_BY_TICKER.get(instrument)),
+            },
+        }
+
     try:
         import visual_brain as _vb_boot  # noqa: PLC0415
         _vb_boot.VB_DB_READY = VB_DB_READY   # share the probed flag
@@ -91296,6 +91385,7 @@ if __name__ == "__main__":
             bars_fn=lambda inst: list(_dbb_for_vb.DATABENTO_BARS_BY_INST.get(inst, [])),
             research_observation_fn=_market_student_observe_visual,
             research_outcome_fn=_market_student_resolve_visual,
+            benchmark_state_fn=_visual_brain_benchmark_state,
         )
     except Exception as _vb_boot_exc:
         logger.warning("[VISUAL_BRAIN] boot error (non-critical, fail-open): %s", _vb_boot_exc)
