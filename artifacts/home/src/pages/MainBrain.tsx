@@ -15,6 +15,7 @@ import { NAV_ITEMS, KNOWN_SECTIONS, SECTION_LABELS } from '../lib/navItems';
 import { TRAINING_LANES, normalizeTrainingSection } from '../lib/trainingLanes';
 import { audioManager, SoundEvent } from '../lib/audioManager';
 import { loadQueue, saveQueue, upsertAlert } from '../lib/globalAlerts';
+import { announceDashboardAuth } from '../lib/dashboardAuth';
 import {
   rankCandidates, getPlanFromRecord, getRankingReasons,
   isActionableVerdict,
@@ -355,6 +356,7 @@ function useMainBrain(ticker: string): MainBrainState & { refresh: () => void } 
       const url = `/api/main-brain${ticker ? `?ticker=${encodeURIComponent(ticker)}` : ''}`;
       const r = await fetch(url, { credentials: 'include', headers: getAuthHeader() });
       if (r.status === 401 || r.status === 403) {
+        announceDashboardAuth(false);
         authFailedRef.current = true;
         setState(s => ({ ...s, fetchState: 'auth_fail', isAuthFail: true, error: 'Authentication required' }));
         inFlight.current = false; return;
@@ -375,6 +377,7 @@ function useMainBrain(ticker: string): MainBrainState & { refresh: () => void } 
       const normalized = normalizeMainBrainPayload(data);
       lastPayload.current = normalized;
       authFailedRef.current = false; // clear on successful auth
+      announceDashboardAuth(true, getAuthHeader()['Authorization'] ?? '');
       setState({ payload: normalized, fetchState: 'loaded', lastOk: Date.now(), error: null, isAuthFail: false });
     } catch (e) {
       setState(s => ({
@@ -15048,7 +15051,6 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 };
 
 
-
 const OPENING_BELL_DURATION_MS = 60_000; // visible for 60 seconds
 
 interface OpeningBellState {
@@ -15259,6 +15261,14 @@ export default function MainBrain() {
     try { return !localStorage.getItem('brain_auth'); } catch { return true; }
   });
 
+  // Claim/release the global dock's protected polling for this route. A stored
+  // password is only a hint; the hook announces true after a protected fetch
+  // actually succeeds.
+  useEffect(() => {
+    announceDashboardAuth(false);
+    return () => announceDashboardAuth(false);
+  }, []);
+
   useEffect(() => {
     if (isAuthFail) setShowLogin(true);
   }, [isAuthFail]);
@@ -15271,6 +15281,7 @@ export default function MainBrain() {
       });
       if (!response.ok) return false;
       try { localStorage.setItem('brain_auth', password); } catch {}
+      announceDashboardAuth(true, 'Basic ' + btoa('admin:' + password));
       setShowLogin(false);
       refresh();
       return true;

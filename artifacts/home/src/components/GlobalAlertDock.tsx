@@ -23,6 +23,11 @@ import {
   loadQueue, saveQueue, upsertAlert, ackAlert, clearAcknowledged,
   setActiveTicker,
 } from '../lib/globalAlerts';
+import {
+  DASHBOARD_AUTH_EVENT,
+  announceDashboardAuth,
+  type DashboardAuthDetail,
+} from '../lib/dashboardAuth';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -67,13 +72,8 @@ function typeBadge(type: AlertType, isShadow: boolean): string {
 function ss(v: unknown, fb = ''): string { return typeof v === 'string' ? v : fb; }
 function sn(v: unknown): number | null   { const n = Number(v); return Number.isFinite(n) ? n : null; }
 
-function authHeaders(): Record<string, string> {
-  const h: Record<string, string> = {};
-  try {
-    const pwd = localStorage.getItem('brain_auth');
-    if (pwd) h['Authorization'] = 'Basic ' + btoa('admin:' + pwd);
-  } catch { /* ignore */ }
-  return h;
+function authHeaders(authorization: string): Record<string, string> {
+  return authorization ? { Authorization: authorization } : {};
 }
 
 function fmtTime(ts: number): string {
@@ -105,14 +105,15 @@ function injectKeyframes() {
 
 // ── Live READY poller for one instrument ──────────────────────────────────────
 
-async function fetchLiveReady(inst: string): Promise<{
+async function fetchLiveReady(inst: string, authorization: string, signal: AbortSignal): Promise<{
   isActionable: boolean;
   id: string;
   alert: Partial<AlertItem>;
 }> {
   const res = await fetch(`/api/main-brain?ticker=${inst}`, {
-    credentials: 'include', headers: authHeaders(),
+    credentials: 'include', headers: authHeaders(authorization), signal,
   });
+  if (res.status === 401 || res.status === 403) announceDashboardAuth(false);
   if (!res.ok) return { isActionable: false, id: '', alert: {} };
 
   const raw = await res.json();
@@ -178,9 +179,10 @@ interface SystemHealthResponse {
   edge_ledger?: { table_ready?: boolean };
 }
 
-async function fetchSystemHealth(headers: Record<string, string>): Promise<SystemHealthResponse | null> {
+async function fetchSystemHealth(headers: Record<string, string>, signal: AbortSignal): Promise<SystemHealthResponse | null> {
   try {
-    const res = await fetch('/api/research-health', { credentials: 'include', headers });
+    const res = await fetch('/api/research-health', { credentials: 'include', headers, signal });
+    if (res.status === 401 || res.status === 403) announceDashboardAuth(false);
     if (!res.ok) return null;
     return await res.json() as SystemHealthResponse;
   } catch { return null; }
@@ -213,11 +215,12 @@ interface OrbStatusResponse {
   instruments?: Record<string, OrbInstStatus>;
 }
 
-async function fetchOrbStatus(): Promise<OrbStatusResponse | null> {
+async function fetchOrbStatus(authorization: string, signal: AbortSignal): Promise<OrbStatusResponse | null> {
   try {
     const res = await fetch('/api/orb/status', {
-      credentials: 'include', headers: authHeaders(),
+      credentials: 'include', headers: authHeaders(authorization), signal,
     });
+    if (res.status === 401 || res.status === 403) announceDashboardAuth(false);
     if (!res.ok) return null;
     return await res.json() as OrbStatusResponse;
   } catch { return null; }
@@ -724,9 +727,18 @@ export const GlobalAlertDock: React.FC = () => {
   const [, navigate] = useLocation();
   const [queue, setQueueState] = useState<AlertItem[]>(() => loadQueue());
   const [drawerOpen, setDrawerOpen]  = useState(false);
+  const [isAuthenticated, setIsAuthenticated] = useState(false);
   const [isMobile, setIsMobile]      = useState(() =>
     typeof window !== 'undefined' ? window.innerWidth < 768 : false
   );
+
+  // The dock is app-global, while protected pages own their auth state.
+  // Keep a ref alongside state so in-flight polls can stop publishing work
+  // immediately when the page reports a logout or expired credential.
+  const authenticatedRef = useRef(false);
+  const authorizationRef = useRef('');
+  const authGenerationRef = useRef(0);
+  const authAbortRef = useRef<AbortController | null>(null);
 
   // In-memory dedup refs (session-only; queue persists across sessions)
   const seenLiveRef         = useRef<Partial<Record<string, string>>>({});  // inst → last READY id
@@ -740,6 +752,39 @@ export const GlobalAlertDock: React.FC = () => {
   const seenSysWarnRef      = useRef<Set<string>>(new Set());
 
   useEffect(() => { injectKeyframes(); }, []);
+
+  useEffect(() => {
+    const handleAuthChange = (event: Event) => {
+      const detail = (event as CustomEvent<DashboardAuthDetail>).detail;
+      const authorization = typeof detail?.authorization === 'string' ? detail.authorization : '';
+      const authenticated = detail?.authenticated === true && Boolean(authorization);
+
+      if (
+        authenticatedRef.current === authenticated
+        && authorizationRef.current === (authenticated ? authorization : '')
+      ) return;
+
+      authAbortRef.current?.abort();
+      authAbortRef.current = authenticated ? new AbortController() : null;
+      authenticatedRef.current = authenticated;
+      authorizationRef.current = authenticated ? authorization : '';
+      authGenerationRef.current += 1;
+      setIsAuthenticated(authenticated);
+
+      if (!authenticated) {
+        // Do not turn an expected auth transition into a misleading
+        // "Feed disconnected" alert when polling resumes later.
+        netOkRef.current = null;
+        consecutiveFailRef.current = 0;
+      }
+    };
+
+    window.addEventListener(DASHBOARD_AUTH_EVENT, handleAuthChange);
+    return () => {
+      authAbortRef.current?.abort();
+      window.removeEventListener(DASHBOARD_AUTH_EVENT, handleAuthChange);
+    };
+  }, []);
 
   // Responsive
   useEffect(() => {
@@ -784,13 +829,18 @@ export const GlobalAlertDock: React.FC = () => {
   // ── LIVE_READY polling (all 4 instruments) ──────────────────────────────────
 
   const pollLive = useCallback(async () => {
-    if (document.hidden) return;
+    if (!authenticatedRef.current || document.hidden) return;
+    const authGeneration = authGenerationRef.current;
+    const authorization = authorizationRef.current;
+    const signal = authAbortRef.current?.signal;
+    if (!signal) return;
     let networkOkCount = 0;  // instruments that returned any HTTP response (didn't throw)
 
     await Promise.allSettled(
       INSTRUMENTS.map(async (inst) => {
         try {
-          const { isActionable, id, alert } = await fetchLiveReady(inst);
+          const { isActionable, id, alert } = await fetchLiveReady(inst, authorization, signal);
+          if (!authenticatedRef.current || authGeneration !== authGenerationRef.current) return;
           networkOkCount++;  // fetchLiveReady only returns (never throws) on HTTP response
           if (!isActionable) {
             // Reset dedup so next READY fires a fresh alert
@@ -812,6 +862,7 @@ export const GlobalAlertDock: React.FC = () => {
         } catch { /* genuine network error — don't increment networkOkCount */ }
       })
     );
+    if (!authenticatedRef.current || authGeneration !== authGenerationRef.current) return;
 
     // ── Connection state machine ──────────────────────────────────────────────
     const allFailed = networkOkCount === 0;
@@ -856,9 +907,14 @@ export const GlobalAlertDock: React.FC = () => {
   // ── ORB shadow polling ──────────────────────────────────────────────────────
 
   const pollOrb = useCallback(async () => {
-    if (document.hidden) return;
+    if (!authenticatedRef.current || document.hidden) return;
+    const authGeneration = authGenerationRef.current;
+    const authorization = authorizationRef.current;
+    const signal = authAbortRef.current?.signal;
+    if (!signal) return;
     try {
-      const data = await fetchOrbStatus();
+      const data = await fetchOrbStatus(authorization, signal);
+      if (!authenticatedRef.current || authGeneration !== authGenerationRef.current) return;
       if (!data?.ok || !data.instruments) return;
 
       for (const inst of INSTRUMENTS) {
@@ -925,11 +981,17 @@ export const GlobalAlertDock: React.FC = () => {
   // SAFETY: display-only; never calls any broker path or modifies gate state.
 
   const pollResearch = useCallback(async () => {
-    if (document.hidden) return;
+    if (!authenticatedRef.current || document.hidden) return;
+    const authGeneration = authGenerationRef.current;
+    const authorization = authorizationRef.current;
+    const signal = authAbortRef.current?.signal;
+    if (!signal) return;
     try {
       const res = await fetch('/api/ghost-research/ready-for-review', {
-        credentials: 'include', headers: authHeaders(),
+        credentials: 'include', headers: authHeaders(authorization), signal,
       });
+      if (res.status === 401 || res.status === 403) announceDashboardAuth(false);
+      if (!authenticatedRef.current || authGeneration !== authGenerationRef.current) return;
       if (!res.ok) return;
       const data = await res.json() as { ok?: boolean; experiments?: Array<{
         experiment_id: string; variant_name: string; instrument: string;
@@ -964,9 +1026,14 @@ export const GlobalAlertDock: React.FC = () => {
   // ── System health polling ───────────────────────────────────────────────────
 
   const pollSystemHealth = useCallback(async () => {
-    if (document.hidden) return;
+    if (!authenticatedRef.current || document.hidden) return;
+    const authGeneration = authGenerationRef.current;
+    const authorization = authorizationRef.current;
+    const signal = authAbortRef.current?.signal;
+    if (!signal) return;
     try {
-      const data = await fetchSystemHealth(authHeaders());
+      const data = await fetchSystemHealth(authHeaders(authorization), signal);
+      if (!authenticatedRef.current || authGeneration !== authGenerationRef.current) return;
       if (!data) return;
 
       const warnings: string[] = [];
@@ -995,28 +1062,32 @@ export const GlobalAlertDock: React.FC = () => {
 
   // Start polling
   useEffect(() => {
-    pollLive();
-    const id = setInterval(pollLive, LIVE_POLL_MS);
+    if (!isAuthenticated) return;
+    void pollLive();
+    const id = setInterval(() => { void pollLive(); }, LIVE_POLL_MS);
     return () => clearInterval(id);
-  }, [pollLive]);
+  }, [isAuthenticated, pollLive]);
 
   useEffect(() => {
-    pollOrb();
-    const id = setInterval(pollOrb, ORB_POLL_MS);
+    if (!isAuthenticated) return;
+    void pollOrb();
+    const id = setInterval(() => { void pollOrb(); }, ORB_POLL_MS);
     return () => clearInterval(id);
-  }, [pollOrb]);
+  }, [isAuthenticated, pollOrb]);
 
   useEffect(() => {
-    pollResearch();
-    const id = setInterval(pollResearch, RESEARCH_POLL_MS);
+    if (!isAuthenticated) return;
+    void pollResearch();
+    const id = setInterval(() => { void pollResearch(); }, RESEARCH_POLL_MS);
     return () => clearInterval(id);
-  }, [pollResearch]);
+  }, [isAuthenticated, pollResearch]);
 
   useEffect(() => {
-    pollSystemHealth();
-    const id = setInterval(pollSystemHealth, SYSTEM_HEALTH_POLL_MS);
+    if (!isAuthenticated) return;
+    void pollSystemHealth();
+    const id = setInterval(() => { void pollSystemHealth(); }, SYSTEM_HEALTH_POLL_MS);
     return () => clearInterval(id);
-  }, [pollSystemHealth]);
+  }, [isAuthenticated, pollSystemHealth]);
 
   // ── Alert click: switch instrument + navigate ───────────────────────────────
 

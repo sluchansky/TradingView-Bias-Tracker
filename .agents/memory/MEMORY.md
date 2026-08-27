@@ -30,7 +30,7 @@
 - [Edge Score, grades & session bonus](edge-score-card-block.md) — EDGE_COMPONENTS BOS20/CHOCH20/VWAP15/Sweep15/Volume15/CVD15/Session10 = max110; grade ≥85A+/≥70A/≥50B/<50 WAIT; zone scores 0 so CHOCH-absent edge caps ~50.
 - [CVD hard filter + RVOL→Volume component](cvd-rvol-filter.md) — CVD = HARD fail-open directional veto; RVOL feeds Volume +15 (≥~1.5), NOT a standalone modifier; ceiling 110; display via alert_diagnostics.
 - [No-signals = structure gate](no-signals-alert-config-gap.md) — "0 signals" usually = no structure alert; structure = ANY-ONE of CHOCH/BOS/HH/HL/LH/LL (shared, needs a `ticker`); diagnose via gate_debug/strict_reason.
-- [Dashboard auth edge & open paths](dashboard-auth-edge.md) — auth lives in Express; never lock /, /ping, /webhook, /healthz; webhook ENTER/CLOSE intentionally OPEN (TradingView can't send a password).
+- [Dashboard auth edge & open paths](dashboard-auth-edge.md) — auth lives in Express; preserve open paths; app-global protected polling requires the validated active-route header and abort-on-revoke.
 - [Volatility monitor gate](volatility-monitor-gate.md) — per-instrument ATR-ratio FAIL-OPEN; SWING hard-gates BLOCK→WAIT; SCALP DISPLAY-ONLY + fail-open extreme-ratio>3.0 DEMOTE brake; single get_volatility feeds gate+brake+display.
 - [JS-in-Python escape trap](cockpit-mode-escape-bug.md) — `\n`/`\t`/astral emoji in JS inside Python triple-quotes → raw newline/UTF-8 500; fix with `\\n`; py_compile misses it — node --check the SERVED `<script>`.
 - [Multi-strategy engine](strategy-engine.md) — regime→strategy (fixed priority); ORB replaced Exhaustion Fade; display's ONLY money-path effect = sanctioned ORB 1:4 retarget; closed-override needs key parity.

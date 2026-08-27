@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useLocation } from 'wouter';
 import { NAV_ITEMS } from '../lib/navItems';
+import { announceDashboardAuth } from '../lib/dashboardAuth';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const BULL  = '#22c55e';
@@ -214,12 +215,27 @@ function useAuth() {
   [pwd]);
 
   const tryAuth = useCallback(async (p: string) => {
+    const authorization = 'Basic ' + btoa('admin:' + p);
     try {
-      const r = await fetch('/api/status', { headers: { 'Authorization': 'Basic ' + btoa('admin:' + p) }, credentials: 'include' });
-      if (r.ok) { setPwd(p); setAuthed(true); try { localStorage.setItem('brain_auth', p); } catch {} }
-      else setAuthed(false);
-    } catch { setAuthed(false); }
+      const r = await fetch('/api/status', { headers: { 'Authorization': authorization }, credentials: 'include' });
+      if (r.ok) {
+        setPwd(p); setAuthed(true);
+        try { localStorage.setItem('brain_auth', p); } catch {}
+        announceDashboardAuth(true, authorization);
+      } else {
+        setAuthed(false);
+        announceDashboardAuth(false);
+      }
+    } catch {
+      setAuthed(false);
+      announceDashboardAuth(false);
+    }
     setCheck(false);
+  }, []);
+
+  useEffect(() => {
+    announceDashboardAuth(false);
+    return () => announceDashboardAuth(false);
   }, []);
 
   useEffect(() => {
@@ -244,8 +260,14 @@ function useLiveData(ticker: Ticker, authHeader: Record<string, string>) {
       if (!alive) return;
       try {
         const r = await fetch(`/api/status?ticker=${ticker}`, { headers: authHeader, credentials: 'include' });
-        if (r.ok) { const j = await r.json(); if (alive) { setData(j); setConn('ok'); setTs(Date.now()); } }
-        else if (alive) setConn('err');
+        if (r.ok) {
+          announceDashboardAuth(true, authHeader.Authorization ?? '');
+          const j = await r.json();
+          if (alive) { setData(j); setConn('ok'); setTs(Date.now()); }
+        } else if (alive) {
+          if (r.status === 401 || r.status === 403) announceDashboardAuth(false);
+          setConn('err');
+        }
       } catch { if (alive) setConn('err'); }
       if (alive) setTimeout(poll, 3000);
     };

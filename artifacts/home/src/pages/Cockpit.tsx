@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { matchesRequiredBlocker } from "../lib/blockerSemantics";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
+import { announceDashboardAuth } from "../lib/dashboardAuth";
 type TradePlan = {
   trade_plan?: boolean;
   direction?: string;
@@ -247,6 +248,13 @@ export default function Cockpit() {
   const barkMutedRef    = useRef(barkMuted);
   barkMutedRef.current  = barkMuted;
 
+  // Cockpit has its own session-scoped credential. Claim the global dock only
+  // after a protected status request succeeds, not merely after form submit.
+  useEffect(() => {
+    announceDashboardAuth(false);
+    return () => announceDashboardAuth(false);
+  }, []);
+
   // ── applyData: shared by active poll + background snap ──────────────────────
   const applyData = useCallback((json: StatusData, ticker: string) => {
     if (ticker === activeRef.current) {
@@ -281,6 +289,7 @@ export default function Cockpit() {
       if (p) headers["Authorization"] = `Basic ${btoa("admin:" + p)}`;
       const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include", headers });
       if (res.status === 401) {
+        announceDashboardAuth(false);
         const hadPwd = !!pwdRef.current;
         setPwd("");
         try { sessionStorage.removeItem("cockpit_pwd"); } catch { /* ignore */ }
@@ -291,6 +300,7 @@ export default function Cockpit() {
       }
       if (res.status === 503) return;
       if (!res.ok) { setFetchError(`HTTP ${res.status}`); return; }
+      announceDashboardAuth(true, headers["Authorization"] ?? "");
       const json: StatusData = await res.json();
       if (json.status === "warming") return;
       applyData(json, ticker);
@@ -308,10 +318,14 @@ export default function Cockpit() {
       const p = pwdRef.current;
       if (p) headers["Authorization"] = `Basic ${btoa("admin:" + p)}`;
       const res = await fetch(`/api/status?ticker=${ticker}`, { credentials: "include", headers });
+      if (res.status === 401) {
+        announceDashboardAuth(false);
+      }
       if (!res.ok) {
         setStaleSnaps(prev => ({ ...prev, [ticker]: true }));
         return;
       }
+      announceDashboardAuth(true, headers["Authorization"] ?? "");
       const json: StatusData = await res.json();
       if (json.status === "warming") return;
       applyData(json, ticker);

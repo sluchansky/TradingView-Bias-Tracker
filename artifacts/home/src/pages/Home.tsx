@@ -7,6 +7,7 @@ import {
   latestBarTimestampMs,
   timestampMs,
 } from '../lib/marketDataFreshness';
+import { announceDashboardAuth } from '../lib/dashboardAuth';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const BULL = '#22c55e'; const BEAR = '#ef4444'; const AMB = '#f59e0b';
@@ -2466,6 +2467,11 @@ export default function Home() {
     authPwd ? { 'Authorization': 'Basic ' + btoa('admin:' + authPwd) } : {}
   , [authPwd]);
 
+  useEffect(() => {
+    announceDashboardAuth(false);
+    return () => announceDashboardAuth(false);
+  }, []);
+
   const handleAuth = useCallback(async (pwd: string): Promise<boolean> => {
     const header = { 'Authorization': 'Basic ' + btoa('admin:' + pwd) };
     try {
@@ -2477,6 +2483,7 @@ export default function Home() {
       try { localStorage.setItem('brain_auth', pwd); } catch {}
       setAuthPwd(pwd);
       setAuthNeeded(false);
+      announceDashboardAuth(true, header.Authorization);
       return true;
     } catch {
       return false;
@@ -2487,8 +2494,14 @@ export default function Home() {
     if (!authPwd || demoMode) return;
     try {
       const r = await fetch(`/api/status?ticker=${ticker}`, { credentials:'include', headers:authHeader });
-      if (r.status === 401) { setAuthNeeded(true); setAuthPwd(''); try { localStorage.removeItem('brain_auth'); } catch {} return; }
+      if (r.status === 401) {
+        announceDashboardAuth(false);
+        setAuthNeeded(true); setAuthPwd('');
+        try { localStorage.removeItem('brain_auth'); } catch {}
+        return;
+      }
       if (r.ok) {
+        announceDashboardAuth(true, authHeader.Authorization ?? '');
         const d = await r.json(); setData(d); setLoading(false);
         const p = Number(d?.current_price || d?.vwap_value || 0);
         if (p > 0) {

@@ -27,6 +27,22 @@ username is ignored; compared with `crypto.timingSafeEqual`. Fails OPEN only whe
 `NODE_ENV==='development'`; in production/deployment a missing secret fails CLOSED
 (503) — a live trading dashboard must lock, not expose, when unconfigured.
 
+**App-global protected polling:** never infer client authentication from the mere
+presence of a persisted password or from a boolean emitted by one route. Every
+dashboard route that can authenticate must publish the exact in-memory
+`Authorization` header only after a protected request succeeds, and revoke it on
+401/403 or route unmount. Consumers must treat repeated publication of the same
+header as idempotent and abort in-flight work whenever the credential changes.
+
+**Why:** dashboard routes use different storage scopes, while app-global consumers
+outlive individual pages. A boolean can enable requests with the wrong route's
+credential; missing route publishers can silently disable polling; and restarting
+an auth session on every successful page poll can cancel legitimate background work.
+
+**How to apply:** any new protected dashboard surface must join the shared auth
+lifecycle before it can rely on app-global feeds. Test direct login, saved-credential
+restore, cross-route navigation, and a post-401 zero-request window.
+
 **CSRF / host trust model:** mutating (non GET/HEAD/OPTIONS) protected requests must
 be same-origin — the request `Origin`/`Referer` host must match a proxy-supplied
 host. Verified empirically through the public proxy: Replit OVERWRITES any
