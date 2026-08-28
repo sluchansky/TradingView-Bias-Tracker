@@ -2,18 +2,19 @@
 
 ## Verdict
 
-**Conditionally safe to transfer to a non-production Windows test host:** yes.
+**Native-Windows approved for the exact safe candidate commit:** yes.
 
 The candidate keeps execution, manual orders, the live runner, coordinator
 fan-out, live Discord, Visual Brain, Visual Brain benchmarking, and candidate
 vision disabled in the supported Windows launchers. The source-only,
 frontend/API, focused Python safety, proxy, and Linux startup checks pass.
 
-**Final native-Windows release approval:** blocked until the checked-in
-`windows-latest` typecheck and `Test-WindowsDashboard.ps1` jobs run on the exact
-candidate commit. Replit does not provide `pwsh`/Windows process semantics, so
-PowerShell parsing, `taskkill.exe /T`, `Get-NetTCPConnection`, native package
-loading, and Windows listener release were not executed here.
+**Final native-Windows release approval:** PASS for
+`9c01bc0a1c513010686f50d1ab4ff26d486ef997`. GitHub Actions run
+[`33132928059`](https://github.com/sluchansky/TradingView-Bias-Tracker/actions/runs/33132928059)
+completed successfully on `windows-latest`, including the full workspace
+typecheck and `scripts/windows/Test-WindowsDashboard.ps1`. The temporary
+validation branch was removed after the run; the Actions record remains.
 
 The repository-wide Python collection-order defect is also still present and
 already has a separate project task. It does not invalidate the focused release
@@ -24,13 +25,16 @@ Python run as a green release gate.
 
 - Branch: `replit-dev`
 - Base commit inspected: `f4864cd1df0487ee51693bf21244990778b994c7`
+- Exact candidate validated on Windows:
+  `9c01bc0a1c513010686f50d1ab4ff26d486ef997`
 - Initial worktree: clean
 - Upstream relation at audit time: 77 commits ahead, 2 commits behind
 - Candidate changes in this audit are limited to Windows safety defaults,
   Windows topology tests/documentation, and deterministic regression fixtures.
-- No publish, deployment, push, pull, fetch, merge, rebase, branch move, tag
-  creation, remote-host action, production access, or execution enablement was
-  performed.
+- The exact candidate was pushed only to a temporary GitHub validation branch
+  so the checked-in push workflow could run. The branch was deleted afterward.
+  No protected branch moved and no publish, deployment, tag, production access,
+  database access, provider access, or execution enablement occurred.
 
 ## Safety-default audit
 
@@ -85,6 +89,26 @@ The unauthenticated 390×844 preview rendered the responsive Main Brain access
 card without browser-console errors. No dashboard password was read or exposed,
 so the authenticated operator surface was not exercised.
 
+### Native Windows exact-candidate release gate
+
+| Check | Result |
+|---|---|
+| GitHub Actions head SHA | PASS — `9c01bc0a1c513010686f50d1ab4ff26d486ef997` |
+| Full workspace typecheck (Windows) | PASS — [job `98726312174`](https://github.com/sluchansky/TradingView-Bias-Tracker/actions/runs/33132928059/job/98726312174) |
+| Release-safe Windows dashboard smoke | PASS — [job `98726312306`](https://github.com/sluchansky/TradingView-Bias-Tracker/actions/runs/33132928059/job/98726312306) |
+| Direct Flask `/ping` | PASS — HTTP readiness reached with `status=ok` |
+| Proxied `/api/ping` | PASS — launcher readiness gate completed before the smoke returned |
+| Safe startup environment | PASS — execution, manual orders, live runner, coordinator fan-out, Discord, Visual Brain, candidate benchmarking, Databento, and database access disabled |
+| Shutdown | PASS — launcher-owned process tree stopped and owned listeners on 8000, 8080, and 24319 were released; port 3000 is not used by this launcher |
+
+The Windows smoke ran with an isolated Python 3.11 virtual environment and a
+fresh frozen pnpm install. Its success line was:
+`Windows dashboard smoke passed: /ping reached and launcher-owned process tree stopped cleanly.`
+GitHub's final orphan-process cleanup reported no named Python or Node process
+requiring termination. The runner emitted a non-fatal warning that older action
+releases are being forced onto the hosted runner's Node.js 24 runtime; it did
+not affect any job result.
+
 ### Trading/safety regression matrix
 
 | Check | Result |
@@ -124,15 +148,12 @@ database was accessed.
 
 ## Known blockers and limitations
 
-1. **Native Windows execution not run in Replit.** The exact candidate still
-   needs the existing GitHub Actions `windows-latest` workspace typecheck and
-   release-safe dashboard smoke.
-2. **Arbitrary-order full Python collection is not green.** A repository-wide
+1. **Arbitrary-order full Python collection is not green.** A repository-wide
    `pytest -q` stopped during collection because
    `test_journal_coaching_correlations_7o3.py` and
    `test_phase4_operator_explanation.py` received a Flask object where the
    `app` module was expected. This is already tracked separately.
-3. **Configured development database reconnect failed.** Source-only
+2. **Configured development database reconnect failed.** Source-only
    persistence policy and database-free startup passed; database repair and
    production access were outside this audit.
 
@@ -140,12 +161,14 @@ database was accessed.
 
 No SQL, journal repair, outcome update, reseed, reconciliation, or production
 database command was run. Existing `STATUS_UNKNOWN` rows were not modified, and
-no execution outcome was fabricated.
+no execution outcome was fabricated. The Windows smoke explicitly cleared
+`DATABASE_URL`, provider keys, Discord webhooks, and live-data inputs.
 
 ## Release boundary
 
-It is safe to move this candidate only to a non-production Windows validation
-host while preserving the required values above. Do not call it a native
-Windows-approved release until the exact commit passes the Windows CI jobs.
-Do not enable execution, live alerts, provider access, database access, Visual
-Brain, or candidate vision as part of that smoke.
+The exact candidate commit
+`9c01bc0a1c513010686f50d1ab4ff26d486ef997` is approved for the documented
+safe Windows startup configuration. This approval does not automatically extend
+to later commits. Preserve the required disabled values above; enabling
+execution, live alerts, provider access, database access, Visual Brain, or
+candidate vision requires a separate reviewed operator decision.
