@@ -25,6 +25,7 @@
 - [Zone Mitigated detection](zone-mitigated-detection.md) — mitigation is PER-INSTRUMENT w/ SCALP TTL; SCALP fully demotes zone at EVERY site (gate, full_analysis override, webhook short-circuit, structure-reset), cfg-guarded; demoting a gate flag alone LEAKS.
 - [VWAP auto-fetch](vwap-auto-fetch.md) — VWAP auto-sourced (MGC≈GC=F, MNQ≈NQ=F); chart/manual push wins a grace window then auto resumes; gate never trades on stale VWAP.
 - [Production deployment topology](deployment-topology.md) — deploy as one Reserved VM; api-server prod build/run supervises Flask+Express; static `home` artifact serves `/`; target chosen in Publish UI.
+- [Published smoke prerequisites](published-smoke-prerequisites.md) — deployment metadata can say public/healthy while live hosts time out or serve an older publish; verify health and publish recency before security smoke.
 - [App-side DB convention: INSERT/SELECT only](db-app-insert-select-only.md) — app.py runs NO DDL; boot does no-DDL readiness probe + `*_DB_READY` flag; new tables via database tool (dev) + Publish schema-diff (prod).
 - [PostgreSQL startup durability guard](postgres-startup-durability-guard.md) — automatic SQL migrations are allowlisted to idempotent table/index creation; guard probes the existing DB read-only before service start.
 - [Edge Score, grades & session bonus](edge-score-card-block.md) — EDGE_COMPONENTS BOS20/CHOCH20/VWAP15/Sweep15/Volume15/CVD15/Session10 = max110; grade ≥85A+/≥70A/≥50B/<50 WAIT; zone scores 0 so CHOCH-absent edge caps ~50.
