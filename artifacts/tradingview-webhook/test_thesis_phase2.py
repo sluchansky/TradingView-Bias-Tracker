@@ -39,10 +39,12 @@ import app  # noqa: E402
 
 def _clear(inst="MGC"):
     with app.THESIS_LOCK:
-        app.THESIS_BY_INST.pop(inst, None)
-        tl = app.THESIS_TIMELINE_BY_INST.get(inst)
-        if tl is not None:
-            tl.clear()
+        for key in list(app.THESIS_BY_INST):
+            if key == inst or str(key).startswith(inst + "|"):
+                app.THESIS_BY_INST.pop(key, None)
+        for key in list(app.THESIS_TIMELINE_BY_INST):
+            if key == inst or str(key).startswith(inst + "|"):
+                app.THESIS_TIMELINE_BY_INST.pop(key, None)
         app.THESIS_NOTIF_LAST_BY_INST.pop(inst, None)
 
 
@@ -97,7 +99,7 @@ def test_p2_01_timeline_records_forming_transition():
         # First call: NEUTRAL → FORMING
         _run("LONG READY", score=65, sweep_ok=False)
         with app.THESIS_LOCK:
-            events = list(app.THESIS_TIMELINE_BY_INST.get("MGC") or [])
+            events = list(app.THESIS_TIMELINE_BY_INST.get("MGC|SCALP") or [])
         assert len(events) >= 1, "Expected at least one timeline event"
         ev = events[0]
         assert ev["newStatus"] != "NEUTRAL", f"Expected non-NEUTRAL, got {ev['newStatus']}"
@@ -115,10 +117,10 @@ def test_p2_02_timeline_records_confidence_jump():
         # delta = 8 >= 5 → should record
         with app.THESIS_LOCK:
             from collections import deque
-            app.THESIS_TIMELINE_BY_INST["MGC"] = deque(maxlen=25)
+            app.THESIS_TIMELINE_BY_INST["MGC|SCALP"] = deque(maxlen=250)
         app._record_thesis_event("MGC", prev, new)
         with app.THESIS_LOCK:
-            events = list(app.THESIS_TIMELINE_BY_INST["MGC"])
+            events = list(app.THESIS_TIMELINE_BY_INST["MGC|SCALP"])
         assert len(events) == 1
         assert events[0]["prevConfidence"] == 50
         assert events[0]["newConfidence"] == 58
@@ -133,12 +135,12 @@ def test_p2_03_post_update_skips_trivial_change():
     try:
         with app.THESIS_LOCK:
             from collections import deque
-            app.THESIS_TIMELINE_BY_INST["MGC"] = deque(maxlen=25)
+            app.THESIS_TIMELINE_BY_INST["MGC|SCALP"] = deque(maxlen=250)
         prev = _snap("FORMING_LONG", confidence=65)
         new  = _snap("FORMING_LONG", confidence=67)   # delta = 2 < 5
         app._thesis_post_update("MGC", prev, new)
         with app.THESIS_LOCK:
-            events = list(app.THESIS_TIMELINE_BY_INST.get("MGC") or [])
+            events = list(app.THESIS_TIMELINE_BY_INST.get("MGC|SCALP") or [])
         assert len(events) == 0, f"Expected 0 events for trivial change, got {len(events)}"
     finally:
         _clear()
@@ -248,7 +250,7 @@ def test_p2_11_thesis_history_route():
         "reasonCodes": [], "primaryReason": "", "invalidationReason": None,
     }
     with app.THESIS_LOCK:
-        app.THESIS_TIMELINE_BY_INST["MGC"] = deque([ev], maxlen=25)
+        app.THESIS_TIMELINE_BY_INST["MGC|SCALP"] = deque([ev], maxlen=250)
 
     with app.app.test_client() as client:
         resp = client.get("/thesis/MGC/history")
@@ -350,7 +352,7 @@ def test_p2_17_apply_thesis_correct_after_phase2():
         _clear()
         adj, t = _run("LONG READY", score=80)
         assert "READY" in adj, f"Expected READY, got {adj!r}"
-        assert t["status"] == "READY_LONG"
+        assert t["status"] == "CONFIRMED"
         assert t["confidence"] == 80
     finally:
         app.TRADING_MODE = saved_mode

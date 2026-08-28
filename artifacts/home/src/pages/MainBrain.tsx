@@ -199,7 +199,8 @@ function useMbConvMemory() {
 function buildMbContext(p: Record<string, unknown>, ticker: string): string {
   const mkt     = (p.market     ?? {}) as Record<string, unknown>;
   const verdict = (p.verdict    ?? {}) as Record<string, unknown>;
-  const thesis  = (p.thesis ?? p.left_brain ?? {}) as Record<string, unknown>;
+  const thesis  = (p.thesis ?? {}) as Record<string, unknown>;
+  const advisory = (p.left_brain ?? {}) as Record<string, unknown>;
   const cp      = (p.candidate_preview ?? {}) as Record<string, unknown>;
   const eb      = (p.edge_breakdown    ?? {}) as Record<string, unknown>;
   const scanner = (p.strategy_scanner  ?? {}) as Record<string, unknown>;
@@ -219,6 +220,10 @@ function buildMbContext(p: Record<string, unknown>, ticker: string): string {
   const thStr    = safeStr(thesis.strength  ?? thesis.thesis_strength, '');
   const thAge    = safeStr(thesis.age_display ?? thesis.age, '');
   const thStatus = safeStr(thesis.status    ?? thesis.thesis_status, '');
+  const thEntry  = safeStr(thesis.entryStatus ?? thesis.entry_status, 'WAIT');
+  const thReason = safeStr(thesis.reason, '');
+  const advDir   = safeStr(advisory.direction, '');
+  const advConf  = safeStr(advisory.confidence, '');
 
   const vReadiness = verdict.is_actionable === true
     ? 'READY'
@@ -249,12 +254,16 @@ function buildMbContext(p: Record<string, unknown>, ticker: string): string {
     `[MAIN BRAIN — ${ticker} — ${tsET} UTC-4]`,
     `Instrument: ${ticker} | Mode: ${safeStr(mkt.trading_mode, '—')} | Session: ${safeStr(mkt.session_status, '—')}`,
     '',
-    'THESIS',
+    'ACTIVE PERSISTENT THESIS — DETERMINISTIC CONTINUITY',
     `Direction: ${thDir || '—'} | Strength: ${thStr || '—'} | Status: ${thStatus || '—'} | Age: ${thAge || '—'}`,
+    `Entry Status: ${thEntry} | Reason: ${thReason || '—'}`,
     '',
-    'VERDICT',
+    'CURRENT MARKET CANDIDATE — STRICT EVALUATOR',
     `Readiness: ${vReadiness} | Edge: ${edgeScore}/110 | Grade: ${edgeGrade || '—'}`,
     `Candidate Direction: ${vDir || '—'} | Candidate Status: ${vCandSt || '—'}`,
+    '',
+    'ADVISORY / RESEARCH — NOT ENTRY AUTHORITY',
+    `Left Brain: ${advDir || '—'} | Confidence: ${advConf || '—'}`,
     '',
     'FUNDAMENTALS — SHADOW ONLY',
     `Status: ${safeStr(fundamental.status, 'NOT ENABLED')} | Event: ${safeStr(fundamental.event_name, 'None')}`,
@@ -14543,6 +14552,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   const v      = (p.verdict           ?? {}) as Record<string, unknown>;
   const op     = (p.operator_presentation ?? {}) as Record<string, unknown>;
   const lb     = (p.left_brain        ?? {}) as Record<string, unknown>;
+  const pt     = (p.thesis            ?? {}) as Record<string, unknown>;
   const cp     = (p.candidate_preview ?? {}) as Record<string, unknown>;
   const sc     = (p.strategy_scanner  ?? {}) as Record<string, unknown>;
   const at     = (p.active_trades     ?? {}) as Record<string, unknown>;
@@ -14583,6 +14593,20 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
     ? (lbAge < 60 ? lbAge + 's' : lbAge < 3600 ? Math.floor(lbAge / 60) + 'm' : Math.floor(lbAge / 3600) + 'h') + ' ago'
     : '';
   const strategy = safeStr(sc.selected_label ?? sc.selected, '');
+
+  // Deterministic persistent thesis — continuity context only. Entry authority
+  // remains the strict verdict above; entryStatus is copied from the backend.
+  const ptDir       = safeStr(pt.direction, 'NEUTRAL');
+  const ptStatus    = safeStr(pt.lifecycle_status ?? pt.status, 'NO THESIS');
+  const ptEntry     = safeStr(pt.entry_status ?? pt.entryStatus, 'WAIT');
+  const ptMode      = safeStr(pt.mode, '');
+  const ptReason    = safeStr(pt.reason, '');
+  const ptConf      = safeNum(pt.confidence) ?? 0;
+  const ptColor     = /long/i.test(ptDir) ? T.green : /short/i.test(ptDir) ? T.red : T.txtMuted;
+  const ptStatusCol = ptStatus === 'CONFIRMED' ? T.green
+                    : ptStatus === 'INVALIDATED' ? T.red
+                    : ptStatus === 'PENDING_REVERSAL' ? T.amber
+                    : T.cyan;
 
   // Trade plan levels.
   // cp.entry_zone is a formatted range string ("4423.5–4424.0") — not parseable by safeNum.
@@ -14666,6 +14690,9 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
         display: 'flex', alignItems: 'center', gap: 10,
         flexWrap: 'wrap', padding: '10px 14px',
       }}>
+        <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.10em' }}>
+          ENTRY STATUS
+        </div>
         {/* Authoritative verdict badge */}
         <div style={{
           background: authVCol + '20', border: `1px solid ${authVCol}55`,
@@ -14727,7 +14754,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
       {/* ═══════════════════════ SETUP ANALYSIS ═══════════════════════════ */}
       <div style={card}>
-        <div style={sLbl}>SETUP ANALYSIS</div>
+        <div style={sLbl}>CURRENT MARKET CANDIDATE · STRICT EVALUATOR</div>
 
         {/* Verdict + score row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
@@ -14756,19 +14783,37 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
           )}
         </div>
 
-        {/* Thesis row */}
+        {/* Deterministic persistent thesis — continuity, never an entry promotion. */}
         <div style={{
-          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10,
+          marginBottom: 8,
           padding: '7px 10px', background: '#040c1c', borderRadius: 7, border: `1px solid ${T.border}`,
         }}>
-          <div style={{ fontSize: 12, fontWeight: 800, color: lbColor }}>{lbDir}</div>
-          {lbConf > 0 && (
-            <div style={{
-              fontSize: 10, fontWeight: 700, color: lbColor,
-              background: lbColor + '16', border: `1px solid ${lbColor}44`, borderRadius: 4, padding: '1px 6px',
-            }}>{lbConf}%</div>
+          <div style={{ ...sLbl, marginBottom: 5 }}>ACTIVE PERSISTENT THESIS · {ptMode || 'CURRENT MODE'}</div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <div style={{ fontSize: 12, fontWeight: 800, color: ptColor }}>{ptDir}</div>
+            <div style={pill(ptStatusCol, ptStatus)}>{ptStatus.replaceAll('_', ' ')}</div>
+            <div style={{ fontSize: 9, fontFamily: T.mono, color: ptColor }}>{ptConf}%</div>
+            <div style={{ fontSize: 8, color: ptEntry === 'READY' ? T.green : T.amber }}>
+              ENTRY {ptEntry}
+            </div>
+          </div>
+          {ptReason && (
+            <div style={{ marginTop: 5, fontSize: 8, color: T.txtSec, lineHeight: 1.4 }}>
+              {ptReason}
+            </div>
           )}
-          {strategy && <div style={{ fontSize: 9, color: T.txtSec }}>· {strategy}</div>}
+        </div>
+
+        {/* Advisory systems are clearly separated from deterministic authority. */}
+        <div style={{
+          display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10,
+          padding: '6px 10px', background: '#040c1c', borderRadius: 7,
+          border: `1px dashed ${T.border}`,
+        }}>
+          <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700 }}>ADVISORY / RESEARCH</div>
+          <div style={{ fontSize: 10, fontWeight: 700, color: lbColor }}>LEFT BRAIN {lbDir}</div>
+          {lbConf > 0 && <div style={{ fontSize: 9, color: lbColor }}>{lbConf}%</div>}
+          {strategy && <div style={{ fontSize: 8, color: T.txtSec }}>· scanner {strategy}</div>}
           {lbAgeStr && <div style={{ marginLeft: 'auto', fontSize: 8, color: T.txtMuted }}>{lbAgeStr}</div>}
         </div>
 

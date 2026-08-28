@@ -127,7 +127,7 @@
 - [Brain Conflict Resolver](brain-conflict-resolver.md) — 10-priority display-only conflict engine; BLOCK on hard vetoes, WAIT/ALLOW on soft penalty; wired at mb_out["conflict_resolver"].
 - [Operator Mode UI](operator-mode-ui.md) — conversational Brain interface at `/`; auth=localStorage Basic Auth; narration=main_brain_voice; chat=/assistant; Engineering=/api/dashboard.
 - [Swing Mode V2 engine](swing-mode-v2.md) — flag-gated SWING_MODE_V2_ENABLED default-OFF 9-category 0-100 HTF scorer + SCANNING→READY lifecycle; Tier-2 via SWING_EMA_UPDATE webhook; /swing-analysis route; goldens byte-identical.
-- [Persistent thesis + hysteresis](thesis-hysteresis.md) — confidence-inertia over evaluate_strict_setup; reversal flip needs prev=None reset before needs_new; 4 integration points; 16 tests; flag-OFF byte-identical.
+- [Persistent thesis continuity](thesis-hysteresis.md) — one evidence-driven thesis per instrument/mode; continuity is demote-only, and reversal requires distinct confirmed evidence.
 - [Phase 3 Thesis Enforcement](thesis-phase3-enforcement.md) — shadow gate evaluates READY vs thesis, display-only by default; confidence_adj is NEVER added to edge_score.
 - [Strategy scan coverage (Phase 6)](strategy-scan-coverage.md) — 3-system audit: 29 total defs; all 5 main-engine scorers always called; OPENING_DRIVE only eligibility gate (outside_session); STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER pattern.
 - [Fast-entry structure bridge](fast-entry-bridge.md) — MICRO_CHOCH/SWEEP_RECLAIM never reached ALERT_HISTORY (fast-side early return); bridge injects CHOCH SUPPLY/DEMAND/LH/HL so structure_confirmed fires.

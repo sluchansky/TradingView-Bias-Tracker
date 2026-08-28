@@ -117,6 +117,16 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
     age_seconds:  thesis.age_seconds  ?? null,
   };
 
+  // ── persistent thesis: deterministic continuity state from full_analysis ────
+  // Keep this separate from Left Brain, which is advisory/research-only.
+  const persistentRaw = (raw.thesis ?? {}) as Record<string, unknown>;
+  const persistent_thesis: Record<string, unknown> = {
+    ...persistentRaw,
+    lifecycle_status: persistentRaw.status ?? null,
+    entry_status:     persistentRaw.entryStatus ?? null,
+    evidence_id:      persistentRaw.lastEvidenceId ?? null,
+  };
+
   // ── backend-owned operator presentation ─────────────────────────────────────
   // This is the sole display contract for strict verdict, candidate/actionable
   // distinction, reason, VWAP wording, and structure guidance. Keep fallback
@@ -336,6 +346,7 @@ export function normalizeMainBrainPayload(raw: Record<string, unknown>): Record<
     market,
     market_state,
     left_brain,
+    thesis: persistent_thesis,
     verdict,
     strategy_scanner,
     active_trades,

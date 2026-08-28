@@ -39,12 +39,15 @@ import app  # noqa: E402
 def _clear(inst="MGC"):
     """Remove any existing thesis for this instrument."""
     with app.THESIS_LOCK:
-        app.THESIS_BY_INST.pop(inst, None)
+        for key in list(app.THESIS_BY_INST):
+            if key == inst or str(key).startswith(inst + "|"):
+                app.THESIS_BY_INST.pop(key, None)
 
 
 def _strict(score=80, direction="Long", zone_valid=True, vwap_ok=True,
             struct_ok=True, sweep_ok=True, vol_ok=True, session_ok=False,
-            missing=None, zone_broken=False):
+            missing=None, zone_broken=False, evidence_id=None,
+            structure_state=None):
     gd = {
         "zone_valid":           zone_valid,
         "vwap_confirmed":       vwap_ok,
@@ -53,7 +56,7 @@ def _strict(score=80, direction="Long", zone_valid=True, vwap_ok=True,
         "volume_confirmed":     vol_ok,
         "session":              session_ok,
     }
-    return {
+    result = {
         "score":                score,
         "direction":            direction,
         "candidate":            direction,
@@ -61,6 +64,11 @@ def _strict(score=80, direction="Long", zone_valid=True, vwap_ok=True,
         "missing":              missing or [],
         "zone_broken_active":   zone_broken,
     }
+    if evidence_id is not None:
+        result["evidence_id"] = evidence_id
+    if structure_state is not None:
+        result["structure_state"] = structure_state
+    return result
 
 
 def _run(verdict, score=80, direction="Long", inst="MGC", **kw):
@@ -80,7 +88,7 @@ def test_ready_promotion_from_forming():
         _clear()
         adj, t = _run("LONG READY", score=80)
         assert "READY" in adj, f"Expected READY verdict, got {adj!r}"
-        assert t["status"] == "READY_LONG", t["status"]
+        assert t["status"] == "CONFIRMED", t["status"]
         assert t["confidence"] == 80
         assert t["thesisId"].startswith("th_")
     finally:
@@ -90,8 +98,8 @@ def test_ready_promotion_from_forming():
 
 # ── Test 2: Hysteresis hold ───────────────────────────────────────────────────
 
-def test_hysteresis_hold_above_60():
-    """After READY, a single eval with raw WAIT but score still >= 60 must HOLD."""
+def test_strict_wait_is_never_promoted_by_continuity():
+    """After CONFIRMED, strict WAIT must remain WAIT even above the old hold floor."""
     saved_mode = app.TRADING_MODE
     try:
         app.TRADING_MODE = "SCALP"
@@ -100,8 +108,9 @@ def test_hysteresis_hold_above_60():
         _run("LONG READY", score=80)
         # Second eval: raw verdict is WAIT, score dips to 68 — above hold floor (60)
         adj, t = _run("WAIT", score=68)
-        assert "READY" in adj, f"Hold band should keep READY, got {adj!r}"
-        assert t["status"] == "READY_LONG"
+        assert adj == "WAIT"
+        assert t["status"] == "WEAKENING"
+        assert t["entryStatus"] == "WAIT"
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -119,11 +128,14 @@ def test_drops_to_wait_below_hold_threshold():
         _run("LONG READY", score=80)
         # Apply 3 opposing evals; each caps the drop at MAX_CONF_DROP=15
         # 80 → max(30,65) = 65 → max(30,50) = 50 → max(30,35) = 35
-        _run("WAIT", score=30)   # 80 → 65
-        _run("WAIT", score=30)   # 65 → 50
-        adj, t = _run("WAIT", score=30)  # 50 → 35
+        s1 = _strict(score=30, evidence_id="drop-1")
+        s2 = _strict(score=30, evidence_id="drop-2")
+        s3 = _strict(score=30, evidence_id="drop-3")
+        app._apply_thesis("MGC", s1, "WAIT")
+        app._apply_thesis("MGC", s2, "WAIT")
+        adj, t = app._apply_thesis("MGC", s3, "WAIT")
         assert "READY" not in adj, f"Should have left hold band, got {adj!r}"
-        assert t["status"] not in ("READY_LONG", "READY_SHORT")
+        assert t["status"] == "WEAKENING"
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -143,7 +155,8 @@ def test_reversal_below_threshold_weakens_not_flips():
         adj, t = _run("SHORT READY", score=70, direction="Short")
         # Must remain Long, just weakened
         assert t["direction"] == "Long", f"Direction should stay Long, got {t['direction']!r}"
-        assert "REVERSAL_THRESHOLD_NOT_REACHED" in (t.get("reasonCodes") or [])
+        assert t["status"] == "PENDING_REVERSAL"
+        assert "REVERSAL_CONFIRMATION_REQUIRED" in (t.get("reasonCodes") or [])
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -151,8 +164,8 @@ def test_reversal_below_threshold_weakens_not_flips():
 
 # ── Test 5: Reversal at/above REVERSAL_THRESHOLD flips ───────────────────────
 
-def test_reversal_at_threshold_flips_direction():
-    """An opposite-direction signal with score >= 85 starts a brand-new thesis."""
+def test_reversal_requires_distinct_confirming_evidence():
+    """A second distinct, structurally confirmed reversal starts a new FORMING thesis."""
     saved_mode = app.TRADING_MODE
     try:
         app.TRADING_MODE = "SCALP"
@@ -160,11 +173,17 @@ def test_reversal_at_threshold_flips_direction():
         # Establish Long thesis
         _, t1 = _run("LONG READY", score=80)
         old_id = t1["thesisId"]
-        # Powerful Short alert at score 87 (>= 85) flips direction
-        _, t2 = _run("SHORT READY", score=87, direction="Short")
-        # New thesis must be Short; thesisId should differ
+        first = _strict(score=87, direction="Short", evidence_id="rev-1")
+        _, pending = app._apply_thesis("MGC", first, "SHORT READY")
+        assert pending["status"] == "PENDING_REVERSAL"
+        second = _strict(
+            score=87, direction="Short", evidence_id="rev-2",
+            structure_state={"state": "REVERSAL_CONFIRMED", "direction": "Short"})
+        adj, t2 = app._apply_thesis("MGC", second, "SHORT READY")
         assert t2["direction"] == "Short", f"Expected Short thesis, got {t2['direction']!r}"
         assert t2["thesisId"] != old_id, "New direction should create a new thesisId"
+        assert t2["status"] == "FORMING"
+        assert adj == "WAIT"
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -242,8 +261,8 @@ def test_per_instrument_isolation():
 
 # ── Test 9: Cooldown blocks new thesis formation ──────────────────────────────
 
-def test_cooldown_blocks_new_thesis():
-    """A thesis in COOLDOWN status returns WAIT and does not start a new thesis."""
+def test_invalidated_thesis_restarts_as_forming():
+    """An invalidated thesis cannot jump directly back to entry-ready."""
     saved_mode = app.TRADING_MODE
     try:
         app.TRADING_MODE = "SWING"
@@ -255,19 +274,11 @@ def test_cooldown_blocks_new_thesis():
         s_broken = _strict(score=82, direction="Long", zone_valid=False,
                            zone_broken=True, missing=["zone_valid"])
         app._apply_thesis("MGC", s_broken, "LONG READY")
-        # Manually set state to COOLDOWN with far-future cooldownUntil
-        with app.THESIS_LOCK:
-            t = app.THESIS_BY_INST.get("MGC")
-            if t:
-                t["status"] = "COOLDOWN"
-                far_future = (app.now_utc() +
-                              datetime.timedelta(seconds=60)).isoformat()
-                t["cooldownUntil"] = far_future
-                app.THESIS_BY_INST["MGC"] = t
-        # Next eval should see COOLDOWN and return WAIT
-        adj, t = _run("LONG READY", score=85, inst="MGC")
-        assert "READY" not in adj, f"Cooldown should block READY, got {adj!r}"
-        assert t["status"] == "COOLDOWN"
+        adj, t = app._apply_thesis(
+            "MGC", _strict(score=85, evidence_id="restart-after-invalid"), "LONG READY")
+        assert adj == "WAIT"
+        assert t["status"] == "FORMING"
+        assert t["entryStatus"] == "WAIT"
     finally:
         app.TRADING_MODE = saved_mode
         _clear("MGC")
@@ -282,11 +293,12 @@ def test_confidence_rise_is_immediate():
         app.TRADING_MODE = "SCALP"
         _clear()
         # Establish at 65
-        _run("WAIT", score=65)
+        app._apply_thesis("MGC", _strict(score=65, evidence_id="rise-1"), "WAIT")
         # Now jump to 90
-        _, t = _run("LONG READY", score=90)
+        _, t = app._apply_thesis(
+            "MGC", _strict(score=90, evidence_id="rise-2"), "LONG READY")
         assert t["confidence"] == 90, f"Immediate rise expected 90, got {t['confidence']}"
-        assert "CONFIDENCE_INCREASED" in (t.get("reasonCodes") or [])
+        assert "MATERIAL_EVIDENCE_STRENGTHENED" in (t.get("reasonCodes") or [])
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -334,9 +346,11 @@ def test_new_thesis_id_after_invalidation():
                 t["cooldownUntil"] = None
                 app.THESIS_BY_INST["MGC"] = t
         # New eval → new thesis
-        _, t2 = _run("LONG READY", score=80, inst="MGC")
+        _, t2 = app._apply_thesis(
+            "MGC", _strict(score=80, evidence_id="after-invalid"), "LONG READY")
         assert t2["thesisId"] != old_id, (
             f"New thesis must have a fresh ID; both were {old_id!r}")
+        assert t2["status"] == "FORMING"
     finally:
         app.TRADING_MODE = saved_mode
         _clear("MGC")
@@ -464,7 +478,7 @@ def test_scalp_no_zone_no_hard_invalidation():
         # for SWING; but zone_broken = "consumed" which is a hard signal we honour)
         # ── skip the above assertion for zone_broken=True; that's SWING-only ──
         # Just confirm status is FORMING or READY
-        assert t["status"] in ("FORMING_LONG", "READY_LONG"), t["status"]
+        assert t["status"] in ("FORMING", "CONFIRMED"), t["status"]
     finally:
         app.TRADING_MODE = saved_mode
         _clear("MGC")
@@ -475,14 +489,14 @@ def test_scalp_no_zone_no_hard_invalidation():
 if __name__ == "__main__":
     tests = [
         test_ready_promotion_from_forming,
-        test_hysteresis_hold_above_60,
+        test_strict_wait_is_never_promoted_by_continuity,
         test_drops_to_wait_below_hold_threshold,
         test_reversal_below_threshold_weakens_not_flips,
-        test_reversal_at_threshold_flips_direction,
+        test_reversal_requires_distinct_confirming_evidence,
         test_zone_broken_hard_invalidation_swing,
         test_structure_lost_hard_invalidation,
         test_per_instrument_isolation,
-        test_cooldown_blocks_new_thesis,
+        test_invalidated_thesis_restarts_as_forming,
         test_confidence_rise_is_immediate,
         test_confidence_fall_capped,
         test_new_thesis_id_after_invalidation,
