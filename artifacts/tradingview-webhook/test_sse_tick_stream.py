@@ -78,6 +78,7 @@ def clean_sse_state():
             _TICK_SUBSCRIBERS[inst].clear()
         _app_module._SSE_TOTAL_CONNS = 0
         _app_module._SSE_DISCONNECTS = 0
+        _app_module.DATABENTO_PARTIAL_BY_INST = {}
     yield
     with _SSE_TOKENS_LOCK:
         _SSE_TOKENS.clear()
@@ -86,6 +87,7 @@ def clean_sse_state():
             _TICK_SUBSCRIBERS[inst].clear()
         _app_module._SSE_TOTAL_CONNS = 0
         _app_module._SSE_DISCONNECTS = 0
+        _app_module.DATABENTO_PARTIAL_BY_INST = {}
 
 
 @pytest.fixture
@@ -254,9 +256,12 @@ class TestConnectionLimits:
                 })
             _app_module._SSE_TOTAL_CONNS += count
 
-    def test_per_owner_limit_429(self, client):
-        # Fill up to max
-        self._fill_subscribers("MGC", _SSE_MAX_PER_OWNER)
+    def test_per_instrument_cap_evicts_oldest(self, client):
+        # The route identifies stream ownership by its exact instrument bucket.
+        # Fill the MGC route bucket to its current reconnect-overlap cap.
+        route_owner = "MGC"
+        cap = 2
+        self._fill_subscribers(route_owner, cap)
         tok = _make_token("MGC")
         # DATABENTO_ENABLED=0 → 503 before limit check, so override for this test
         _orig = _app_module.DATABENTO_ENABLED
@@ -264,10 +269,10 @@ class TestConnectionLimits:
         try:
             _app_module.DATABENTO_ENABLED = True
             _app_module._DATABENTO_BRAIN = object()  # truthy sentinel
-            resp = client.get(f"/main-brain/tick-stream?inst=MGC&token={tok}")
-            assert resp.status_code == 429
-            body = resp.get_json()
-            assert "LIMIT" in body["reason"]
+            resp = client.get(f"/main-brain/tick-stream?inst={route_owner}&token={tok}")
+            assert resp.status_code == 200
+            assert len(_TICK_SUBSCRIBERS[route_owner]) == cap
+            assert _app_module._SSE_TOTAL_CONNS == cap
         finally:
             _app_module.DATABENTO_ENABLED = _orig
             _app_module._DATABENTO_BRAIN = _orig_brain

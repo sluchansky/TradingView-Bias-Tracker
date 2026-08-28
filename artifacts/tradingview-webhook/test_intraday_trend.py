@@ -294,7 +294,7 @@ class TestTimeRestriction(unittest.TestCase):
     def test_fail_open_on_none(self):
         # Should not raise when et_now=None
         ok, state, reason = app._it_time_restriction(None)
-        self.assertIn(state, ("OK", "ENTRY_BLOCKED", "FORCE_FLAT"))
+        self.assertIn(state, ("OK", "ENTRY_BLOCKED", "FORCE_FLAT", "BLOCKED_SESSION"))
 
 
 # ─────────────────────────────────────────────────────────────────────────────

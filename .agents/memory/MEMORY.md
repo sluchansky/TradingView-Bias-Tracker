@@ -9,12 +9,9 @@
 - [Verdict-history pending chain](verdict-history-pending-chain.md) — a failed queued head cancels descendants and rewinds to the last durable link; never persist dangling chains.
 
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
-- [Visual Brain 2.0](visual-brain-engine.md) — completed bars debounce into a local paid-call gate; retain timer heartbeat fallback, exact retry reservations, dependency injection, and ephemeral screenshots.
-- [Visual Brain SDK transport](visual-brain-sdk-transport.md) — pin OpenAI 3.3.1 + HTTPX 0.28.1; pass an explicit verified, proxy-isolated HTTPX client only to the observer.
-- [Visual Brain cost benchmark](visual-brain-cost-benchmark.md) — default-off in-memory telemetry only; candidates run after canonical persistence on bounded async workers and never feed trading state.
+- [Visual Brain safety](visual-brain-engine.md) — debounce, proxy-isolated transport, retry reservations, bounded spend telemetry, and observer-only candidates stay fail-safe.
 
-- [Databento MGC overnight silence + partial-flush fix](databento-mgc-overnight-silence.md) — MGC has 0 Databento records overnight (genuine COMEX silence); partial-flush daemon closes stale low-volume bars within 70s; thread-safety via _partial_lock.
-- [Databento bounded backpressure](databento-bounded-backpressure.md) — source-time freshness and non-overlapping record consumers prevent delayed market data from looking live.
+- [Databento feed safety](databento-mgc-overnight-silence.md) — distinguish genuine MGC overnight silence from stale bars; bound intake/backpressure and partial flushes so delayed data cannot look live.
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); MGC/MNQ string symmetry; any scoring change must keep invariants.

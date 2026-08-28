@@ -11,8 +11,8 @@ veto no longer fires in either mode — ENFORCE_MIN_RR is retained config but un
 
 Mode profiles under test (SCALP is the retuned "cut losers fast" profile; SWING now uses
 WIDER flag-on ATR stops — the legacy 1.5/2.0 is exercised by the flag-off SWING golden):
-  • SCALP: multiplier 1.5 / 2.0; per-instrument min-stop FLOOR (MGC 3 / MNQ 12 / MES 3 / MYM 20 pts) — too-tight stops WIDENED.
-  • SWING: multiplier 2.25 / 2.75 (flag-on); MGC 5 pts/50t; MNQ 20 pts/40t; MES 4 pts/16t; MYM 30 pts/30t (reject).
+  • SCALP: multiplier 2.5 / 3.0; per-instrument min-stop FLOOR (MGC 3 / MNQ 12 / MES 3 / MYM 20 pts) — too-tight stops WIDENED.
+  • SWING: multiplier 2.5 / 3.0 (flag-off canonical geometry); MGC 5 pts/50t; MNQ 20 pts/40t; MES 4 pts/16t; MYM 30 pts/30t (reject).
 
 Runnable two ways:
   • pytest test_dynamic_stop.py
@@ -24,6 +24,7 @@ under `__main__`), and every test passes volatility + nearest levels explicitly.
 
 import os
 import sys
+from unittest.mock import patch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import app  # noqa: E402
@@ -59,57 +60,59 @@ def test_atr_zero_or_negative_rejected():
 
 def test_multiplier_volatility_wins_over_mode():
     # Elevated regime forces the mode's HIGH multiplier (volatility wins over mode):
-    # SCALP 2.0 (legacy), SWING 2.75 (flag-on WIDE stops) — each larger than that mode's
+    # SCALP and flag-off SWING both use the canonical 3.0 elevated multiplier.
     # base multiplier. (atr=10 keeps the resulting stop above both modes' MGC minimums so
     # it isn't widened/rejected.)
-    expected = {"SCALP": 2.0, "SWING": 2.75}
-    for regime in ("HIGH_CAUTION", "HIGH_BLOCK"):
-        for mode in ("SCALP", "SWING"):
-            r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
-                                       _vol(atr=10.0, regime=regime), mode)
-            assert r["ok"] is True
-            assert r["multiplier"] == expected[mode]
+    expected = {"SCALP": 3.0, "SWING": 3.0}
+    with patch.dict(os.environ, {"SWING_HTF_ENABLED": "0"}):
+        for regime in ("HIGH_CAUTION", "HIGH_BLOCK"):
+            for mode in ("SCALP", "SWING"):
+                r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
+                                           _vol(atr=10.0, regime=regime), mode)
+                assert r["ok"] is True
+                assert r["multiplier"] == expected[mode]
 
 
-def test_multiplier_scalp_normal_is_1_5():
+def test_multiplier_scalp_normal_is_2_5():
     r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
                                _vol(atr=10.0, regime="NORMAL"), "SCALP")
     assert r["ok"] is True
-    assert r["multiplier"] == 1.5
+    assert r["multiplier"] == 2.5
 
 
-def test_multiplier_swing_normal_is_2_25():
-    # Flag-on SWING uses WIDER ATR stops (SWING_STOP_ATR_MULT 2.25) vs the legacy 1.5.
-    r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
-                               _vol(atr=10.0, regime="NORMAL"), "SWING")
-    assert r["ok"] is True
-    assert r["multiplier"] == 2.25
+def test_multiplier_swing_normal_is_2_5():
+    # Flag-off SWING uses the canonical 2.5 stop multiplier.
+    with patch.dict(os.environ, {"SWING_HTF_ENABLED": "0"}):
+        r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
+                                   _vol(atr=10.0, regime="NORMAL"), "SWING")
+        assert r["ok"] is True
+        assert r["multiplier"] == 2.5
 
 
 def test_structure_wider_than_atr_wins_long():
-    # SCALP mult 1.5 -> ATR stop = 1997.0; structure stop = 1989.0 (further below)
+    # SCALP mult 2.5 -> ATR stop = 1995.0; structure stop = 1989.0 (further below)
     # is the safer/wider stop and wins.
     r = app._dynamic_stop_plan("Long", 2000.0, 1990.0, None, "MGC",
                                _vol(atr=2.0, regime="NORMAL"), "SCALP")
-    assert r["atr_stop"] == 1997.0
+    assert r["atr_stop"] == 1995.0
     assert r["structure_stop"] == 1989.0
     assert r["calculated_stop"] == 1989.0
 
 
 def test_atr_wider_than_structure_wins_long():
-    # SCALP mult 1.5 -> ATR stop = 1970.0 (further below) vs structure stop = 1994.0.
+    # SCALP mult 2.5 -> ATR stop = 1950.0 (further below) vs structure stop = 1994.0.
     r = app._dynamic_stop_plan("Long", 2000.0, 1995.0, None, "MGC",
                                _vol(atr=20.0, regime="NORMAL"), "SCALP")
-    assert r["atr_stop"] == 1970.0
+    assert r["atr_stop"] == 1950.0
     assert r["structure_stop"] == 1994.0
-    assert r["calculated_stop"] == 1970.0
+    assert r["calculated_stop"] == 1950.0
 
 
 def test_structure_wider_than_atr_wins_short():
     # Short: structure stop = nearest_supply + buf, wider = further ABOVE.
     r = app._dynamic_stop_plan("Short", 2000.0, None, 2010.0, "MGC",
                                _vol(atr=2.0, regime="NORMAL"), "SCALP")
-    assert r["atr_stop"] == 2003.0
+    assert r["atr_stop"] == 2005.0
     assert r["structure_stop"] == 2011.0
     assert r["calculated_stop"] == 2011.0
 
@@ -183,18 +186,18 @@ def test_scalp_min_floor_is_literal_ignores_legacy_env():
 
 
 def test_scalp_mgc_valid_stop_snaps_and_surfaces_metadata():
-    # atr 5.0 * 1.5 = 7.5 pts (above the 3-pt MGC floor, so no widening) -> 75 ticks
+    # atr 5.0 * 2.5 = 12.5 pts (above the 3-pt MGC floor, so no widening) -> 125 ticks
     # @ 0.1. min_stop_ticks metadata is the MGC scalp floor (30); min_floor_applied
     # False because the natural stop already clears the floor.
     r = app._dynamic_stop_plan("Long", 2000.0, None, None, "MGC",
                                _vol(atr=5.0, regime="NORMAL"), "SCALP")
     assert r["ok"] is True
-    assert r["multiplier"] == 1.5
+    assert r["multiplier"] == 2.5
     assert r["min_stop_ticks"] == 30
     assert r["min_floor_applied"] is False
-    assert r["stop_distance_ticks"] == 75
-    assert round(r["risk_points"], 4) == 7.5
-    assert r["final_stop"] == 1992.5
+    assert r["stop_distance_ticks"] == 125
+    assert round(r["risk_points"], 4) == 12.5
+    assert r["final_stop"] == 1987.5
 
 
 def test_long_stop_below_entry_short_stop_above():
@@ -325,7 +328,7 @@ def test_plan_success_long_surfaces_metadata():
                                     mode="SCALP")
     assert p["trade_plan"] is True
     assert p["atr_pts"] == 10.0
-    assert p["atr_multiplier"] == 1.5
+    assert p["atr_multiplier"] == 2.5
     assert p["min_stop_ticks"] == 30
     assert p["stop_distance_ticks"] >= 1
     assert p["stop_valid"] is True
@@ -351,14 +354,14 @@ def _with_mode(mode, fn):
         app.TRADING_MODE = saved
 
 
-def test_fixed_1to1_rr_swing_no_longer_vetoes():
-    # Fixed-1:1 model: reward always mirrors risk, so the legacy SWING "<1:2 on TP2
-    # -> no trade" veto no longer fires — a wide-stop SWING plan is still valid 1:1.
+def test_swing_flag_off_uses_fixed_1to1_rr():
+    # The deterministic flag-off SWING contract uses the fixed 1:1 target model.
     def run():
         return app.build_strict_trade_plan(
             "Long", "MGC", 2000.0, 2010.0, 1990.0,
             volatility=_vol(atr=20.0, regime="NORMAL"), mode="SWING")
-    p = _with_mode("SWING", run)
+    with patch.dict(os.environ, {"SWING_HTF_ENABLED": "0"}):
+        p = _with_mode("SWING", run)
     assert p["trade_plan"] is True
     assert p["rr"] == "1:1"
 

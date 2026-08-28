@@ -35,7 +35,9 @@ class OrderFlowEdgeScoreTests(unittest.TestCase):
 
     def test_modifier_changes_the_shared_score_and_visible_breakdown(self):
         assessment = {
-            "confluences": {"bos": True},
+            # Canonical structure scoring is one active-cycle allocation, not
+            # the retired raw BOS boolean component.
+            "confluences": {"structure_allocation_points": 20},
             "session": {"preferred": False},
             "risk_label": "",
             "volatility": {},
@@ -45,7 +47,7 @@ class OrderFlowEdgeScoreTests(unittest.TestCase):
             "edge_modifiers": [{"label": "Order Flow Confirms Long", "points": 15}],
         }
         score, _ = app.compute_trade_edge_components(
-            {"bos_confirmed": True},
+            {"structure_allocation": 20},
             entry["edge_modifiers"],
         )
         breakdown = app.compute_edge_breakdown(assessment, entry)

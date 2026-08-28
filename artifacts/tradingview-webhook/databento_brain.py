@@ -1189,13 +1189,19 @@ class DatabentoBrain:
                         unsupported = True
                     else:
                         self._queue_depth_by_inst[inst] += 1
+                        # The worker may have removed an item from Queue before
+                        # it can acquire _dispatch_lock to decrement the
+                        # per-instrument counter.  Use the bounded Queue itself
+                        # for high-water telemetry so that one in-flight record
+                        # is never misreported as waiting backlog.
+                        observed_total = record_queue.qsize()
                         self._queue_max_depth_by_inst[inst] = max(
                             self._queue_max_depth_by_inst[inst],
-                            self._queue_depth_by_inst[inst],
+                            min(RECORD_QUEUE_MAX, self._queue_depth_by_inst[inst]),
                         )
                         self._queue_max_observed_total = max(
                             self._queue_max_observed_total,
-                            sum(self._queue_depth_by_inst.values()),
+                            observed_total,
                         )
                         self._queue_enqueued_by_inst[inst] += 1
         self._publish_queue_telemetry(inst)
@@ -1940,13 +1946,14 @@ class DatabentoBrain:
                     try:
                         record_queue.put_nowait((p, inst, "bar_close", p.get("source_event_ts")))
                         self._queue_depth_by_inst[inst] += 1
+                        observed_total = record_queue.qsize()
                         self._queue_max_depth_by_inst[inst] = max(
                             self._queue_max_depth_by_inst[inst],
-                            self._queue_depth_by_inst[inst],
+                            min(RECORD_QUEUE_MAX, self._queue_depth_by_inst[inst]),
                         )
                         self._queue_max_observed_total = max(
                             self._queue_max_observed_total,
-                            sum(self._queue_depth_by_inst.values()),
+                            observed_total,
                         )
                         self._queue_enqueued_by_inst[inst] += 1
                     except queue.Full:

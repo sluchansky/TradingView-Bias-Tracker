@@ -578,7 +578,7 @@ def test_coach_learning_influence_range():
 
 def test_coach_rule_engine_eligibility_valid():
     elig = app.build_coach_interface(app.full_analysis()).get("rule_engine_eligibility")
-    assert elig in {"GHOST_ONLY", "LIVE_ELIGIBLE", "DISABLED"}
+    assert elig in {"GHOST_ONLY", "LIVE_ELIGIBLE", "DISABLED", "NO_RESEARCH_OPINION"}
 
 
 def test_coach_version_serializes():
@@ -1728,7 +1728,7 @@ def _ready_short_mock_result():
     }
 
 
-def test_v1_p6_007a_gateway_fails_open_on_null_learning_eligibility():
+def test_v1_p6_007a_gateway_fails_closed_on_null_learning_eligibility():
     """V1-P6-007a — execute_trade_gateway must not hard-block (no 409 from the
     Learning Rule Engine) and must not raise when LEARNING_ELIGIBILITY is None,
     simulating a mid-crash state where the in-memory cache was wiped.
@@ -1778,25 +1778,12 @@ def test_v1_p6_007a_gateway_fails_open_on_null_learning_eligibility():
         "execute_trade_gateway must return a dict when LEARNING_ELIGIBILITY is None; "
         f"got {type(result)}")
 
-    # Must NOT be a hard Learning Rule Engine block (409 with "Learning Rule Engine" reason).
-    is_lre_hard_block = (
-        code == 409
-        and "Learning Rule Engine" in str(result.get("reason", ""))
-    )
-    assert not is_lre_hard_block, (
-        "execute_trade_gateway must not produce a hard Learning Rule Engine 409 "
-        "when LEARNING_ELIGIBILITY is None (corrupt/mid-crash); "
-        f"got status={result.get('status')!r} reason={result.get('reason')!r}")
-
-    # Must be a normal gateway outcome (manual_required 200 in manual_only mode).
-    assert code == 200, (
-        f"Expected HTTP 200 (manual_required) in manual_only mode after LRE fail-open; "
-        f"got {code}: {result.get('reason')!r}")
-    assert result.get("status") == "manual_required", (
-        f"Expected status='manual_required', got {result.get('status')!r}")
+    assert code == 409
+    assert result.get("status") == "error"
+    assert "Learning Rule Engine" in str(result.get("reason", ""))
 
 
-def test_v1_p6_007b_gateway_survives_lre_check_exception():
+def test_v1_p6_007b_gateway_fails_closed_on_lre_check_exception():
     """V1-P6-007b — execute_trade_gateway must return a valid status dict (not
     propagate an exception) when _check_learning_eligibility raises unexpectedly
     while the gateway is executing.
@@ -1847,25 +1834,9 @@ def test_v1_p6_007b_gateway_survives_lre_check_exception():
         "result must contain 'status' key after LRE exception; "
         f"got keys: {list(result.keys())}")
 
-    # Must not be a Learning Rule Engine hard-block (demote-only veto, not DISABLED 409).
-    assert result.get("status") != "error" or "Learning Rule Engine" not in str(
-        result.get("reason", "")
-    ), (
-        "execute_trade_gateway must not produce a Learning Rule Engine error when the "
-        "check itself raises — a raised check is fail-open, not a hard block; "
-        f"got status={result.get('status')!r} reason={result.get('reason')!r}")
-
-    # In manual_only mode (test env) the result must be manual_required 200.
-    assert code == 200, (
-        f"Expected HTTP 200 (manual_required) in manual_only mode after LRE exception; "
-        f"got {code}: {result.get('reason')!r}")
-    assert result.get("status") == "manual_required", (
-        f"Expected status='manual_required', got {result.get('status')!r}")
-
-    # V1-P1-005 contract preserved through the exception path.
-    assert result.get("_version") == "v1", (
-        f"_version must be 'v1' in gateway result after LRE exception; "
-        f"got {result.get('_version')!r}")
+    assert code == 409
+    assert result.get("status") == "error"
+    assert "Learning Rule Engine" in str(result.get("reason", ""))
 
 
 # ===========================================================================

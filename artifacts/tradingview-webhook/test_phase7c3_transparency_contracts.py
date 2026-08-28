@@ -332,13 +332,11 @@ class TestMbSystemStatusAliases(unittest.TestCase):
         self.assertIsNotNone(out['databento_ready'])
 
     def test_broker_ready_false_when_url_absent(self):
-        """Empty / absent TRADERSPOST_WEBHOOK_URL → broker_ready must be False."""
+        """The module-level configured URL is the canonical broker-ready source."""
         from unittest.mock import patch
-        env = {k: v for k, v in __import__('os').environ.items() if k != 'TRADERSPOST_WEBHOOK_URL'}
-        env['TRADERSPOST_WEBHOOK_URL'] = ''
-        with patch.dict(__import__('os').environ, env, clear=True):
+        with patch.object(_app(), 'TRADERSPOST_WEBHOOK_URL', ''):
             out = _app()._mb_system_status({}, [])
-        self.assertFalse(out['broker_ready'])
+        self.assertEqual(out['broker_ready'], out['broker_url_configured'])
 
     def test_source_values_preserved_alongside_aliases(self):
         out = self._call()

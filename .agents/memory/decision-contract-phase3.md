@@ -31,9 +31,10 @@ Query params: `instrument=`, `decision_id=`, `transitions=1`, `mismatches=1`.
 - SHADOW MODE ONLY: `shadow_mode=True`; canonical record never gates broker transmission
 - EARLY → EXECUTABLE in LEGAL_TRANSITIONS as legacy compat path (not promoted, not changed)
 - Shadow compression: READY → EXECUTABLE is legal shortcut in shadow mode (QUALIFIED/RISK_PENDING/RISK_APPROVED not independently observable without deep gateway instrumentation)
+- BLOCKED_RISK may not jump directly to EXECUTABLE; it must recover through a non-executable requalification/reset state first.
 - SETUP_FORMING → QUALIFIED added (ORB TOUCH/CLOSE_OUTSIDE confirmation modes skip EARLY)
 - EARLY → QUALIFIED added (ORB retest-holds path)
 - `_owner_required` is defined AFTER some route decorators in app.py — confirmed pre-existing collection errors in test_brain_contract/test_learning_engine etc; NOT caused by Phase 3
 
 **Why:** Creates an auditable, typed record of every decision lifecycle step so Phase 4+ can promote it to a live gate without rewriting the logic from scratch.
-**How to apply:** When adding new states or transitions, update LEGAL_TRANSITIONS in decision_contract.py AND add a test in TestLegalTransitions. Never add DDL to app.py — use executeSql or publish schema-diff.
+**How to apply:** When adding new states or transitions, update LEGAL_TRANSITIONS in decision_contract.py AND add a test in TestLegalTransitions. Preserve the BLOCKED_RISK requalification boundary. Never add DDL to app.py — use executeSql or publish schema-diff.

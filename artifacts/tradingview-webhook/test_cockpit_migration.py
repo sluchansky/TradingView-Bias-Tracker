@@ -111,9 +111,11 @@ class TestCockpitBrainMigration(unittest.TestCase):
     # ── M: null direction safe ────────────────────────────────────────────────
     def test_m_null_direction_safe(self):
         """M: direction has ?? fallback to prevent null rendering as 'null'."""
-        # Must have brain?.decision.direction ?? "—" pattern
-        self.assertIn('brain?.decision.direction ?? "—"', self.src,
-                      "M: brain?.decision.direction ?? '—' null-safe fallback")
+        # Direction is normalized from the operator presentation, then rendered
+        # null-safely rather than reading the retired direct expression.
+        self.assertIn("const decisionDirection = operator", self.src)
+        self.assertIn('decisionDirection ?? "—"', self.src,
+                      "M: normalized direction has a null-safe fallback")
 
     # ── N: reason from brain.reasons.top[0] ──────────────────────────────────
     def test_n_reason_from_brain(self):
@@ -282,7 +284,7 @@ class TestSafetyStates(unittest.TestCase):
 
     def test_null_direction_no_false_render(self):
         """Null direction renders as '—' not the string 'null'."""
-        self.assertIn("brain?.decision.direction ?? \"—\"", self.src)
+        self.assertIn("decisionDirection ?? \"—\"", self.src)
 
     def test_empty_reasons_no_crash(self):
         """Empty reasons.top[0] → empty string, not crash."""

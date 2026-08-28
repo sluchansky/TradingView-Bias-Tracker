@@ -296,7 +296,14 @@ def _build_legal_transitions() -> frozenset:
         DS.RISK_PENDING, DS.RISK_APPROVED, DS.EXECUTABLE,
     ]
     for src in _BLOCKED:
-        for dst in _RECOVERY_STATES:
+        # A risk rejection may only recover through a non-executable
+        # requalification/reset state.  This is a shadow-observer contract and
+        # never controls a money path.
+        recovery_states = (
+            [dst for dst in _RECOVERY_STATES if dst != DS.EXECUTABLE]
+            if src == DS.BLOCKED_RISK else _RECOVERY_STATES
+        )
+        for dst in recovery_states:
             pairs.add((src, dst))
     # Self-transitions (repeated signal, no state change)
     for s in [DS.OBSERVING, DS.WAIT, DS.SETUP_FORMING, DS.EARLY,

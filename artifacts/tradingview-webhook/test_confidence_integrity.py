@@ -34,8 +34,7 @@ import app  # noqa: E402
 def test_edge_components_weights_unchanged():
     """D) No EDGE_COMPONENTS weights changed."""
     expected = [
-        ("bos_confirmed",   "BOS Confirmed",       20),
-        ("choch_confirmed", "CHOCH Confirmed",      20),
+        ("structure_allocation", "Market Structure", 40),
         ("vwap_confirmed",  "VWAP Confirmation",    15),
         ("liquidity_sweep", "Liquidity Sweep",      15),
         ("volume_confirmed","Volume Confirmation",  15),

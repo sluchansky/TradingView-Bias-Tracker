@@ -66,7 +66,9 @@ BT_SPECS = {
 
 # ── Copied mode knobs (mirror live MODES) — only what the backtest needs ───────
 BT_MODES = {
-    "SCALP": {"stop_mult": 1.5, "stop_mult_high": 2.0, "enforce_min_rr": False,
+    # Mirror live SCALP STOP_ATR_MULT / STOP_ATR_MULT_HIGH exactly.  This is a
+    # copied research configuration only; changing it cannot alter live risk.
+    "SCALP": {"stop_mult": 2.5, "stop_mult_high": 3.0, "enforce_min_rr": False,
               "vol_high_caution": 1.6, "vol_high_block": 2.5,
               "vol_quiet_caution": 0.55, "vol_quiet_block": 0.35,
               "rvol_confirm": 1.5, "near_pct": 0.006, "extended_pct": 0.016},

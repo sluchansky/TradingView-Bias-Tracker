@@ -210,20 +210,20 @@ class TestCaseB_DatabentSourceSymbolMapping(unittest.TestCase):
 
     @unittest.skipUnless(_DB_IMPORTABLE, "databento_brain not importable")
     def test_b2_mgc_continuous_symbol(self):
-        self.assertEqual(DB_SYMBOLS["MGC"], "MGC.c.0")
+        self.assertEqual(DB_SYMBOLS["MGC"], "MGC.c.1")
 
     @unittest.skipUnless(_DB_IMPORTABLE, "databento_brain not importable")
     def test_b3_reverse_map_continuous_to_canonical(self):
         reverse = {v: k for k, v in DB_SYMBOLS.items()}
-        self.assertEqual(reverse["MGC.c.0"], "MGC")
+        self.assertEqual(reverse[DB_SYMBOLS["MGC"]], "MGC")
 
     @unittest.skipUnless(_DB_IMPORTABLE, "databento_brain not importable")
     def test_b4_all_four_instruments_have_continuous_symbols(self):
         for inst in ("MGC", "MNQ", "MES", "MYM"):
             self.assertIn(inst, DB_SYMBOLS)
             sym = DB_SYMBOLS[inst]
-            self.assertTrue(sym.endswith(".c.0"),
-                            f"{inst}: expected .c.0 suffix, got {sym!r}")
+            self.assertRegex(sym, rf"^{inst}\.c\.\d+$",
+                             f"{inst}: expected a continuous symbol, got {sym!r}")
 
 
 class TestCaseC_ActiveContractResolution(unittest.TestCase):

@@ -31,6 +31,7 @@ _FAKE_CTX = {
     "price_above_vwap": True, "price_below_vwap": False, "near_vwap": False,
     "has_bull_sweep": False, "has_bear_sweep": False,
     "has_choch_demand": False, "has_choch_supply": False,
+    "has_bos_demand": False, "has_bos_supply": False,
     "has_bull_confirm": False, "has_bear_confirm": False,
     "structure_long": False, "structure_short": False,
     "volume_ok": False, "cvd_state": "neutral",
@@ -40,6 +41,8 @@ _FAKE_CTX = {
     "broke_range_high": False, "broke_range_low": False,
     "range_high": 2110.0, "range_low": 2090.0,
     "nearest_demand": None, "nearest_supply": None,
+    "zone_dist_supply_atr": None, "zone_dist_demand_atr": None,
+    "at_supply_zone": False, "at_demand_zone": False,
     "atr_pts": 5.0, "rvol_value": 1.0, "volume_spike_fresh": False,
 }
 _FAKE_REGIME = {"regime": "BALANCED", "reason": "Balanced market conditions"}
@@ -92,11 +95,11 @@ def _run_engine(ticker="MGC", price=2100.0, ctx_override=None, scorer_override=N
 class TestStrategyInventory:
     """Part 2 — Canonical strategy inventory: registry counts and parity."""
 
-    def test_inv_main_engine_has_exactly_five_strategies(self):
-        """Main engine: STRATEGY_DEFS, PRIORITY, and SCORERS each contain exactly 5."""
-        assert len(app.STRATEGY_DEFS) == 5
-        assert len(app.STRATEGY_PRIORITY) == 5
-        assert len(app.STRATEGY_SCORERS) == 5
+    def test_inv_main_engine_registry_is_complete(self):
+        """Main engine inventory is the current nine-strategy scanner."""
+        assert len(app.STRATEGY_DEFS) == 9
+        assert len(app.STRATEGY_PRIORITY) == 9
+        assert len(app.STRATEGY_SCORERS) == 9
 
     def test_inv_all_priority_keys_have_defs_and_scorers(self):
         """Every key in STRATEGY_PRIORITY has a matching STRATEGY_DEFS and SCORERS entry."""
@@ -234,13 +237,11 @@ class TestCoverageProof:
     # T08 — non-selected candidate visible diagnostically
     def test_t08_non_selected_candidate_visible(self):
         """T10: A non-selected candidate remains visible with result='candidate'."""
-        scorers = {
-            "OPENING_DRIVE":            _no_signal_scorer,
+        scorers = {k: _no_signal_scorer for k in app.STRATEGY_PRIORITY}
+        scorers.update({
             "LIQUIDITY_SWEEP_REVERSAL": _long_scorer,
-            "VWAP_TREND_CONTINUATION":  _long_scorer,
-            "RANGE_EXPANSION_BREAKOUT": _no_signal_scorer,
-            "OPENING_RANGE_BREAKOUT":   _no_signal_scorer,
-        }
+            "VWAP_TREND_CONTINUATION": _long_scorer,
+        })
         _run_engine(ctx_override=dict(_FAKE_CTX, in_opening_window=False),
                     scorer_override=scorers)
         diag = app.STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER.get("MGC", {})
@@ -261,13 +262,8 @@ class TestCoverageProof:
             call_log.append("called")
             return {"direction": None, "conditions": [("A", False)], "target_r": 2.0}
 
-        scorers = {
-            "OPENING_DRIVE":            _failing_scorer,   # first in priority → exception
-            "LIQUIDITY_SWEEP_REVERSAL": _tracked,
-            "VWAP_TREND_CONTINUATION":  _tracked,
-            "RANGE_EXPANSION_BREAKOUT": _tracked,
-            "OPENING_RANGE_BREAKOUT":   _tracked,
-        }
+        scorers = {k: _tracked for k in app.STRATEGY_PRIORITY}
+        scorers["OPENING_DRIVE"] = _failing_scorer  # first in priority → exception
         engine = _run_engine(scorer_override=scorers)
 
         # Outer try/except catches the exception → returns _closed_strategy_engine() fallback
@@ -304,9 +300,9 @@ class TestCoverageProof:
         ctx = dict(_FAKE_CTX, in_opening_window=False)  # OPENING_DRIVE ineligible
         _run_engine(ctx_override=ctx)
         diag = app.STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER.get("MGC", {})
-        assert diag.get("registered_count") == 5
-        assert diag.get("eligible_count")   == 4   # OPENING_DRIVE excluded
-        assert diag.get("evaluated_count")  == 4   # all 4 eligible ones evaluated
+        assert diag.get("registered_count") == len(app.STRATEGY_PRIORITY)
+        assert diag.get("eligible_count") == len(app.STRATEGY_PRIORITY) - 1
+        assert diag.get("evaluated_count") == len(app.STRATEGY_PRIORITY) - 1
         assert diag.get("unevaluated_eligible") == 0
 
     # T12 — per-ticker isolation (equivalent to Long/Short distinct counts)
@@ -482,7 +478,8 @@ class TestEndpointAndInfra:
     def test_t24_endpoint_does_not_mutate_diag_dict(self):
         """T24: GET /strategy-scan-diagnostics must not modify STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER."""
         app.STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER["MGC"] = {
-            "ticker": "MGC", "mode": "SCALP", "strategies": [], "registered_count": 5,
+            "ticker": "MGC", "mode": "SCALP", "strategies": [],
+            "registered_count": len(app.STRATEGY_PRIORITY),
         }
         snapshot_before = {k: dict(v) for k, v in app.STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER.items()}
         client = app.app.test_client()

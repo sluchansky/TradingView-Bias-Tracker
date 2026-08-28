@@ -286,10 +286,12 @@ class TestResponsiveLayout(unittest.TestCase):
         self.assertIn('window.removeEventListener("resize"', self.src,
                       "resize listener removed on unmount")
 
-    def test_mobile_grid_columns(self):
-        """Mobile layout uses 2-column grid (no right rail column)."""
-        self.assertIn('"56px 1fr"', self.src,
-                      "Mobile grid: 56px nav + 1fr content (no right rail)")
+    def test_mobile_flex_column_layout(self):
+        """Mobile layout intentionally stacks the cockpit in a flex column."""
+        self.assertIn('display: "flex"', self.src,
+                      "Mobile layout uses flex")
+        self.assertIn('flexDirection: "column"', self.src,
+                      "Mobile layout stacks navigation and content vertically")
 
     def test_desktop_grid_columns(self):
         """Desktop layout uses 3-column grid with right rail."""

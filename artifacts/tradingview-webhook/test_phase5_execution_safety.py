@@ -1452,8 +1452,8 @@ class TestP5_Stage4_CompatibilityProof(unittest.TestCase):
         This proves the interface-test helper update was non-weakening.
         """
         import ast as _ast
-        src = open(
-            "artifacts/tradingview-webhook/app.py").read()
+        from pathlib import Path
+        src = Path(__file__).with_name("app.py").read_text()
 
         # Get inner function source
         inner_start = src.find("def _execute_trade_gateway_inner(")
@@ -1480,7 +1480,8 @@ class TestP5_Stage4_CompatibilityProof(unittest.TestCase):
 
     def test_s4_16_version_count_still_3_in_inner(self):
         """Inner function still has exactly 3 _version:v1 insertions (unchanged)."""
-        src = open("artifacts/tradingview-webhook/app.py").read()
+        from pathlib import Path
+        src = Path(__file__).with_name("app.py").read_text()
         inner_start = src.find("def _execute_trade_gateway_inner(")
         inner_end   = src.find("def _gw_outcome(", inner_start)
         inner_src   = src[inner_start:inner_end]

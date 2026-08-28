@@ -74,8 +74,7 @@ def _minimal_wait(direction=None, edge_score=30, **kw):
                 {"label": "Bearish BOS",          "points": 0},
             ],
             "components": [
-                {"key": "bos_confirmed",     "label": "Bearish BOS",          "points": 20, "present": False},
-                {"key": "choch_confirmed",   "label": "Bearish CHOCH",        "points": 20, "present": False},
+                {"key": "structure_allocation", "label": "Market Structure",  "points": 40, "present": False},
                 {"key": "vwap_confirmed",    "label": "VWAP Confirmation",    "points": 15, "present": True},
                 {"key": "liquidity_sweep",   "label": "Liquidity Sweep",      "points": 15, "present": False},
                 {"key": "volume_confirmed",  "label": "Volume Confirmation",  "points": 15, "present": True},
@@ -209,11 +208,10 @@ def test_edge_detail_component_points_present():
     assert "component_points" in ed, "component_points missing"
     cp = ed["component_points"]
     assert isinstance(cp, dict), "component_points should be a dict"
-    # VWAP and volume are present in fixture (both 15); others are 0
+    # VWAP and volume are present in fixture (both 15); structure is 0.
     assert cp.get("vwap") == 15,   "vwap should be 15 (present)"
     assert cp.get("volume") == 15, "volume should be 15 (present)"
-    assert cp.get("bos")   == 0,   "bos should be 0 (absent)"
-    assert cp.get("choch") == 0,   "choch should be 0 (absent)"
+    assert cp.get("structure") == 0, "structure should be 0 (absent)"
 
 
 def test_edge_detail_final_score_matches_edge_score():
