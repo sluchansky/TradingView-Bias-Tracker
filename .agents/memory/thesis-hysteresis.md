@@ -26,6 +26,12 @@ binding across heartbeat evaluations and restart restoration.
 Persist the stable reason, originating structure context, explicit invalidation
 conditions, evidence epoch, and mode with the thesis.
 
+Persist each logical transition with a deterministic identity derived from stable
+evidence and transition facts, never processing time. A confirmed reversal must
+commit the prior-thesis INVALIDATED event, replacement FORMING event, and current
+snapshot in one database transaction; partial histories must never survive a
+worker or process failure.
+
 After restart, persisted thesis direction and confidence may be restored for
 continuity, but entry authority must be forced to paused/WAIT until one fresh
 strict evaluation succeeds. Restored snapshots must not influence enforced
@@ -33,7 +39,9 @@ thesis alignment before that evaluation.
 
 **Why:** Evaluation-count hysteresis changed confidence every few seconds, mixed
 SCALP and intraday state, and could visibly contradict strict entry authority.
+Separate event/snapshot commits could also leave unrecoverable half-reversals.
 
 **How to apply:** Future thesis consumers must key by instrument and canonical
-mode, preserve exact evidence identity and append-only transitions, and never
-use continuity or research context to promote a strict WAIT.
+mode, preserve exact evidence identity, atomically persist append-only transitions
+with their snapshot, and never use continuity or research context to promote a
+strict WAIT.

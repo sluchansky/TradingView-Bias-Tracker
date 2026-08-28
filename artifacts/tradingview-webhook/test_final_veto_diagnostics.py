@@ -203,7 +203,8 @@ class TestFinalVetoDiagnostics(unittest.TestCase):
             with patches[0], patches[1], patches[2], patches[3], patches[4], patch.object(
                 app, "_it_entry_veto_reasons", return_value=[],
             ), patch.object(
-                app, "_apply_thesis", side_effect=lambda _i, _s, verdict, *_: (verdict, {}),
+                app, "_apply_thesis",
+                side_effect=lambda _i, _s, verdict, *_, **__: (verdict, {}),
             ), patch.object(
                 app, "_compute_thesis_gate",
                 return_value={"action": "BLOCK", "reason": "Thesis conflicts with setup."},

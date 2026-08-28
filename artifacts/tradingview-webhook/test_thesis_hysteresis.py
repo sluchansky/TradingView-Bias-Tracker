@@ -760,16 +760,20 @@ def test_restart_restore_keeps_mode_epoch_and_origin_context():
     )
 
     class Cursor:
+        query = ""
+
         def __enter__(self):
             return self
 
         def __exit__(self, *_args):
             return False
 
-        def execute(self, _sql):
-            return None
+        def execute(self, sql):
+            self.query = sql
 
         def fetchall(self):
+            if "hysteresis_thesis_events" in self.query:
+                return []
             return [("MGC", "SCALP", dict(original), app.now_utc())]
 
     class Connection:

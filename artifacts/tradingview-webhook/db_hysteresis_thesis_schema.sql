@@ -13,6 +13,35 @@ CREATE TABLE IF NOT EXISTS hysteresis_thesis (
     PRIMARY KEY (instrument, mode)
 );
 
+CREATE TABLE IF NOT EXISTS hysteresis_thesis_events (
+    event_id          TEXT        PRIMARY KEY,
+    instrument        TEXT        NOT NULL,
+    mode              TEXT        NOT NULL,
+    thesis_id         TEXT,
+    previous_thesis_id TEXT,
+    prev_status       TEXT        NOT NULL,
+    new_status        TEXT        NOT NULL,
+    evidence_epoch    TEXT,
+    transition_index  SMALLINT    NOT NULL DEFAULT 0,
+    data              JSONB       NOT NULL,
+    occurred_at       TIMESTAMPTZ NOT NULL,
+    recorded_at       TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+ALTER TABLE hysteresis_thesis_events
+    ADD COLUMN IF NOT EXISTS transition_index SMALLINT NOT NULL DEFAULT 0;
+
+UPDATE hysteresis_thesis_events
+SET mode = CASE
+        WHEN UPPER(mode) = 'SWING' THEN 'INTRADAY_TREND'
+        ELSE UPPER(mode)
+    END,
+    data = CASE
+        WHEN UPPER(COALESCE(data->>'mode', mode)) = 'SWING'
+        THEN jsonb_set(data, '{mode}', '"INTRADAY_TREND"'::jsonb, TRUE)
+        ELSE data
+    END;
+
 ALTER TABLE hysteresis_thesis
     ADD COLUMN IF NOT EXISTS mode TEXT;
 
@@ -114,3 +143,27 @@ BEGIN
     END IF;
 END
 $$;
+
+DO $$
+BEGIN
+    IF NOT EXISTS (
+        SELECT 1
+          FROM pg_constraint
+         WHERE conrelid = 'hysteresis_thesis_events'::regclass
+           AND conname = 'hysteresis_thesis_events_mode_check'
+    ) THEN
+        ALTER TABLE hysteresis_thesis_events
+            ADD CONSTRAINT hysteresis_thesis_events_mode_check
+            CHECK (mode IN ('SCALP', 'INTRADAY_TREND'));
+    END IF;
+END
+$$;
+
+CREATE INDEX IF NOT EXISTS idx_hysteresis_thesis_events_scope_time
+    ON hysteresis_thesis_events (
+        instrument,
+        mode,
+        occurred_at DESC,
+        transition_index DESC,
+        event_id DESC
+    );

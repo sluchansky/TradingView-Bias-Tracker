@@ -367,6 +367,11 @@ class _ModeScopedThesisStore:
     def values(self):
         return self._data.values()
 
+    def update(self, other):
+        items = other.items() if hasattr(other, "items") else other
+        for key, value in items:
+            self[key] = value
+
     def copy(self):
         return dict(self._data)
 
@@ -29301,9 +29306,12 @@ def _mb_decision_timeline(inst, errors):
     """
     events = []
 
-    # 1. Thesis transition events — real store, maxlen=25/instrument, no lock needed
+    # 1. Thesis transition events — real store, maxlen=25/instrument+mode
     try:
-        for evt in list(THESIS_TIMELINE_BY_INST.get(inst) or [])[:10]:
+        mode = _thesis_effective_mode()
+        for evt in list(
+            THESIS_TIMELINE_BY_INST.get((inst, mode)) or []
+        )[:10]:
             events.append({
                 "event_type": "THESIS_TRANSITION",
                 "ts":         evt.get("ts"),
@@ -45280,19 +45288,40 @@ def _ms_to_human(ms):
 
 # ── Timeline event recording ───────────────────────────────────────────────────
 
-def _record_thesis_event(inst, prev_snap, new_snap, mode=None):
-    """Append a transition event to the instrument/mode timeline (fail-open)."""
+def _record_thesis_event(inst, prev_snap, new_snap, mode=None,
+                         transition_index=0):
+    """Append one exact transition to the instrument/mode timeline (fail-open)."""
     try:
         mode = _thesis_effective_mode(mode or new_snap.get("mode"))
+        ts = new_snap.get("lastUpdatedAt") or now_utc().isoformat()
+        event_seed = {
+            "instrument": inst,
+            "mode": mode,
+            "previousThesisId": prev_snap.get("thesisId"),
+            "thesisId": new_snap.get("thesisId"),
+            "prevStatus": prev_snap.get("status", "NEUTRAL"),
+            "newStatus": new_snap.get("status", "NEUTRAL"),
+            "prevConfidence": int(prev_snap.get("confidence") or 0),
+            "newConfidence": int(new_snap.get("confidence") or 0),
+            "evidenceEpoch": new_snap.get("evidenceEpoch"),
+            "structureEpoch": new_snap.get("structureEpoch"),
+            "transitionIndex": int(transition_index or 0),
+        }
         event = {
-            "ts":               new_snap.get("lastUpdatedAt") or now_utc().isoformat(),
+            "eventId":          "thev_" + hashlib.sha256(
+                json.dumps(event_seed, sort_keys=True, default=str).encode("utf-8")
+            ).hexdigest()[:24],
+            "ts":               ts,
             "thesisId":         new_snap.get("thesisId"),
+            "previousThesisId": prev_snap.get("thesisId"),
             "direction":        new_snap.get("direction"),
             "mode":             mode,
             "prevStatus":       prev_snap.get("status", "NEUTRAL"),
             "newStatus":        new_snap.get("status", "NEUTRAL"),
             "prevConfidence":   int(prev_snap.get("confidence") or 0),
             "newConfidence":    int(new_snap.get("confidence") or 0),
+            "evidenceEpoch":    new_snap.get("evidenceEpoch"),
+            "transitionIndex":  int(transition_index or 0),
             "reasonCodes":      list(new_snap.get("reasonCodes") or []),
             "primaryReason":    ((new_snap.get("reasonCodes") or [""])[0]),
             "invalidationReason": new_snap.get("invalidationReason"),
@@ -45301,9 +45330,16 @@ def _record_thesis_event(inst, prev_snap, new_snap, mode=None):
             key = (inst, mode)
             if key not in THESIS_TIMELINE_BY_INST:
                 THESIS_TIMELINE_BY_INST[key] = deque(maxlen=25)
+            if any(
+                existing.get("eventId") == event["eventId"]
+                for existing in THESIS_TIMELINE_BY_INST[key]
+            ):
+                return event
             THESIS_TIMELINE_BY_INST[key].appendleft(event)
+        return event
     except Exception as exc:
         logger.debug("_record_thesis_event fail-open [%s]: %s", inst, exc)
+        return None
 
 # ── Discord notification helpers ───────────────────────────────────────────────
 
@@ -45454,7 +45490,7 @@ def _maybe_send_thesis_notification(inst, prev_snap, new_snap):
 # ── Database persist / restore ────────────────────────────────────────────────
 
 def _check_hysteresis_thesis_db_ready():
-    """Probe the hysteresis_thesis table (no DDL). FAIL-OPEN."""
+    """Probe thesis snapshot + event tables (no DDL). FAIL-OPEN."""
     global THESIS_DB_READY
     try:
         conn = get_db_connection()
@@ -45462,6 +45498,9 @@ def _check_hysteresis_thesis_db_ready():
             return
         with conn.cursor() as cur:
             cur.execute("SELECT instrument, mode FROM hysteresis_thesis LIMIT 1")
+            cur.execute(
+                "SELECT instrument, mode FROM hysteresis_thesis_events LIMIT 1"
+            )
         conn.close()
         THESIS_DB_READY = True
         logger.info("hysteresis_thesis table ready (thesis persistence enabled)")
@@ -45469,44 +45508,141 @@ def _check_hysteresis_thesis_db_ready():
         logger.warning("hysteresis_thesis unavailable (thesis DB disabled): %s", exc)
         THESIS_DB_READY = False
 
-def _persist_thesis_state(inst, snap, mode=None):
-    """UPSERT the current thesis snapshot for `inst`/`mode` (fail-open).
-    Runs in the slow-task worker so it never blocks the webhook path."""
-    if not THESIS_DB_READY or not inst or not snap:
+def _insert_thesis_state(cur, inst, snap, mode=None):
+    """Write one current snapshot using the caller's transaction."""
+    import json as _json
+    mode = _thesis_effective_mode(mode or snap.get("mode"))
+    cur.execute(
+        """INSERT INTO hysteresis_thesis
+               (instrument, mode, thesis_id, direction, status, confidence, data, updated_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
+           ON CONFLICT (instrument, mode)
+           DO UPDATE SET
+               thesis_id  = EXCLUDED.thesis_id,
+               direction  = EXCLUDED.direction,
+               status     = EXCLUDED.status,
+               confidence = EXCLUDED.confidence,
+               data       = EXCLUDED.data,
+               updated_at = NOW()""",
+        (
+            inst,
+            mode,
+            snap.get("thesisId"),
+            snap.get("direction"),
+            snap.get("status"),
+            snap.get("confidence"),
+            _json.dumps(snap),
+        ),
+    )
+
+
+def _insert_thesis_event(cur, inst, event):
+    """Write one immutable event using the caller's transaction."""
+    import json as _json
+    mode = _thesis_effective_mode(event.get("mode"))
+    cur.execute(
+        """INSERT INTO hysteresis_thesis_events
+               (event_id, instrument, mode, thesis_id,
+                previous_thesis_id, prev_status, new_status,
+                evidence_epoch, transition_index, data, occurred_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
+           ON CONFLICT (event_id) DO NOTHING""",
+        (
+            event.get("eventId"),
+            inst,
+            mode,
+            event.get("thesisId"),
+            event.get("previousThesisId"),
+            event.get("prevStatus") or "NEUTRAL",
+            event.get("newStatus") or "NEUTRAL",
+            event.get("evidenceEpoch"),
+            int(event.get("transitionIndex") or 0),
+            _json.dumps(event),
+            event.get("ts") or now_utc().isoformat(),
+        ),
+    )
+
+
+def _close_thesis_db_connection(conn, *, rollback=False):
+    """Best-effort rollback/close for fail-open thesis persistence."""
+    if not conn:
         return
+    if rollback:
+        try:
+            conn.rollback()
+        except Exception:
+            pass
     try:
-        import json as _json
-        mode = _thesis_effective_mode(mode or snap.get("mode"))
+        conn.close()
+    except Exception:
+        pass
+
+
+def _persist_thesis_state(inst, snap, mode=None):
+    """UPSERT the current thesis snapshot for `inst`/`mode` (fail-open)."""
+    if not THESIS_DB_READY or not inst or not snap:
+        return False
+    conn = None
+    try:
         conn = get_db_connection()
         if not conn:
-            return
+            return False
         with conn.cursor() as cur:
-            cur.execute(
-                """INSERT INTO hysteresis_thesis
-                       (instrument, mode, thesis_id, direction, status, confidence, data, updated_at)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, NOW())
-                   ON CONFLICT (instrument, mode)
-                   DO UPDATE SET
-                       thesis_id  = EXCLUDED.thesis_id,
-                       direction  = EXCLUDED.direction,
-                       status     = EXCLUDED.status,
-                       confidence = EXCLUDED.confidence,
-                       data       = EXCLUDED.data,
-                       updated_at = NOW()""",
-                (inst, mode,
-                 snap.get("thesisId"),
-                 snap.get("direction"),
-                 snap.get("status"),
-                 snap.get("confidence"),
-                 _json.dumps(snap)),
-            )
+            _insert_thesis_state(cur, inst, snap, mode)
         conn.commit()
-        conn.close()
+        _close_thesis_db_connection(conn)
+        return True
     except Exception as exc:
+        _close_thesis_db_connection(conn, rollback=True)
         logger.debug("_persist_thesis_state fail-open [%s]: %s", inst, exc)
+        return False
+
+
+def _persist_thesis_event(inst, event):
+    """INSERT one immutable thesis transition event (fail-open)."""
+    if not THESIS_DB_READY or not inst or not event:
+        return False
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        with conn.cursor() as cur:
+            _insert_thesis_event(cur, inst, event)
+        conn.commit()
+        _close_thesis_db_connection(conn)
+        return True
+    except Exception as exc:
+        _close_thesis_db_connection(conn, rollback=True)
+        logger.debug("_persist_thesis_event fail-open [%s]: %s", inst, exc)
+        return False
+
+
+def _persist_thesis_transition_bundle(inst, snap, mode, events):
+    """Atomically persist transition event(s) and their resulting snapshot."""
+    if not THESIS_DB_READY or not inst or not snap:
+        return False
+    conn = None
+    try:
+        conn = get_db_connection()
+        if not conn:
+            return False
+        with conn.cursor() as cur:
+            for event in events or ():
+                _insert_thesis_event(cur, inst, event)
+            _insert_thesis_state(cur, inst, snap, mode)
+        conn.commit()
+        _close_thesis_db_connection(conn)
+        return True
+    except Exception as exc:
+        _close_thesis_db_connection(conn, rollback=True)
+        logger.debug(
+            "_persist_thesis_transition_bundle fail-open [%s]: %s", inst, exc,
+        )
+        return False
 
 def _restore_thesis_states():
-    """On boot, restore the most-recent thesis snapshot for every instrument.
+    """On boot, restore current snapshots and bounded append-only history.
     Validates age (THESIS_RESTORE_MAX_AGE_MS), status, and schema.
     A stale, malformed, or cooldown-expired row resets that instrument to NEUTRAL.
     NEVER submits a trade — only restores THESIS_BY_INST for display/inertia."""
@@ -45523,7 +45659,49 @@ def _restore_thesis_states():
         with conn.cursor() as cur:
             cur.execute("SELECT instrument, mode, data, updated_at FROM hysteresis_thesis")
             rows = cur.fetchall()
+            cur.execute(
+                """SELECT instrument, mode, data
+                     FROM (
+                         SELECT instrument, mode, data, occurred_at,
+                                transition_index, event_id,
+                                ROW_NUMBER() OVER (
+                                    PARTITION BY instrument, mode
+                                    ORDER BY occurred_at DESC,
+                                             transition_index DESC,
+                                             event_id DESC
+                                ) AS row_num
+                           FROM hysteresis_thesis_events
+                     ) AS ranked
+                    WHERE row_num <= 25
+                    ORDER BY instrument, mode, occurred_at DESC,
+                             transition_index DESC, event_id DESC"""
+            )
+            event_rows = cur.fetchall()
         conn.close()
+        restored_timelines = {}
+        for event_inst, event_mode, event_raw in event_rows:
+            try:
+                event = (
+                    event_raw if isinstance(event_raw, dict)
+                    else _json.loads(event_raw or "{}")
+                )
+                if not event or not event.get("eventId"):
+                    continue
+                event_mode = _thesis_effective_mode(
+                    event_mode or event.get("mode")
+                )
+                event["mode"] = event_mode
+                restored_timelines.setdefault(
+                    (event_inst, event_mode), []
+                ).append(event)
+            except Exception as row_exc:
+                logger.debug(
+                    "Thesis history restore row error [%s]: %s",
+                    event_inst, row_exc,
+                )
+        with THESIS_LOCK:
+            for key, events in restored_timelines.items():
+                THESIS_TIMELINE_BY_INST[key] = deque(events, maxlen=25)
         for inst, mode, data_raw, updated_at in rows:
             try:
                 snap = (data_raw if isinstance(data_raw, dict)
@@ -45602,16 +45780,56 @@ def _thesis_post_update(inst, prev_snap, new_snap, mode=None):
         if not (status_changed or conf_delta >= 5 or evidence_changed):
             return
         mode = _thesis_effective_mode(mode or new_snap.get("mode"))
+        events_to_persist = []
+        replacement_transition = bool(
+            prev_snap.get("thesisId")
+            and new_snap.get("replacesThesisId") == prev_snap.get("thesisId")
+            and prev_snap.get("direction")
+            and new_snap.get("direction")
+            and prev_snap.get("direction") != new_snap.get("direction")
+        )
+        if replacement_transition:
+            invalidated = dict(prev_snap)
+            invalidated.update({
+                "status": "INVALIDATED",
+                "entryStatus": "WAIT",
+                "entryPaused": True,
+                "pauseReason": "Confirmed opposite structure.",
+                "invalidationReason": "Confirmed opposite structure",
+                "lastUpdatedAt": new_snap.get("lastUpdatedAt"),
+                "evidenceEpoch": new_snap.get("evidenceEpoch"),
+                "structureEpoch": new_snap.get("structureEpoch"),
+                "reasonCodes": [
+                    "CONFIRMED_OPPOSITE_STRUCTURE",
+                    "THESIS_REPLACED",
+                ],
+            })
+            invalidated_event = _record_thesis_event(
+                inst, prev_snap, invalidated, mode, transition_index=0,
+            )
+            forming_event = _record_thesis_event(
+                inst, invalidated, new_snap, mode, transition_index=1,
+            )
+            events_to_persist = [
+                event for event in (invalidated_event, forming_event) if event
+            ]
+        elif status_changed or conf_delta >= 5:
+            event = _record_thesis_event(inst, prev_snap, new_snap, mode)
+            if event:
+                events_to_persist.append(event)
         if status_changed or conf_delta >= 5:
-            _record_thesis_event(inst, prev_snap, new_snap, mode)
             # Phase 3: mark untriggered setups stale on direction flip or invalidation
             _mark_setups_stale_for_inst(inst, prev_snap, new_snap)
             if _THESIS_DISCORD_ALERTS_ENABLED:
                 _maybe_send_thesis_notification(inst, prev_snap, new_snap)
         if _THESIS_DB_PERSISTENCE_ENABLED and THESIS_DB_READY:
             _snap_copy = dict(new_snap)
+            _event_copies = [dict(event) for event in events_to_persist]
+            def _persist_transition_bundle(i=inst, m=mode, s=_snap_copy,
+                                           events=_event_copies):
+                _persist_thesis_transition_bundle(i, s, m, events)
             _enqueue_slow(
-                lambda i=inst, m=mode, s=_snap_copy: _persist_thesis_state(i, s, m)
+                _persist_transition_bundle
             )
     except Exception as exc:
         logger.debug("_thesis_post_update fail-open [%s]: %s", inst, exc)
@@ -45884,10 +46102,13 @@ def _apply_thesis_inner(inst, strict, raw_verdict, trade_plan,
         # thesisId — the old direction is gone.
         reversal_transition = confirmed_opposite_structure
         if reversal_transition:
+            replaced_thesis = dict(prev)
             prev = None
             prev_status = "NEUTRAL"
             prev_conf = 0
             same_evidence = False
+        else:
+            replaced_thesis = None
 
         needs_new = (
             not prev
@@ -45914,6 +46135,10 @@ def _apply_thesis_inner(inst, strict, raw_verdict, trade_plan,
             t["structureEpoch"] = structure_epoch
             if reversal_transition:
                 t["reversalDetectedEpoch"] = evidence_epoch
+                t["replacesThesisId"] = replaced_thesis.get("thesisId")
+                t["replacementInvalidationReason"] = (
+                    "Confirmed opposite structure"
+                )
         else:
             t         = dict(prev)
             base_conf = prev_conf
@@ -46053,12 +46278,24 @@ def get_all_thesis():
     Returns the current thesis snapshot for every enabled instrument in one call.
     The dashboard thesis panel polls this every 3 s to render all-instrument cards."""
     insts = enabled_instruments()
-    out   = {}
+    requested_mode = _thesis_effective_mode(request.args.get("mode"))
+    out = {}
+    by_mode = {}
     with THESIS_LOCK:
         for inst in insts:
-            t = THESIS_BY_INST.get(inst)
+            t = THESIS_BY_INST.get((inst, requested_mode))
             out[inst] = dict(t) if t else None
-    return jsonify({"ok": True, "thesis": out, "instruments": insts}), 200
+            by_mode[inst] = {}
+            for mode in ("SCALP", "INTRADAY_TREND"):
+                scoped = THESIS_BY_INST.get((inst, mode))
+                by_mode[inst][mode] = dict(scoped) if scoped else None
+    return jsonify({
+        "ok": True,
+        "mode": requested_mode,
+        "thesis": out,
+        "thesisByMode": by_mode,
+        "instruments": insts,
+    }), 200
 
 @app.route("/thesis/<instrument>/history", methods=["GET"])
 def get_thesis_history(instrument):
@@ -92028,8 +92265,7 @@ if __name__ == "__main__":
                 }
                 break
 
-        with THESIS_LOCK:
-            thesis = dict(THESIS_BY_INST.get(instrument) or {})
+        thesis = get_thesis_snapshot(instrument, TRADING_MODE) or {}
         with STATE_LOCK:
             setup_state = dict(SETUP_STATE.get(instrument) or {})
         ready_snapshot = dict(LAST_READY_BY_TICKER.get(instrument) or {})
