@@ -155,3 +155,4 @@
 - [GitHub local-object transfer](github-tag-object-transfer.md) — REST refs cannot target local-only commits; use scoped `gh` Git auth to transfer the exact branch/tag ref safely.
 - [Persistent market-student ledger](persistent-market-student-ledger.md) — consolidated research stays asynchronous, exact-ID-linked, immutable, manually promoted, and isolated from every money path.
 - [FVG result evidence identity](fvg-result-evidence-identity.md) — each FVG variant result is separate evidence; project and resolve it by exact result ID, not only the baseline opportunity.
+- [Gateway safety test isolation](gateway-safety-tests-asia-hours.md) — unrelated gateway contracts need deterministic time/session context and fresh processes.
