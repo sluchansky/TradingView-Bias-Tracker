@@ -562,6 +562,7 @@ const VerdictHistoryPage: React.FC = () => {
   const [jumpValidation, setJumpValidation] = useState<string | null>(null);
   const [urlError, setUrlError] = useState<string | null>(initialUrlState.error);
   const [jump, setJump] = useState<VerdictHistoryJump>(initialUrlState.jump);
+  const [copyState, setCopyState] = useState<'idle' | 'copying' | 'success' | 'unavailable'>('idle');
   const { data, loading, error, refresh } = useVerdictHistory(
     instrument, mode, limit, beforeEventId, throughEventId, jump, urlError,
   );
@@ -578,6 +579,7 @@ const VerdictHistoryPage: React.FC = () => {
     setJump({ eventId: null, timestamp: null });
     setJumpValidation(null);
     setUrlError(null);
+    setCopyState('idle');
     clearVerdictHistoryUrl();
   };
   const submitJump = () => {
@@ -594,6 +596,7 @@ const VerdictHistoryPage: React.FC = () => {
     setBeforeEventId(null);
     setThroughEventId(null);
     setPageNumber(0);
+    setCopyState('idle');
     setJump({
       eventId: eventValue || null,
       timestamp: timestampValue || null,
@@ -603,6 +606,33 @@ const VerdictHistoryPage: React.FC = () => {
     setJumpEventId('');
     setJumpTimestamp('');
     resetPagination();
+  };
+  const copyIncidentLink = async () => {
+    const resolvedEventId = data?.jump?.status === 'RESOLVED' ? data.jump.resolved_event_id : null;
+    if (resolvedEventId == null) {
+      setCopyState('unavailable');
+      return;
+    }
+    setCopyState('copying');
+    try {
+      const url = new URL(window.location.href);
+      const urlInstrument = url.searchParams.get('instrument')?.trim().toUpperCase();
+      const urlMode = url.searchParams.get('mode')?.trim().toUpperCase();
+      const urlEventId = url.searchParams.get('event_id')?.trim();
+      if (
+        urlInstrument !== instrument
+        || urlMode !== mode
+        || urlEventId !== String(resolvedEventId)
+        || url.searchParams.has('timestamp')
+      ) {
+        throw new Error('Resolved incident URL is not canonical');
+      }
+      if (!navigator.clipboard?.writeText) throw new Error('Clipboard unavailable');
+      await navigator.clipboard.writeText(url.toString());
+      setCopyState('success');
+    } catch {
+      setCopyState('unavailable');
+    }
   };
   const loadOlder = () => {
     if (!data?.page.has_older || data.page.older_before_event_id == null || loading) return;
@@ -705,9 +735,16 @@ const VerdictHistoryPage: React.FC = () => {
         </div>
       ) : (
         <>
-          {data.jump?.status === 'RESOLVED' && <div data-testid="history-jump-resolution" style={{ display:'flex', justifyContent:'space-between', gap:12, alignItems:'center', flexWrap:'wrap', marginBottom:12, padding:'10px 12px', background:`${T.cyan}0d`, border:`1px solid ${T.cyan}44`, borderRadius:7 }}>
-            <div><span style={{ color:T.cyan, fontSize:9, fontWeight:800, letterSpacing:'0.09em' }}>INCIDENT ANCHOR RESOLVED</span><div style={{ color:T.txtPri, fontSize:12, marginTop:4 }}>Event {data.jump.resolved_event_id} · {historyDate(data.jump.resolved_recorded_at ?? data.events[data.events.length - 1]?.recorded_at ?? null)}</div></div>
-            <div style={{ color:T.txtMuted, fontSize:9 }}>Timestamp jumps select the first immutable event recorded at or after the requested UTC time.</div>
+           {data.jump?.status === 'RESOLVED' && data.jump.resolved_event_id != null && <div data-testid="history-jump-resolution" style={{ display:'flex', justifyContent:'space-between', gap:12, alignItems:'center', flexWrap:'wrap', marginBottom:12, padding:'10px 12px', background:`${T.cyan}0d`, border:`1px solid ${T.cyan}44`, borderRadius:7 }}>
+             <div><span style={{ color:T.cyan, fontSize:9, fontWeight:800, letterSpacing:'0.09em' }}>INCIDENT ANCHOR RESOLVED</span><div style={{ color:T.txtPri, fontSize:12, marginTop:4 }}>Event {data.jump.resolved_event_id} · {historyDate(data.jump.resolved_recorded_at ?? data.events[data.events.length - 1]?.recorded_at ?? null)}</div></div>
+             <div style={{ display:'flex', alignItems:'center', gap:10, flexWrap:'wrap' }}>
+               <div style={{ color:T.txtMuted, fontSize:9 }}>Timestamp jumps select the first immutable event recorded at or after the requested UTC time.</div>
+               <button data-testid="button-copy-verdict-history" type="button" onClick={() => { void copyIncidentLink(); }} disabled={copyState === 'copying'} style={{ ...historyButtonStyle, opacity:copyState === 'copying' ? 0.55 : 1, cursor:copyState === 'copying' ? 'wait' : 'pointer' }}>
+                 {copyState === 'copying' ? 'Copying…' : 'Copy incident link'}
+               </button>
+               {copyState === 'success' && <span data-testid="status-history-copy-success" role="status" style={{ color:T.green, fontSize:9, fontWeight:700 }}>Incident link copied.</span>}
+               {copyState === 'unavailable' && <span data-testid="status-history-copy-unavailable" role="status" style={{ color:T.amber, fontSize:9, fontWeight:700 }}>Clipboard unavailable. Copy the URL from the address bar.</span>}
+             </div>
           </div>}
           <div data-testid="history-chain-summary" style={{ display:'grid', gridTemplateColumns:'minmax(180px,1.2fr) repeat(4,1fr)', gap:8, marginBottom:12 }}>
             <div style={{ ...historyMetricStyle, borderColor:`${chainColor}55` }}><span>CHAIN INTEGRITY</span><b data-testid="value-chain-status" style={{ color:chainColor }}>{chain?.status ?? 'EMPTY'}</b></div>

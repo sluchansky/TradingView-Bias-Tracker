@@ -74,6 +74,21 @@ describe('immutable verdict history operator contract', () => {
     expect(source).toContain('clearVerdictHistoryUrl');
   });
 
+  it('offers explicit copy feedback only for the resolved canonical incident URL', () => {
+    expect(source).toContain('Copy incident link');
+    expect(source).toContain('button-copy-verdict-history');
+    expect(source).toContain("data?.jump?.status === 'RESOLVED'");
+    expect(source).toContain('data.jump.resolved_event_id != null');
+    expect(source).toContain("url.searchParams.get('instrument')");
+    expect(source).toContain("url.searchParams.get('mode')");
+    expect(source).toContain("url.searchParams.get('event_id')");
+    expect(source).toContain('navigator.clipboard?.writeText');
+    expect(source).toContain('await navigator.clipboard.writeText(url.toString())');
+    expect(source).toContain('status-history-copy-success');
+    expect(source).toContain('status-history-copy-unavailable');
+    expect(source).toContain('Clipboard unavailable. Copy the URL from the address bar.');
+  });
+
   it('keeps missing and broken incident results explicit with no alternate data', () => {
     expect(source).toContain('status-history-jump-not-found');
     expect(source).toContain('status-history-jump-unavailable');
