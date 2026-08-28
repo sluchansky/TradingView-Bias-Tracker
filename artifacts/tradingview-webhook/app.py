@@ -88580,7 +88580,42 @@ def route_authoritative_verdict_history():
                 "ok": False, "available": False, "read_only": True,
                 "observer_only": True, "error": "invalid_limit",
             }), 400
-        return jsonify(_avh.get_history_report(instrument, mode, limit))
+        before_raw = request.args.get("before_event_id")
+        through_raw = request.args.get("through_event_id")
+        if before_raw not in (None, "") and through_raw not in (None, ""):
+            return jsonify({
+                "ok": False, "available": False, "read_only": True,
+                "observer_only": True, "error": "invalid_cursor",
+            }), 400
+        before_event_id = None
+        if before_raw not in (None, ""):
+            try:
+                before_event_id = int(before_raw)
+                if before_event_id <= 0:
+                    raise ValueError("cursor must be positive")
+            except (TypeError, ValueError):
+                return jsonify({
+                    "ok": False, "available": False, "read_only": True,
+                    "observer_only": True, "error": "invalid_cursor",
+                }), 400
+        through_event_id = None
+        if through_raw not in (None, ""):
+            try:
+                through_event_id = int(through_raw)
+                if through_event_id <= 0:
+                    raise ValueError("cursor must be positive")
+            except (TypeError, ValueError):
+                return jsonify({
+                    "ok": False, "available": False, "read_only": True,
+                    "observer_only": True, "error": "invalid_cursor",
+                }), 400
+        return jsonify(_avh.get_history_report(
+            instrument,
+            mode,
+            limit,
+            before_event_id=before_event_id,
+            through_event_id=through_event_id,
+        ))
     except Exception as exc:
         logger.warning("authoritative verdict history read failed: %s", exc)
         return jsonify({

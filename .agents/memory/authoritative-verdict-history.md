@@ -32,3 +32,14 @@ non-null first predecessor as truncated can hide real chain corruption.
 one row beyond the displayed limit, and validate that extra row against the
 first displayed previous key. Keep legacy reconstruction ordering unchanged
 unless separately audited.
+
+Pagination cursors must name an exact event in the requested instrument/mode.
+Use an exclusive `before` cursor for older pages and a separate inclusive
+`through` cursor to reconstruct a previously viewed page after new appends.
+
+**Why:** Treating sequence gaps as cursors can silently cross scopes, while
+returning to an uncapped “latest” query can shift the prior page as live verdicts
+arrive.
+
+**How to apply:** Reject missing, conflicting, or out-of-scope cursor events;
+report the actual verified boundary event ID; never gap-seek to a nearby row.

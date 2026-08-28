@@ -521,6 +521,183 @@ def test_operator_history_report_uses_append_order_when_timestamps_invert():
     assert "ORDER BY event_id ASC" in sql
 
 
+def test_operator_history_cursor_returns_stable_older_page_and_verified_boundary():
+    rows = [
+        {
+            "event_id": 70,
+            "observation_key": "outside-older",
+            "previous_observation_key": "still-older",
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+        },
+        {
+            "event_id": 80,
+            "observation_key": "page-first",
+            "previous_observation_key": "outside-older",
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+        },
+        {
+            "event_id": 90,
+            "observation_key": "page-last",
+            "previous_observation_key": "page-first",
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+        },
+    ]
+    boundary = {
+        "event_id": 100,
+        "observation_key": "newer-page-first",
+        "previous_observation_key": "page-last",
+    }
+
+    with (
+        patch.object(avh, "_query_history_link", return_value=boundary) as link,
+        patch.object(avh, "_query_history", return_value=rows) as query,
+    ):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report(
+            "MGC", "SCALP", limit=2, before_event_id=100
+        )
+
+    link.assert_called_once_with("MGC", "SCALP", 100)
+    query.assert_called_once_with(
+        "MGC", "SCALP", 3, newest_window=True,
+        before_event_id=100, through_event_id=None,
+    )
+    assert [event["event_id"] for event in report["events"]] == [80, 90]
+    assert report["chain"]["status"] == "PARTIAL"
+    assert report["page"] == {
+        "before_event_id": 100,
+        "through_event_id": None,
+        "resume_before_event_id": 100,
+        "resume_through_event_id": None,
+        "first_event_id": 80,
+        "last_event_id": 90,
+        "has_older": True,
+        "has_newer": True,
+        "older_before_event_id": 80,
+        "newer_boundary_status": "CONTIGUOUS",
+        "newer_boundary_event_id": 100,
+    }
+
+
+def test_operator_history_cursor_exposes_broken_newer_page_boundary():
+    rows = [{
+        "event_id": 90,
+        "observation_key": "page-last",
+        "previous_observation_key": None,
+        "verdict": "WAIT",
+        "wait_ready_state": "WAIT",
+    }]
+    boundary = {
+        "event_id": 100,
+        "observation_key": "newer-page-first",
+        "previous_observation_key": "missing-page-last",
+    }
+
+    with (
+        patch.object(avh, "_query_history_link", return_value=boundary),
+        patch.object(avh, "_query_history", return_value=rows),
+    ):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report(
+            "MNQ", "INTRADAY_TREND", limit=50, before_event_id=100
+        )
+
+    assert report["page"]["newer_boundary_status"] == "BROKEN"
+    assert report["chain"]["status"] == "BROKEN"
+    assert report["chain"]["breaks"] == 1
+
+
+def test_operator_history_cursor_rejects_missing_or_out_of_scope_boundary():
+    with patch.object(avh, "_query_history_link", return_value=None):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report(
+            "MES", "SCALP", limit=50, before_event_id=999
+        )
+
+    assert report["ok"] is False
+    assert report["available"] is False
+    assert report["error"] == "cursor_unavailable"
+    assert report["events"] == []
+
+
+def test_latest_page_returns_stable_resume_cursor_above_its_last_event():
+    rows = [{
+        "event_id": 250,
+        "observation_key": "latest",
+        "previous_observation_key": None,
+        "verdict": "WAIT",
+        "wait_ready_state": "WAIT",
+    }]
+    with patch.object(avh, "_query_history", return_value=rows):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report("MGC", "SCALP", limit=50)
+
+    assert report["page"]["before_event_id"] is None
+    assert report["page"]["through_event_id"] is None
+    assert report["page"]["resume_before_event_id"] is None
+    assert report["page"]["resume_through_event_id"] == 250
+    assert report["page"]["has_newer"] is False
+
+
+def test_through_cursor_reconstructs_exact_page_after_new_event_appends():
+    rows = [
+        {
+            "event_id": 240,
+            "observation_key": "page-first",
+            "previous_observation_key": None,
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+        },
+        {
+            "event_id": 250,
+            "observation_key": "page-last",
+            "previous_observation_key": "page-first",
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+        },
+    ]
+    cursor_row = {
+        "event_id": 250,
+        "observation_key": "page-last",
+        "previous_observation_key": "page-first",
+    }
+    appended_boundary = {
+        "event_id": 260,
+        "observation_key": "new-after-navigation",
+        "previous_observation_key": "page-last",
+    }
+    with (
+        patch.object(avh, "_query_history_link", return_value=cursor_row),
+        patch.object(
+            avh, "_query_next_history_link", return_value=appended_boundary
+        ),
+        patch.object(avh, "_query_history", return_value=rows) as query,
+    ):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report(
+            "MGC", "SCALP", limit=50, through_event_id=250
+        )
+
+    query.assert_called_once_with(
+        "MGC", "SCALP", 51, newest_window=True,
+        before_event_id=None, through_event_id=250,
+    )
+    assert [event["event_id"] for event in report["events"]] == [240, 250]
+    assert report["page"]["through_event_id"] == 250
+    assert report["page"]["resume_through_event_id"] == 250
+    assert report["page"]["has_newer"] is True
+    assert report["page"]["newer_boundary_event_id"] == 260
+    assert report["page"]["newer_boundary_status"] == "CONTIGUOUS"
+
+
 def _structure_row(at, *, recorded_at=None, state="REVERSAL_CANDIDATE",
                     blocked=True, score=88, event="BOS continuation",
                     actionable=False, direction="Long", **extra):

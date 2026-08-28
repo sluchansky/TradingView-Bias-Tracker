@@ -30,4 +30,22 @@ describe('immutable verdict history operator contract', () => {
     expect(source).toContain('event.waiting_for.map(value => safeStr(value)).join');
     expect(source).not.toContain('[...event.blockers, ...event.waiting_for].slice(0,2)');
   });
+
+  it('implements cursor navigation without mutating the audit surface', () => {
+    expect(source).toContain('before_event_id');
+    expect(source).toContain('older_before_event_id');
+    expect(source).toContain('resume_before_event_id');
+    expect(source).toContain('through_event_id');
+    expect(source).toContain('resume_through_event_id');
+    expect(source).toContain('button-older-verdict-history');
+    expect(source).toContain('button-newer-verdict-history');
+    expect(source).toContain('cursorStack');
+    expect(source).toContain('data.page.older_before_event_id');
+    expect(source).toContain('data?.page?.newer_boundary_status');
+    expect(source).toContain('NEWER BOUNDARY:');
+    expect(source).toContain('CONTIGUOUS · VERIFIED');
+    expect(source).toContain('BROKEN · CONTINUITY NOT VERIFIED');
+    expect(source).toContain('LATEST SNAPSHOT');
+    expect(source).toContain('setCursorStack([])');
+  });
 });

@@ -352,13 +352,26 @@ type VerdictHistoryResponse = {
   count: number;
   chain: { status: 'EMPTY' | 'VALID' | 'PARTIAL' | 'BROKEN'; roots: number; contiguous: number; breaks: number; partial: boolean };
   events: VerdictHistoryEvent[];
+  page: {
+    before_event_id: number | null;
+    through_event_id: number | null;
+    resume_before_event_id: number | null;
+    resume_through_event_id: number | null;
+    first_event_id: number | null;
+    last_event_id: number | null;
+    has_older: boolean;
+    has_newer: boolean;
+    older_before_event_id: number | null;
+    newer_boundary_status: 'LATEST' | 'CONTIGUOUS' | 'BROKEN' | 'ROOT' | 'EMPTY';
+    newer_boundary_event_id: number | null;
+  };
   error?: string;
 };
 
 const HISTORY_INSTRUMENTS = ['MGC', 'MNQ', 'MES', 'MYM'] as const;
 const HISTORY_MODES = ['SCALP', 'INTRADAY_TREND'] as const;
 
-function useVerdictHistory(instrument: string, mode: string, limit: number) {
+function useVerdictHistory(instrument: string, mode: string, limit: number, beforeEventId: number | null, throughEventId: number | null) {
   const [state, setState] = useState<{ data: VerdictHistoryResponse | null; loading: boolean; error: string | null }>({
     data: null, loading: true, error: null,
   });
@@ -367,6 +380,11 @@ function useVerdictHistory(instrument: string, mode: string, limit: number) {
     let cancelled = false;
     setState(s => ({ ...s, loading: true, error: null }));
     const query = new URLSearchParams({ instrument, mode, limit: String(limit) });
+    if (beforeEventId != null && Number.isInteger(beforeEventId) && beforeEventId > 0) {
+      query.set('before_event_id', String(beforeEventId));
+    } else if (throughEventId != null && Number.isInteger(throughEventId) && throughEventId > 0) {
+      query.set('through_event_id', String(throughEventId));
+    }
     fetch(`/api/authoritative-verdict-history?${query.toString()}`, {
       credentials: 'include', headers: getAuthHeader(),
     }).then(async response => {
@@ -380,7 +398,7 @@ function useVerdictHistory(instrument: string, mode: string, limit: number) {
       if (!cancelled) setState({ data: null, loading: false, error: error instanceof Error ? error.message : 'History unavailable' });
     });
     return () => { cancelled = true; };
-  }, [instrument, mode, limit, revision]);
+  }, [instrument, mode, limit, beforeEventId, throughEventId, revision]);
   return { ...state, refresh: () => setRevision(value => value + 1) };
 }
 
@@ -397,9 +415,44 @@ const VerdictHistoryPage: React.FC = () => {
   const [instrument, setInstrument] = useState<string>('MGC');
   const [mode, setMode] = useState<string>('SCALP');
   const [limit, setLimit] = useState(100);
-  const { data, loading, error, refresh } = useVerdictHistory(instrument, mode, limit);
+  const [beforeEventId, setBeforeEventId] = useState<number | null>(null);
+  const [throughEventId, setThroughEventId] = useState<number | null>(null);
+  const [cursorStack, setCursorStack] = useState<Array<{ before: number | null; through: number | null }>>([]);
+  const [pageNumber, setPageNumber] = useState(0);
+  const { data, loading, error, refresh } = useVerdictHistory(instrument, mode, limit, beforeEventId, throughEventId);
+  const resetPagination = () => {
+    setCursorStack([]);
+    setBeforeEventId(null);
+    setThroughEventId(null);
+    setPageNumber(0);
+  };
+  const loadOlder = () => {
+    if (!data?.page.has_older || data.page.older_before_event_id == null || loading) return;
+    setCursorStack(stack => [...stack, {
+      before: data.page.resume_before_event_id,
+      through: data.page.resume_through_event_id,
+    }]);
+    setBeforeEventId(data.page.older_before_event_id);
+    setThroughEventId(null);
+    setPageNumber(page => page + 1);
+  };
+  const loadNewer = () => {
+    if (!data?.page.has_newer || loading) return;
+    if (cursorStack.length > 0) {
+      const priorCursor = cursorStack[cursorStack.length - 1];
+      setCursorStack(stack => stack.slice(0, -1));
+      setBeforeEventId(priorCursor.before);
+      setThroughEventId(priorCursor.through);
+      setPageNumber(page => Math.max(0, page - 1));
+    } else if (throughEventId != null) {
+      setBeforeEventId(null);
+      setThroughEventId(null);
+    }
+  };
   const chain = data?.chain;
   const chainColor = chain?.status === 'VALID' ? T.green : chain?.status === 'BROKEN' ? T.red : chain?.status === 'PARTIAL' ? T.amber : T.txtMuted;
+  const boundaryStatus = data?.page?.newer_boundary_status ?? 'EMPTY';
+  const boundaryColor = boundaryStatus === 'BROKEN' ? T.red : boundaryStatus === 'CONTIGUOUS' ? T.green : boundaryStatus === 'ROOT' ? T.cyan : T.txtMuted;
   return (
     <div data-testid="page-verdict-history" style={{ maxWidth: 1320, margin: '0 auto' }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:16, marginBottom:16, flexWrap:'wrap' }}>
@@ -412,17 +465,17 @@ const VerdictHistoryPage: React.FC = () => {
       </div>
       <div data-testid="history-filters" style={{ display:'flex', gap:8, alignItems:'end', flexWrap:'wrap', padding:'11px 12px', marginBottom:12, background:T.panel, border:`1px solid ${T.border}`, borderRadius:9 }}>
         <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>INSTRUMENT
-          <select data-testid="select-history-instrument" value={instrument} onChange={event => setInstrument(event.target.value)} style={{ ...historySelectStyle, color:T.txtPri }}>
+          <select data-testid="select-history-instrument" value={instrument} onChange={event => { resetPagination(); setInstrument(event.target.value); }} style={{ ...historySelectStyle, color:T.txtPri }}>
             {HISTORY_INSTRUMENTS.map(value => <option key={value} value={value}>{value}</option>)}
           </select>
         </label>
         <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>MODE
-          <select data-testid="select-history-mode" value={mode} onChange={event => setMode(event.target.value)} style={{ ...historySelectStyle, color:T.txtPri }}>
+          <select data-testid="select-history-mode" value={mode} onChange={event => { resetPagination(); setMode(event.target.value); }} style={{ ...historySelectStyle, color:T.txtPri }}>
             {HISTORY_MODES.map(value => <option key={value} value={value}>{value}</option>)}
           </select>
         </label>
         <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>EVENT LIMIT
-          <select data-testid="select-history-limit" value={limit} onChange={event => setLimit(Number(event.target.value))} style={{ ...historySelectStyle, color:T.txtPri }}>
+          <select data-testid="select-history-limit" value={limit} onChange={event => { resetPagination(); setLimit(Number(event.target.value)); }} style={{ ...historySelectStyle, color:T.txtPri }}>
             {[50, 100, 250, 500].map(value => <option key={value} value={value}>{value}</option>)}
           </select>
         </label>
@@ -448,6 +501,18 @@ const VerdictHistoryPage: React.FC = () => {
             <div style={historyMetricStyle}><span>CONTIGUOUS</span><b>{chain?.contiguous ?? 0}</b></div>
             <div style={historyMetricStyle}><span>BREAKS</span><b style={{ color:(chain?.breaks ?? 0) > 0 ? T.red : T.txtPri }}>{chain?.breaks ?? 0}</b></div>
           </div>
+           <div data-testid="history-pagination" style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, flexWrap:'wrap', padding:'9px 11px', marginBottom:12, background:T.panel, border:`1px solid ${boundaryStatus === 'BROKEN' ? T.red + '66' : T.border}`, borderRadius:7 }}>
+             <div style={{ display:'flex', alignItems:'center', gap:9, flexWrap:'wrap' }}>
+               <span data-testid="history-page-indicator" style={{ color:T.txtPri, fontSize:10, fontWeight:800, letterSpacing:'0.08em' }}>{pageNumber === 0 ? (throughEventId == null ? 'LATEST' : 'LATEST SNAPSHOT') : `OLDER PAGE ${pageNumber}`}</span>
+               {(pageNumber > 0 || throughEventId != null) && <span data-testid="history-newer-boundary" style={{ color:boundaryColor, fontSize:9, fontWeight:800, letterSpacing:'0.07em' }}>
+                 NEWER BOUNDARY: {boundaryStatus === 'CONTIGUOUS' ? 'CONTIGUOUS · VERIFIED' : boundaryStatus === 'BROKEN' ? 'BROKEN · CONTINUITY NOT VERIFIED' : boundaryStatus}
+               </span>}
+             </div>
+             <div style={{ display:'flex', gap:6 }}>
+               <button data-testid="button-newer-verdict-history" onClick={loadNewer} disabled={loading || !data.page.has_newer} aria-label="Load newer verdict history page" style={{ ...historyButtonStyle, opacity: loading || !data.page.has_newer ? 0.4 : 1, cursor: loading || !data.page.has_newer ? 'not-allowed' : 'pointer' }}>Newer page</button>
+               <button data-testid="button-older-verdict-history" onClick={loadOlder} disabled={loading || !data.page.has_older || data.page.older_before_event_id == null} aria-label="Load older verdict history page" style={{ ...historyButtonStyle, opacity: loading || !data.page.has_older || data.page.older_before_event_id == null ? 0.4 : 1, cursor: loading || !data.page.has_older || data.page.older_before_event_id == null ? 'not-allowed' : 'pointer' }}>Older page</button>
+             </div>
+           </div>
           <div data-testid="verdict-history-timeline" style={{ display:'grid', gap:7 }}>
             {data.events.map((event, index) => <VerdictHistoryRow key={`${event.event_id}-${index}`} event={event} index={index} />)}
           </div>

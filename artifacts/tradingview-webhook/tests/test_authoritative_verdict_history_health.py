@@ -331,8 +331,12 @@ def test_observer_disabled_reports_disabled_state_without_database_access(monkey
 def test_operator_history_route_validates_scope_and_returns_curated_report(monkeypatch):
     calls = []
 
-    def report(instrument, mode, limit):
-        calls.append((instrument, mode, limit))
+    def report(
+        instrument, mode, limit, before_event_id=None, through_event_id=None
+    ):
+        calls.append((
+            instrument, mode, limit, before_event_id, through_event_id
+        ))
         return {
             "ok": True,
             "available": True,
@@ -357,7 +361,21 @@ def test_operator_history_route_validates_scope_and_returns_curated_report(monke
     )
     assert response.status_code == 200
     assert response.get_json()["available"] is True
-    assert calls == [("MNQ", "INTRADAY_TREND", 500)]
+    assert calls == [("MNQ", "INTRADAY_TREND", 500, None, None)]
+
+    cursor_response = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MNQ&mode=SCALP&limit=50&before_event_id=321"
+    )
+    assert cursor_response.status_code == 200
+    assert calls[-1] == ("MNQ", "SCALP", 50, 321, None)
+
+    resume_response = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MGC&mode=SCALP&limit=50&through_event_id=654"
+    )
+    assert resume_response.status_code == 200
+    assert calls[-1] == ("MGC", "SCALP", 50, None, 654)
 
     invalid_instrument = client.get(
         "/authoritative-verdict-history?instrument=ES&mode=SCALP"
@@ -376,3 +394,17 @@ def test_operator_history_route_validates_scope_and_returns_curated_report(monke
     )
     assert invalid_limit.status_code == 400
     assert invalid_limit.get_json()["error"] == "invalid_limit"
+
+    invalid_cursor = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MGC&mode=SCALP&before_event_id=0"
+    )
+    assert invalid_cursor.status_code == 400
+    assert invalid_cursor.get_json()["error"] == "invalid_cursor"
+
+    conflicting_cursors = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MGC&mode=SCALP&before_event_id=12&through_event_id=11"
+    )
+    assert conflicting_cursors.status_code == 400
+    assert conflicting_cursors.get_json()["error"] == "invalid_cursor"

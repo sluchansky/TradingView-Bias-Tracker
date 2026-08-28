@@ -632,6 +632,8 @@ def _query_history(
     limit: int = 120,
     *,
     newest_window: bool = False,
+    before_event_id: Optional[int] = None,
+    through_event_id: Optional[int] = None,
 ) -> List[dict]:
     """Read immutable rows and surface failures to read-only report callers."""
     if not _DB_READY or not callable(_DB_FN):
@@ -658,17 +660,32 @@ def _query_history(
                 payload
             """
             if newest_window:
+                cursor_clause = ""
+                cursor_values: tuple = ()
+                if before_event_id is not None:
+                    cursor_clause = " AND event_id < %s"
+                    cursor_values = (int(before_event_id),)
+                elif through_event_id is not None:
+                    cursor_clause = " AND event_id <= %s"
+                    cursor_values = (int(through_event_id),)
+                params: tuple = (
+                    str(instrument).upper(),
+                    str(mode).upper(),
+                    *cursor_values,
+                    limit,
+                )
                 cur.execute(f"""
                     SELECT {select_columns}
                       FROM (
                             SELECT {select_columns}
                               FROM authoritative_verdict_history
                              WHERE instrument = %s AND mode = %s
+                                   {cursor_clause}
                              ORDER BY event_id DESC
                              LIMIT %s
                            ) AS latest_history
                      ORDER BY event_id ASC
-                """, (str(instrument).upper(), str(mode).upper(), limit))
+                """, params)
             else:
                 cur.execute(f"""
                     SELECT {select_columns}
@@ -687,6 +704,69 @@ def _query_history(
             pass
 
 
+def _query_history_link(instrument: str, mode: str, event_id: int) -> Optional[dict]:
+    """Read one exact immutable chain link for scope-bound cursor validation."""
+    if not _DB_READY or not callable(_DB_FN):
+        raise RuntimeError("history database unavailable")
+    conn = None
+    try:
+        conn = _DB_FN()
+        if conn is None:
+            raise RuntimeError("history database unavailable")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT event_id, observation_key, previous_observation_key
+                  FROM authoritative_verdict_history
+                 WHERE instrument = %s AND mode = %s AND event_id = %s
+                 LIMIT 1
+            """, (str(instrument).upper(), str(mode).upper(), int(event_id)))
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(
+            ("event_id", "observation_key", "previous_observation_key"), row
+        ))
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
+def _query_next_history_link(
+    instrument: str, mode: str, event_id: int
+) -> Optional[dict]:
+    """Read the first scoped immutable link newer than an inclusive cursor."""
+    if not _DB_READY or not callable(_DB_FN):
+        raise RuntimeError("history database unavailable")
+    conn = None
+    try:
+        conn = _DB_FN()
+        if conn is None:
+            raise RuntimeError("history database unavailable")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT event_id, observation_key, previous_observation_key
+                  FROM authoritative_verdict_history
+                 WHERE instrument = %s AND mode = %s AND event_id > %s
+                 ORDER BY event_id ASC
+                 LIMIT 1
+            """, (str(instrument).upper(), str(mode).upper(), int(event_id)))
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(
+            ("event_id", "observation_key", "previous_observation_key"), row
+        ))
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
 def get_history(instrument: str, mode: str, limit: int = 120) -> List[dict]:
     """Read immutable rows for reconstruction; never called by live trading."""
     try:
@@ -696,7 +776,13 @@ def get_history(instrument: str, mode: str, limit: int = 120) -> List[dict]:
         return []
 
 
-def get_history_report(instrument: str, mode: str, limit: int = 120) -> dict:
+def get_history_report(
+    instrument: str,
+    mode: str,
+    limit: int = 120,
+    before_event_id: Optional[int] = None,
+    through_event_id: Optional[int] = None,
+) -> dict:
     """Return a curated operator timeline with explicit availability and links."""
     instrument = str(instrument or "").upper()
     mode = str(mode or "").upper()
@@ -715,6 +801,19 @@ def get_history_report(instrument: str, mode: str, limit: int = 120) -> dict:
             "breaks": 0,
             "partial": False,
         },
+        "page": {
+            "before_event_id": before_event_id,
+            "through_event_id": through_event_id,
+            "resume_before_event_id": None,
+            "resume_through_event_id": None,
+            "first_event_id": None,
+            "last_event_id": None,
+            "has_older": False,
+            "has_newer": False,
+            "older_before_event_id": None,
+            "newer_boundary_status": "LATEST" if before_event_id is None else "EMPTY",
+            "newer_boundary_event_id": None,
+        },
         "events": [],
     }
     if not _DB_READY or not callable(_DB_FN):
@@ -724,12 +823,45 @@ def get_history_report(instrument: str, mode: str, limit: int = 120) -> dict:
         requested_limit = max(1, min(int(limit), 500))
     except (TypeError, ValueError):
         requested_limit = 120
+    if before_event_id is not None and through_event_id is not None:
+        return {**base, "error": "invalid_cursor"}
+    cursor_value = before_event_id if before_event_id is not None else through_event_id
+    cursor_row = None
+    if cursor_value is not None:
+        try:
+            cursor_value = int(cursor_value)
+        except (TypeError, ValueError):
+            return {**base, "error": "invalid_cursor"}
+        if cursor_value <= 0:
+            return {**base, "error": "invalid_cursor"}
+        if before_event_id is not None:
+            before_event_id = cursor_value
+        else:
+            through_event_id = cursor_value
+        try:
+            cursor_row = _query_history_link(instrument, mode, cursor_value)
+        except Exception as exc:
+            logger.debug("AuthoritativeVerdictHistory cursor read failed: %s", exc)
+            return {**base, "error": _error_code(exc, "history_query_failed")}
+        if cursor_row is None:
+            return {**base, "error": "cursor_unavailable"}
+    boundary_row = cursor_row if before_event_id is not None else None
+    if through_event_id is not None:
+        try:
+            boundary_row = _query_next_history_link(
+                instrument, mode, through_event_id
+            )
+        except Exception as exc:
+            logger.debug("AuthoritativeVerdictHistory newer-link read failed: %s", exc)
+            return {**base, "error": _error_code(exc, "history_query_failed")}
     try:
         rows = _query_history(
             instrument,
             mode,
             min(requested_limit + 1, 2000),
             newest_window=True,
+            before_event_id=before_event_id,
+            through_event_id=through_event_id,
         )
     except Exception as exc:
         logger.debug("AuthoritativeVerdictHistory operator read failed: %s", exc)
@@ -790,6 +922,24 @@ def get_history_report(instrument: str, mode: str, limit: int = 120) -> dict:
         })
         prior_key = observation_key
 
+    first_event_id = events[0]["event_id"] if events else None
+    last_event_id = events[-1]["event_id"] if events else None
+    newer_boundary_status = "LATEST"
+    if boundary_row is not None:
+        boundary_previous = _text(boundary_row.get("previous_observation_key"))
+        last_key = events[-1]["observation_key"] if events else None
+        if events and boundary_previous == last_key:
+            newer_boundary_status = "CONTIGUOUS"
+        elif not events and boundary_previous is None:
+            newer_boundary_status = "ROOT"
+        else:
+            newer_boundary_status = "BROKEN"
+            breaks += 1
+    resume_before_event_id = before_event_id
+    resume_through_event_id = through_event_id
+    if before_event_id is None and resume_through_event_id is None:
+        resume_through_event_id = last_event_id
+
     base.update({
         "ok": True,
         "available": True,
@@ -803,6 +953,21 @@ def get_history_report(instrument: str, mode: str, limit: int = 120) -> dict:
             "contiguous": contiguous,
             "breaks": breaks,
             "partial": partial,
+        },
+        "page": {
+            "before_event_id": before_event_id,
+            "through_event_id": through_event_id,
+            "resume_before_event_id": resume_before_event_id,
+            "resume_through_event_id": resume_through_event_id,
+            "first_event_id": first_event_id,
+            "last_event_id": last_event_id,
+            "has_older": window_truncated,
+            "has_newer": boundary_row is not None,
+            "older_before_event_id": first_event_id if window_truncated else None,
+            "newer_boundary_status": newer_boundary_status,
+            "newer_boundary_event_id": (
+                _safe(boundary_row.get("event_id")) if boundary_row else None
+            ),
         },
         "events": events,
     })
