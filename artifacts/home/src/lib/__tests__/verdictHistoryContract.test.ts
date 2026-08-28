@@ -66,6 +66,10 @@ describe('immutable verdict history operator contract', () => {
     expect(source).toContain("query.set('mode', mode)");
     expect(source).toContain("query.set('event_id', String(eventId))");
     expect(source).toContain("window.history.replaceState");
+    expect(source).toContain('pushVerdictHistoryLocatorUrl');
+    expect(source).toContain('window.history.pushState');
+    expect(source).toContain("window.addEventListener('popstate'");
+    expect(source).toContain('setJumpEventId(next.jump.eventId ?? \'\')');
     expect(source).toContain('HISTORY_INSTRUMENTS');
     expect(source).toContain('HISTORY_MODES');
     expect(source).toContain('The shared incident link is incomplete.');

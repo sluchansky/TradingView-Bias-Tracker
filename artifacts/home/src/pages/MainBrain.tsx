@@ -449,7 +449,37 @@ function writeVerdictHistoryUrl(instrument: string, mode: string, eventId: numbe
   }
 }
 
-function clearVerdictHistoryUrl(): void {
+function pushVerdictHistoryLocatorUrl(
+  instrument: string,
+  mode: string,
+  jump: VerdictHistoryJump,
+): void {
+  try {
+    const query = new URLSearchParams(window.location.search);
+    query.set('instrument', instrument);
+    query.set('mode', mode);
+    if (jump.eventId) {
+      query.set('event_id', jump.eventId);
+      query.delete('timestamp');
+    } else if (jump.timestamp) {
+      query.set('timestamp', jump.timestamp);
+      query.delete('event_id');
+    } else {
+      query.delete('event_id');
+      query.delete('timestamp');
+    }
+    const search = query.toString();
+    window.history.pushState(
+      null,
+      '',
+      `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`,
+    );
+  } catch {
+    // URL state is a convenience for reopening an audit, never a prerequisite.
+  }
+}
+
+function clearVerdictHistoryUrl(push = false): void {
   try {
     const query = new URLSearchParams(window.location.search);
     query.delete('instrument');
@@ -457,7 +487,9 @@ function clearVerdictHistoryUrl(): void {
     query.delete('event_id');
     query.delete('timestamp');
     const search = query.toString();
-    window.history.replaceState(
+    const write = push ? window.history.pushState : window.history.replaceState;
+    write.call(
+      window.history,
       null,
       '',
       `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`,
@@ -567,11 +599,30 @@ const VerdictHistoryPage: React.FC = () => {
     instrument, mode, limit, beforeEventId, throughEventId, jump, urlError,
   );
   useEffect(() => {
+    const handlePopState = () => {
+      const next = readVerdictHistoryUrl();
+      setInstrument(next.instrument);
+      setMode(next.mode);
+      setBeforeEventId(null);
+      setThroughEventId(null);
+      setCursorStack([]);
+      setPageNumber(0);
+      setJumpEventId(next.jump.eventId ?? '');
+      setJumpTimestamp(next.jump.timestamp ?? '');
+      setJumpValidation(null);
+      setUrlError(next.error);
+      setJump(next.jump);
+      setCopyState('idle');
+    };
+    window.addEventListener('popstate', handlePopState);
+    return () => window.removeEventListener('popstate', handlePopState);
+  }, []);
+  useEffect(() => {
     if (data?.jump?.status === 'RESOLVED' && data.jump.resolved_event_id != null) {
       writeVerdictHistoryUrl(instrument, mode, data.jump.resolved_event_id);
     }
   }, [data?.jump?.status, data?.jump?.resolved_event_id, instrument, mode]);
-  const resetPagination = () => {
+  const resetPagination = (pushUrl = false) => {
     setCursorStack([]);
     setBeforeEventId(null);
     setThroughEventId(null);
@@ -580,7 +631,7 @@ const VerdictHistoryPage: React.FC = () => {
     setJumpValidation(null);
     setUrlError(null);
     setCopyState('idle');
-    clearVerdictHistoryUrl();
+    clearVerdictHistoryUrl(pushUrl);
   };
   const submitJump = () => {
     const eventValue = jumpEventId.trim();
@@ -591,7 +642,10 @@ const VerdictHistoryPage: React.FC = () => {
     }
     setJumpValidation(null);
     setUrlError(null);
-    clearVerdictHistoryUrl();
+    pushVerdictHistoryLocatorUrl(instrument, mode, {
+      eventId: eventValue || null,
+      timestamp: timestampValue || null,
+    });
     setCursorStack([]);
     setBeforeEventId(null);
     setThroughEventId(null);
@@ -605,7 +659,7 @@ const VerdictHistoryPage: React.FC = () => {
   const clearJump = () => {
     setJumpEventId('');
     setJumpTimestamp('');
-    resetPagination();
+    resetPagination(true);
   };
   const copyIncidentLink = async () => {
     const resolvedEventId = data?.jump?.status === 'RESOLVED' ? data.jump.resolved_event_id : null;
