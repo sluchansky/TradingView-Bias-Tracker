@@ -1,4 +1,6 @@
+import { readFileSync } from "node:fs";
 import http from "node:http";
+import { resolve } from "node:path";
 import express from "express";
 import request from "supertest";
 import { describe, expect, it } from "vitest";
@@ -6,6 +8,36 @@ import { createViewOnlyRouter } from "./view-only";
 import { mintLinkToken, mintSessionCookie } from "./view-tokens";
 
 const DASHBOARD_PASSWORD = "view-only-boundary-test-password";
+const root = resolve(import.meta.dirname, "../../../..");
+
+function configuredProxyPaths(): string[] {
+  const manifest = readFileSync(
+    resolve(root, "artifacts/api-server/.replit-artifact/artifact.toml"),
+    "utf8",
+  );
+  const pathsLine = manifest.match(/^paths\s*=\s*\[([^\]]*)\]/m)?.[1] ?? "";
+  return Array.from(pathsLine.matchAll(/"([^"]+)"/g), (match) => match[1]);
+}
+
+// Model the outer path router that decides which artifact receives a request.
+// Keeping this in the test makes the /view manifest entry part of the exercised
+// boundary instead of only asserting the Express mount in isolation.
+function createConfiguredProxy(api: express.Express): express.Express {
+  const paths = configuredProxyPaths();
+  const proxy = express();
+  proxy.use((req, res, next) => {
+    const rawPath = String(req.url ?? "").split("?")[0];
+    const forwarded = paths.some(
+      (prefix) => rawPath === prefix || rawPath.startsWith(`${prefix}/`),
+    );
+    if (!forwarded) {
+      res.status(404).send("path not configured");
+      return;
+    }
+    api(req, res, next);
+  });
+  return proxy;
+}
 
 const ownerActions = [
   {
@@ -93,13 +125,16 @@ describe("watch-only session boundary", () => {
 
     const previousPassword = process.env.DASHBOARD_PASSWORD;
     process.env.DASHBOARD_PASSWORD = DASHBOARD_PASSWORD;
-    const app = express();
-    app.use(express.raw({ type: () => true, limit: "1mb" }));
-    app.use("/view", createViewOnlyRouter(address.port));
+    const api = express();
+    api.use(express.raw({ type: () => true, limit: "1mb" }));
+    api.use("/view", createViewOnlyRouter(address.port));
+    const app = createConfiguredProxy(api);
     const { exp } = mintLinkToken(3600, "viewer-password");
     const session = mintSessionCookie(exp);
 
     try {
+      expect(configuredProxyPaths()).toContain("/view");
+
       const status = await request(app)
         .get("/view/api/status?ticker=MGC")
         .set("Cookie", `vsess=${session}`);
