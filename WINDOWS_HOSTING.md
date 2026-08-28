@@ -106,6 +106,9 @@ DISCORD_LIVE=0
 TRAINING_MODE_ENABLED=1
 MANUAL_ORDER_ENABLED=0
 LIVE_RUNNER_ENABLED=0
+VISUAL_BRAIN_ENABLED=0
+VISUAL_BRAIN_BENCHMARK_ENABLED=0
+VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED=0
 ```
 
 Before enabling market data or any execution route, verify the corresponding
@@ -138,7 +141,8 @@ only the first `=` and never prints values.
 
 The launcher loads a local `.env` when present, defaults every safety setting to
 the first-boot values above, and refuses to start if a local file attempts to
-enable execution, manual orders, live runner, or Discord delivery. Databento
+enable execution, manual orders, live runner, Discord delivery, Visual Brain,
+or Visual Brain candidate benchmarking. Databento
 also remains disabled unless an operator passes the explicit
 `-EnableDatabento` switch described below.
 The default local port is 8000. To choose it explicitly:
@@ -209,7 +213,8 @@ local environment and pass the explicit switch:
 ```
 
 This enables data ingestion only. It preserves disabled execution, manual
-orders, live runner, Discord delivery, and coordinator fan-out. The launcher
+orders, live runner, Discord delivery, coordinator fan-out, Visual Brain, and
+Visual Brain candidate benchmarking. The launcher
 refuses stale listeners and verifies direct Flask and browser-facing chart
 parity before it opens the browser.
 

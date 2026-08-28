@@ -386,6 +386,15 @@ class TestStatePersistence(unittest.TestCase):
     def setUp(self):
         self.vb = _import_vb()
         self.vb._LAST_OBSERVATION_BY_INST.clear()
+        self.vb._VB_GATE_STATE_BY_INST.clear()
+        self.vb._bars_fn = lambda _instrument: [{
+            "ts": 1_770_000_000,
+            "open": 30_100.0,
+            "high": 30_120.0,
+            "low": 30_090.0,
+            "close": 30_110.0,
+            "volume": 100,
+        }]
         self.vb.VISUAL_BRAIN_ENABLED = True
 
     def test_last_observation_updated_after_tick(self):

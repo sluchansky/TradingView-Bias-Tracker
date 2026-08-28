@@ -58,6 +58,9 @@ $safeDefaults = @{
     "TRAINING_MODE_ENABLED" = "1"
     "MANUAL_ORDER_ENABLED" = "0"
     "LIVE_RUNNER_ENABLED" = "0"
+    "VISUAL_BRAIN_ENABLED" = "0"
+    "VISUAL_BRAIN_BENCHMARK_ENABLED" = "0"
+    "VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED" = "0"
 }
 foreach ($entry in $safeDefaults.GetEnumerator()) {
     if (-not [Environment]::GetEnvironmentVariable($entry.Key, "Process")) {

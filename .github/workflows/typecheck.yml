@@ -99,6 +99,9 @@ jobs:
           MANUAL_ORDER_ENABLED: "0"
           LIVE_RUNNER_ENABLED: "0"
           CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED: "0"
+          VISUAL_BRAIN_ENABLED: "0"
+          VISUAL_BRAIN_BENCHMARK_ENABLED: "0"
+          VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED: "0"
           TRAINING_MODE_ENABLED: "1"
           DATABASE_URL: ""
         run: .\scripts\windows\Test-WindowsDashboard.ps1

@@ -84,6 +84,9 @@ Set-SafeDefault "DISCORD_LIVE_ENABLED" "0"
 # A copied Replit environment must never turn this local launcher into a sender.
 Set-SafeDefault "REPLIT_DEPLOYMENT" "0"
 Set-SafeDefault "CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED" "0"
+Set-SafeDefault "VISUAL_BRAIN_ENABLED" "0"
+Set-SafeDefault "VISUAL_BRAIN_BENCHMARK_ENABLED" "0"
+Set-SafeDefault "VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED" "0"
 if ($EnableDatabento) {
     [Environment]::SetEnvironmentVariable("DATABENTO_ENABLED", "1", "Process")
 } elseif ([string]::IsNullOrWhiteSpace((Get-ProcessEnv "DATABENTO_ENABLED"))) {

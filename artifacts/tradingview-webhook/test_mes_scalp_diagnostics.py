@@ -38,7 +38,7 @@ def test_mes_scalp_strict_gate_does_not_require_zone():
             alert_history=_mes_short_alerts(),
             volatility={"status": "ok", "atr_pts": 10.0, "regime": "NORMAL",
                         "label": "Normal", "ratio": 1.0},
-            session=None,
+            session={"preferred": False},
             cooldown_active=False,
         )["directions"]["Short"]
     finally:
@@ -74,7 +74,7 @@ def test_mes_structure_is_instrument_isolated():
             ],
             volatility={"status": "ok", "atr_pts": 10.0, "regime": "NORMAL",
                         "label": "Normal", "ratio": 1.0},
-            session=None,
+            session={"preferred": False},
             cooldown_active=False,
         )["directions"]["Short"]
     finally:
