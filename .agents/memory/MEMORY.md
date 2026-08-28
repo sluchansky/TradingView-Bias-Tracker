@@ -150,6 +150,7 @@
 - [Market data display freshness](market-data-display-freshness.md) — stale or unreachable Databento/Visual Brain snapshots are unavailable UI state: clear overlays and actions rather than retaining prior values.
 - [MNQ structure provenance tracing](mnq-structure-provenance.md) — async analysis must attach audit results by opaque per-bar trace ID, never by “latest” record.
 - [Operator presentation contract](operator-presentation-contract.md) — one display-only strict-result projection owns candidate/actionable semantics, reason, VWAP wording, and structure guidance across every operator surface.
+- [Authenticated browser regression boundary](authenticated-browser-regression.md) — prove dashboard credentials at a protected no-op edge route, then fixture unstable downstream data for deterministic UI assertions.
 - [Structure confirmation lag diagnostic](structure-confirmation-lag.md) — immutable verdict snapshots classify high-score structure waits as confirmed, expired, source-delayed, or detector-stale.
 - [Databento soak evidence](databento-soak-evidence.md) — sample queue peaks during intake; post-drain snapshots hide bounded-dispatcher pressure.
 - [Fundamental awareness shadow context](fundamental-awareness-shadow-context.md) — scheduled US high-impact events reuse the cached calendar; two default-OFF flags are required and the context is never a money-path input.

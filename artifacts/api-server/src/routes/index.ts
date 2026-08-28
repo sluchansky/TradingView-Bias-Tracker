@@ -91,6 +91,13 @@ export function createLiveBotRouter(
   router.use(healthRouter);
   router.use(dashboardAuth);
 
+  // Lightweight browser-regression probe. Reaching this handler proves the
+  // request crossed dashboardAuth; it deliberately performs no Flask, DB, or
+  // trading work and returns no credential-derived data.
+  router.get("/operator-console-auth-check", (_req, res) => {
+    res.status(204).end();
+  });
+
 // Mint a watch-only, expiring, password-protected dashboard link. ADMIN-ONLY:
 // it sits AFTER dashboardAuth (so the owner's password + CSRF check are enforced)
 // and BEFORE createFlaskProxy, and it is NOT in BOT1_ROUTES — so it is handled

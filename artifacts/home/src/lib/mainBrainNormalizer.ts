@@ -41,6 +41,90 @@ export function mapStrategyResult(r: string): string {
   return r.toUpperCase() || '—';
 }
 
+export interface OperatorStatusPresentation {
+  verdict: string;
+  isActionable: boolean;
+  candidateDirection: string | null;
+  actionableDirection: string | null;
+  candidateLabel: string | null;
+  reasoning: string | null;
+  vwapWording: string | null;
+  regimeWording: string | null;
+}
+
+function recordValue(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' ? value as Record<string, unknown> : {};
+}
+
+/**
+ * Read the backend-owned operator decision contract from either /status or
+ * /main-brain. Legacy pages historically selected secondary "favored" fields,
+ * which could disagree with a directional WAIT or with the final READY side.
+ */
+export function normalizeOperatorStatusPresentation(raw: Record<string, unknown>): OperatorStatusPresentation {
+  const op = recordValue(raw.operator_presentation);
+  const v = recordValue(raw.verdict);
+  const brain = recordValue(raw.brain);
+  const brainDecision = recordValue(brain.decision);
+  const brainVwap = recordValue(brain.vwap_presentation);
+  const rawVwap = recordValue(raw.vwap_presentation);
+  const reasonTop = Array.isArray(brain.reasons)
+    ? brain.reasons[0]
+    : (() => {
+        const top = recordValue(brain.reasons).top;
+        return Array.isArray(top) ? top[0] : null;
+      })();
+  const hasOpActionable = Object.prototype.hasOwnProperty.call(op, 'actionable_direction');
+  const candidateDirection = (
+    op.candidate_direction
+    ?? v.candidate_direction
+    ?? v.direction
+    ?? brainDecision.direction
+    ?? raw.strict_direction
+    ?? raw.direction
+    ?? null
+  );
+  const isActionable = op.is_actionable === true
+    || (Object.prototype.hasOwnProperty.call(op, 'is_actionable')
+      ? op.is_actionable === true
+      : v.is_actionable === true || brainDecision.is_ready === true || raw.is_actionable === true);
+  const actionableDirection = hasOpActionable
+    ? (op.actionable_direction ?? null)
+    : (v.actionable_direction ?? (isActionable ? candidateDirection : null));
+  const rawVerdict = typeof raw.verdict === 'string' ? raw.verdict : null;
+  const verdict = String(
+    op.verdict
+    ?? v.readiness
+    ?? v.verdict
+    ?? brainDecision.verdict
+    ?? rawVerdict
+    ?? raw.status
+    ?? 'WAIT',
+  ).toUpperCase();
+  const reasoning = (
+    op.reasoning
+    ?? v.strict_reason
+    ?? raw.strict_reason
+    ?? reasonTop
+    ?? null
+  );
+  const vwap = recordValue(op.vwap ?? v.vwap ?? brainVwap.vwap ?? rawVwap);
+  return {
+    verdict,
+    isActionable,
+    candidateDirection: candidateDirection == null ? null : String(candidateDirection),
+    actionableDirection: actionableDirection == null ? null : String(actionableDirection),
+    candidateLabel: (op.candidate_label ?? v.candidate_label) == null
+      ? null
+      : String(op.candidate_label ?? v.candidate_label),
+    reasoning: reasoning == null ? null : String(reasoning),
+    vwapWording: vwap.wording == null ? null : String(vwap.wording),
+    regimeWording: (op.regime_wording ?? brain.regime_wording ?? raw.regime_wording) == null
+      ? null
+      : String(op.regime_wording ?? brain.regime_wording ?? raw.regime_wording),
+  };
+}
+
 // ── Operator risk state classifier ──────────────────────────────────────────
 // Pure function (no theme tokens, no React) — reads the prop_firm block that
 // build_main_brain_payload() now includes and returns a machine-readable state

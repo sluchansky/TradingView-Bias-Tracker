@@ -6,11 +6,13 @@
   "scripts": {
     "preinstall": "node ./scripts/check-pnpm-install.mjs",
     "build": "pnpm run typecheck && pnpm -r --if-present run build",
+    "test:operator-console": "playwright test --config artifacts/home/playwright.config.ts",
     "typecheck:libs": "tsc --build",
     "typecheck": "pnpm run typecheck:libs && pnpm -r --filter \"./artifacts/**\" --filter \"./scripts\" --if-present run typecheck"
   },
   "private": true,
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "prettier": "^3.8.3",
     "typescript": "~5.9.3"
   }

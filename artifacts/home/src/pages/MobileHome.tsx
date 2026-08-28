@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react'
 import { useLocation } from 'wouter';
 import { NAV_ITEMS } from '../lib/navItems';
 import { announceDashboardAuth } from '../lib/dashboardAuth';
+import { normalizeOperatorStatusPresentation } from '../lib/mainBrainNormalizer';
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 const BULL  = '#22c55e';
@@ -280,10 +281,10 @@ function useLiveData(ticker: Ticker, authHeader: Record<string, string>) {
 
 // ── Derived helpers ───────────────────────────────────────────────────────────
 function verdictInfo(data: any): { label: string; color: string; bg: string } {
-  const mb  = data?.main_brain || {};
-  const st  = String(mb.status || data?.verdict || 'WAIT').toUpperCase();
+  const operator = normalizeOperatorStatusPresentation((data || {}) as Record<string, unknown>);
+  const st  = operator.verdict;
+  const dir = String(operator.isActionable ? operator.actionableDirection : operator.candidateDirection || '').toUpperCase();
   if (st === 'READY' || st.includes('READY')) {
-    const dir = String(mb.direction || data?.direction || '').toUpperCase();
     if (dir.includes('SHORT')) return { label: 'SHORT READY', color: BEAR, bg: 'rgba(239,68,68,0.12)' };
     return { label: 'LONG READY', color: BULL, bg: 'rgba(34,197,94,0.12)' };
   }
@@ -1247,21 +1248,29 @@ function SignalTab({ data, ticker, narration, avatarState, speaking, authHeader 
   const price = Number(data?.current_price || 0);
   const vwap  = Number(data?.vwap_value   || 0);
   const atr   = Number(data?.atr_pts || data?.current_atr || 0);
-  const mb    = data?.main_brain || {};
-  const reason = data?.strict_reason || mb.what_now || '';
+  const operator = normalizeOperatorStatusPresentation((data || {}) as Record<string, unknown>);
+  const reason = operator.reasoning || '';
   const isReady = label.includes('READY') || label === 'MANAGING';
 
   return (
-    <div style={{ display:'flex', flexDirection:'column', gap:12 }}>
+    <div data-testid="mobile-signal-tab" style={{ display:'flex', flexDirection:'column', gap:12 }}>
       {/* Verdict pill */}
       <div style={{ display:'flex', justifyContent:'center', paddingTop:4 }}>
-        <div style={{ padding:'12px 28px', borderRadius:50,
+        <div data-testid="mobile-decision" style={{ padding:'12px 28px', borderRadius:50,
           background:bg, border:`1.5px solid ${color}40`,
           boxShadow:`0 0 24px ${color}28` }}>
           <span style={{ fontSize:18, fontFamily:'monospace', fontWeight:800,
             letterSpacing:'0.10em', color }}>{label}</span>
         </div>
       </div>
+      <div data-testid="mobile-candidate-label" style={{ textAlign:'center', fontSize:11, color:'rgba(255,255,255,0.60)', fontFamily:'monospace' }}>
+        {operator.candidateLabel || `${operator.candidateDirection || 'No direction'} candidate — ${operator.verdict}`}
+      </div>
+      {operator.vwapWording && (
+        <div data-testid="mobile-vwap" style={{ textAlign:'center', fontSize:10, color:CYAN, fontFamily:'monospace' }}>
+          {operator.vwapWording}
+        </div>
+      )}
 
       {/* ── TRADE PLAN: shown prominently when READY ── */}
       {isReady && data?.trade_plan && (
@@ -1339,7 +1348,7 @@ function SignalTab({ data, ticker, narration, avatarState, speaking, authHeader 
       {reason && (
         <Card>
           <CardLabel>Why {label}</CardLabel>
-          <p style={{ fontSize:13, color:'rgba(255,255,255,0.60)', lineHeight:1.6, margin:0 }}>{reason}</p>
+          <p data-testid="mobile-reason" style={{ fontSize:13, color:'rgba(255,255,255,0.60)', lineHeight:1.6, margin:0 }}>{reason}</p>
         </Card>
       )}
     </div>

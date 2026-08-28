@@ -8,6 +8,7 @@ import {
   timestampMs,
 } from '../lib/marketDataFreshness';
 import { announceDashboardAuth } from '../lib/dashboardAuth';
+import { normalizeOperatorStatusPresentation } from '../lib/mainBrainNormalizer';
 
 // ── Constants ──────────────────────────────────────────────────────────────────
 const BULL = '#22c55e'; const BEAR = '#ef4444'; const AMB = '#f59e0b';
@@ -2615,18 +2616,20 @@ export default function Home() {
   useEffect(() => { if (chatRef.current) chatRef.current.scrollTop = chatRef.current.scrollHeight; }, [msgs]);
 
   // Derived
+  const operator = normalizeOperatorStatusPresentation((data || {}) as Record<string, unknown>);
   const mb      = (data?.main_brain || {}) as Record<string,any>;
   const voice_d = (data?.main_brain_voice || {}) as Record<string,any>;
-  const status  = (mb.status || 'WATCHING') as string;
+  const status  = operator.verdict || (mb.status || 'WATCHING') as string;
   const edge    = Number(mb.edge_score ?? data?.edge_score ?? 0);
   const grade   = (mb.edge_grade ?? data?.edge_grade ?? '') as string;
-  const dirn    = (mb.favored_direction ?? '') as string;
+  const dirn    = (operator.isActionable ? operator.actionableDirection : operator.candidateDirection)
+    ?? (mb.favored_direction ?? '') as string;
   const price   = Number(data?.current_price || 0);
-  const strictR = (data?.strict_reason || mb.wait_reason || '') as string;
+  const strictR = (operator.reasoning || mb.wait_reason || '') as string;
   const marketStatus = (data?.market_status ?? '') as string;
   const isOpen  = /open/i.test(marketStatus);
   const feedReady = demoMode || dbStatus?.current === true;
-  const isActionable = feedReady && (data?.is_actionable === true || status === 'READY');
+  const isActionable = feedReady && operator.isActionable;
   const isManaging = !!(data?.active_trade || data?.managing_trade);
 
   // Intelligence panel shortcuts
@@ -4136,11 +4139,15 @@ export default function Home() {
               )}
 
               {/* Wait reason */}
-              {strictR && status === 'WAIT' && isOpen && (
-                <div className="wait-box" style={{ padding:'8px 12px', borderRadius:7, background:'rgba(245,158,11,0.07)',
+              {(operator.candidateLabel || strictR || operator.vwapWording) && isOpen && (
+                <div data-testid="legacy-operator-decision" className="wait-box" style={{ padding:'8px 12px', borderRadius:7, background:'rgba(245,158,11,0.07)',
                   border:'1px solid rgba(245,158,11,0.18)', fontSize:12, color:AMB, fontFamily:'monospace',
                   maxWidth:480 }}>
-                  {strictR}
+                  <div data-testid="legacy-candidate-label" style={{ fontWeight:700 }}>
+                    {operator.candidateLabel || `${dirn || 'No direction'} candidate — ${status}`}
+                  </div>
+                  {strictR && <div data-testid="legacy-reason">{strictR}</div>}
+                  {operator.vwapWording && <div data-testid="legacy-vwap" style={{ color:CYAN }}>{operator.vwapWording}</div>}
                 </div>
               )}
 

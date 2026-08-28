@@ -2768,9 +2768,9 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
         ? `REVERSAL CANDIDATE · +${structurePoints} STRUCTURE`
         : 'AWAITING STRUCTURE · +0 STRUCTURE';
 
-  // Verdict explanation from Brain voice (already normalized)
-  const mb          = (p.main_brain ?? {}) as Record<string, unknown>;
-  const explanation = safeStr(mb.voice, '');
+  // Repeat the backend-owned strict explanation so the prose cannot contradict
+  // the Decision Clarity fields.
+  const explanation = safeStr(op.reasoning ?? v.strict_reason, '');
 
   const explainBtn = (
     <button
@@ -2803,6 +2803,16 @@ const VerdictPanel: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                 {grade && <Pill text={`Grade ${grade}`} color={score >= 70 ? T.green : score >= 50 ? T.amber : T.red} />}
                 <Pill text={isReady ? 'ACTIONABLE' : 'NOT ACTIONABLE'} color={isReady ? T.green : T.red} />
               </div>
+              {op.candidate_label != null && (
+                <div data-testid="main-brain-candidate-label" style={{ fontSize:9.5, color:T.txtSec, marginBottom:4 }}>
+                  {safeStr(op.candidate_label, '')}
+                </div>
+              )}
+              {((op.vwap ?? {}) as Record<string, unknown>).wording != null && (
+                <div data-testid="main-brain-vwap" style={{ fontSize:9.5, color:T.cyan, marginBottom:4 }}>
+                  {safeStr(((op.vwap ?? {}) as Record<string, unknown>).wording, '')}
+                </div>
+              )}
               <div style={{ fontFamily:T.mono, fontSize:12, color:T.txtSec }}>
                 <span style={{ color:T.cyan, fontWeight:700 }}>{score}</span>
                 <span style={{ color:T.txtMuted }}> / {scoreMax}</span>
@@ -14992,6 +15002,11 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
             border: `1px solid ${(/long/i.test(authDir) ? T.green : T.red)}40`,
           }}>
             {authDir.toUpperCase()}
+          </div>
+        )}
+        {op.candidate_label != null && (
+          <div data-testid="main-brain-candidate-label" style={{ fontSize: 9, color: T.txtSec }}>
+            {safeStr(op.candidate_label, '')}
           </div>
         )}
 

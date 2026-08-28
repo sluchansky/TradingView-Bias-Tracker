@@ -101,7 +101,7 @@ timeoutMs = 120000
 
 [nix]
 channel = "stable-25_05"
-packages = ["cairo", "ffmpeg-full", "freetype", "ghostscript", "gobject-introspection", "gtk3", "pkg-config", "qhull", "tcl", "tk"]
+packages = ["cairo", "ffmpeg-full", "freetype", "ghostscript", "gobject-introspection", "gtk3", "pkg-config", "qhull", "tcl", "tk", "nspr", "nss", "mesa", "libgbm", "libxkbcommon", "libdrm", "alsa-lib", "at-spi2-atk", "cups", "dbus", "glib", "pango"]
 
 [userenv]
 

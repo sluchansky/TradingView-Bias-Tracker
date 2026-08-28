@@ -3,6 +3,7 @@ import { matchesRequiredBlocker } from "../lib/blockerSemantics";
 
 // ── Types ──────────────────────────────────────────────────────────────────────
 import { announceDashboardAuth } from "../lib/dashboardAuth";
+import { normalizeOperatorStatusPresentation } from "../lib/mainBrainNormalizer";
 type TradePlan = {
   trade_plan?: boolean;
   direction?: string;
@@ -108,6 +109,9 @@ type StatusData = {
     instruments?: Record<string, { freshness?: string; auto_age_secs?: number }>;
   };
   brain?: BrainContract;
+  operator_presentation?: Record<string, unknown>;
+  vwap_presentation?: Record<string, unknown>;
+  regime_wording?: string;
 };
 
 type InstSnap = { state: string; edge: number; mode: string };
@@ -202,13 +206,14 @@ function playChihuahuaBark(): void {
 
 function buildLegacyBrainFallback(d: StatusData): BrainContract {
   console.warn("[Cockpit] data.brain absent — using legacy whole-contract fallback");
+  const operator = normalizeOperatorStatusPresentation(d as unknown as Record<string, unknown>);
   const top: string[] = [];
-  if (d.strict_reason) top.push(d.strict_reason);
+  if (operator.reasoning) top.push(operator.reasoning);
   return {
     decision: {
-      verdict: d.verdict,
-      is_ready: d.verdict.includes("READY"),
-      direction: d.strict_direction ?? null,
+      verdict: operator.verdict,
+      is_ready: operator.isActionable,
+      direction: operator.isActionable ? operator.actionableDirection : operator.candidateDirection,
       next_action: d.stage_next_step ?? null,
     },
     score: {
@@ -377,8 +382,14 @@ export default function Cockpit() {
 
   // ── Brain Contract (Phase 4B — single whole-contract accessor) ───────────────
   const brain    = data != null ? (data.brain ?? buildLegacyBrainFallback(data)) : null;
-  const verdict  = brain?.decision.verdict ?? "—";
-  const isReady  = brain?.decision.is_ready ?? false;
+  const operator = data != null
+    ? normalizeOperatorStatusPresentation(data as unknown as Record<string, unknown>)
+    : null;
+  const verdict  = operator?.verdict ?? brain?.decision.verdict ?? "—";
+  const isReady  = operator?.isActionable ?? brain?.decision.is_ready ?? false;
+  const decisionDirection = operator
+    ? (operator.isActionable ? operator.actionableDirection : operator.candidateDirection)
+    : brain?.decision.direction;
   const edge     = brain?.score.value ?? 0;
   const edgeMax  = brain?.score.max ?? 110;
   const mode     = data?.trading_mode ?? "—";
@@ -389,7 +400,7 @@ export default function Cockpit() {
         : "—");
 
   // Brain-owned operator fields
-  const reason       = safeStr(brain?.reasons.top?.[0]) ?? (data ? "" : "Connecting to bot...");
+  const reason       = operator?.reasoning ?? safeStr(brain?.reasons.top?.[0]) ?? (data ? "" : "Connecting to bot...");
   const nextReq      = safeStr(brain?.decision.next_action) ?? (data ? "No requirement pending." : "—");
   const invalidation = safeStr(data?.stage_invalidation) ?? (data ? "No invalidation defined." : "—");
 
@@ -444,9 +455,9 @@ export default function Cockpit() {
   const vwapVal   = data?.confluences?.vwap_value ?? data?.vwap_value;
   const price     = data?.current_price;
   const aboveVwap = vwapVal != null && price != null ? price > vwapVal : null;
-  const vwapCtx   = vwapVal != null
+  const vwapCtx   = operator?.vwapWording ?? (vwapVal != null
     ? `${vwapVal.toFixed(2)} · ${aboveVwap === true ? "price above" : aboveVwap === false ? "price below" : ""}`
-    : "—";
+    : "—");
   const atrStr    = data?.current_atr != null ? `${data.current_atr.toFixed(2)} pts` : "—";
 
   // Section 3 — execution context (flat /status)
@@ -661,7 +672,7 @@ export default function Cockpit() {
         {/* Primary verdict + score + grade + direction */}
         <div style={{ marginBottom: "24px" }}>
           {/* Verdict headline — single primary display */}
-          <div id="primary-verdict" className="cockpit-primary-verdict" style={{
+          <div id="primary-verdict" data-testid="cockpit-decision" className="cockpit-primary-verdict" style={{
             fontSize: "76px", fontWeight: 800, color: verdictColor,
             letterSpacing: "-4px", lineHeight: 0.95, textShadow: verdictGlow,
             marginBottom: "20px", userSelect: "none",
@@ -699,12 +710,12 @@ export default function Cockpit() {
                 background: "rgba(52,211,153,0.08)", border: "1px solid rgba(52,211,153,0.18)",
                 borderRadius: "8px", padding: "3px 10px",
                 fontSize: "11px", color: C.teal, fontWeight: 700, letterSpacing: "0.5px",
-              }}>{brain?.decision.direction ?? "—"}</div>
+              }} data-testid="cockpit-direction">{decisionDirection ?? "—"}</div>
             )}
           </div>
 
           {/* Primary reason (Brain reasons.top[0] only) */}
-          <p style={{ fontSize: "17px", fontWeight: 400, color: C.textSecondary, lineHeight: 1.65, maxWidth: "620px", margin: 0 }}>
+          <p data-testid="cockpit-reason" style={{ fontSize: "17px", fontWeight: 400, color: C.textSecondary, lineHeight: 1.65, maxWidth: "620px", margin: 0 }}>
             {reason}
           </p>
         </div>
