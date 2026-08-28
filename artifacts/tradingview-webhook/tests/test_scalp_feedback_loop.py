@@ -21,6 +21,8 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from unittest.mock import MagicMock, patch, call
 
+import pytest
+
 # ---------------------------------------------------------------------------
 # Minimal stubs — must be registered BEFORE importing gate_effectiveness
 # ---------------------------------------------------------------------------
@@ -35,7 +37,6 @@ def _make_app_stub():
     return stub
 
 _APP_STUB = _make_app_stub()
-sys.modules.setdefault("app", _APP_STUB)
 
 def _make_dbb_stub():
     stub = types.ModuleType("databento_brain")
@@ -43,9 +44,19 @@ def _make_dbb_stub():
     return stub
 
 _DBB_STUB = _make_dbb_stub()
-sys.modules.setdefault("databento_brain", _DBB_STUB)
 
 import gate_effectiveness as ge  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _isolated_dependency_modules(monkeypatch):
+    """Give every test fresh lazy-import dependencies, independent of order."""
+    global _APP_STUB, _DBB_STUB
+    _APP_STUB = _make_app_stub()
+    _DBB_STUB = _make_dbb_stub()
+    monkeypatch.setitem(sys.modules, "app", _APP_STUB)
+    monkeypatch.setitem(sys.modules, "databento_brain", _DBB_STUB)
+
 
 # ---------------------------------------------------------------------------
 # Shared test helpers
