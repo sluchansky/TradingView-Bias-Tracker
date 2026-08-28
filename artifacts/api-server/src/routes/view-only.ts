@@ -169,10 +169,10 @@ function noStoreHtml(res: any): void {
   res.set("referrer-policy", "no-referrer");
 }
 
-function fetchFlaskDashboard(): Promise<{ status: number; body: string }> {
+function fetchFlaskDashboard(flaskPort: number): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
     const r = http.request(
-      { hostname: "localhost", port: FLASK_PORT, path: "/dashboard", method: "GET" },
+      { hostname: "localhost", port: flaskPort, path: "/dashboard", method: "GET" },
       (pr) => {
         const chunks: Buffer[] = [];
         pr.on("data", (c) => chunks.push(c));
@@ -219,7 +219,7 @@ function noteFail(token: string): void {
   }
 }
 
-export function createViewOnlyRouter(): Router {
+export function createViewOnlyRouter(flaskPort = FLASK_PORT): Router {
   const router = Router();
 
   // GET /view — a signed session is required. A first-time viewer supplies an
@@ -257,7 +257,7 @@ export function createViewOnlyRouter(): Router {
     // ── Authenticated session → serve the read-only dashboard ────────────────
     let data: { status: number; body: string };
     try {
-      data = await fetchFlaskDashboard();
+      data = await fetchFlaskDashboard(flaskPort);
     } catch {
       res.status(502).set("cache-control", "no-store").send("Dashboard unavailable");
       return;
@@ -360,7 +360,7 @@ export function createViewOnlyRouter(): Router {
       ? "?" + new URLSearchParams(req.query as Record<string, string>).toString()
       : "";
     const preq = http.request(
-      { hostname: "localhost", port: FLASK_PORT, path: "/status" + query, method: "GET" },
+      { hostname: "localhost", port: flaskPort, path: "/status" + query, method: "GET" },
       (pr) => {
         res.status(pr.statusCode ?? 200);
         const ct = pr.headers["content-type"];
