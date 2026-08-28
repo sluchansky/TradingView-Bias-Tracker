@@ -379,6 +379,93 @@ const HISTORY_INSTRUMENTS = ['MGC', 'MNQ', 'MES', 'MYM'] as const;
 const HISTORY_MODES = ['SCALP', 'INTRADAY_TREND'] as const;
 
 type VerdictHistoryJump = { eventId: string | null; timestamp: string | null };
+type VerdictHistoryUrlState = {
+  instrument: string;
+  mode: string;
+  jump: VerdictHistoryJump;
+  error: string | null;
+};
+
+function readVerdictHistoryUrl(): VerdictHistoryUrlState {
+  const latest: VerdictHistoryUrlState = {
+    instrument: 'MGC',
+    mode: 'SCALP',
+    jump: { eventId: null, timestamp: null },
+    error: null,
+  };
+  try {
+    const query = new URLSearchParams(window.location.search);
+    const rawInstrument = query.get('instrument')?.trim().toUpperCase() || null;
+    const rawMode = query.get('mode')?.trim().toUpperCase() || null;
+    const eventId = query.get('event_id')?.trim() || null;
+    const timestamp = query.get('timestamp')?.trim() || null;
+    const hasIncidentUrlState = [rawInstrument, rawMode, eventId, timestamp].some(Boolean);
+    if (!hasIncidentUrlState) return latest;
+
+    const instrument = rawInstrument && (HISTORY_INSTRUMENTS as readonly string[]).includes(rawInstrument)
+      ? rawInstrument
+      : latest.instrument;
+    const mode = rawMode && (HISTORY_MODES as readonly string[]).includes(rawMode)
+      ? rawMode
+      : latest.mode;
+    let error: string | null = null;
+    if (!rawInstrument || !rawMode) {
+      error = 'The shared incident link is incomplete. It must include instrument, mode, and one exact incident locator.';
+    } else if (instrument !== rawInstrument) {
+      error = 'The shared incident link has an invalid instrument.';
+    } else if (mode !== rawMode) {
+      error = 'The shared incident link must use a canonical mode.';
+    } else if (Boolean(eventId) === Boolean(timestamp)) {
+      error = 'The shared incident link must include exactly one event ID or UTC timestamp.';
+    } else if (eventId && !/^[1-9]\d*$/.test(eventId)) {
+      error = 'The shared incident link has an invalid event ID.';
+    }
+    return {
+      instrument,
+      mode,
+      jump: { eventId, timestamp },
+      error,
+    };
+  } catch {
+    return { ...latest, error: 'The shared incident link could not be read.' };
+  }
+}
+
+function writeVerdictHistoryUrl(instrument: string, mode: string, eventId: number | string): void {
+  try {
+    const query = new URLSearchParams(window.location.search);
+    query.set('instrument', instrument);
+    query.set('mode', mode);
+    query.set('event_id', String(eventId));
+    query.delete('timestamp');
+    const search = query.toString();
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`,
+    );
+  } catch {
+    // URL state is a convenience for reopening an audit, never a prerequisite.
+  }
+}
+
+function clearVerdictHistoryUrl(): void {
+  try {
+    const query = new URLSearchParams(window.location.search);
+    query.delete('instrument');
+    query.delete('mode');
+    query.delete('event_id');
+    query.delete('timestamp');
+    const search = query.toString();
+    window.history.replaceState(
+      null,
+      '',
+      `${window.location.pathname}${search ? `?${search}` : ''}${window.location.hash}`,
+    );
+  } catch {
+    // URL state is a convenience for reopening an audit, never a prerequisite.
+  }
+}
 
 function useVerdictHistory(
   instrument: string,
@@ -387,13 +474,18 @@ function useVerdictHistory(
   beforeEventId: number | null,
   throughEventId: number | null,
   jump: VerdictHistoryJump,
+  urlError: string | null,
 ) {
   const [state, setState] = useState<{ data: VerdictHistoryResponse | null; loading: boolean; error: string | null }>({
-    data: null, loading: true, error: null,
+    data: null, loading: !urlError, error: urlError,
   });
   const [revision, setRevision] = useState(0);
   useEffect(() => {
     let cancelled = false;
+    if (urlError) {
+      setState({ data: null, loading: false, error: urlError });
+      return () => { cancelled = true; };
+    }
     setState(s => ({ ...s, loading: true, error: null }));
     const query = new URLSearchParams({ instrument, mode, limit: String(limit) });
     if (jump.eventId) {
@@ -419,7 +511,7 @@ function useVerdictHistory(
       if (!cancelled) setState({ data: null, loading: false, error: error instanceof Error ? error.message : 'History unavailable' });
     });
     return () => { cancelled = true; };
-  }, [instrument, mode, limit, beforeEventId, throughEventId, jump.eventId, jump.timestamp, revision]);
+  }, [instrument, mode, limit, beforeEventId, throughEventId, jump.eventId, jump.timestamp, revision, urlError]);
   return { ...state, refresh: () => setRevision(value => value + 1) };
 }
 
@@ -433,6 +525,7 @@ function historyDate(value: string | null): string {
 }
 
 function historyErrorLabel(error: string | null, jump: VerdictHistoryJump, instrument: string, mode: string): string {
+  if (error?.startsWith('The shared incident link')) return error;
   if (jump.eventId || jump.timestamp) {
     if (error === 'jump_target_not_found') {
       return `No incident found in ${instrument} · ${mode} for that exact locator.`;
@@ -446,6 +539,7 @@ function historyErrorLabel(error: string | null, jump: VerdictHistoryJump, instr
 }
 
 function historyErrorTestId(error: string | null, jump: VerdictHistoryJump): string {
+  if (error?.startsWith('The shared incident link')) return 'status-history-jump-invalid';
   if (!jump.eventId && !jump.timestamp) return 'status-history-unavailable';
   if (error === 'jump_target_not_found') return 'status-history-jump-not-found';
   if (error === 'invalid_event_id' || error === 'invalid_timestamp' || error === 'invalid_jump') {
@@ -455,20 +549,27 @@ function historyErrorTestId(error: string | null, jump: VerdictHistoryJump): str
 }
 
 const VerdictHistoryPage: React.FC = () => {
-  const [instrument, setInstrument] = useState<string>('MGC');
-  const [mode, setMode] = useState<string>('SCALP');
+  const [initialUrlState] = useState<VerdictHistoryUrlState>(() => readVerdictHistoryUrl());
+  const [instrument, setInstrument] = useState<string>(initialUrlState.instrument);
+  const [mode, setMode] = useState<string>(initialUrlState.mode);
   const [limit, setLimit] = useState(100);
   const [beforeEventId, setBeforeEventId] = useState<number | null>(null);
   const [throughEventId, setThroughEventId] = useState<number | null>(null);
   const [cursorStack, setCursorStack] = useState<Array<{ before: number | null; through: number | null }>>([]);
   const [pageNumber, setPageNumber] = useState(0);
-  const [jumpEventId, setJumpEventId] = useState('');
-  const [jumpTimestamp, setJumpTimestamp] = useState('');
+  const [jumpEventId, setJumpEventId] = useState(initialUrlState.jump.eventId ?? '');
+  const [jumpTimestamp, setJumpTimestamp] = useState(initialUrlState.jump.timestamp ?? '');
   const [jumpValidation, setJumpValidation] = useState<string | null>(null);
-  const [jump, setJump] = useState<VerdictHistoryJump>({ eventId: null, timestamp: null });
+  const [urlError, setUrlError] = useState<string | null>(initialUrlState.error);
+  const [jump, setJump] = useState<VerdictHistoryJump>(initialUrlState.jump);
   const { data, loading, error, refresh } = useVerdictHistory(
-    instrument, mode, limit, beforeEventId, throughEventId, jump,
+    instrument, mode, limit, beforeEventId, throughEventId, jump, urlError,
   );
+  useEffect(() => {
+    if (data?.jump?.status === 'RESOLVED' && data.jump.resolved_event_id != null) {
+      writeVerdictHistoryUrl(instrument, mode, data.jump.resolved_event_id);
+    }
+  }, [data?.jump?.status, data?.jump?.resolved_event_id, instrument, mode]);
   const resetPagination = () => {
     setCursorStack([]);
     setBeforeEventId(null);
@@ -476,6 +577,8 @@ const VerdictHistoryPage: React.FC = () => {
     setPageNumber(0);
     setJump({ eventId: null, timestamp: null });
     setJumpValidation(null);
+    setUrlError(null);
+    clearVerdictHistoryUrl();
   };
   const submitJump = () => {
     const eventValue = jumpEventId.trim();
@@ -485,6 +588,8 @@ const VerdictHistoryPage: React.FC = () => {
       return;
     }
     setJumpValidation(null);
+    setUrlError(null);
+    clearVerdictHistoryUrl();
     setCursorStack([]);
     setBeforeEventId(null);
     setThroughEventId(null);
@@ -589,7 +694,7 @@ const VerdictHistoryPage: React.FC = () => {
       </div>
       {loading ? <HistorySkeleton /> : error ? (
         <div data-testid={historyErrorTestId(error, jump)} role="status" style={historyEmptyStyle}>
-          <strong style={{ color:T.amber }}>{jump.eventId || jump.timestamp ? 'Incident lookup did not resolve' : 'History unavailable'}</strong>
+          <strong style={{ color:T.amber }}>{jump.eventId || jump.timestamp || error.startsWith('The shared incident link') ? 'Incident lookup did not resolve' : 'History unavailable'}</strong>
           <span style={{ color:T.txtMuted, marginTop:6 }}>{historyErrorLabel(error, jump, instrument, mode)}</span>
           <button data-testid="button-retry-verdict-history" onClick={refresh} style={{ ...historyButtonStyle, marginTop:14 }}>Retry</button>
         </div>

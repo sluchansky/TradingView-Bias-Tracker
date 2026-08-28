@@ -59,6 +59,21 @@ describe('immutable verdict history operator contract', () => {
     expect(source).toContain('Timestamp jumps select the first immutable event recorded at or after');
   });
 
+  it('restores and shares only resolved, canonical, read-only incident links', () => {
+    expect(source).toContain('readVerdictHistoryUrl');
+    expect(source).toContain('writeVerdictHistoryUrl(instrument, mode, data.jump.resolved_event_id)');
+    expect(source).toContain("query.set('instrument', instrument)");
+    expect(source).toContain("query.set('mode', mode)");
+    expect(source).toContain("query.set('event_id', String(eventId))");
+    expect(source).toContain("window.history.replaceState");
+    expect(source).toContain('HISTORY_INSTRUMENTS');
+    expect(source).toContain('HISTORY_MODES');
+    expect(source).toContain('The shared incident link is incomplete.');
+    expect(source).toContain('The shared incident link must use a canonical mode.');
+    expect(source).toContain('urlError');
+    expect(source).toContain('clearVerdictHistoryUrl');
+  });
+
   it('keeps missing and broken incident results explicit with no alternate data', () => {
     expect(source).toContain('status-history-jump-not-found');
     expect(source).toContain('status-history-jump-unavailable');
