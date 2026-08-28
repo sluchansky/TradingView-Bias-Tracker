@@ -74995,13 +74995,35 @@ async function api(path, body=null) {
   }
 }
 
-// Owner-only: mint a WATCH-ONLY, expiring, password-protected link that lets other
-// View-only link — just the base /view URL, no password, always live.
-function shareViewLink() {
-  var base = window.location.origin;
-  var url = base + '/view';
-  try { navigator.clipboard.writeText(url); } catch(e) {}
-  alert('View-only link: ' + url + ' -- Anyone with this URL can watch your live dashboard (read-only, no controls). No password. Copied to clipboard.');
+// Owner-only: verify the public watch boundary before copying a link. The
+// server does the probe and mints the link only after the published host proves
+// it serves the current read-only implementation.
+async function shareViewLink() {
+  try {
+    var r = await fetch(BASE + '/view-link', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: '{}',
+      cache: 'no-store',
+      credentials: 'same-origin'
+    });
+    var data = await r.json();
+    if (!r.ok || !data || !data.url || !data.publish || data.publish.ok !== true) {
+      var warning = data && data.error === 'publish_stale'
+        ? 'The published watch page is stale or missing current read-only protection.'
+        : 'The public watch page could not be reached.';
+      alert('Watch link not shared: ' + warning + ' No link was copied.');
+      return;
+    }
+    var copied = false;
+    try {
+      await navigator.clipboard.writeText(data.url);
+      copied = true;
+    } catch(copyErr) {}
+    alert('Verified view-only link: ' + data.url + ' -- Password: ' + data.password + ' -- Anyone with this URL and password can watch the live dashboard (read-only, no controls). ' + (copied ? 'Copied to clipboard.' : 'Copy the link manually.'));
+  } catch(e) {
+    alert('Watch link not shared: the public watch page could not be verified. No link was copied.');
+  }
 }
 
 async function enterTrade() {

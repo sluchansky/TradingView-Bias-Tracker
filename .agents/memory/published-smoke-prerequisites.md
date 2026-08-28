@@ -3,8 +3,8 @@ name: Published smoke prerequisites
 description: Caveats for proving a security boundary on the real published host rather than only in local tests.
 ---
 
-Published deployment metadata is not sufficient evidence for a live smoke: a deployment may be marked public with a successful build while both public hostnames time out, and the active publish may lag behind the current branch.
+Published deployment metadata is not sufficient evidence for a live smoke or a shareable link: a deployment may be marked public with a successful build while its public host times out or serves an older revision.
 
-**Why:** Production routing and the published revision are outside the local test process; a passing unit test cannot prove that the Replit proxy serves the hardened route.
+**Why:** Production routing and the active revision are outside the local test process. A passing unit test or metadata health flag cannot prove that the public proxy serves the hardened route.
 
-**How to apply:** Before a published security smoke, obtain the production URL from deployment metadata, check a fast health endpoint over HTTPS on every reported public host, and confirm the current code has been published. If the host does not return, report the smoke as blocked instead of treating deployment metadata as a pass.
+**How to apply:** Before sharing or smoke-testing a security-sensitive public route, probe a versioned read-only marker through the public HTTPS boundary. Use a trusted canonical origin or verified proxy host metadata, no credentials, an absolute deadline, and a small response cap. Treat missing markers as stale and transport/current-service failures as unavailable; never mint or present a link after either result.

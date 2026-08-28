@@ -1,5 +1,7 @@
 import { Router } from "express";
 import http from "http";
+import https from "https";
+import { randomUUID } from "node:crypto";
 import {
   viewConfigured,
   verifyLinkToken,
@@ -22,12 +24,126 @@ const DEV = process.env.NODE_ENV === "development";
 const FLASK_PORT = 8000;
 const COOKIE = "vsess";
 const STATUS_PATH = "/view/api/status"; // the ONLY path the injected fetch allows
+export const WATCH_LINK_PROTOCOL = "watch-only-v2";
+const WATCH_LINK_MARKER = `<meta name="watch-link-protocol" content="${WATCH_LINK_PROTOCOL}">`;
+const PUBLISH_PROBE_TIMEOUT_MS = 5_000;
+const PUBLISH_PROBE_MAX_BYTES = 64 * 1024;
+const LOCAL_DASHBOARD_HEALTH_TIMEOUT_MS = 3_000;
+const LOCAL_DASHBOARD_HEALTH_MAX_BYTES = 4 * 1024 * 1024;
+
+export type PublishedWatchCheck =
+  | { ok: true; status: number }
+  | { ok: false; reason: "unreachable" | "stale" };
+
+/**
+ * Verify the behavior that a newly shared /view link will actually receive.
+ * This intentionally probes the public origin rather than localhost: deployment
+ * metadata can be healthy while the public routing boundary still serves an
+ * older revision or does not answer at all.
+ */
+export function checkPublishedWatchHost(
+  origin: string,
+  timeoutMs = PUBLISH_PROBE_TIMEOUT_MS,
+): Promise<PublishedWatchCheck> {
+  let target: URL;
+  try {
+    target = new URL(origin);
+    if (
+      !["http:", "https:"].includes(target.protocol)
+      || target.username
+      || target.password
+      || target.pathname !== "/"
+      || target.search
+      || target.hash
+    ) {
+      return Promise.resolve({ ok: false, reason: "stale" });
+    }
+  } catch {
+    return Promise.resolve({ ok: false, reason: "stale" });
+  }
+
+  const transport = target.protocol === "https:" ? https : http;
+  const probePath = `/view/healthz?__watch_link_probe=${encodeURIComponent(randomUUID())}`;
+
+  return new Promise((resolve) => {
+    let settled = false;
+    let response: http.IncomingMessage | undefined;
+    let request: http.ClientRequest | undefined;
+    let deadline: NodeJS.Timeout | undefined;
+    const finish = (result: PublishedWatchCheck): void => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      resolve(result);
+    };
+    request = transport.request(
+      {
+        hostname: target.hostname,
+        port: target.port || undefined,
+        path: probePath,
+        method: "GET",
+        headers: {
+          accept: "text/html",
+          "accept-encoding": "identity",
+          "cache-control": "no-cache",
+          "user-agent": "watch-link-publish-probe/1",
+        },
+      },
+      (incoming) => {
+        response = incoming;
+        const chunks: Buffer[] = [];
+        let total = 0;
+        incoming.on("data", (chunk: Buffer | string) => {
+          const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          total += data.length;
+          if (total > PUBLISH_PROBE_MAX_BYTES) {
+            incoming.destroy();
+            finish({ ok: false, reason: "stale" });
+            return;
+          }
+          chunks.push(data);
+        });
+        incoming.on("end", () => {
+          const status = incoming.statusCode ?? 0;
+          const body = Buffer.concat(chunks).toString("utf8");
+          const protocolHeader = String(incoming.headers["x-watch-link-protocol"] ?? "");
+          let payload: { status?: unknown; protocol?: unknown } = {};
+          try {
+            payload = JSON.parse(body);
+          } catch {
+            // A stale publish may answer with its SPA or a legacy HTML page.
+          }
+          const currentProtocol = protocolHeader === WATCH_LINK_PROTOCOL
+            && payload.protocol === WATCH_LINK_PROTOCOL;
+          if (!currentProtocol) {
+            finish({ ok: false, reason: "stale" });
+            return;
+          }
+          finish(
+            status === 200 && payload.status === "ok"
+              ? { ok: true, status }
+              : { ok: false, reason: "unreachable" },
+          );
+        });
+        incoming.on("error", () => finish({ ok: false, reason: "unreachable" }));
+      },
+    );
+    deadline = setTimeout(() => {
+      response?.destroy();
+      request?.destroy();
+      finish({ ok: false, reason: "unreachable" });
+    }, timeoutMs);
+    request.on("error", () => finish({ ok: false, reason: "unreachable" }));
+    request.end();
+  });
+}
 
 // ── read-only <head> injection: hide controls, stub non-status fetches, add
 //    copy deterrents (best-effort — the server-side /status-only gate is the
 //    real protection), and a "VIEW ONLY" badge. ────────────────────────────
 const READONLY_HEAD = `
 <meta name="referrer" content="no-referrer">
+${WATCH_LINK_MARKER}
 <style id="ro-style">
   #view-nav,#btn-share-view{display:none!important}
   #view-backtest,#view-tradezella,#view-research,#view-academy{display:none!important}
@@ -169,19 +285,60 @@ function noStoreHtml(res: any): void {
   res.set("referrer-policy", "no-referrer");
 }
 
-function fetchFlaskDashboard(flaskPort: number): Promise<{ status: number; body: string }> {
+function fetchFlaskDashboard(
+  flaskPort: number,
+  options: { timeoutMs?: number; maxBytes?: number } = {},
+): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
+    let settled = false;
+    let response: http.IncomingMessage | undefined;
+    let deadline: NodeJS.Timeout | undefined;
+    const finishResolve = (value: { status: number; body: string }): void => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      resolve(value);
+    };
+    const finishReject = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      if (deadline) clearTimeout(deadline);
+      reject(error);
+    };
     const r = http.request(
       { hostname: "localhost", port: flaskPort, path: "/dashboard", method: "GET" },
       (pr) => {
+        response = pr;
         const chunks: Buffer[] = [];
-        pr.on("data", (c) => chunks.push(c));
+        let total = 0;
+        pr.on("data", (chunk: Buffer | string) => {
+          const data = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+          total += data.length;
+          if (options.maxBytes != null && total > options.maxBytes) {
+            pr.destroy();
+            r.destroy();
+            finishReject(new Error("dashboard response too large"));
+            return;
+          }
+          chunks.push(data);
+        });
         pr.on("end", () =>
-          resolve({ status: pr.statusCode ?? 200, body: Buffer.concat(chunks).toString("utf8") }),
+          finishResolve({
+            status: pr.statusCode ?? 200,
+            body: Buffer.concat(chunks).toString("utf8"),
+          }),
         );
+        pr.on("error", (error) => finishReject(error));
       },
     );
-    r.on("error", reject);
+    if (options.timeoutMs != null) {
+      deadline = setTimeout(() => {
+        response?.destroy();
+        r.destroy();
+        finishReject(new Error("dashboard health timeout"));
+      }, options.timeoutMs);
+    }
+    r.on("error", (error) => finishReject(error));
     r.end();
   });
 }
@@ -221,6 +378,51 @@ function noteFail(token: string): void {
 
 export function createViewOnlyRouter(flaskPort = FLASK_PORT): Router {
   const router = Router();
+  let healthInFlight: Promise<boolean> | null = null;
+
+  const dashboardHealthy = (): Promise<boolean> => {
+    if (healthInFlight) return healthInFlight;
+    healthInFlight = (async () => {
+      try {
+        const data = await fetchFlaskDashboard(flaskPort, {
+          timeoutMs: LOCAL_DASHBOARD_HEALTH_TIMEOUT_MS,
+          maxBytes: LOCAL_DASHBOARD_HEALTH_MAX_BYTES,
+        });
+        if (data.status !== 200) return false;
+        transformDashboard(data.body);
+        return true;
+      } catch {
+        return false;
+      }
+    })().finally(() => {
+      healthInFlight = null;
+    });
+    return healthInFlight;
+  };
+
+  // GET /view/healthz — public, bounded, and read-only. The pre-share check
+  // reaches this through the published hostname, then this route verifies that
+  // the local dashboard HTML is available and still accepts the read-only
+  // transform. It exposes no market, journal, research, or execution data.
+  router.get("/healthz", async (_req: any, res: any) => {
+    res.set("cache-control", "no-store");
+    res.set("x-watch-link-protocol", WATCH_LINK_PROTOCOL);
+    if (!viewConfigured()) {
+      res.status(503).json({
+        status: "unavailable",
+        protocol: WATCH_LINK_PROTOCOL,
+      });
+      return;
+    }
+    if (await dashboardHealthy()) {
+      res.status(200).json({ status: "ok", protocol: WATCH_LINK_PROTOCOL });
+      return;
+    }
+    res.status(503).json({
+      status: "unavailable",
+      protocol: WATCH_LINK_PROTOCOL,
+    });
+  });
 
   // GET /view — a signed session is required. A first-time viewer supplies an
   // expiring signed link token, then logs in to receive that session. There is
@@ -274,6 +476,7 @@ export function createViewOnlyRouter(flaskPort = FLASK_PORT): Router {
       return;
     }
     noStoreHtml(res);
+    res.set("x-watch-link-protocol", WATCH_LINK_PROTOCOL);
     res.status(200).send(outHtml);
   });
 
