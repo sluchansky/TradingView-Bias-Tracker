@@ -343,6 +343,20 @@ export function createViewOnlyRouter(flaskPort = FLASK_PORT): Router {
     res.status(200).send(pageShell("Logged out", "<h1>Logged out</h1><p>You can close this tab.</p>"));
   });
 
+  // Express does not route an encoded slash such as /api%2Ftraderspost through
+  // the /api fallback below. Inspect the raw router URL first so path
+  // obfuscation cannot turn a view-only request into a 404 (or, after a future
+  // routing change, reach an owner endpoint). Only the literal status path is
+  // allowed to continue to the read-only handler.
+  router.use((req: any, res: any, next: any) => {
+    const rawPath = String(req.url ?? "").split("?")[0];
+    if (/^\/api(?:\/|%2f)/i.test(rawPath) && rawPath !== "/api/status") {
+      res.status(403).json({ error: "forbidden (view-only)" });
+      return;
+    }
+    next();
+  });
+
   // GET /view/api/status — the ONLY data path viewers get. Upstream path is
   // HARDCODED to /status (traversal-proof); only the query is relayed. A signed
   // view session is required, so this endpoint cannot expose market data to an

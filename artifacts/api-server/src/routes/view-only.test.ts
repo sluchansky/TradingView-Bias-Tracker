@@ -9,7 +9,13 @@ const DASHBOARD_PASSWORD = "view-only-boundary-test-password";
 
 const ownerActions = [
   {
-    name: "execution",
+    name: "execution GET",
+    method: "GET" as const,
+    path: "/view/api/traderspost",
+    body: undefined,
+  },
+  {
+    name: "execution POST",
     method: "POST" as const,
     path: "/view/api/traderspost",
     body: { ticker: "MGC", contracts: 1 },
@@ -26,10 +32,43 @@ const ownerActions = [
     path: "/view/api/paper-sim/reprocess",
     body: { ledger: "scalp", id: 42, fetch_verified_history: true },
   },
+  {
+    name: "strategy delete",
+    method: "DELETE" as const,
+    path: "/view/api/strategy-trades/42",
+    body: undefined,
+  },
+];
+
+const obfuscatedOwnerActions = [
+  {
+    name: "encoded separator",
+    method: "GET" as const,
+    path: "/view/api%2Ftraderspost",
+    body: undefined,
+  },
+  {
+    name: "encoded separator lowercase",
+    method: "POST" as const,
+    path: "/view/api%2ftraderspost",
+    body: { ticker: "MGC", contracts: 1 },
+  },
+  {
+    name: "dot segment",
+    method: "PATCH" as const,
+    path: "/view/api/./journal/trade/native/42/review",
+    body: { overall_quality: 1 },
+  },
+  {
+    name: "parent dot segment",
+    method: "DELETE" as const,
+    path: "/view/api/journal/trade/native/42/../42",
+    body: undefined,
+  },
 ];
 
 describe("watch-only session boundary", () => {
-  it("reads status but rejects owner actions without reaching the upstream fixture", async () => {
+  it("reads status but rejects owner actions and obfuscated paths without reaching the upstream fixture", async () => {
     const received: Array<{ method: string; path: string }> = [];
     const upstream = http.createServer((req, res) => {
       received.push({ method: req.method ?? "", path: req.url ?? "" });
@@ -68,13 +107,18 @@ describe("watch-only session boundary", () => {
       expect(status.status).toBe(200);
       expect(status.body).toEqual({ ok: true, test_fixture: true, ticker: "MGC" });
 
-      for (const action of ownerActions) {
-        const actionRequest = action.method === "PATCH"
-          ? request(app).patch(action.path)
-          : request(app).post(action.path);
-        const response = await actionRequest
-          .set("Cookie", `vsess=${session}`)
-          .send(action.body);
+      for (const action of [...ownerActions, ...obfuscatedOwnerActions]) {
+        const actionRequest = action.method === "GET"
+          ? request(app).get(action.path)
+          : action.method === "PATCH"
+            ? request(app).patch(action.path)
+            : action.method === "DELETE"
+              ? request(app).delete(action.path)
+              : request(app).post(action.path);
+        const preparedRequest = action.body === undefined
+          ? actionRequest
+          : actionRequest.send(action.body);
+        const response = await preparedRequest.set("Cookie", `vsess=${session}`);
 
         expect(response.status, `${action.name} status`).toBe(403);
         expect(response.body, `${action.name} body`).toEqual({
