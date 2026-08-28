@@ -43,3 +43,15 @@ arrive.
 
 **How to apply:** Reject missing, conflicting, or out-of-scope cursor events;
 report the actual verified boundary event ID; never gap-seek to a nearby row.
+
+Direct incident jumps must resolve an exact scoped event ID, or the first scoped
+recording at/after a requested timestamp, into the existing inclusive `through`
+cursor rather than introducing a separate window query.
+
+**Why:** Reusing the validated cursor path keeps both chain boundaries visible
+and prevents a missing or cross-scope locator from silently substituting nearby
+history or live state.
+
+**How to apply:** Keep jump resolution read-only and instrument/mode-bound;
+return explicit invalid, not-found, unavailable, and broken states with no
+fallback data.

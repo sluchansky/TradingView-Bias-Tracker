@@ -6481,8 +6481,6 @@ def get_volatility(ticker):
 _HTF_LAST_REFRESH_TS = [0.0]  # monotonic ts of the last HTF refresh (throttle)
 
 
-
-
 def _refresh_htf_if_due(force=False):
     """No-op: Yahoo Finance removed. HTF data arrives via Pine Script webhooks
     only (SWING_EMA_UPDATE / htf-overlay). compute_swing_context() fails-open
@@ -9857,7 +9855,6 @@ def _ingest_htf_overlay(data, resolved_inst, normalized):
     except Exception as exc:  # additive overlay must never break the webhook
         logger.warning("HTF overlay ingest error for %s: %s", resolved_inst, exc)
         return None
-
 
 
 def _managed_watch_loop():
@@ -26246,7 +26243,6 @@ def _mb_analyst_notebook(result, inst, all_rows=None):
         return {}
 
 
-
 def compute_market_narrative(result, inst):
     """Synthesize the session story at READ time from persisted market_events grouped
     Overnight / London / NY Open / NY Session, plus a live Current + Expectation line.
@@ -38952,7 +38948,6 @@ def _mb_capture_cognitive(result):
         pass
 
 
-
 # ══ Data Feed Status — Phase 1: alert-driven data feed monitoring (DISPLAY-ONLY) ══
 # Surfaces per-instrument alert/price freshness so the dashboard clearly shows
 # DATA MODE: ALERT-ONLY and warns when data is stale.  Never touches gate/scoring.
@@ -39468,8 +39463,6 @@ def compute_thesis_tracker(inst, result):
             except Exception: pass
     res = _mb_cached(("thesis_trk", inst), 15.0, _produce)
     return res if isinstance(res, dict) else {"available": False, "snapshots": [], "pattern": None}
-
-
 
 
 def _mb_event_throttled(instrument, event_type, fingerprint, state, ttl_secs=900):
@@ -41995,7 +41988,6 @@ def _nj_delete_screenshot(internal_trade_id, attachment_id):
 # ─────────────────────────────────────────────────────────────────────────────
 # End Native Journal Phase C helpers
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 
 def _dq_has_active_trade(inst, direction):
@@ -87010,7 +87002,6 @@ def alerts_mute():
     return jsonify({"status": "ok", "muted": snapshot}), 200
 
 
-
 @app.route("/micro-scalp", methods=["GET", "POST"])
 def micro_scalp_toggle():
     """Read or set the MICRO SCALP MODE toggle + the LIVE arm + the ghost ledger.
@@ -88609,12 +88600,47 @@ def route_authoritative_verdict_history():
                     "ok": False, "available": False, "read_only": True,
                     "observer_only": True, "error": "invalid_cursor",
                 }), 400
+        jump_event_raw = next((
+            request.args.get(name) for name in (
+                "event_id", "jump_event_id", "start_event_id"
+            ) if request.args.get(name) not in (None, "")
+        ), None)
+        jump_timestamp_raw = next((
+            request.args.get(name) for name in (
+                "timestamp", "jump_timestamp", "start_timestamp"
+            ) if request.args.get(name) not in (None, "")
+        ), None)
+        if jump_event_raw is not None and jump_timestamp_raw is not None:
+            return jsonify({
+                "ok": False, "available": False, "read_only": True,
+                "observer_only": True, "error": "invalid_jump",
+            }), 400
+        jump_kwargs = {}
+        if jump_event_raw is not None:
+            try:
+                jump_event_id = int(jump_event_raw)
+                if jump_event_id <= 0:
+                    raise ValueError("event id must be positive")
+            except (TypeError, ValueError):
+                return jsonify({
+                    "ok": False, "available": False, "read_only": True,
+                    "observer_only": True, "error": "invalid_event_id",
+                }), 400
+            jump_kwargs["event_id"] = jump_event_id
+        elif jump_timestamp_raw is not None:
+            jump_kwargs["timestamp"] = jump_timestamp_raw
+        if jump_kwargs and (before_event_id is not None or through_event_id is not None):
+            return jsonify({
+                "ok": False, "available": False, "read_only": True,
+                "observer_only": True, "error": "invalid_jump_cursor",
+            }), 400
         return jsonify(_avh.get_history_report(
             instrument,
             mode,
             limit,
             before_event_id=before_event_id,
             through_event_id=through_event_id,
+            **jump_kwargs,
         ))
     except Exception as exc:
         logger.warning("authoritative verdict history read failed: %s", exc)

@@ -351,6 +351,13 @@ type VerdictHistoryResponse = {
   mode: string;
   count: number;
   chain: { status: 'EMPTY' | 'VALID' | 'PARTIAL' | 'BROKEN'; roots: number; contiguous: number; breaks: number; partial: boolean };
+  jump: {
+    status: 'NONE' | 'RESOLVED' | 'NOT_FOUND' | 'UNAVAILABLE' | 'INVALID';
+    requested_event_id: string | number | null;
+    requested_timestamp: string | null;
+    resolved_event_id: number | null;
+    resolved_recorded_at: string | null;
+  };
   events: VerdictHistoryEvent[];
   page: {
     before_event_id: number | null;
@@ -371,7 +378,16 @@ type VerdictHistoryResponse = {
 const HISTORY_INSTRUMENTS = ['MGC', 'MNQ', 'MES', 'MYM'] as const;
 const HISTORY_MODES = ['SCALP', 'INTRADAY_TREND'] as const;
 
-function useVerdictHistory(instrument: string, mode: string, limit: number, beforeEventId: number | null, throughEventId: number | null) {
+type VerdictHistoryJump = { eventId: string | null; timestamp: string | null };
+
+function useVerdictHistory(
+  instrument: string,
+  mode: string,
+  limit: number,
+  beforeEventId: number | null,
+  throughEventId: number | null,
+  jump: VerdictHistoryJump,
+) {
   const [state, setState] = useState<{ data: VerdictHistoryResponse | null; loading: boolean; error: string | null }>({
     data: null, loading: true, error: null,
   });
@@ -380,7 +396,11 @@ function useVerdictHistory(instrument: string, mode: string, limit: number, befo
     let cancelled = false;
     setState(s => ({ ...s, loading: true, error: null }));
     const query = new URLSearchParams({ instrument, mode, limit: String(limit) });
-    if (beforeEventId != null && Number.isInteger(beforeEventId) && beforeEventId > 0) {
+    if (jump.eventId) {
+      query.set('event_id', jump.eventId);
+    } else if (jump.timestamp) {
+      query.set('timestamp', jump.timestamp);
+    } else if (beforeEventId != null && Number.isInteger(beforeEventId) && beforeEventId > 0) {
       query.set('before_event_id', String(beforeEventId));
     } else if (throughEventId != null && Number.isInteger(throughEventId) && throughEventId > 0) {
       query.set('through_event_id', String(throughEventId));
@@ -388,8 +408,9 @@ function useVerdictHistory(instrument: string, mode: string, limit: number, befo
     fetch(`/api/authoritative-verdict-history?${query.toString()}`, {
       credentials: 'include', headers: getAuthHeader(),
     }).then(async response => {
-      if (!response.ok) throw new Error(`History unavailable (${response.status})`);
-      const body = await response.json() as VerdictHistoryResponse;
+      const body = await response.json().catch(() => null) as VerdictHistoryResponse | null;
+      if (!response.ok) throw new Error(body?.error || `History unavailable (${response.status})`);
+      if (!body) throw new Error('History unavailable');
       if (!body.available || body.ok === false) throw new Error(body.error || 'History unavailable');
       return body;
     }).then(data => {
@@ -398,7 +419,7 @@ function useVerdictHistory(instrument: string, mode: string, limit: number, befo
       if (!cancelled) setState({ data: null, loading: false, error: error instanceof Error ? error.message : 'History unavailable' });
     });
     return () => { cancelled = true; };
-  }, [instrument, mode, limit, beforeEventId, throughEventId, revision]);
+  }, [instrument, mode, limit, beforeEventId, throughEventId, jump.eventId, jump.timestamp, revision]);
   return { ...state, refresh: () => setRevision(value => value + 1) };
 }
 
@@ -411,6 +432,28 @@ function historyDate(value: string | null): string {
   });
 }
 
+function historyErrorLabel(error: string | null, jump: VerdictHistoryJump, instrument: string, mode: string): string {
+  if (jump.eventId || jump.timestamp) {
+    if (error === 'jump_target_not_found') {
+      return `No incident found in ${instrument} · ${mode} for that exact locator.`;
+    }
+    if (error === 'invalid_event_id' || error === 'invalid_timestamp' || error === 'invalid_jump') {
+      return 'The incident locator is invalid. Enter one positive event ID or one UTC timestamp.';
+    }
+    return 'The incident history is unavailable for that locator. No live or alternate data is shown.';
+  }
+  return error || 'History unavailable';
+}
+
+function historyErrorTestId(error: string | null, jump: VerdictHistoryJump): string {
+  if (!jump.eventId && !jump.timestamp) return 'status-history-unavailable';
+  if (error === 'jump_target_not_found') return 'status-history-jump-not-found';
+  if (error === 'invalid_event_id' || error === 'invalid_timestamp' || error === 'invalid_jump') {
+    return 'status-history-jump-invalid';
+  }
+  return 'status-history-jump-unavailable';
+}
+
 const VerdictHistoryPage: React.FC = () => {
   const [instrument, setInstrument] = useState<string>('MGC');
   const [mode, setMode] = useState<string>('SCALP');
@@ -419,12 +462,42 @@ const VerdictHistoryPage: React.FC = () => {
   const [throughEventId, setThroughEventId] = useState<number | null>(null);
   const [cursorStack, setCursorStack] = useState<Array<{ before: number | null; through: number | null }>>([]);
   const [pageNumber, setPageNumber] = useState(0);
-  const { data, loading, error, refresh } = useVerdictHistory(instrument, mode, limit, beforeEventId, throughEventId);
+  const [jumpEventId, setJumpEventId] = useState('');
+  const [jumpTimestamp, setJumpTimestamp] = useState('');
+  const [jumpValidation, setJumpValidation] = useState<string | null>(null);
+  const [jump, setJump] = useState<VerdictHistoryJump>({ eventId: null, timestamp: null });
+  const { data, loading, error, refresh } = useVerdictHistory(
+    instrument, mode, limit, beforeEventId, throughEventId, jump,
+  );
   const resetPagination = () => {
     setCursorStack([]);
     setBeforeEventId(null);
     setThroughEventId(null);
     setPageNumber(0);
+    setJump({ eventId: null, timestamp: null });
+    setJumpValidation(null);
+  };
+  const submitJump = () => {
+    const eventValue = jumpEventId.trim();
+    const timestampValue = jumpTimestamp.trim();
+    if (Boolean(eventValue) === Boolean(timestampValue)) {
+      setJumpValidation('Enter either an exact event ID or a UTC timestamp, not both.');
+      return;
+    }
+    setJumpValidation(null);
+    setCursorStack([]);
+    setBeforeEventId(null);
+    setThroughEventId(null);
+    setPageNumber(0);
+    setJump({
+      eventId: eventValue || null,
+      timestamp: timestampValue || null,
+    });
+  };
+  const clearJump = () => {
+    setJumpEventId('');
+    setJumpTimestamp('');
+    resetPagination();
   };
   const loadOlder = () => {
     if (!data?.page.has_older || data.page.older_before_event_id == null || loading) return;
@@ -432,6 +505,7 @@ const VerdictHistoryPage: React.FC = () => {
       before: data.page.resume_before_event_id,
       through: data.page.resume_through_event_id,
     }]);
+    setJump({ eventId: null, timestamp: null });
     setBeforeEventId(data.page.older_before_event_id);
     setThroughEventId(null);
     setPageNumber(page => page + 1);
@@ -444,7 +518,8 @@ const VerdictHistoryPage: React.FC = () => {
       setBeforeEventId(priorCursor.before);
       setThroughEventId(priorCursor.through);
       setPageNumber(page => Math.max(0, page - 1));
-    } else if (throughEventId != null) {
+    } else if (throughEventId != null || jump.eventId != null || jump.timestamp != null) {
+      setJump({ eventId: null, timestamp: null });
       setBeforeEventId(null);
       setThroughEventId(null);
     }
@@ -453,6 +528,22 @@ const VerdictHistoryPage: React.FC = () => {
   const chainColor = chain?.status === 'VALID' ? T.green : chain?.status === 'BROKEN' ? T.red : chain?.status === 'PARTIAL' ? T.amber : T.txtMuted;
   const boundaryStatus = data?.page?.newer_boundary_status ?? 'EMPTY';
   const boundaryColor = boundaryStatus === 'BROKEN' ? T.red : boundaryStatus === 'CONTIGUOUS' ? T.green : boundaryStatus === 'ROOT' ? T.cyan : T.txtMuted;
+  const olderBoundaryStatus = data?.events?.[0]?.chain_status ?? 'EMPTY';
+  const olderBoundaryColor = olderBoundaryStatus === 'BROKEN' ? T.red : olderBoundaryStatus === 'WINDOW_START' ? T.amber : olderBoundaryStatus === 'ROOT' ? T.cyan : T.green;
+  const newerBoundaryLabel = boundaryStatus === 'CONTIGUOUS'
+    ? 'CONTIGUOUS · VERIFIED'
+    : boundaryStatus === 'BROKEN'
+      ? 'BROKEN · CONTINUITY NOT VERIFIED'
+      : boundaryStatus === 'LATEST'
+        ? 'LATEST SNAPSHOT'
+        : boundaryStatus;
+  const olderBoundaryLabel = olderBoundaryStatus === 'WINDOW_START'
+    ? 'CONTIGUOUS · VERIFIED TO OUTSIDE LINK'
+    : olderBoundaryStatus === 'BROKEN'
+      ? 'BROKEN · CONTINUITY NOT VERIFIED'
+      : olderBoundaryStatus === 'ROOT'
+        ? 'ROOT · VERIFIED'
+        : olderBoundaryStatus;
   return (
     <div data-testid="page-verdict-history" style={{ maxWidth: 1320, margin: '0 auto' }}>
       <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:16, marginBottom:16, flexWrap:'wrap' }}>
@@ -481,10 +572,25 @@ const VerdictHistoryPage: React.FC = () => {
         </label>
         <button data-testid="button-refresh-verdict-history" onClick={refresh} style={{ ...historyButtonStyle, marginLeft:'auto' }}>Refresh history</button>
       </div>
+      <div data-testid="history-jump-controls" style={{ display:'flex', gap:8, alignItems:'end', flexWrap:'wrap', padding:'11px 12px', marginBottom:12, background:T.panel, border:`1px solid ${T.border}`, borderRadius:9 }}>
+        <div style={{ minWidth:180, marginRight:4 }}>
+          <div style={{ color:T.cyan, fontSize:9, fontWeight:800, letterSpacing:'0.1em' }}>JUMP TO INCIDENT</div>
+          <div style={{ color:T.txtMuted, fontSize:9, marginTop:4 }}>Uses immutable history in the selected scope only.</div>
+        </div>
+        <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>EXACT EVENT ID
+          <input data-testid="input-history-jump-event-id" type="number" min="1" step="1" inputMode="numeric" value={jumpEventId} onChange={event => setJumpEventId(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') submitJump(); }} placeholder="e.g. 12457" style={{ ...historySelectStyle, minWidth:150, color:T.txtPri }} />
+        </label>
+        <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>RECORDED AT OR AFTER (UTC)
+          <input data-testid="input-history-jump-timestamp" type="datetime-local" value={jumpTimestamp} onChange={event => setJumpTimestamp(event.target.value)} onKeyDown={event => { if (event.key === 'Enter') submitJump(); }} style={{ ...historySelectStyle, minWidth:210, color:T.txtPri }} />
+        </label>
+        <button data-testid="button-jump-verdict-history" onClick={submitJump} disabled={loading} style={{ ...historyButtonStyle, opacity:loading ? 0.45 : 1, cursor:loading ? 'wait' : 'pointer' }}>Open incident window</button>
+        {(jump.eventId || jump.timestamp) && <button data-testid="button-clear-verdict-history-jump" onClick={clearJump} style={{ ...historyButtonStyle, borderColor:T.borderMid, color:T.txtSec, background:T.panelAlt }}>Return to latest</button>}
+        {jumpValidation && <div data-testid="status-history-jump-invalid" role="status" style={{ flexBasis:'100%', color:T.amber, fontSize:10 }}>{jumpValidation}</div>}
+      </div>
       {loading ? <HistorySkeleton /> : error ? (
-        <div data-testid="status-history-unavailable" role="status" style={historyEmptyStyle}>
-          <strong style={{ color:T.amber }}>History unavailable</strong>
-          <span style={{ color:T.txtMuted, marginTop:6 }}>{error}. No live or alternate data is shown.</span>
+        <div data-testid={historyErrorTestId(error, jump)} role="status" style={historyEmptyStyle}>
+          <strong style={{ color:T.amber }}>{jump.eventId || jump.timestamp ? 'Incident lookup did not resolve' : 'History unavailable'}</strong>
+          <span style={{ color:T.txtMuted, marginTop:6 }}>{historyErrorLabel(error, jump, instrument, mode)}</span>
           <button data-testid="button-retry-verdict-history" onClick={refresh} style={{ ...historyButtonStyle, marginTop:14 }}>Retry</button>
         </div>
       ) : !data?.events?.length ? (
@@ -494,6 +600,10 @@ const VerdictHistoryPage: React.FC = () => {
         </div>
       ) : (
         <>
+          {data.jump?.status === 'RESOLVED' && <div data-testid="history-jump-resolution" style={{ display:'flex', justifyContent:'space-between', gap:12, alignItems:'center', flexWrap:'wrap', marginBottom:12, padding:'10px 12px', background:`${T.cyan}0d`, border:`1px solid ${T.cyan}44`, borderRadius:7 }}>
+            <div><span style={{ color:T.cyan, fontSize:9, fontWeight:800, letterSpacing:'0.09em' }}>INCIDENT ANCHOR RESOLVED</span><div style={{ color:T.txtPri, fontSize:12, marginTop:4 }}>Event {data.jump.resolved_event_id} · {historyDate(data.jump.resolved_recorded_at ?? data.events[data.events.length - 1]?.recorded_at ?? null)}</div></div>
+            <div style={{ color:T.txtMuted, fontSize:9 }}>Timestamp jumps select the first immutable event recorded at or after the requested UTC time.</div>
+          </div>}
           <div data-testid="history-chain-summary" style={{ display:'grid', gridTemplateColumns:'minmax(180px,1.2fr) repeat(4,1fr)', gap:8, marginBottom:12 }}>
             <div style={{ ...historyMetricStyle, borderColor:`${chainColor}55` }}><span>CHAIN INTEGRITY</span><b data-testid="value-chain-status" style={{ color:chainColor }}>{chain?.status ?? 'EMPTY'}</b></div>
             <div style={historyMetricStyle}><span>EVENTS</span><b data-testid="value-history-count">{data.count}</b></div>
@@ -503,10 +613,11 @@ const VerdictHistoryPage: React.FC = () => {
           </div>
            <div data-testid="history-pagination" style={{ display:'flex', alignItems:'center', justifyContent:'space-between', gap:10, flexWrap:'wrap', padding:'9px 11px', marginBottom:12, background:T.panel, border:`1px solid ${boundaryStatus === 'BROKEN' ? T.red + '66' : T.border}`, borderRadius:7 }}>
              <div style={{ display:'flex', alignItems:'center', gap:9, flexWrap:'wrap' }}>
-               <span data-testid="history-page-indicator" style={{ color:T.txtPri, fontSize:10, fontWeight:800, letterSpacing:'0.08em' }}>{pageNumber === 0 ? (throughEventId == null ? 'LATEST' : 'LATEST SNAPSHOT') : `OLDER PAGE ${pageNumber}`}</span>
-               {(pageNumber > 0 || throughEventId != null) && <span data-testid="history-newer-boundary" style={{ color:boundaryColor, fontSize:9, fontWeight:800, letterSpacing:'0.07em' }}>
-                 NEWER BOUNDARY: {boundaryStatus === 'CONTIGUOUS' ? 'CONTIGUOUS · VERIFIED' : boundaryStatus === 'BROKEN' ? 'BROKEN · CONTINUITY NOT VERIFIED' : boundaryStatus}
-               </span>}
+                <span data-testid="history-page-indicator" style={{ color:T.txtPri, fontSize:10, fontWeight:800, letterSpacing:'0.08em' }}>{pageNumber === 0 ? (data.jump?.status === 'RESOLVED' ? 'INCIDENT WINDOW' : throughEventId == null ? 'LATEST' : 'LATEST SNAPSHOT') : `OLDER PAGE ${pageNumber}`}</span>
+                <div data-testid="history-chain-boundaries" style={{ display:'flex', gap:9, flexWrap:'wrap' }}>
+                  <span data-testid="history-older-boundary" style={{ color:olderBoundaryColor, fontSize:9, fontWeight:800, letterSpacing:'0.07em' }}>OLDER BOUNDARY: {olderBoundaryLabel}</span>
+                  <span data-testid="history-newer-boundary" style={{ color:boundaryColor, fontSize:9, fontWeight:800, letterSpacing:'0.07em' }}>NEWER BOUNDARY: {newerBoundaryLabel}</span>
+                </div>
              </div>
              <div style={{ display:'flex', gap:6 }}>
                <button data-testid="button-newer-verdict-history" onClick={loadNewer} disabled={loading || !data.page.has_newer} aria-label="Load newer verdict history page" style={{ ...historyButtonStyle, opacity: loading || !data.page.has_newer ? 0.4 : 1, cursor: loading || !data.page.has_newer ? 'not-allowed' : 'pointer' }}>Newer page</button>

@@ -698,6 +698,132 @@ def test_through_cursor_reconstructs_exact_page_after_new_event_appends():
     assert report["page"]["newer_boundary_status"] == "CONTIGUOUS"
 
 
+def test_event_id_jump_resolves_inside_scope_and_reuses_verified_through_cursor():
+    target = {
+        "event_id": 90,
+        "observation_key": "incident",
+        "previous_observation_key": "prior",
+    }
+    rows = [
+        {
+            "event_id": 80,
+            "observation_key": "prior",
+            "previous_observation_key": None,
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+        },
+        {
+            "event_id": 90,
+            "observation_key": "incident",
+            "previous_observation_key": "prior",
+            "verdict": "LONG READY",
+            "wait_ready_state": "READY",
+        },
+    ]
+    newer = {
+        "event_id": 100,
+        "observation_key": "after-incident",
+        "previous_observation_key": "incident",
+    }
+    with (
+        patch.object(avh, "_query_history_link", return_value=target) as link,
+        patch.object(avh, "_query_next_history_link", return_value=newer),
+        patch.object(avh, "_query_history", return_value=rows) as query,
+    ):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report(
+            "MNQ", "SCALP", limit=50, event_id=90
+        )
+
+    assert link.call_count == 2
+    assert all(call.args == ("MNQ", "SCALP", 90) for call in link.call_args_list)
+    query.assert_called_once_with(
+        "MNQ", "SCALP", 51, newest_window=True,
+        before_event_id=None, through_event_id=90,
+    )
+    assert report["jump"] == {
+        "status": "RESOLVED",
+        "requested_event_id": 90,
+        "requested_timestamp": None,
+        "resolved_event_id": 90,
+        "resolved_recorded_at": None,
+    }
+    assert [event["event_id"] for event in report["events"]] == [80, 90]
+    assert report["page"]["through_event_id"] == 90
+    assert report["page"]["newer_boundary_status"] == "CONTIGUOUS"
+    assert report["chain"]["status"] == "VALID"
+
+
+def test_timestamp_jump_resolves_first_scoped_record_at_or_after_timestamp():
+    target = {
+        "event_id": 75,
+        "observation_key": "timestamp-target",
+        "previous_observation_key": "prior",
+        "recorded_at": "2026-08-28T14:30:01+00:00",
+    }
+    with (
+        patch.object(avh, "_query_history_at_or_after", return_value=target) as resolver,
+        patch.object(avh, "_query_history_link", return_value=target),
+        patch.object(avh, "_query_next_history_link", return_value=None),
+        patch.object(avh, "_query_history", return_value=[{
+            "event_id": 75,
+            "observation_key": "timestamp-target",
+            "previous_observation_key": None,
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+        }]),
+    ):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report(
+            "MGC", "INTRADAY_TREND", limit=50,
+            timestamp="2026-08-28T14:30:00Z",
+        )
+
+    resolved_at = resolver.call_args.args[2]
+    assert resolved_at.isoformat() == "2026-08-28T14:30:00+00:00"
+    assert resolver.call_args.args[:2] == ("MGC", "INTRADAY_TREND")
+    assert report["jump"]["status"] == "RESOLVED"
+    assert report["jump"]["resolved_event_id"] == 75
+    assert report["jump"]["resolved_recorded_at"] == "2026-08-28T14:30:01+00:00"
+    assert report["page"]["through_event_id"] == 75
+
+
+def test_jump_target_missing_or_out_of_scope_never_falls_back_to_live_data():
+    with patch.object(avh, "_query_history_link", return_value=None):
+        avh._DB_READY = True
+        avh.configure(lambda: object())
+        report = avh.get_history_report(
+            "MES", "SCALP", limit=50, event_id=999
+        )
+
+    assert report["ok"] is False
+    assert report["available"] is False
+    assert report["error"] == "jump_target_not_found"
+    assert report["jump"]["status"] == "NOT_FOUND"
+    assert report["events"] == []
+
+
+def test_jump_rejects_conflicting_or_invalid_locators_without_reading_history():
+    avh._DB_READY = True
+    avh.configure(lambda: object())
+
+    conflict = avh.get_history_report(
+        "MNQ", "SCALP", event_id=7,
+        timestamp="2026-08-28T14:30:00Z",
+    )
+    invalid_time = avh.get_history_report(
+        "MNQ", "SCALP", timestamp="not-a-timestamp",
+    )
+
+    assert conflict["error"] == "invalid_jump"
+    assert conflict["jump"]["status"] == "INVALID"
+    assert invalid_time["error"] == "invalid_timestamp"
+    assert invalid_time["jump"]["status"] == "INVALID"
+    assert conflict["events"] == invalid_time["events"] == []
+
+
 def _structure_row(at, *, recorded_at=None, state="REVERSAL_CANDIDATE",
                     blocked=True, score=88, event="BOS continuation",
                     actionable=False, direction="Long", **extra):

@@ -330,13 +330,17 @@ def test_observer_disabled_reports_disabled_state_without_database_access(monkey
 
 def test_operator_history_route_validates_scope_and_returns_curated_report(monkeypatch):
     calls = []
+    jump_calls = []
 
     def report(
-        instrument, mode, limit, before_event_id=None, through_event_id=None
+        instrument, mode, limit, before_event_id=None, through_event_id=None,
+        **jump,
     ):
         calls.append((
             instrument, mode, limit, before_event_id, through_event_id
         ))
+        if jump:
+            jump_calls.append(jump)
         return {
             "ok": True,
             "available": True,
@@ -377,6 +381,23 @@ def test_operator_history_route_validates_scope_and_returns_curated_report(monke
     assert resume_response.status_code == 200
     assert calls[-1] == ("MGC", "SCALP", 50, None, 654)
 
+    event_jump_response = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MES&mode=SCALP&event_id=777"
+    )
+    assert event_jump_response.status_code == 200
+    assert calls[-1] == ("MES", "SCALP", 120, None, None)
+    assert jump_calls[-1] == {"event_id": 777}
+
+    timestamp_jump_response = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MYM&mode=INTRADAY_TREND"
+        "&timestamp=2026-08-28T14%3A30%3A00Z"
+    )
+    assert timestamp_jump_response.status_code == 200
+    assert calls[-1] == ("MYM", "INTRADAY_TREND", 120, None, None)
+    assert jump_calls[-1] == {"timestamp": "2026-08-28T14:30:00Z"}
+
     invalid_instrument = client.get(
         "/authoritative-verdict-history?instrument=ES&mode=SCALP"
     )
@@ -408,3 +429,18 @@ def test_operator_history_route_validates_scope_and_returns_curated_report(monke
     )
     assert conflicting_cursors.status_code == 400
     assert conflicting_cursors.get_json()["error"] == "invalid_cursor"
+
+    conflicting_jump = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MGC&mode=SCALP&event_id=12"
+        "&timestamp=2026-08-28T14%3A30%3A00Z"
+    )
+    assert conflicting_jump.status_code == 400
+    assert conflicting_jump.get_json()["error"] == "invalid_jump"
+
+    jump_with_cursor = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=MGC&mode=SCALP&event_id=12&through_event_id=11"
+    )
+    assert jump_with_cursor.status_code == 400
+    assert jump_with_cursor.get_json()["error"] == "invalid_jump_cursor"

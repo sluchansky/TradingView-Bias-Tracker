@@ -734,6 +734,43 @@ def _query_history_link(instrument: str, mode: str, event_id: int) -> Optional[d
             pass
 
 
+def _query_history_at_or_after(
+    instrument: str, mode: str, timestamp: datetime
+) -> Optional[dict]:
+    """Resolve a recorded incident timestamp inside one exact history scope."""
+    if not _DB_READY or not callable(_DB_FN):
+        raise RuntimeError("history database unavailable")
+    conn = None
+    try:
+        conn = _DB_FN()
+        if conn is None:
+            raise RuntimeError("history database unavailable")
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT event_id, observation_key, previous_observation_key,
+                       recorded_at
+                  FROM authoritative_verdict_history
+                 WHERE instrument = %s
+                   AND mode = %s
+                   AND recorded_at >= %s
+                 ORDER BY recorded_at ASC, event_id ASC
+                 LIMIT 1
+            """, (str(instrument).upper(), str(mode).upper(), timestamp))
+            row = cur.fetchone()
+        if not row:
+            return None
+        return dict(zip(
+            ("event_id", "observation_key", "previous_observation_key",
+             "recorded_at"), row
+        ))
+    finally:
+        try:
+            if conn is not None:
+                conn.close()
+        except Exception:
+            pass
+
+
 def _query_next_history_link(
     instrument: str, mode: str, event_id: int
 ) -> Optional[dict]:
@@ -782,10 +819,15 @@ def get_history_report(
     limit: int = 120,
     before_event_id: Optional[int] = None,
     through_event_id: Optional[int] = None,
+    *,
+    event_id: Optional[int] = None,
+    timestamp: Any = None,
 ) -> dict:
     """Return a curated operator timeline with explicit availability and links."""
     instrument = str(instrument or "").upper()
     mode = str(mode or "").upper()
+    jump_requested_event_id = event_id
+    jump_requested_timestamp = timestamp
     base = {
         "ok": False,
         "available": False,
@@ -814,15 +856,103 @@ def get_history_report(
             "newer_boundary_status": "LATEST" if before_event_id is None else "EMPTY",
             "newer_boundary_event_id": None,
         },
+        "jump": {
+            "status": "NONE",
+            "requested_event_id": jump_requested_event_id,
+            "requested_timestamp": _text(jump_requested_timestamp),
+            "resolved_event_id": None,
+            "resolved_recorded_at": None,
+        },
         "events": [],
     }
     if not _DB_READY or not callable(_DB_FN):
-        return {**base, "error": "history_unavailable"}
+        return {
+            **base,
+            "error": "history_unavailable",
+            "jump": {
+                **base["jump"],
+                "status": "UNAVAILABLE" if (
+                    event_id is not None or timestamp is not None
+                ) else "NONE",
+            },
+        }
 
     try:
         requested_limit = max(1, min(int(limit), 500))
     except (TypeError, ValueError):
         requested_limit = 120
+    if event_id is not None and timestamp not in (None, ""):
+        return {
+            **base,
+            "error": "invalid_jump",
+            "jump": {**base["jump"], "status": "INVALID"},
+        }
+    jump_row = None
+    if event_id is not None or timestamp not in (None, ""):
+        if before_event_id is not None or through_event_id is not None:
+            return {
+                **base,
+                "error": "invalid_jump_cursor",
+                "jump": {**base["jump"], "status": "INVALID"},
+            }
+        if event_id is not None:
+            try:
+                event_id = int(event_id)
+            except (TypeError, ValueError):
+                return {
+                    **base,
+                    "error": "invalid_event_id",
+                    "jump": {**base["jump"], "status": "INVALID"},
+                }
+            if event_id <= 0:
+                return {
+                    **base,
+                    "error": "invalid_event_id",
+                    "jump": {**base["jump"], "status": "INVALID"},
+                }
+            try:
+                jump_row = _query_history_link(instrument, mode, event_id)
+            except Exception as exc:
+                logger.debug("AuthoritativeVerdictHistory jump read failed: %s", exc)
+                return {
+                    **base,
+                    "error": _error_code(exc, "history_query_failed"),
+                    "jump": {**base["jump"], "status": "UNAVAILABLE"},
+                }
+        else:
+            timestamp_value = _diagnostic_datetime(timestamp)
+            if timestamp_value is None:
+                return {
+                    **base,
+                    "error": "invalid_timestamp",
+                    "jump": {**base["jump"], "status": "INVALID"},
+                }
+            try:
+                jump_row = _query_history_at_or_after(
+                    instrument, mode, timestamp_value
+                )
+            except Exception as exc:
+                logger.debug("AuthoritativeVerdictHistory timestamp jump failed: %s", exc)
+                return {
+                    **base,
+                    "error": _error_code(exc, "history_query_failed"),
+                    "jump": {**base["jump"], "status": "UNAVAILABLE"},
+                }
+        if jump_row is None:
+            return {
+                **base,
+                "error": "jump_target_not_found",
+                "jump": {**base["jump"], "status": "NOT_FOUND"},
+            }
+        event_id = int(jump_row["event_id"])
+        through_event_id = event_id
+        base["jump"] = {
+            "status": "RESOLVED",
+            "requested_event_id": jump_requested_event_id,
+            "requested_timestamp": _text(jump_requested_timestamp),
+            "resolved_event_id": event_id,
+            "resolved_recorded_at": _text(jump_row.get("recorded_at")),
+        }
     if before_event_id is not None and through_event_id is not None:
         return {**base, "error": "invalid_cursor"}
     cursor_value = before_event_id if before_event_id is not None else through_event_id

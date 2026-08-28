@@ -1,17 +1,15 @@
 # Memory Index
-
-- [INTRADAY_TREND dedicated plan engine](intraday-trend-plan-engine.md) — build_intraday_trade_plan() fully separated from SWING; structural stop only, targets from real session levels ≥2R, 15:15 cutoff, chase gate; _swing_htf_enabled() SWING-only.
-- [INTRADAY_TREND native engine](intraday-trend-native-engine.md) — 6 native IT helpers + analyze_intraday_trend(); BLOCKED_EXTENSION/OPPOSED_1H status codes; 5 ghost_obs columns; 109 tests; ghost/shadow only.
 - [Native structure startup warm-up](native-structure-startup-warmup.md) — replay only validated closed Databento OHLCV before live subscription; suppress historical alert fan-out so startup bars never act like new evidence.
 - [Native structure confirmed-pivot breaks](native-structure-confirmed-pivot-breaks.md) — BOS/CHOCH must compare against previously confirmed swing levels, never the still-confirming pivot window.
 - [Windows local dashboard topology](windows-local-dashboard-topology.md) — local chart must own Flask/proxy processes and use a proxy-only bridge so it never serves a different cache or mutates DB state.
 - [Authoritative verdict history](authoritative-verdict-history.md) — final SCALP/IT snapshots are async, chained, append-only observations; structured live fields must be reduced to DB-safe scalars.
 - [Verdict-history pending chain](verdict-history-pending-chain.md) — a failed queued head cancels descendants and rewinds to the last durable link; never persist dangling chains.
-
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
 - [Visual Brain safety](visual-brain-engine.md) — debounce, proxy-isolated transport, retry reservations, bounded spend telemetry, and observer-only candidates stay fail-safe.
-
-- [Databento feed safety](databento-mgc-overnight-silence.md) — distinguish genuine MGC overnight silence from stale bars; bound intake/backpressure and partial flushes so delayed data cannot look live.
+- [Visual Brain SDK transport](visual-brain-sdk-transport.md) — pin OpenAI 3.3.1 + HTTPX 0.28.1; pass an explicit verified, proxy-isolated HTTPX client only to the observer.
+- [Visual Brain cost benchmark](visual-brain-cost-benchmark.md) — default-off in-memory telemetry only; candidates run after canonical persistence on bounded async workers and never feed trading state.
+- [Databento feed safety](databento-mgc-overnight-silence.md) — distinguish genuine overnight silence from stale bars; bounded partial flushes prevent delayed data from looking live.
+- [Databento bounded backpressure](databento-bounded-backpressure.md) — source-time freshness and non-overlapping record consumers prevent delayed market data from looking live.
 - [api-server proxy route whitelist](proxy-route-whitelist.md) — Flask routes must be added to the Express `/api` proxy whitelist or they 404; how to debug 404s on this stack.
 - [Express /api proxy must forward RAW body](api-proxy-raw-body.md) — proxy must buffer raw bytes + forward client's original content-type; express.json() drops TradingView text/plain webhooks → "0 evaluations".
 - [SCALP/SWING trading mode](trading-mode-scalp-swing.md) — webhook scoring has two sensitivity profiles via cfg(); MGC/MNQ string symmetry; any scoring change must keep invariants.
@@ -25,7 +23,6 @@
 - [Published smoke prerequisites](published-smoke-prerequisites.md) — trust a bounded public version-marker probe, not deployment metadata, before sharing or smoke-testing a published route.
 - [App-side DB convention: INSERT/SELECT only](db-app-insert-select-only.md) — app.py runs NO DDL; boot does no-DDL readiness probe + `*_DB_READY` flag; new tables via database tool (dev) + Publish schema-diff (prod).
 - [PostgreSQL startup durability guard](postgres-startup-durability-guard.md) — automatic SQL migrations are allowlisted to idempotent table/index creation; guard probes the existing DB read-only before service start.
-- [Edge Score, grades & session bonus](edge-score-card-block.md) — EDGE_COMPONENTS BOS20/CHOCH20/VWAP15/Sweep15/Volume15/CVD15/Session10 = max110; grade ≥85A+/≥70A/≥50B/<50 WAIT; zone scores 0 so CHOCH-absent edge caps ~50.
 - [CVD hard filter + RVOL→Volume component](cvd-rvol-filter.md) — CVD = HARD fail-open directional veto; RVOL feeds Volume +15 (≥~1.5), NOT a standalone modifier; ceiling 110; display via alert_diagnostics.
 - [No-signals = structure gate](no-signals-alert-config-gap.md) — "0 signals" usually = no structure alert; structure = ANY-ONE of CHOCH/BOS/HH/HL/LH/LL (shared, needs a `ticker`); diagnose via gate_debug/strict_reason.
 - [Dashboard auth edge & open paths](dashboard-auth-edge.md) — auth lives in Express; preserve open paths; app-global protected polling requires the validated active-route header and abort-on-revoke.
@@ -72,7 +69,6 @@
 - [LIVE 2-contract runner + trade-mgmt suite](live-two-contract-runner.md) — flag-gated default-OFF; runner fires only after primary 2xx; RUNNER_MODE trail|be_2r; primary TP forced to 1R for be_2r; node --check the SERVED dashboard <script>.
 - [Trade-management analytics sidecar](trade-mgmt-analytics-sidecar.md) — flag-gated DISPLAY-only close-time metrics (MFE/MAE, commission, oversized-loss); OFF==today (None, no mt mutation, null /status key).
 - [Opposite-side reversal buffer](opposite-side-buffer.md) — TradersPost-only buy↔sell send spacing per instrument; RESERVE send_at under lock before sleeping; exits never buffered; default 0=OFF byte-identical.
-- [Canonical Decision Contract Phase 3](decision-contract-phase3.md) — shadow-only typed state machine; 5 app.py hooks; 166 tests; DC_DB_READY flag; /decision-state route; never gates.
 - [Signal source ownership](signal-source-ownership.md) — CVD/RVOL now Databento-only via _databento_is_canonical guard; FVG already clean; BOS/sweep/VWAP/zones still dual or legacy.
 - [Order Flow Engine V1](order-flow-v1.md) — Databento buy/sell flow maps directionally to bounded ±15 Edge Score points; missing flow is a no-op and hard-zero setups stay zero.
 - [MBP-1 top-of-book Order Flow](mbp1-top-of-book-order-flow.md) — additive Databento best-bid/ask snapshots are fresh-only and fail-open; stale/reconnect state never influences scoring.
@@ -80,7 +76,6 @@
 - [Central Ghost Coordinator Phase 2B](central-ghost-coordinator-phase2b.md) — live shadow intake is enabled; persistence and fan-out remain explicitly off, with legacy research ledgers authoritative until paired-event evidence is reviewed.
 - [Coordinator durable health totals](coordinator-durable-health-totals.md) — bounded latest-row restore is for active-window dedupe; complete research health must come from read-only durable aggregates and label both scopes.
 - [Canonical Ghost Phase 1 shadow authority](canonical-ghost-phase1-shadow-authority.md) — generic ghost lifecycle alone establishes SCALP/IT authority; exact-ledger recovery and no fuzzy correlation protect shadow evidence across restart.
-- [GRE Phase 4 — FVG_REVISIT Research Family](gre-phase4-fvg-revisit.md) — FVG_REVISIT as Research Family #2; strategy_family/strategy SEPARATE fields; deterministic rfid/revisit_id; 10 variants; 86 tests; prod DB apply still needed.
 - [Canonical Databento Market State Engine](canonical-market-state.md) — shadow VWAP/ATR/structure/sweep engine; all selectors default LEGACY; bar callback reads full bar from DATABENTO_BARS_BY_INST[-1]; DB fn is get_db_connection; 56 tests.
 - [Scalp strategy advisory ("potential trades")](scalp-strategy-advisory.md) — DISPLAY-ONLY Main-Brain layer ranking 16 research scalp strategies; votes come from scalp_live_sim.diagnose_strategies; NEVER a money path; flag-OFF byte-identical.
 - [Learning influences live scoring](learning-score-influence.md) — master-flag bounded ±15 Edge-Score adjust; MUST fold inside _analysis_edge_breakdown; ONLY when eb.score>0 (hard-block 0 must not resurrect); OFF byte-identical.
@@ -103,17 +98,10 @@
 - [Execution Arm / Disarm Control](arm-disarm-control.md) — in-memory arm session required for live auto-execution; 5-state model; safety_locked checked first; _check_arm_for_transmission reads raw _ARM_STATE directly (testable).
 - [Unified Learning Brain](unified-learning-brain.md) — PER_MODE_STATS global (inst,mode key) feeds compute_playbook_selector + compute_unified_learning; display-only cognitive seam; goldens byte-identical.
 - [Execution Enable/Disable control](execution-enable-disable.md) — execution_enabled + armed are independent; an explicit disabled deployment pin overrides stale persisted runtime mode or enable state at boot.
-- [Native Journal Phase A](native-journal-phase-a.md) — canonical per-trade table; NJ helpers use json.dumps NOT _jj; _nj_close_by_instrument needs own NJ_DB_READY guard; test _set_row sentinel pattern for nullable columns.
-- [Native Journal Phase B — Management Timeline](native-journal-phase-b.md) — 10 wire points; _nj_set_outcome idempotency guard + 5-col SELECT; _mock_db_row needs 5 values in Phase A tests; managed-trade close gap fixed via _close_managed_trade NJ hook.
 - [Native Journal read API (Phase 7K-A.2)](native-journal-read-api.md) — 3 Flask routes + proxy whitelist + JNativeTradesTab + source selector in JTradesTab; React.Fragment wrapper required (bare <> gets consumed by inner detail-pane fragment); prod schema not yet applied (Publish first).
-- [Native Journal Phase C — Review workflow](native-journal-phase-c.md) — PATCH /review + screenshot routes placed BEFORE @_arm_owner_required definition → decorator removed (Express auth sufficient); Phase A _set_row needs 7 cols after source_label added; 53 tests.
 - [Managed paper journal bridge](managed-paper-journal-bridge.md) — Display-managed MGC/MNQ/MES/MYM trades mirror as PAPER by stable UUID; gateway paper rows attach first to prevent duplicates.
-- [Journal Coaching Drill-Down (Phase 7O.1)](journal-coaching-drilldown.md) — _RATING_FIELDS frozenset at module level; JDrillFilter 15-field contract; JCoachingTab onDrill prop; JournalFullPage URL sync + popstate; 41 tests.
-- [Directional Symmetry Audit (Phase 7M)](directional-symmetry-audit.md) — Market-Driven verdict; 23 tests; fixture lessons: MITIGATED_FLAG=False for SCALP, INST not TICKER key, stale-VWAP tests gate_debug.vwap_confirmed not score delta.
-- [Learning Engine Audit (Phase 7I)](learning-engine-audit.md) — 4 confirmed defects; win_rate SQL case mismatch is latent at n<20; key format mismatch may persist even at n≥20; diagnostics layer added.
 - [Learning key compat + 4-part canonical format](learning-key-compat.md) — CHOCH→LIQUIDITY_SWEEP_REVERSAL in _LEGACY_STRATEGY_KEY_MAP; 4-part pipe key {INST}|{MODE}|{STRATEGY}|{DIR}; valid STRATEGY_PRIORITY keys → CANONICAL n=0 (not NOT_FOUND); coach fixed: INSUFFICIENT_SAMPLES not KEY_NOT_FOUND.
 - [Coach and Manager Interface v1 semantics](coach-manager-interface-semantics.md) — weight_updated=updated_at (not ready); thesis_resolved=False in full_analysis; active_trade/managed_trade must be dict-copied before return.
-- [Left Brain obs-infra closure](lb-obs-infra.md) — maxlen 5000, dedup guard, renamed fit_score field, endpoint v2 (inst/limit/summary/metadata), playbook sort fix; production needs re-publish.
 - [Structure-reversal demote](structure-reversal-demote.md) — SCALP-only flag-gated: fresh opposite BOS/CHOCH >CONFLICT_WINDOW_MIN newer NULLs stale side's structure credit; default OFF byte-identical; own smoke not goldens.
 - [USER_APPROVED_PREVIEW preview-take](user-approved-preview-take.md) — owner-only manual "take FORMING setup" money path; RE-RUNS mode-correct SCALP/SWING vetoes fail-closed + unconditional local-flatness gate; flag default OFF; goldens byte-identical.
 - [Liquidity Sweep Focus overlay](liquidity-sweep-focus.md) — flag-gated DISPLAY/ADVISORY-ONLY sweep-state; recency re-scan of ALERT_HISTORY (never trust stale key presence); instrument-prefixed match; flag-OFF byte-identical.
@@ -128,9 +116,7 @@
 - [Swing Mode V2 engine](swing-mode-v2.md) — flag-gated SWING_MODE_V2_ENABLED default-OFF 9-category 0-100 HTF scorer + SCANNING→READY lifecycle; Tier-2 via SWING_EMA_UPDATE webhook; /swing-analysis route; goldens byte-identical.
 - [Persistent thesis continuity](thesis-hysteresis.md) — instrument+mode state is evidence-epoch idempotent; blocked WAIT never becomes actionable; confirmed reversals pause for a newer epoch.
 - [Phase 3 Thesis Enforcement](thesis-phase3-enforcement.md) — shadow gate evaluates READY vs thesis, display-only by default; confidence_adj is NEVER added to edge_score.
-- [Strategy scan coverage (Phase 6)](strategy-scan-coverage.md) — 3-system audit: 29 total defs; all 5 main-engine scorers always called; OPENING_DRIVE only eligibility gate (outside_session); STRATEGY_SCAN_DIAGNOSTICS_BY_TICKER pattern.
 - [Fast-entry structure bridge](fast-entry-bridge.md) — MICRO_CHOCH/SWEEP_RECLAIM never reached ALERT_HISTORY (fast-side early return); bridge injects CHOCH SUPPLY/DEMAND/LH/HL so structure_confirmed fires.
-- [Decision Quality analytics (Phase 5F)](decision-quality-analytics.md) — DB-backed snapshot analytics; dedup pattern; component win-rate computation; outcome hook location.
 - [Overnight volatility fetch (ES/NQ bar scarcity)](overnight-volatility-fetch.md) — ES/NQ return only ~12 bars overnight; VOL_MIN_BARS must stay ≤ that or MES/MNQ ATR silently breaks.
 - [Fast Entry Trigger](fast-entry-trigger.md) — DISPLAY-FIRST 1s/5s timing layer (2 flags default OFF); only sharpens timing on already valid/aligned HTF setup; reuses legacy FULL-READY auto fire-once key; goldens DON'T cover it (own smoke).
 - [Paper managed-trade same-bar fill guard](paper-managed-samebar-fill-guard.md) — paper watcher must skip exit-eval on bars opened at/before entry_epoch or fresh paper trade "instantly fills"; entry_epoch=registration≈fill (sub-ms) — don't move it.

@@ -48,4 +48,23 @@ describe('immutable verdict history operator contract', () => {
     expect(source).toContain('LATEST SNAPSHOT');
     expect(source).toContain('setCursorStack([])');
   });
+
+  it('jumps by exact event ID or UTC timestamp through the same scoped cursor report', () => {
+    expect(source).toContain("query.set('event_id', jump.eventId)");
+    expect(source).toContain("query.set('timestamp', jump.timestamp)");
+    expect(source).toContain('input-history-jump-event-id');
+    expect(source).toContain('input-history-jump-timestamp');
+    expect(source).toContain('button-jump-verdict-history');
+    expect(source).toContain('INCIDENT ANCHOR RESOLVED');
+    expect(source).toContain('Timestamp jumps select the first immutable event recorded at or after');
+  });
+
+  it('keeps missing and broken incident results explicit with no alternate data', () => {
+    expect(source).toContain('status-history-jump-not-found');
+    expect(source).toContain('status-history-jump-unavailable');
+    expect(source).toContain('No live or alternate data is shown.');
+    expect(source).toContain('OLDER BOUNDARY:');
+    expect(source).toContain('NEWER BOUNDARY:');
+    expect(source).toContain('BROKEN · CONTINUITY NOT VERIFIED');
+  });
 });
