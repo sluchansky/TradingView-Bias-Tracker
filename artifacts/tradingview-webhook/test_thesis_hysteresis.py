@@ -40,14 +40,14 @@ def _clear(inst="MGC"):
     """Remove any existing thesis for this instrument."""
     with app.THESIS_LOCK:
         for key in list(app.THESIS_BY_INST):
-            if key == inst or str(key).startswith(inst + "|"):
+            if isinstance(key, tuple) and key[0] == inst:
                 app.THESIS_BY_INST.pop(key, None)
 
 
 def _strict(score=80, direction="Long", zone_valid=True, vwap_ok=True,
             struct_ok=True, sweep_ok=True, vol_ok=True, session_ok=False,
-            missing=None, zone_broken=False, evidence_id=None,
-            structure_state=None):
+            missing=None, zone_broken=False, evidence_epoch=None,
+            structure_state=None, reason=None):
     gd = {
         "zone_valid":           zone_valid,
         "vwap_confirmed":       vwap_ok,
@@ -56,7 +56,7 @@ def _strict(score=80, direction="Long", zone_valid=True, vwap_ok=True,
         "volume_confirmed":     vol_ok,
         "session":              session_ok,
     }
-    result = {
+    out = {
         "score":                score,
         "direction":            direction,
         "candidate":            direction,
@@ -64,11 +64,13 @@ def _strict(score=80, direction="Long", zone_valid=True, vwap_ok=True,
         "missing":              missing or [],
         "zone_broken_active":   zone_broken,
     }
-    if evidence_id is not None:
-        result["evidence_id"] = evidence_id
+    if evidence_epoch is not None:
+        out["evidence_epoch"] = evidence_epoch
     if structure_state is not None:
-        result["structure_state"] = structure_state
-    return result
+        out["structure_state"] = structure_state
+    if reason is not None:
+        out["reason"] = reason
+    return out
 
 
 def _run(verdict, score=80, direction="Long", inst="MGC", **kw):
@@ -88,7 +90,7 @@ def test_ready_promotion_from_forming():
         _clear()
         adj, t = _run("LONG READY", score=80)
         assert "READY" in adj, f"Expected READY verdict, got {adj!r}"
-        assert t["status"] == "CONFIRMED", t["status"]
+        assert t["status"] == "READY_LONG", t["status"]
         assert t["confidence"] == 80
         assert t["thesisId"].startswith("th_")
     finally:
@@ -98,8 +100,8 @@ def test_ready_promotion_from_forming():
 
 # ── Test 2: Hysteresis hold ───────────────────────────────────────────────────
 
-def test_strict_wait_is_never_promoted_by_continuity():
-    """After CONFIRMED, strict WAIT must remain WAIT even above the old hold floor."""
+def test_hysteresis_hold_above_60():
+    """The thesis can stay READY, but a strict WAIT must stay non-actionable."""
     saved_mode = app.TRADING_MODE
     try:
         app.TRADING_MODE = "SCALP"
@@ -108,9 +110,9 @@ def test_strict_wait_is_never_promoted_by_continuity():
         _run("LONG READY", score=80)
         # Second eval: raw verdict is WAIT, score dips to 68 — above hold floor (60)
         adj, t = _run("WAIT", score=68)
-        assert adj == "WAIT"
-        assert t["status"] == "WEAKENING"
-        assert t["entryStatus"] == "WAIT"
+        assert adj == "WAIT", f"Strict WAIT must stay WAIT, got {adj!r}"
+        assert t["status"] == "READY_LONG"
+        assert t["entryPaused"] is True
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -125,17 +127,14 @@ def test_drops_to_wait_below_hold_threshold():
         app.TRADING_MODE = "SCALP"
         _clear()
         # Establish READY_LONG at 80
-        _run("LONG READY", score=80)
+        _run("LONG READY", score=80, evidence_epoch="bar-1")
         # Apply 3 opposing evals; each caps the drop at MAX_CONF_DROP=15
         # 80 → max(30,65) = 65 → max(30,50) = 50 → max(30,35) = 35
-        s1 = _strict(score=30, evidence_id="drop-1")
-        s2 = _strict(score=30, evidence_id="drop-2")
-        s3 = _strict(score=30, evidence_id="drop-3")
-        app._apply_thesis("MGC", s1, "WAIT")
-        app._apply_thesis("MGC", s2, "WAIT")
-        adj, t = app._apply_thesis("MGC", s3, "WAIT")
+        _run("WAIT", score=30, evidence_epoch="bar-2")   # 80 → 65
+        _run("WAIT", score=30, evidence_epoch="bar-3")   # 65 → 50
+        adj, t = _run("WAIT", score=30, evidence_epoch="bar-4")  # 50 → 35
         assert "READY" not in adj, f"Should have left hold band, got {adj!r}"
-        assert t["status"] == "WEAKENING"
+        assert t["status"] not in ("READY_LONG", "READY_SHORT")
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -155,8 +154,7 @@ def test_reversal_below_threshold_weakens_not_flips():
         adj, t = _run("SHORT READY", score=70, direction="Short")
         # Must remain Long, just weakened
         assert t["direction"] == "Long", f"Direction should stay Long, got {t['direction']!r}"
-        assert t["status"] == "PENDING_REVERSAL"
-        assert "REVERSAL_CONFIRMATION_REQUIRED" in (t.get("reasonCodes") or [])
+        assert "REVERSAL_THRESHOLD_NOT_REACHED" in (t.get("reasonCodes") or [])
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -164,8 +162,8 @@ def test_reversal_below_threshold_weakens_not_flips():
 
 # ── Test 5: Reversal at/above REVERSAL_THRESHOLD flips ───────────────────────
 
-def test_reversal_requires_distinct_confirming_evidence():
-    """A second distinct, structurally confirmed reversal starts a new FORMING thesis."""
+def test_reversal_at_threshold_flips_direction():
+    """A confirmed opposite structure starts paused, never immediately READY."""
     saved_mode = app.TRADING_MODE
     try:
         app.TRADING_MODE = "SCALP"
@@ -173,17 +171,24 @@ def test_reversal_requires_distinct_confirming_evidence():
         # Establish Long thesis
         _, t1 = _run("LONG READY", score=80)
         old_id = t1["thesisId"]
-        first = _strict(score=87, direction="Short", evidence_id="rev-1")
-        _, pending = app._apply_thesis("MGC", first, "SHORT READY")
-        assert pending["status"] == "PENDING_REVERSAL"
-        second = _strict(
-            score=87, direction="Short", evidence_id="rev-2",
-            structure_state={"state": "REVERSAL_CONFIRMED", "direction": "Short"})
-        adj, t2 = app._apply_thesis("MGC", second, "SHORT READY")
+        # Confirmed Short structure flips the thesis but pauses entry.
+        adj, t2 = _run(
+            "SHORT READY",
+            score=87,
+            direction="Short",
+            evidence_epoch="bar-2",
+            structure_state={
+                "state": "REVERSAL_CONFIRMED",
+                "confirmed": True,
+                "direction": "Short",
+                "last_event_at": "2026-08-28T12:01:00+00:00",
+            },
+        )
+        # New thesis must be Short; thesisId should differ
         assert t2["direction"] == "Short", f"Expected Short thesis, got {t2['direction']!r}"
         assert t2["thesisId"] != old_id, "New direction should create a new thesisId"
-        assert t2["status"] == "FORMING"
         assert adj == "WAIT"
+        assert t2["status"] == "FORMING_SHORT"
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -261,8 +266,8 @@ def test_per_instrument_isolation():
 
 # ── Test 9: Cooldown blocks new thesis formation ──────────────────────────────
 
-def test_invalidated_thesis_restarts_as_forming():
-    """An invalidated thesis cannot jump directly back to entry-ready."""
+def test_cooldown_blocks_new_thesis():
+    """A thesis in COOLDOWN status returns WAIT and does not start a new thesis."""
     saved_mode = app.TRADING_MODE
     try:
         app.TRADING_MODE = "SWING"
@@ -274,11 +279,19 @@ def test_invalidated_thesis_restarts_as_forming():
         s_broken = _strict(score=82, direction="Long", zone_valid=False,
                            zone_broken=True, missing=["zone_valid"])
         app._apply_thesis("MGC", s_broken, "LONG READY")
-        adj, t = app._apply_thesis(
-            "MGC", _strict(score=85, evidence_id="restart-after-invalid"), "LONG READY")
-        assert adj == "WAIT"
-        assert t["status"] == "FORMING"
-        assert t["entryStatus"] == "WAIT"
+        # Manually set state to COOLDOWN with far-future cooldownUntil
+        with app.THESIS_LOCK:
+            t = app.THESIS_BY_INST.get("MGC")
+            if t:
+                t["status"] = "COOLDOWN"
+                far_future = (app.now_utc() +
+                              datetime.timedelta(seconds=60)).isoformat()
+                t["cooldownUntil"] = far_future
+                app.THESIS_BY_INST["MGC"] = t
+        # Next eval should see COOLDOWN and return WAIT
+        adj, t = _run("LONG READY", score=85, inst="MGC")
+        assert "READY" not in adj, f"Cooldown should block READY, got {adj!r}"
+        assert t["status"] == "COOLDOWN"
     finally:
         app.TRADING_MODE = saved_mode
         _clear("MGC")
@@ -293,12 +306,11 @@ def test_confidence_rise_is_immediate():
         app.TRADING_MODE = "SCALP"
         _clear()
         # Establish at 65
-        app._apply_thesis("MGC", _strict(score=65, evidence_id="rise-1"), "WAIT")
+        _run("WAIT", score=65)
         # Now jump to 90
-        _, t = app._apply_thesis(
-            "MGC", _strict(score=90, evidence_id="rise-2"), "LONG READY")
+        _, t = _run("LONG READY", score=90)
         assert t["confidence"] == 90, f"Immediate rise expected 90, got {t['confidence']}"
-        assert "MATERIAL_EVIDENCE_STRENGTHENED" in (t.get("reasonCodes") or [])
+        assert "CONFIDENCE_INCREASED" in (t.get("reasonCodes") or [])
     finally:
         app.TRADING_MODE = saved_mode
         _clear()
@@ -346,11 +358,9 @@ def test_new_thesis_id_after_invalidation():
                 t["cooldownUntil"] = None
                 app.THESIS_BY_INST["MGC"] = t
         # New eval → new thesis
-        _, t2 = app._apply_thesis(
-            "MGC", _strict(score=80, evidence_id="after-invalid"), "LONG READY")
+        _, t2 = _run("LONG READY", score=80, inst="MGC")
         assert t2["thesisId"] != old_id, (
             f"New thesis must have a fresh ID; both were {old_id!r}")
-        assert t2["status"] == "FORMING"
     finally:
         app.TRADING_MODE = saved_mode
         _clear("MGC")
@@ -478,9 +488,311 @@ def test_scalp_no_zone_no_hard_invalidation():
         # for SWING; but zone_broken = "consumed" which is a hard signal we honour)
         # ── skip the above assertion for zone_broken=True; that's SWING-only ──
         # Just confirm status is FORMING or READY
-        assert t["status"] in ("FORMING", "CONFIRMED"), t["status"]
+        assert t["status"] in ("FORMING_LONG", "READY_LONG"), t["status"]
     finally:
         app.TRADING_MODE = saved_mode
+        _clear("MGC")
+
+
+def test_identical_heartbeat_epoch_does_not_drain_confidence():
+    saved_mode = app.TRADING_MODE
+    try:
+        app.TRADING_MODE = "SCALP"
+        _clear("MGC")
+        _run("LONG READY", score=80, evidence_epoch="bar-1")
+        _, first = _run("WAIT", score=20, evidence_epoch="bar-2")
+        _, second = _run("WAIT", score=20, evidence_epoch="bar-2")
+        _, third = _run("WAIT", score=20, evidence_epoch="bar-2")
+        assert first["confidence"] == 65
+        assert second["confidence"] == first["confidence"]
+        assert third["confidence"] == first["confidence"]
+        assert "EVIDENCE_UNCHANGED" in third["reasonCodes"]
+    finally:
+        app.TRADING_MODE = saved_mode
+        _clear("MGC")
+
+
+def test_new_bar_epoch_updates_confidence_once():
+    saved_mode = app.TRADING_MODE
+    try:
+        app.TRADING_MODE = "SCALP"
+        _clear("MGC")
+        _run("LONG READY", score=80, evidence_epoch="bar-1")
+        _, bar2 = _run("WAIT", score=40, evidence_epoch="bar-2")
+        _, bar2_repeat = _run("WAIT", score=40, evidence_epoch="bar-2")
+        _, bar3 = _run("WAIT", score=40, evidence_epoch="bar-3")
+        assert bar2["confidence"] == 65
+        assert bar2_repeat["confidence"] == 65
+        assert bar3["confidence"] == 50
+    finally:
+        app.TRADING_MODE = saved_mode
+        _clear("MGC")
+
+
+def test_scalp_and_intraday_theses_are_isolated():
+    _clear("MGC")
+    try:
+        scalp_strict = _strict(
+            score=82, direction="Long", evidence_epoch="scalp-bar-1",
+        )
+        it_strict = _strict(
+            score=90, direction="Short", evidence_epoch="it-bar-1",
+        )
+        _, scalp = app._apply_thesis(
+            "MGC", scalp_strict, "LONG READY", mode="SCALP",
+        )
+        _, intraday = app._apply_thesis(
+            "MGC", it_strict, "SHORT READY", mode="INTRADAY_TREND",
+        )
+        assert scalp["mode"] == "SCALP"
+        assert intraday["mode"] == "INTRADAY_TREND"
+        assert scalp["direction"] == "Long"
+        assert intraday["direction"] == "Short"
+        assert scalp["thesisId"] != intraday["thesisId"]
+        assert app.get_thesis_snapshot("MGC", "SCALP")["direction"] == "Long"
+        assert app.get_thesis_snapshot("MGC", "INTRADAY_TREND")["direction"] == "Short"
+    finally:
+        _clear("MGC")
+
+
+def test_same_epoch_hard_invalidation_still_demotes_immediately():
+    _clear("MGC")
+    try:
+        ready = _strict(
+            score=82, direction="Long", evidence_epoch="bar-1",
+        )
+        app._apply_thesis("MGC", ready, "LONG READY", mode="SWING")
+        broken = _strict(
+            score=82, direction="Long", zone_valid=False,
+            zone_broken=True, missing=["zone_valid"],
+            evidence_epoch="bar-1",
+        )
+        adj, snap = app._apply_thesis(
+            "MGC", broken, "WAIT", mode="SWING",
+        )
+        assert adj == "WAIT"
+        assert snap["status"] == "INVALIDATED"
+        assert snap["confidence"] == 0
+        cleared = _strict(
+            score=90,
+            direction="Long",
+            evidence_epoch="bar-1",
+        )
+        retry_adj, retry_snap = app._apply_thesis(
+            "MGC", cleared, "LONG READY", mode="SWING",
+        )
+        assert retry_adj == "WAIT"
+        assert retry_snap["status"] == "INVALIDATED"
+        assert retry_snap["thesisId"] == snap["thesisId"]
+    finally:
+        _clear("MGC")
+
+
+def test_confirmed_opposite_structure_demotes_even_inside_same_bar():
+    _clear("MGC")
+    try:
+        ready = _strict(
+            score=82,
+            direction="Long",
+            evidence_epoch="bar-1",
+            structure_state={
+                "state": "TREND_CONFIRMED",
+                "confirmed": True,
+                "direction": "Long",
+                "last_event_at": "2026-08-28T12:00:00+00:00",
+            },
+        )
+        _, original = app._apply_thesis(
+            "MGC", ready, "LONG READY", mode="SCALP",
+        )
+        opposite = _strict(
+            score=90,
+            direction="Short",
+            evidence_epoch="bar-1",
+            structure_state={
+                "state": "REVERSAL_CONFIRMED",
+                "confirmed": True,
+                "direction": "Short",
+                "last_event_at": "2026-08-28T12:00:01+00:00",
+            },
+        )
+        adj, reversed_snap = app._apply_thesis(
+            "MGC", opposite, "SHORT READY", mode="SCALP",
+        )
+        assert adj == "WAIT"
+        assert reversed_snap["direction"] == "Short"
+        assert reversed_snap["status"] == "FORMING_SHORT"
+        assert reversed_snap["entryPaused"] is True
+        assert reversed_snap["thesisId"] != original["thesisId"]
+
+        same_adj, same_snap = app._apply_thesis(
+            "MGC", opposite, "SHORT READY", mode="SCALP",
+        )
+        assert same_adj == "WAIT"
+        assert same_snap["thesisId"] == reversed_snap["thesisId"]
+
+        later = dict(opposite)
+        later["evidence_epoch"] = "bar-2"
+        later_adj, later_snap = app._apply_thesis(
+            "MGC", later, "SHORT READY", mode="SCALP",
+        )
+        assert later_adj == "SHORT READY"
+        assert later_snap["thesisId"] == reversed_snap["thesisId"]
+    finally:
+        _clear("MGC")
+
+
+def test_reversal_candidate_never_flips_active_thesis():
+    _clear("MGC")
+    try:
+        ready = _strict(
+            score=82,
+            direction="Long",
+            evidence_epoch="bar-1",
+            structure_state={
+                "state": "TREND_CONFIRMED",
+                "confirmed": True,
+                "direction": "Long",
+                "last_event_at": "2026-08-28T12:00:00+00:00",
+            },
+        )
+        _, original = app._apply_thesis(
+            "MGC", ready, "LONG READY", mode="SCALP",
+        )
+        candidate = _strict(
+            score=95,
+            direction="Short",
+            evidence_epoch="bar-2",
+            structure_state={
+                "state": "REVERSAL_CANDIDATE",
+                "confirmed": False,
+                "direction": "Short",
+                "last_event_at": "2026-08-28T12:01:00+00:00",
+            },
+        )
+        adj, snap = app._apply_thesis(
+            "MGC", candidate, "SHORT READY", mode="SCALP",
+        )
+        assert adj == "WAIT"
+        assert snap["direction"] == "Long"
+        assert snap["thesisId"] == original["thesisId"]
+        assert snap["entryPaused"] is True
+    finally:
+        _clear("MGC")
+
+
+def test_active_thesis_cannot_bypass_reversal_pause():
+    _clear("MGC")
+    try:
+        ready = _strict(
+            score=82,
+            direction="Long",
+            evidence_epoch="bar-1",
+            structure_state={
+                "state": "TREND_CONFIRMED",
+                "confirmed": True,
+                "direction": "Long",
+                "last_event_at": "2026-08-28T12:00:00+00:00",
+            },
+        )
+        _, original = app._apply_thesis(
+            "MGC", ready, "LONG READY", mode="SCALP",
+        )
+        with app.THESIS_LOCK:
+            active = dict(app.THESIS_BY_INST[("MGC", "SCALP")])
+            active["status"] = "ACTIVE_LONG"
+            app.THESIS_BY_INST[("MGC", "SCALP")] = active
+
+        candidate = _strict(
+            score=95,
+            direction="Short",
+            evidence_epoch="bar-2",
+            structure_state={
+                "state": "REVERSAL_CANDIDATE",
+                "confirmed": False,
+                "direction": "Short",
+                "last_event_at": "2026-08-28T12:01:00+00:00",
+            },
+        )
+        candidate_adj, candidate_snap = app._apply_thesis(
+            "MGC", candidate, "SHORT READY", mode="SCALP",
+        )
+        assert candidate_adj == "WAIT"
+        assert candidate_snap["direction"] == "Long"
+        assert candidate_snap["thesisId"] == original["thesisId"]
+
+        confirmed = dict(candidate)
+        confirmed["evidence_epoch"] = "bar-3"
+        confirmed["structure_state"] = {
+            "state": "REVERSAL_CONFIRMED",
+            "confirmed": True,
+            "direction": "Short",
+            "last_event_at": "2026-08-28T12:02:00+00:00",
+        }
+        confirmed_adj, confirmed_snap = app._apply_thesis(
+            "MGC", confirmed, "SHORT READY", mode="SCALP",
+        )
+        assert confirmed_adj == "WAIT"
+        assert confirmed_snap["status"] == "FORMING_SHORT"
+        assert confirmed_snap["entryPaused"] is True
+    finally:
+        _clear("MGC")
+
+
+def test_restart_restore_keeps_mode_epoch_and_origin_context():
+    saved_ready = app.THESIS_DB_READY
+    saved_conn = app.get_db_connection
+    _clear("MGC")
+
+    persisted = _strict(
+        score=84,
+        direction="Long",
+        evidence_epoch="bar-restore",
+        structure_state={
+            "state": "TREND_CONFIRMED",
+            "direction": "Long",
+            "last_event_at": "2026-08-28T12:00:00+00:00",
+        },
+        reason="Bullish structure remains confirmed.",
+    )
+    _, original = app._apply_thesis(
+        "MGC", persisted, "LONG READY", mode="SCALP",
+    )
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, _sql):
+            return None
+
+        def fetchall(self):
+            return [("MGC", "SCALP", dict(original), app.now_utc())]
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def close(self):
+            return None
+
+    try:
+        _clear("MGC")
+        app.THESIS_DB_READY = True
+        app.get_db_connection = lambda: Connection()
+        app._restore_thesis_states()
+        restored = app.get_thesis_snapshot("MGC", "SCALP")
+        assert restored["thesisId"] == original["thesisId"]
+        assert restored["evidenceEpoch"] == "bar-restore"
+        assert restored["stableReason"] == "Bullish structure remains confirmed."
+        assert restored["originatingStructureContext"]["state"] == "TREND_CONFIRMED"
+        assert restored["invalidationConditions"]
+    finally:
+        app.get_db_connection = saved_conn
+        app.THESIS_DB_READY = saved_ready
         _clear("MGC")
 
 
@@ -489,14 +801,14 @@ def test_scalp_no_zone_no_hard_invalidation():
 if __name__ == "__main__":
     tests = [
         test_ready_promotion_from_forming,
-        test_strict_wait_is_never_promoted_by_continuity,
+        test_hysteresis_hold_above_60,
         test_drops_to_wait_below_hold_threshold,
         test_reversal_below_threshold_weakens_not_flips,
-        test_reversal_requires_distinct_confirming_evidence,
+        test_reversal_at_threshold_flips_direction,
         test_zone_broken_hard_invalidation_swing,
         test_structure_lost_hard_invalidation,
         test_per_instrument_isolation,
-        test_invalidated_thesis_restarts_as_forming,
+        test_cooldown_blocks_new_thesis,
         test_confidence_rise_is_immediate,
         test_confidence_fall_capped,
         test_new_thesis_id_after_invalidation,
@@ -504,6 +816,14 @@ if __name__ == "__main__":
         test_status_payload_has_thesis_key,
         test_journal_entry_has_thesis_fields,
         test_scalp_no_zone_no_hard_invalidation,
+        test_identical_heartbeat_epoch_does_not_drain_confidence,
+        test_new_bar_epoch_updates_confidence_once,
+        test_scalp_and_intraday_theses_are_isolated,
+        test_same_epoch_hard_invalidation_still_demotes_immediately,
+        test_confirmed_opposite_structure_demotes_even_inside_same_bar,
+        test_reversal_candidate_never_flips_active_thesis,
+        test_active_thesis_cannot_bypass_reversal_pause,
+        test_restart_restore_keeps_mode_epoch_and_origin_context,
     ]
     passed = failed = 0
     for fn in tests:

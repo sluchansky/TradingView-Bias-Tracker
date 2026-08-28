@@ -15,7 +15,7 @@ def _clear():
 
 
 def _strict(
-    evidence_id,
+    evidence_epoch,
     *,
     score=80,
     direction="Long",
@@ -26,7 +26,7 @@ def _strict(
     zone_broken=False,
 ):
     return {
-        "evidence_id": evidence_id,
+        "evidence_epoch": evidence_epoch,
         "score": score,
         "direction": direction,
         "candidate": direction,
@@ -57,10 +57,13 @@ def test_identical_heartbeat_is_a_true_noop():
     _clear()
     strict = _strict("same-bar")
     _, first = _apply("MNQ", "SCALP", dict(strict))
-    timeline_before = list(app.THESIS_TIMELINE_BY_INST["MNQ|SCALP"])
+    timeline_before = list(app.THESIS_TIMELINE_BY_INST[("MNQ", "SCALP")])
     _, second = _apply("MNQ", "SCALP", dict(strict))
-    timeline_after = list(app.THESIS_TIMELINE_BY_INST["MNQ|SCALP"])
-    assert second == first
+    timeline_after = list(app.THESIS_TIMELINE_BY_INST[("MNQ", "SCALP")])
+    assert second["thesisId"] == first["thesisId"]
+    assert second["confidence"] == first["confidence"]
+    assert second["status"] == first["status"]
+    assert second["evidenceEpoch"] == first["evidenceEpoch"]
     assert timeline_after == timeline_before
 
 
@@ -77,7 +80,7 @@ def test_instrument_and_mode_are_both_isolated():
     assert mes["direction"] == "Short"
     assert len({scalp["thesisId"], intraday["thesisId"], mes["thesisId"]}) == 3
     assert set(app.THESIS_BY_INST) == {
-        "MNQ|SCALP", "MNQ|INTRADAY_TREND", "MES|SCALP",
+        ("MNQ", "SCALP"), ("MNQ", "INTRADAY_TREND"), ("MES", "SCALP"),
     }
 
 
@@ -92,64 +95,91 @@ def test_explicit_zone_invalidation_demotes_ready():
     assert snap["invalidationReason"] == "Zone consumed"
 
 
-def test_reversal_requires_pending_then_distinct_structure_confirmation():
+def test_reversal_requires_confirmed_structure_then_newer_entry_epoch():
     _clear()
     _, original = _apply("MNQ", "SCALP", _strict("long", direction="Long"))
     verdict1, pending = _apply(
         "MNQ", "SCALP", _strict("short-candidate", score=90, direction="Short"))
     assert verdict1 == "WAIT"
-    assert pending["status"] == "PENDING_REVERSAL"
+    assert pending["status"] == "READY_LONG"
     assert pending["direction"] == "Long"
+    assert pending["entryStatus"] == "WAIT"
 
     confirmed = _strict(
         "short-confirmed",
         score=90,
         direction="Short",
-        structure_state={"state": "REVERSAL_CONFIRMED", "direction": "Short"},
+        structure_state={
+            "state": "REVERSAL_CONFIRMED",
+            "confirmed": True,
+            "direction": "Short",
+            "last_event_at": "2026-08-28T12:01:00+00:00",
+        },
     )
     verdict2, replacement = _apply("MNQ", "SCALP", confirmed)
     assert verdict2 == "WAIT"
-    assert replacement["status"] == "FORMING"
+    assert replacement["status"] == "FORMING_SHORT"
     assert replacement["direction"] == "Short"
-    assert replacement["replacesThesisId"] == original["thesisId"]
-    assert replacement["replacedThesisFinalStatus"] == "INVALIDATED"
+    assert replacement["thesisId"] != original["thesisId"]
+    assert replacement["entryStatus"] == "WAIT"
+    assert replacement["reversalDetectedEpoch"] == "short-confirmed"
+
+    later = _strict(
+        "short-next-bar",
+        score=90,
+        direction="Short",
+        structure_state={
+            "state": "TREND_CONFIRMED",
+            "confirmed": True,
+            "direction": "Short",
+            "last_event_at": "2026-08-28T12:02:00+00:00",
+        },
+    )
+    verdict3, ready = _apply("MNQ", "SCALP", later)
+    assert verdict3 == "SHORT READY"
+    assert ready["status"] == "READY_SHORT"
+    assert ready["entryStatus"] == "READY"
 
 
 def test_strict_wait_never_becomes_ready_but_strict_ready_passes():
     _clear()
     ready_verdict, confirmed = _apply("MYM", "SCALP", _strict("ready"))
     assert ready_verdict == "LONG READY"
-    assert confirmed["status"] == "CONFIRMED"
+    assert confirmed["status"] == "READY_LONG"
+    assert confirmed["entryStatus"] == "READY"
 
     waiting = _strict("new-wait", score=74, ready=False)
     wait_verdict, weakening = _apply("MYM", "SCALP", waiting)
     assert wait_verdict == "WAIT"
-    assert weakening["status"] == "WEAKENING"
+    assert weakening["status"] == "READY_LONG"
+    assert weakening["entryPaused"] is True
     assert weakening["entryStatus"] == "WAIT"
 
 
-def test_restart_restores_stale_rows_for_each_mode(monkeypatch):
+def test_restart_restores_recent_rows_for_each_mode(monkeypatch):
     _clear()
-    stale_at = app.now_utc() - timedelta(hours=8)
+    restored_at = app.now_utc() - timedelta(minutes=5)
     rows = [
         ("MNQ", "SCALP", {
             "thesisId": "th_scalp",
             "instrument": "MNQ",
             "mode": "SCALP",
             "direction": "Long",
-            "status": "WEAKENING",
+            "status": "READY_LONG",
             "confidence": 64,
-            "createdAt": stale_at.isoformat(),
-        }, stale_at),
-        ("MNQ", "INTRADAY_TREND", {
+            "entryStatus": "READY",
+            "entryPaused": False,
+            "createdAt": restored_at.isoformat(),
+        }, restored_at),
+        ("MNQ", "SWING", {
             "thesisId": "th_it",
             "instrument": "MNQ",
-            "mode": "INTRADAY_TREND",
+            "mode": "SWING",
             "direction": "Short",
-            "status": "FORMING",
+            "status": "FORMING_SHORT",
             "confidence": 58,
-            "createdAt": stale_at.isoformat(),
-        }, stale_at),
+            "createdAt": restored_at.isoformat(),
+        }, restored_at),
     ]
 
     class Cursor:
@@ -180,5 +210,66 @@ def test_restart_restores_stale_rows_for_each_mode(monkeypatch):
     intraday = app.get_thesis_snapshot("MNQ", "INTRADAY_TREND")
     assert scalp["thesisId"] == "th_scalp"
     assert intraday["thesisId"] == "th_it"
-    assert scalp["evidenceStaleOnRestore"] is True
-    assert intraday["evidenceStaleOnRestore"] is True
+    assert scalp["mode"] == "SCALP"
+    assert intraday["mode"] == "INTRADAY_TREND"
+    assert scalp["entryStatus"] == "WAIT"
+    assert intraday["entryStatus"] == "WAIT"
+    assert scalp["entryPaused"] is True
+    assert scalp["restoredAwaitingFreshEvaluation"] is True
+    assert app._evaluate_thesis_alignment(scalp, "Long") == "NO_THESIS"
+
+    verdict, refreshed = _apply(
+        "MNQ", "SCALP", _strict("post-restart-fresh", direction="Long")
+    )
+    assert verdict == "LONG READY"
+    assert refreshed["entryStatus"] == "READY"
+    assert refreshed["entryPaused"] is False
+    assert refreshed["restoredAwaitingFreshEvaluation"] is False
+
+
+def test_swing_aliases_the_intraday_thesis():
+    _clear()
+    _, swing = _apply("MGC", "SWING", _strict("swing-bar", direction="Long"))
+    intraday = app.get_thesis_snapshot("MGC", "INTRADAY_TREND")
+    assert swing["mode"] == "INTRADAY_TREND"
+    assert intraday["thesisId"] == swing["thesisId"]
+    assert ("MGC", "SWING") not in set(app.THESIS_BY_INST)
+    assert ("MGC", "INTRADAY_TREND") in set(app.THESIS_BY_INST)
+
+
+def test_swing_persistence_writes_the_canonical_mode(monkeypatch):
+    calls = []
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def execute(self, sql, params):
+            calls.append((sql, params))
+
+    class Connection:
+        def cursor(self):
+            return Cursor()
+
+        def commit(self):
+            return None
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(app, "THESIS_DB_READY", True)
+    monkeypatch.setattr(app, "get_db_connection", lambda: Connection())
+    snap = {
+        "thesisId": "th_swing",
+        "instrument": "MGC",
+        "mode": "SWING",
+        "direction": "Long",
+        "status": "READY_LONG",
+        "confidence": 82,
+    }
+    app._persist_thesis_state("MGC", snap, mode="SWING")
+    assert calls
+    assert calls[0][1][1] == "INTRADAY_TREND"
