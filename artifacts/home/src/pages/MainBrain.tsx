@@ -1,8 +1,10 @@
 /**
  * V1 Phase 7C — Main Brain Operator Console
  *
- * Read-only dashboard sourced exclusively from GET /api/main-brain.
- * No backend mutations, no gateway calls, no broker requests.
+ * Operator console sourced from GET /api/main-brain plus authenticated,
+ * deliberate operator actions. Explanation panels are read-only; execution,
+ * journal, research-repair, and configuration controls use existing guarded
+ * server endpoints and never bypass the backend safety boundaries.
  * Auth: same Basic Auth pattern as Home.tsx (localStorage brain_auth).
  * Polling: 7 s (reduced when hidden). Manual refresh control included.
  */

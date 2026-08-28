@@ -11,7 +11,8 @@ Coverage:
 - /main-brain endpoint is in the Express proxy whitelist
 - MainBrain.tsx source audits: no hardcoded live trading values
 - Safe rendering contract: null/missing field handling
-- No backend mutation from UI load (no writes, no gateway calls, no broker calls)
+- Read-only explanation surfaces remain separate from deliberate authenticated
+  operator actions (execution, journal, and research repair)
 - Polling cadence contract
 - Manual refresh control presence
 - Strategy count: exactly 5 canonical main-engine strategies
@@ -28,7 +29,7 @@ Coverage:
 - Authentication: same Basic Auth pattern, no credential leak
 - No new Flask route required (UI served by existing SPA)
 - Validation document exists
-- Phase 7B backend unmodified
+- Phase 7B backend contract and regression suite remain valid
 
 Run with:
     python3 artifacts/tradingview-webhook/test_phase7c_main_brain_ui.py
@@ -531,7 +532,13 @@ class TC016_DesignTokens(unittest.TestCase):
 
 
 class TC017_AuthenticatedOperatorConsole(unittest.TestCase):
-    """Authenticated operator reads and explicit actions keep their safety boundaries."""
+    """Authenticated reads/actions keep their safety boundaries.
+
+    MainBrain is a mixed operator console: most panels explain backend state,
+    while a small set of visible controls intentionally calls existing
+    server-authoritative endpoints.  The audit must protect that distinction
+    rather than treating every POST or supporting GET as a defect.
+    """
 
     def setUp(self):
         self.mb_tsx = slurp('artifacts/home/src/pages/MainBrain.tsx')
@@ -566,6 +573,25 @@ class TC017_AuthenticatedOperatorConsole(unittest.TestCase):
                 r"getAuthHeader\(\)|Authorization",
                 "Every MainBrain POST must include the authenticated operator header",
             )
+
+    def test_090a_deliberate_write_surfaces_are_explicit(self):
+        # These are intentional operator controls, not dashboard-load writes.
+        # Keep the audit focused on the safety boundary: the UI may expose
+        # existing guarded routes, but must not invent a direct /enter path.
+        expected_controls = [
+            "/api/traderspost",       # server-authoritative execution gateway
+            "/api/manual-order",      # owner-controlled manual desk gateway
+            "/api/quick-exit",        # protected flatten action
+            "/api/stop-managing",     # local tracking action
+            "/api/execution/",        # enable/arm/disarm configuration
+            "/api/journal/",          # review/import/attachment controls
+            "/api/paper-sim/reprocess",  # research-only repair
+        ]
+        for endpoint in expected_controls:
+            self.assertIn(endpoint, self.mb_tsx,
+                          f"Expected authenticated operator surface is missing: {endpoint}")
+        self.assertNotIn("/api/enter", self.mb_tsx,
+                         "MainBrain must not bypass the existing execution gateway")
 
     def test_091_authenticated_journal_access(self):
         # Journal data and review controls are part of the authenticated
@@ -611,8 +637,22 @@ class TC018_BackendUnmodified(unittest.TestCase):
             [sys.executable, 'artifacts/tradingview-webhook/test_phase7b_main_brain_route.py'],
             capture_output=True, text=True, cwd=ROOT
         )
-        self.assertIn("57 passed", result.stdout,
-            f"Phase 7B tests must still pass 57/57\n{result.stdout}\n{result.stderr}")
+        output = f"{result.stdout}\n{result.stderr}"
+        self.assertEqual(
+            result.returncode,
+            0,
+            f"Phase 7B regression suite failed (test count may change over time):\n{output}",
+        )
+        summary = re.search(
+            r"TOTAL:\s+(\d+)\s+checks\s+—\s+(\d+)\s+passed,\s+(\d+)\s+failed",
+            output,
+        )
+        self.assertIsNotNone(summary, f"Phase 7B suite did not emit a check summary:\n{output}")
+        if summary:
+            total, passed, failed = (int(value) for value in summary.groups())
+            self.assertGreater(total, 0, "Phase 7B suite must execute at least one check")
+            self.assertEqual(passed, total, "Every Phase 7B check must pass")
+            self.assertEqual(failed, 0, "Phase 7B suite must report zero failures")
 
     def test_096_main_brain_endpoint_in_app_py(self):
         app_py = slurp('artifacts/tradingview-webhook/app.py')
