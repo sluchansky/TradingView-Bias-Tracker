@@ -14,3 +14,9 @@ Advisory comparisons must use only exact paired baseline/candidate cycles. A can
 **Why:** Mixing unpaired baseline cycles into candidate cost or quality denominators can make a sparse candidate look cheaper or more reliable than it is.
 
 **How to apply:** Expose unpaired coverage separately, gate confidence on paired coverage, and keep every recommendation advisory with no automatic rollout.
+
+Candidate execution must remain disabled whenever the Visual Brain 2.0 event gate is enabled, even if an old benchmark candidate flag is present.
+
+**Why:** Visual Brain 2.0 explicitly preserves GPT-5.4 as the sole paid observer and excludes candidate/local-model rollout; telemetry must never imply a candidate is off while still executing it.
+
+**How to apply:** Candidate benchmark tests may opt into the legacy benchmark-only mode explicitly, but the event-driven runtime must report and enforce candidate-off behavior.

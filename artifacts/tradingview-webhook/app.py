@@ -88601,6 +88601,21 @@ def route_visual_brain_benchmark():
         return jsonify({"ok": False, "error": str(exc)}), 500
 
 
+@app.route("/visual-brain/health", methods=["GET"])
+def route_visual_brain_health():
+    """Read-only Visual Brain 2.0 gate, heartbeat, cap, and cost telemetry."""
+    try:
+        import visual_brain as _vb  # noqa: PLC0415
+        inst = request.args.get("instrument")
+        limit = min(max(int(request.args.get("limit", "50")), 1), 200)
+        return jsonify(_vb.get_visual_brain_health(
+            limit=limit,
+            instrument=inst,
+        ))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/visual-brain/all-status", methods=["GET"])
 def route_visual_brain_all_status():
     """All active Visual Brain instrument observations in one call (DISPLAY/SHADOW-ONLY).
@@ -88622,6 +88637,7 @@ def route_visual_brain_all_status():
             "db_ready":   _vb.VB_DB_READY,
             "symbols":    _vb._VB_SYMBOLS,
             "cost":       _vb.get_cost_summary(),
+            "health":     _vb.get_visual_brain_health(limit=20),
             "instruments": instruments,
         })
     except Exception as exc:
@@ -91552,7 +91568,7 @@ if __name__ == "__main__":
     # never needs `import app`, which would create a duplicate module with empty
     # globals, breaking DB connections and price stores.
     def _visual_brain_benchmark_state(inst):
-        """Read existing deterministic state for shadow trigger telemetry only."""
+        """Read existing deterministic state for Visual Brain's local gate only."""
         instrument = str(inst or "").upper()
         structure_event = None
         for record in reversed(list(ALERT_HISTORY)):
@@ -91576,6 +91592,46 @@ if __name__ == "__main__":
         with STATE_LOCK:
             setup_state = dict(SETUP_STATE.get(instrument) or {})
         ready_snapshot = dict(LAST_READY_BY_TICKER.get(instrument) or {})
+        price_record = dict(AUTO_PRICE_BY_TICKER.get(instrument) or {})
+        vwap_record = dict(VWAP_BY_TICKER.get(instrument) or {})
+        try:
+            gate_price = float(price_record.get("value"))
+            gate_vwap = float(vwap_record.get("value"))
+            gate_distance = abs(gate_price - gate_vwap) / max(abs(gate_vwap), 1.0)
+            vwap_side = (
+                "ABOVE" if gate_price > gate_vwap
+                else "BELOW" if gate_price < gate_vwap
+                else "AT"
+            )
+            vwap_distance_bucket = (
+                "NEAR" if gate_distance <= 0.0005
+                else "MID" if gate_distance <= 0.0015
+                else "FAR"
+            )
+        except (TypeError, ValueError):
+            vwap_side = "UNKNOWN"
+            vwap_distance_bucket = "UNKNOWN"
+        volatility_record = dict(VOLATILITY_BY_TICKER.get(instrument) or {})
+        try:
+            vol_ratio = float(volatility_record.get("ratio"))
+            volatility_regime = (
+                "QUIET" if vol_ratio < 0.75
+                else "NORMAL" if vol_ratio < 1.5
+                else "ELEVATED" if vol_ratio < 3.0
+                else "EXTREME"
+            )
+        except (TypeError, ValueError):
+            volatility_regime = "UNKNOWN"
+        rvol_record = dict(RVOL_BY_TICKER.get(instrument) or {})
+        try:
+            rvol_value = float(rvol_record.get("value"))
+            volume_regime = (
+                "LOW" if rvol_value < 1.0
+                else "NORMAL" if rvol_value < 1.5
+                else "HIGH"
+            )
+        except (TypeError, ValueError):
+            volume_regime = "UNKNOWN"
         blockers = (
             setup_state.get("blockers")
             or ready_snapshot.get("strict_missing")
@@ -91588,10 +91644,23 @@ if __name__ == "__main__":
         return {
             "instrument": instrument,
             "structure_event": structure_event,
-            "vwap": dict(VWAP_BY_TICKER.get(instrument) or {}),
+            "vwap": {
+                "side": vwap_side,
+                "distance_bucket": vwap_distance_bucket,
+                "source": vwap_record.get("source"),
+                "available": bool(vwap_record),
+            },
             "levels": {
                 "nearest_supply": ready_snapshot.get("nearest_supply"),
                 "nearest_demand": ready_snapshot.get("nearest_demand"),
+            },
+            "session_levels": {
+                key: ready_snapshot.get(key)
+                for key in (
+                    "session_high", "session_low", "overnight_high",
+                    "overnight_low", "prior_day_high", "prior_day_low",
+                )
+                if ready_snapshot.get(key) is not None
             },
             "thesis": {
                 key: thesis.get(key)
@@ -91605,11 +91674,14 @@ if __name__ == "__main__":
                 for key in ("state", "status", "reason")
                 if key in setup_state
             },
-            "volatility": dict(VOLATILITY_BY_TICKER.get(instrument) or {}),
+            "volatility": {
+                "regime": volatility_regime,
+                "available": bool(volatility_record),
+            },
             "volume": {
-                "rvol": dict(RVOL_BY_TICKER.get(instrument) or {}),
-                "volume_spike": dict(VOLUME_SPIKE_BY_TICKER.get(instrument) or {}),
-                "cvd": dict(CVD_BY_TICKER.get(instrument) or {}),
+                "regime": volume_regime,
+                "spike": bool(VOLUME_SPIKE_BY_TICKER.get(instrument)),
+                "cvd_state": (CVD_BY_TICKER.get(instrument) or {}).get("state"),
             },
             "session": (
                 ready_snapshot.get("session")
@@ -91617,10 +91689,11 @@ if __name__ == "__main__":
                 or thesis.get("session")
             ),
             "recovery": {
-                "price_available": bool(AUTO_PRICE_BY_TICKER.get(instrument)),
-                "vwap_available": bool(VWAP_BY_TICKER.get(instrument)),
-                "volatility_available": bool(VOLATILITY_BY_TICKER.get(instrument)),
+                "price_available": bool(price_record),
+                "vwap_available": bool(vwap_record),
+                "volatility_available": bool(volatility_record),
             },
+            "market_active": bool(market_session_status().get("open", False)),
         }
 
     try:
@@ -91640,6 +91713,14 @@ if __name__ == "__main__":
             research_outcome_fn=_market_student_resolve_visual,
             benchmark_state_fn=_visual_brain_benchmark_state,
         )
+        _db_brain = globals().get("_DATABENTO_BRAIN")
+        if _db_brain is not None:
+            _db_brain.register_completed_bar_callback(
+                _vb_boot.notify_completed_bar
+            )
+            logger.info(
+                "[VISUAL_BRAIN] completed-bar event callback registered"
+            )
     except Exception as _vb_boot_exc:
         logger.warning("[VISUAL_BRAIN] boot error (non-critical, fail-open): %s", _vb_boot_exc)
     if LEFT_BRAIN_MARKET_INTELLIGENCE_ENABLED:

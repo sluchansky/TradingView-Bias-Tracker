@@ -1,7 +1,7 @@
-"""Visual Brain V1 — Multi-Instrument Stateful Market Observer.
+"""Visual Brain V2 — Multi-Instrument Stateful Market Observer.
 
 Captures the live chart (or a locally-generated candlestick
-chart from Databento bars) once per 60 seconds, sends the image plus native
+chart from Databento bars) only after a deterministic local trigger, sends the image plus native
 multi-timeframe context and a compact text history to a vision-capable LLM,
 receives a strict JSON market state, and persists every observation to
 visual_brain_observations.
@@ -11,7 +11,8 @@ SHADOW / OBSERVATION ONLY.
 - Does NOT modify SCALP / INTRADAY_TREND / SWING decision logic.
 - Does NOT alter gate thresholds, edge scores, or execution paths.
 - All writes FAIL-OPEN — a bug here cannot affect the money path.
-- One model call maximum per 300 seconds; screenshot compressed to ≤800px wide.
+- A conservative event-driven gate and heartbeat protect the paid observer;
+  screenshots are compressed to ≤800px wide.
 
 Flag: VISUAL_BRAIN_ENABLED=true  (default OFF → byte-identical).
 Instruments: VISUAL_BRAIN_SYMBOL=MNQ,MGC  (comma-separated; default MNQ and MGC).
@@ -28,6 +29,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from collections import deque
 from datetime import datetime, timezone, timedelta
 from typing import Any, Callable, Optional
@@ -78,7 +80,52 @@ VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX = max(
     0,
     int(os.getenv("VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX", "3")),
 )
+VISUAL_BRAIN_MAX_STALENESS_SECONDS = max(
+    60,
+    int(os.getenv(
+        "VISUAL_BRAIN_MAX_STALENESS_SECONDS",
+        str(VISUAL_BRAIN_BENCHMARK_MAX_STALENESS_SECONDS),
+    )),
+)
+VISUAL_BRAIN_IMAGE_HAMMING_MAX = max(
+    0,
+    int(os.getenv(
+        "VISUAL_BRAIN_IMAGE_HAMMING_MAX",
+        str(VISUAL_BRAIN_BENCHMARK_IMAGE_HAMMING_MAX),
+    )),
+)
 _BENCHMARK_HISTORY_LIMIT = 200
+
+# ── Event-driven paid-observer gate ───────────────────────────────────────────
+# These controls apply only to Visual Brain's shadow observer.  They are
+# intentionally independent of the trading engine's execution/risk controls.
+VISUAL_BRAIN_EVENT_GATING_ENABLED = os.getenv(
+    "VISUAL_BRAIN_EVENT_GATING_ENABLED", "true"
+).lower() in ("true", "1", "yes", "on")
+VISUAL_BRAIN_EVENT_DEBOUNCE_SECONDS = max(
+    0.0, float(os.getenv("VISUAL_BRAIN_EVENT_DEBOUNCE_SECONDS", "5"))
+)
+VISUAL_BRAIN_CALL_WINDOW_SECONDS = max(
+    60, int(os.getenv("VISUAL_BRAIN_CALL_WINDOW_SECONDS", "3600"))
+)
+VISUAL_BRAIN_MAX_CALLS_PER_WINDOW = max(
+    1, min(10_000, int(os.getenv("VISUAL_BRAIN_MAX_CALLS_PER_WINDOW", "6")))
+)
+_daily_cap_raw = os.getenv(
+    "VISUAL_BRAIN_MAX_DAILY_SPEND_USD",
+    os.getenv("VISUAL_BRAIN_DAILY_SPEND_CAP_USD", "1.00"),
+)
+try:
+    VISUAL_BRAIN_MAX_DAILY_SPEND_USD = max(0.0, float(_daily_cap_raw))
+except (TypeError, ValueError):
+    VISUAL_BRAIN_MAX_DAILY_SPEND_USD = 1.0
+try:
+    VISUAL_BRAIN_ESTIMATED_CALL_COST_USD = max(
+        0.0, float(os.getenv("VISUAL_BRAIN_ESTIMATED_CALL_COST_USD", "0.01"))
+    )
+except (TypeError, ValueError):
+    VISUAL_BRAIN_ESTIMATED_CALL_COST_USD = 0.01
+_VB_MAX_API_ATTEMPTS = 2
 
 # ── Module-level state ────────────────────────────────────────────────────────
 VB_DB_READY          = False
@@ -134,6 +181,30 @@ _BENCHMARK_MAX_INSTRUMENTS = 16
 _BENCHMARK_MAX_PENDING_CANDIDATES = 50
 _BENCHMARK_MAX_ACTIVE_CANDIDATES = 4
 
+# Event-gate state is deliberately separate from benchmark state.  It is
+# display-only, in-memory, and never read by the evaluator or execution path.
+_GATE_LOCK = threading.RLock()
+_VB_GATE_STATE_BY_INST: dict = {}
+_VB_GATE_RECENT: deque = deque(maxlen=200)
+_VB_GATE_COUNTERS = {
+    "ticks": 0,
+    "paid_calls_allowed": 0,
+    "paid_calls_avoided": 0,
+    "suppressed_no_new_bar": 0,
+    "suppressed_fingerprint": 0,
+    "suppressed_event_debounce": 0,
+    "suppressed_heartbeat": 0,
+    "suppressed_cap": 0,
+    "suppressed_other": 0,
+    "trigger_reasons": {},
+    "suppression_reasons": {},
+}
+_VB_CALL_RESERVATIONS: deque = deque(maxlen=10_000)
+_VB_INFLIGHT: set[str] = set()
+_VB_EVENT_TIMERS: dict[str, threading.Timer] = {}
+_VB_EVENT_TOKENS: dict[str, str] = {}
+_VB_PENDING_BAR_EVENTS: dict[str, int] = {}
+
 
 def _benchmark_empty_counters() -> dict:
     return {
@@ -176,7 +247,7 @@ def _benchmark_empty_counters() -> dict:
 
 def _benchmark_reset_state() -> None:
     """Reset only in-memory benchmark state; intended for isolated tests."""
-    global _BENCHMARK_COUNTERS
+    global _BENCHMARK_COUNTERS, _VB_GATE_COUNTERS
     with _BENCHMARK_LOCK:
         _BENCHMARK_LAST_BY_INST.clear()
         _BENCHMARK_RECENT.clear()
@@ -184,6 +255,32 @@ def _benchmark_reset_state() -> None:
         _BENCHMARK_ACTIVE_CANDIDATES.clear()
         _BENCHMARK_OPEN_CYCLES.clear()
         _BENCHMARK_COUNTERS = _benchmark_empty_counters()
+    with _GATE_LOCK:
+        _VB_GATE_STATE_BY_INST.clear()
+        _VB_GATE_RECENT.clear()
+        _VB_CALL_RESERVATIONS.clear()
+        _VB_INFLIGHT.clear()
+        for timer in _VB_EVENT_TIMERS.values():
+            try:
+                timer.cancel()
+            except Exception:
+                pass
+        _VB_EVENT_TIMERS.clear()
+        _VB_EVENT_TOKENS.clear()
+        _VB_PENDING_BAR_EVENTS.clear()
+        _VB_GATE_COUNTERS = {
+            "ticks": 0,
+            "paid_calls_allowed": 0,
+            "paid_calls_avoided": 0,
+            "suppressed_no_new_bar": 0,
+            "suppressed_fingerprint": 0,
+            "suppressed_event_debounce": 0,
+            "suppressed_heartbeat": 0,
+            "suppressed_cap": 0,
+            "suppressed_other": 0,
+            "trigger_reasons": {},
+            "suppression_reasons": {},
+        }
 
 
 _BENCHMARK_COUNTERS = _benchmark_empty_counters()
@@ -468,6 +565,452 @@ def compute_benchmark_trigger_policies(
     }
 
 
+def _gate_market_active(snapshot: Optional[dict], bars: list[dict] | None = None) -> bool:
+    """Conservatively identify an active market without consulting trading state."""
+    if isinstance(snapshot, dict):
+        if "market_active" in snapshot:
+            return snapshot.get("market_active") is True
+        recovery = snapshot.get("recovery")
+        if isinstance(recovery, dict) and recovery.get("price_available"):
+            return True
+        if snapshot.get("price") is not None or snapshot.get("last_price") is not None:
+            return True
+    return bool(bars)
+
+
+def compute_visual_brain_gate(
+    previous_state: Optional[dict],
+    *,
+    completed_bar_fingerprint: Optional[str],
+    image_fingerprint: Optional[dict] = None,
+    context_fingerprint: Optional[str] = None,
+    deterministic_snapshot: Optional[dict] = None,
+    bars: list[dict] | None = None,
+    now_epoch: Optional[float] = None,
+    max_staleness_seconds: Optional[int] = None,
+    event_debounce_seconds: Optional[float] = None,
+) -> dict:
+    """Pure local decision for whether a paid observation is warranted.
+
+    This is intentionally separate from the canonical evaluator.  It only
+    compares immutable fingerprints and deterministic display context.  The
+    caller may run it once before a screenshot (image omitted) and again after
+    capture (image supplied).
+    """
+    previous = previous_state if isinstance(previous_state, dict) else {}
+    image = image_fingerprint if isinstance(image_fingerprint, dict) else {}
+    previous_image = previous.get("image_fingerprint") or {}
+    new_bar = bool(
+        completed_bar_fingerprint
+        and completed_bar_fingerprint != previous.get("completed_bar_fingerprint")
+    )
+    current_semantic = _benchmark_semantic_snapshot(deterministic_snapshot)
+    previous_semantic = previous.get("semantic_snapshot") or {}
+    event_reasons = _benchmark_event_reasons(previous_semantic, current_semantic)
+    event_signature = _stable_hash(current_semantic) if event_reasons else None
+    previous_event_signature = previous.get("last_event_signature")
+
+    now = float(now_epoch if now_epoch is not None else time.time())
+    last_paid_at = previous.get("last_paid_at", previous.get("last_baseline_at"))
+    try:
+        staleness = (
+            max(0.0, now - float(last_paid_at))
+            if last_paid_at is not None else None
+        )
+    except (TypeError, ValueError):
+        staleness = None
+    threshold = max(
+        60,
+        int(
+            max_staleness_seconds
+            if max_staleness_seconds is not None
+            else VISUAL_BRAIN_MAX_STALENESS_SECONDS
+        ),
+    )
+    heartbeat = bool(
+        _gate_market_active(deterministic_snapshot, bars)
+        and (last_paid_at is None or (staleness is not None and staleness >= threshold))
+    )
+
+    exact_duplicate = bool(
+        image.get("sha256")
+        and image.get("sha256") == previous_image.get("sha256")
+    )
+    distance = _hamming_distance(image.get("ahash"), previous_image.get("ahash"))
+    near_duplicate = bool(
+        not exact_duplicate
+        and distance is not None
+        and distance <= VISUAL_BRAIN_IMAGE_HAMMING_MAX
+    )
+    context_unchanged = bool(
+        context_fingerprint
+        and previous.get("context_fingerprint")
+        and context_fingerprint == previous.get("context_fingerprint")
+    )
+
+    initial = not previous and bool(completed_bar_fingerprint)
+    debounce = (
+        VISUAL_BRAIN_EVENT_DEBOUNCE_SECONDS
+        if event_debounce_seconds is None
+        else max(0.0, float(event_debounce_seconds))
+    )
+    pending_signature = previous.get("pending_event_signature")
+    pending_since = previous.get("pending_event_since")
+    debounce_pending = False
+    if (
+        not initial
+        and event_signature
+        and event_signature != previous_event_signature
+    ):
+        if pending_signature != event_signature:
+            pending_since = now
+        try:
+            debounce_pending = debounce > 0 and now - float(pending_since) < debounce
+        except (TypeError, ValueError):
+            debounce_pending = debounce > 0
+
+    suppression: list[str] = []
+    if not completed_bar_fingerprint or not new_bar:
+        suppression.append("no_new_completed_bar")
+    meaningful_event = bool(event_reasons and not debounce_pending)
+    trigger_reasons = list(event_reasons)
+    if initial:
+        trigger_reasons = ["initial_observation"]
+    elif heartbeat:
+        trigger_reasons.append("max_staleness_heartbeat")
+
+    if debounce_pending:
+        suppression.append("event_debounce")
+    if exact_duplicate:
+        suppression.append("exact_chart_fingerprint")
+    elif near_duplicate:
+        suppression.append("near_identical_chart_fingerprint")
+    if context_unchanged and not initial:
+        suppression.append("unchanged_context_fingerprint")
+    if not initial and not meaningful_event and not heartbeat:
+        suppression.append("no_meaningful_event")
+
+    # A first observation is allowed with no image yet so the caller knows to
+    # capture one.  Subsequent calls always require a newly completed bar and a
+    # trigger; image/context suppression is applied once capture is available.
+    should_call = bool(
+        completed_bar_fingerprint
+        and new_bar
+        and (initial or meaningful_event or heartbeat)
+        and not debounce_pending
+        and not exact_duplicate
+        and not near_duplicate
+        and (initial or not context_unchanged)
+    )
+    if image_fingerprint is None and should_call:
+        suppression = [item for item in suppression if "fingerprint" not in item]
+    if not completed_bar_fingerprint:
+        reason = "no_new_completed_bar"
+    elif not new_bar:
+        reason = "no_new_completed_bar"
+    elif debounce_pending:
+        reason = "event_debounce"
+    elif exact_duplicate:
+        reason = "exact_chart_fingerprint"
+    elif near_duplicate:
+        reason = "near_identical_chart_fingerprint"
+    elif context_unchanged and not initial:
+        reason = "unchanged_context_fingerprint"
+    elif initial:
+        reason = "initial_observation"
+    elif meaningful_event:
+        reason = "deterministic_event"
+    elif heartbeat:
+        reason = "max_staleness_heartbeat"
+    else:
+        reason = "no_meaningful_event"
+    return {
+        "call": should_call,
+        "reason": reason,
+        "trigger_reasons": trigger_reasons,
+        "suppression_reasons": suppression,
+        "event_reasons": event_reasons,
+        "event_signature": event_signature,
+        "semantic_fingerprint": _stable_hash(current_semantic),
+        "semantic_snapshot": current_semantic,
+        "completed_bar_fingerprint": completed_bar_fingerprint,
+        "new_completed_bar": new_bar,
+        "image_fingerprint": _safe_copy(image),
+        "image_hamming_distance": distance,
+        "exact_chart_fingerprint": exact_duplicate,
+        "near_identical_chart_fingerprint": near_duplicate,
+        "context_fingerprint": context_fingerprint,
+        "context_unchanged": context_unchanged,
+        "heartbeat": {
+            "active": _gate_market_active(deterministic_snapshot, bars),
+            "due": heartbeat,
+            "staleness_seconds": round(staleness, 3) if staleness is not None else None,
+            "max_staleness_seconds": threshold,
+        },
+        "pending_event_signature": event_signature if debounce_pending else None,
+        "pending_event_since": pending_since if debounce_pending else None,
+    }
+
+
+def _cost_day_now() -> str:
+    """Return the cost-counter day using the existing ET helper."""
+    return _et_date_str()
+
+
+def _cap_snapshot_locked(now: Optional[float] = None) -> dict:
+    now = float(now if now is not None else time.time())
+    cutoff = now - float(VISUAL_BRAIN_CALL_WINDOW_SECONDS)
+    while _VB_CALL_RESERVATIONS and _VB_CALL_RESERVATIONS[0]["ts"] < cutoff:
+        _VB_CALL_RESERVATIONS.popleft()
+    today = _cost_day_now()
+    with _COST_LOCK:
+        actual_cost = _vb_cost_today if _vb_cost_reset_day == today else 0.0
+        actual_calls = _vb_calls_today if _vb_cost_reset_day == today else 0
+    reserved_cost = sum(
+        float(item.get("estimated_cost_usd") or 0)
+        for item in _VB_CALL_RESERVATIONS
+        if item.get("day") == today
+        and (item.get("pending") or item.get("estimated_only"))
+    )
+    window_calls = len(_VB_CALL_RESERVATIONS)
+    projected_cost = actual_cost + reserved_cost
+    has_pending = any(
+        item.get("pending") for item in _VB_CALL_RESERVATIONS
+        if item.get("day") == today
+    )
+    if window_calls >= VISUAL_BRAIN_MAX_CALLS_PER_WINDOW:
+        state = "RESERVED" if has_pending else "CALL_WINDOW_CAP_REACHED"
+    elif projected_cost >= VISUAL_BRAIN_MAX_DAILY_SPEND_USD:
+        state = "RESERVED" if has_pending else "DAILY_SPEND_CAP_REACHED"
+    else:
+        state = "OPEN"
+    next_projected_cost = (
+        projected_cost
+        + VISUAL_BRAIN_ESTIMATED_CALL_COST_USD * _VB_MAX_API_ATTEMPTS
+    )
+    if (
+        window_calls + _VB_MAX_API_ATTEMPTS
+        > VISUAL_BRAIN_MAX_CALLS_PER_WINDOW
+    ):
+        next_state = "CALL_WINDOW_CAP_REACHED"
+    elif next_projected_cost > VISUAL_BRAIN_MAX_DAILY_SPEND_USD:
+        next_state = "DAILY_SPEND_CAP_REACHED"
+    else:
+        next_state = "OPEN"
+    return {
+        "state": state,
+        "window_calls": window_calls,
+        "max_calls_per_window": VISUAL_BRAIN_MAX_CALLS_PER_WINDOW,
+        "window_seconds": VISUAL_BRAIN_CALL_WINDOW_SECONDS,
+        "actual_calls_today": actual_calls,
+        "actual_spend_usd": round(actual_cost, 8),
+        "projected_spend_usd": round(projected_cost, 8),
+        "next_observation_state": next_state,
+        "next_observation_projected_spend_usd": round(
+            next_projected_cost, 8
+        ),
+        "next_observation_allowed": next_state == "OPEN",
+        "daily_spend_cap_usd": VISUAL_BRAIN_MAX_DAILY_SPEND_USD,
+        "estimated_call_cost_usd": VISUAL_BRAIN_ESTIMATED_CALL_COST_USD,
+        "max_attempts_per_observation": _VB_MAX_API_ATTEMPTS,
+        "date": today,
+    }
+
+
+def _reserve_paid_call(
+    now: Optional[float] = None,
+    attempt_budget: int = _VB_MAX_API_ATTEMPTS,
+) -> tuple[bool, dict]:
+    """Reserve every possible API attempt before network work; caps fail closed."""
+    attempt_budget = max(1, min(int(attempt_budget), _VB_MAX_API_ATTEMPTS))
+    with _GATE_LOCK:
+        snapshot = _cap_snapshot_locked(now)
+        if (
+            snapshot["window_calls"] + attempt_budget
+            > VISUAL_BRAIN_MAX_CALLS_PER_WINDOW
+        ):
+            snapshot["state"] = "CALL_WINDOW_CAP_REACHED"
+            return False, snapshot
+        projected = (
+            float(snapshot.get("actual_spend_usd") or 0)
+            + sum(
+                float(item.get("estimated_cost_usd") or 0)
+                for item in _VB_CALL_RESERVATIONS
+                if item.get("day") == snapshot["date"]
+                and (item.get("pending") or item.get("estimated_only"))
+            )
+            + VISUAL_BRAIN_ESTIMATED_CALL_COST_USD * attempt_budget
+        )
+        if projected > VISUAL_BRAIN_MAX_DAILY_SPEND_USD:
+            snapshot["state"] = "DAILY_SPEND_CAP_REACHED"
+            return False, snapshot
+        reservation_id = uuid.uuid4().hex
+        timestamp = float(now if now is not None else time.time())
+        for attempt in range(1, attempt_budget + 1):
+            _VB_CALL_RESERVATIONS.append({
+                "reservation_id": reservation_id,
+                "attempt": attempt,
+                "ts": timestamp,
+                "day": snapshot["date"],
+                "estimated_cost_usd": VISUAL_BRAIN_ESTIMATED_CALL_COST_USD,
+                "pending": True,
+                "started": False,
+                "settled": False,
+            })
+        result = _cap_snapshot_locked(now)
+        result["reservation_id"] = reservation_id
+        result["reserved_attempts"] = attempt_budget
+        return True, result
+
+
+def _start_reserved_attempt(reservation_id: Optional[str], attempt: int) -> bool:
+    """Bind one network attempt to its exact pre-call reservation."""
+    if not reservation_id:
+        return True
+    with _GATE_LOCK:
+        for item in _VB_CALL_RESERVATIONS:
+            if (
+                item.get("reservation_id") == reservation_id
+                and item.get("attempt") == attempt
+                and item.get("pending")
+            ):
+                item["started"] = True
+                return True
+    return False
+
+
+def _finish_reservation(reservation_id: Optional[str]) -> None:
+    """Release unused retry slots and conservatively retain unreported attempts."""
+    if not reservation_id:
+        return
+    with _GATE_LOCK:
+        kept = deque(maxlen=_VB_CALL_RESERVATIONS.maxlen)
+        for item in _VB_CALL_RESERVATIONS:
+            if item.get("reservation_id") != reservation_id:
+                kept.append(item)
+                continue
+            if not item.get("started"):
+                continue
+            if item.get("pending"):
+                item["pending"] = False
+                item["estimated_only"] = True
+            kept.append(item)
+        _VB_CALL_RESERVATIONS.clear()
+        _VB_CALL_RESERVATIONS.extend(kept)
+
+
+def _record_gate_decision(instrument: str, decision: dict, *, cap: Optional[dict] = None) -> None:
+    """Record bounded read-only gate telemetry."""
+    record = {
+        "instrument": str(instrument or "").upper(),
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "reason": decision.get("reason"),
+        "call": bool(decision.get("call")),
+        "trigger_reasons": list(decision.get("trigger_reasons") or []),
+        "suppression_reasons": list(decision.get("suppression_reasons") or []),
+        "heartbeat": _safe_copy(decision.get("heartbeat") or {}),
+        "cap": _safe_copy(cap or {}),
+    }
+    with _GATE_LOCK:
+        _VB_GATE_COUNTERS["ticks"] += 1
+        if record["call"]:
+            _VB_GATE_COUNTERS["paid_calls_allowed"] += 1
+        else:
+            _VB_GATE_COUNTERS["paid_calls_avoided"] += 1
+        reason = str(record["reason"] or "other")
+        bucket = (
+            "suppressed_no_new_bar" if reason == "no_new_completed_bar"
+            else "suppressed_fingerprint" if "fingerprint" in reason
+            else "suppressed_event_debounce" if reason == "event_debounce"
+            else "suppressed_heartbeat" if reason == "within_staleness_budget"
+            else "suppressed_cap" if "CAP_REACHED" in str((cap or {}).get("state"))
+            else "suppressed_other"
+        )
+        if not record["call"]:
+            _VB_GATE_COUNTERS[bucket] += 1
+        for trigger in record["trigger_reasons"]:
+            counts = _VB_GATE_COUNTERS["trigger_reasons"]
+            counts[trigger] = counts.get(trigger, 0) + 1
+        for suppressed in record["suppression_reasons"]:
+            counts = _VB_GATE_COUNTERS["suppression_reasons"]
+            counts[suppressed] = counts.get(suppressed, 0) + 1
+        _VB_GATE_RECENT.append(record)
+
+
+def get_visual_brain_health(limit: int = 50, instrument: Optional[str] = None) -> dict:
+    """Return bounded, read-only event-gate/cost telemetry."""
+    limit = max(1, min(int(limit), 200))
+    with _GATE_LOCK:
+        records = list(_VB_GATE_RECENT)
+        counters = _safe_copy(_VB_GATE_COUNTERS)
+        states = _safe_copy(_VB_GATE_STATE_BY_INST)
+        cap = _cap_snapshot_locked()
+    if instrument:
+        records = [
+            item for item in records
+            if item.get("instrument") == str(instrument).upper()
+        ]
+    records = records[-limit:]
+    cost = get_cost_summary()
+    last_record = records[-1] if records else {}
+    per_inst = {}
+    for inst, state in states.items():
+        per_inst[inst] = {
+            "last_call_at": state.get("last_paid_at"),
+            "last_bar": state.get("completed_bar_fingerprint"),
+            "last_reason": state.get("last_reason"),
+            "heartbeat": state.get("heartbeat"),
+            "pending_completed_bar_events": _VB_PENDING_BAR_EVENTS.get(inst, 0),
+        }
+    return {
+        "ok": True,
+        "enabled": VISUAL_BRAIN_ENABLED,
+        "event_gating_enabled": VISUAL_BRAIN_EVENT_GATING_ENABLED,
+        "candidate_enabled": False,
+        "model": _VB_MODEL,
+        "heartbeat": {
+            "max_staleness_seconds": VISUAL_BRAIN_MAX_STALENESS_SECONDS,
+            "approximately_minutes": round(
+                VISUAL_BRAIN_MAX_STALENESS_SECONDS / 60, 1
+            ),
+            "instruments": per_inst,
+        },
+        "caps": cap,
+        "cap_state": cap.get("state"),
+        "cost": cost,
+        "spend": {
+            "actual_usd": cost.get("cost_today_usd", 0.0),
+            "projected_usd": cap.get("projected_spend_usd", 0.0),
+            "cap_usd": cap.get("daily_spend_cap_usd"),
+        },
+        "calls": {
+            "actual_today": cost.get("calls_today", 0),
+            "allowed_since_restart": counters.get("paid_calls_allowed", 0),
+            "avoided_since_restart": counters.get("paid_calls_avoided", 0),
+            "projected_without_caps": (
+                counters.get("paid_calls_allowed", 0)
+                + counters.get("suppressed_cap", 0)
+            ),
+        },
+        "calls_avoided": counters.get("paid_calls_avoided", 0),
+        "actual_calls": cost.get("calls_today", 0),
+        "projected_calls": (
+            counters.get("paid_calls_allowed", 0)
+            + counters.get("suppressed_cap", 0)
+        ),
+        "counters": counters,
+        "last_call_reason": next(
+            (item.get("reason") for item in reversed(records) if item.get("call")),
+            None,
+        ),
+        "last_trigger_reasons": list(last_record.get("trigger_reasons") or []),
+        "last_suppression_reasons": list(
+            last_record.get("suppression_reasons") or []
+        ),
+        "recent_decisions": records,
+    }
+
+
 def _benchmark_begin_cycle(instrument: str) -> Optional[dict]:
     if not VISUAL_BRAIN_BENCHMARK_ENABLED:
         return None
@@ -491,6 +1034,9 @@ def _benchmark_begin_cycle(instrument: str) -> Optional[dict]:
     }
 
 
+_BENCHMARK_SNAPSHOT_UNSET = object()
+
+
 def _benchmark_prepare_cycle(
     cycle: Optional[dict],
     *,
@@ -499,15 +1045,17 @@ def _benchmark_prepare_cycle(
     market_context: dict,
     previous_state: Optional[dict],
     recent_history: list[dict],
+    deterministic_snapshot: Any = _BENCHMARK_SNAPSHOT_UNSET,
 ) -> None:
     if cycle is None:
         return
     try:
-        deterministic_snapshot = {}
-        if _benchmark_state_fn is not None:
-            deterministic_snapshot = _benchmark_state_fn(cycle["instrument"]) or {}
-            if not isinstance(deterministic_snapshot, dict):
-                deterministic_snapshot = {}
+        if deterministic_snapshot is _BENCHMARK_SNAPSHOT_UNSET:
+            deterministic_snapshot = {}
+            if _benchmark_state_fn is not None:
+                deterministic_snapshot = _benchmark_state_fn(cycle["instrument"]) or {}
+        if not isinstance(deterministic_snapshot, dict):
+            deterministic_snapshot = {}
         image_fp = _image_fingerprint(screenshot_bytes)
         bar_fp = _completed_bar_fingerprint(bars)
         cycle.update({
@@ -780,7 +1328,11 @@ def _paired_candidate_worker(
 
 def _run_paired_benchmark_candidate(cycle: Optional[dict]) -> None:
     """Schedule best-effort candidate measurement; baseline never waits for it."""
-    if cycle is None or not VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED:
+    if (
+        cycle is None
+        or VISUAL_BRAIN_EVENT_GATING_ENABLED
+        or not VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED
+    ):
         return
     if not cycle.get("screenshot_bytes"):
         return
@@ -871,6 +1423,7 @@ def _benchmark_finish_cycle(cycle: Optional[dict]) -> None:
                 (policies.get("deterministic_events") or {}).get("semantic_fingerprint")
             ),
             "policies": _safe_copy(policies),
+            "event_gate": _safe_copy(cycle.get("event_gate") or {}),
             "baseline": {
                 "model": _VB_MODEL,
                 "api_calls": baseline_calls,
@@ -1361,6 +1914,7 @@ def get_benchmark_report(
     candidate_enabled = (
         VISUAL_BRAIN_BENCHMARK_ENABLED
         and VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED
+        and not VISUAL_BRAIN_EVENT_GATING_ENABLED
     )
     return {
         "ok": True,
@@ -1397,6 +1951,9 @@ def get_benchmark_report(
         "by_session": by_session,
         "advisory": _benchmark_advisory(
             recent, overall, candidate_enabled=candidate_enabled
+        ),
+        "event_gate": get_visual_brain_health(
+            limit=limit, instrument=instrument
         ),
         "recent_cycles": recent,
     }
@@ -1461,17 +2018,35 @@ def _et_date_str() -> str:
     return et.strftime("%Y-%m-%d")
 
 
-def _record_cost(input_tokens: int, output_tokens: int) -> None:
+def _record_cost(
+    input_tokens: int,
+    output_tokens: int,
+    reservation_id: Optional[str] = None,
+    attempt: Optional[int] = None,
+) -> None:
     global _vb_calls_today, _vb_cost_today, _vb_cost_reset_day
     today = _et_date_str()
-    with _COST_LOCK:
-        if _vb_cost_reset_day != today:
-            _vb_calls_today = 0
-            _vb_cost_today  = 0.0
-            _vb_cost_reset_day = today
-        _vb_calls_today += 1
-        _vb_cost_today  += (input_tokens * _COST_PER_INPUT_TOK
-                            + output_tokens * _COST_PER_OUTPUT_TOK)
+    with _GATE_LOCK:
+        with _COST_LOCK:
+            if _vb_cost_reset_day != today:
+                _vb_calls_today = 0
+                _vb_cost_today = 0.0
+                _vb_cost_reset_day = today
+            _vb_calls_today += 1
+            _vb_cost_today += (
+                input_tokens * _COST_PER_INPUT_TOK
+                + output_tokens * _COST_PER_OUTPUT_TOK
+            )
+        if reservation_id:
+            for reservation in _VB_CALL_RESERVATIONS:
+                if (
+                    reservation.get("reservation_id") == reservation_id
+                    and reservation.get("attempt") == attempt
+                ):
+                    reservation["pending"] = False
+                    reservation["settled"] = True
+                    reservation.pop("estimated_only", None)
+                    break
 
 
 def get_cost_summary() -> dict:
@@ -2133,6 +2708,7 @@ def analyze_visual_market(
     recent_history: list[dict],
     instrument: str = "MNQ",
     market_context: Optional[dict] = None,
+    _reservation_id: Optional[str] = None,
 ) -> dict:
     """Send screenshot + compact history to GPT-4o vision; return parsed dict.
 
@@ -2177,6 +2753,10 @@ def analyze_visual_market(
                 attempt + 1, 0, 0
             )
             try:
+                if not _start_reserved_attempt(_reservation_id, attempt + 1):
+                    raise RuntimeError(
+                        "Visual Brain paid-attempt reservation unavailable"
+                    )
                 resp = client.chat.completions.create(
                     model=_VB_MODEL,
                     max_completion_tokens=_VB_MAX_TOKENS,
@@ -2185,7 +2765,12 @@ def analyze_visual_market(
                 usage = resp.usage
                 in_tok  = usage.prompt_tokens     if usage else 0
                 out_tok = usage.completion_tokens if usage else 0
-                _record_cost(in_tok, out_tok)
+                _record_cost(
+                    in_tok,
+                    out_tok,
+                    reservation_id=_reservation_id,
+                    attempt=attempt + 1,
+                )
                 if attempt_record is not None:
                     attempt_record["input_tokens"] = int(in_tok or 0)
                     attempt_record["output_tokens"] = int(out_tok or 0)
@@ -2668,7 +3253,57 @@ _VB_STARTED = False
 _BACKFILL_RUNNING = False   # guards against concurrent backfill threads
 
 
-def _vb_tick(instrument: str = "MNQ") -> None:
+def _read_gate_snapshot(instrument: str) -> dict:
+    if _benchmark_state_fn is None:
+        return {}
+    try:
+        snapshot = _benchmark_state_fn(instrument) or {}
+        return snapshot if isinstance(snapshot, dict) else {}
+    except Exception as exc:
+        logger.debug("[VISUAL_BRAIN] deterministic snapshot unavailable: %s", exc)
+        return {}
+
+
+def _commit_gate_state(
+    instrument: str,
+    previous: dict,
+    decision: dict,
+    *,
+    paid_call: bool,
+    now_epoch: float,
+) -> None:
+    """Advance only the private local gate state."""
+    state = dict(previous or {})
+    consume_inputs = decision.get("reason") != "event_debounce"
+    if consume_inputs and decision.get("completed_bar_fingerprint"):
+        state["completed_bar_fingerprint"] = decision["completed_bar_fingerprint"]
+    if consume_inputs and decision.get("image_fingerprint"):
+        state["image_fingerprint"] = _safe_copy(decision["image_fingerprint"])
+    if consume_inputs and decision.get("context_fingerprint"):
+        state["context_fingerprint"] = decision["context_fingerprint"]
+    # Do not consume an intra-bar deterministic event before a completed bar can
+    # carry it into a paid observation.  This preserves the event accumulator.
+    if consume_inputs and decision.get("new_completed_bar"):
+        state["semantic_snapshot"] = _safe_copy(
+            decision.get("semantic_snapshot") or {}
+        )
+        if decision.get("event_signature") and decision.get("reason") != "event_debounce":
+            state["last_event_signature"] = decision["event_signature"]
+    if decision.get("pending_event_signature"):
+        state["pending_event_signature"] = decision["pending_event_signature"]
+        state["pending_event_since"] = decision.get("pending_event_since")
+    else:
+        state.pop("pending_event_signature", None)
+        state.pop("pending_event_since", None)
+    if paid_call:
+        state["last_paid_at"] = now_epoch
+    state["last_reason"] = decision.get("reason")
+    state["heartbeat"] = _safe_copy(decision.get("heartbeat") or {})
+    with _GATE_LOCK:
+        _VB_GATE_STATE_BY_INST[instrument] = state
+
+
+def _vb_tick(instrument: str = "MNQ", event_driven: bool = False) -> None:
     """One observation cycle for one instrument: capture → analyze → persist → reschedule.
 
     Scheduling contract: `_schedule_next(instrument)` is called EXACTLY ONCE,
@@ -2685,8 +3320,31 @@ def _vb_tick(instrument: str = "MNQ") -> None:
     if not VISUAL_BRAIN_ENABLED:
         return   # disabled → true no-op; no timer accumulated
 
+    busy = False
+    with _GATE_LOCK:
+        if instrument in _VB_INFLIGHT:
+            busy = True
+        else:
+            _VB_INFLIGHT.add(instrument)
+    if busy:
+        busy_decision = {
+            "call": False,
+            "reason": "single_flight_busy",
+            "trigger_reasons": [],
+            "suppression_reasons": ["single_flight_busy"],
+            "heartbeat": {},
+        }
+        _record_gate_decision(instrument, busy_decision)
+        if event_driven:
+            notify_completed_bar(instrument)
+        else:
+            _schedule_next(instrument)
+        return
+
     benchmark_cycle = _benchmark_begin_cycle(instrument)
+    reservation_id: Optional[str] = None
     try:
+        now_epoch = time.time()
         screenshot_bytes: Optional[bytes] = None
         bars_for_benchmark: list[dict] = []
 
@@ -2702,6 +3360,54 @@ def _vb_tick(instrument: str = "MNQ") -> None:
                 market_context = _build_market_context(bars_for_benchmark, instrument)
         except Exception as context_exc:
             logger.warning("[VISUAL_BRAIN] market context failed: %s", context_exc)
+
+        deterministic_snapshot = _read_gate_snapshot(instrument)
+        bar_fingerprint = _completed_bar_fingerprint(bars_for_benchmark)
+        context_fingerprint = _stable_hash({
+            "market_context": _drop_volatile_fields(market_context),
+            "deterministic": _benchmark_semantic_snapshot(deterministic_snapshot),
+        })
+        with _GATE_LOCK:
+            gate_previous = _safe_copy(
+                _VB_GATE_STATE_BY_INST.get(instrument) or {}
+            )
+        pre_gate = compute_visual_brain_gate(
+            gate_previous,
+            completed_bar_fingerprint=bar_fingerprint,
+            context_fingerprint=context_fingerprint,
+            deterministic_snapshot=deterministic_snapshot,
+            bars=bars_for_benchmark,
+            now_epoch=now_epoch,
+            event_debounce_seconds=(
+                0 if event_driven else VISUAL_BRAIN_EVENT_DEBOUNCE_SECONDS
+            ),
+        )
+        if not VISUAL_BRAIN_EVENT_GATING_ENABLED:
+            pre_gate.update({
+                "call": True,
+                "reason": "legacy_interval",
+                "trigger_reasons": ["legacy_interval"],
+                "suppression_reasons": [],
+            })
+        if not pre_gate["call"]:
+            _benchmark_prepare_cycle(
+                benchmark_cycle,
+                bars=bars_for_benchmark,
+                screenshot_bytes=None,
+                market_context=market_context,
+                previous_state=None,
+                recent_history=[],
+                deterministic_snapshot=deterministic_snapshot,
+            )
+            if benchmark_cycle is not None:
+                benchmark_cycle["event_gate"] = _safe_copy(pre_gate)
+            _commit_gate_state(
+                instrument, gate_previous, pre_gate,
+                paid_call=False, now_epoch=now_epoch,
+            )
+            _record_gate_decision(instrument, pre_gate)
+            return
+
         try:
             screenshot_bytes = capture_chart_screenshot(instrument)
         except Exception as cap_exc:
@@ -2715,10 +3421,94 @@ def _vb_tick(instrument: str = "MNQ") -> None:
                 market_context=market_context,
                 previous_state=None,
                 recent_history=[],
+                deterministic_snapshot=deterministic_snapshot,
             )
+            no_image = dict(pre_gate)
+            no_image.update({
+                "call": False,
+                "reason": "screenshot_unavailable",
+                "suppression_reasons": ["screenshot_unavailable"],
+            })
+            if benchmark_cycle is not None:
+                benchmark_cycle["event_gate"] = _safe_copy(no_image)
+            _commit_gate_state(
+                instrument, gate_previous, no_image,
+                paid_call=False, now_epoch=now_epoch,
+            )
+            _record_gate_decision(instrument, no_image)
             logger.warning("[VISUAL_BRAIN] skipping cycle — no screenshot")
             return   # finally → _schedule_next() fires exactly once
 
+        image_fingerprint = _image_fingerprint(screenshot_bytes)
+        gate = compute_visual_brain_gate(
+            gate_previous,
+            completed_bar_fingerprint=bar_fingerprint,
+            image_fingerprint=image_fingerprint,
+            context_fingerprint=context_fingerprint,
+            deterministic_snapshot=deterministic_snapshot,
+            bars=bars_for_benchmark,
+            now_epoch=now_epoch,
+            event_debounce_seconds=(
+                0 if event_driven else VISUAL_BRAIN_EVENT_DEBOUNCE_SECONDS
+            ),
+        )
+        if not VISUAL_BRAIN_EVENT_GATING_ENABLED:
+            gate.update({
+                "call": True,
+                "reason": "legacy_interval",
+                "trigger_reasons": ["legacy_interval"],
+                "suppression_reasons": [],
+            })
+        if not gate["call"]:
+            _benchmark_prepare_cycle(
+                benchmark_cycle,
+                bars=bars_for_benchmark,
+                screenshot_bytes=screenshot_bytes,
+                market_context=market_context,
+                previous_state=None,
+                recent_history=[],
+                deterministic_snapshot=deterministic_snapshot,
+            )
+            if benchmark_cycle is not None:
+                benchmark_cycle["event_gate"] = _safe_copy(gate)
+            _commit_gate_state(
+                instrument, gate_previous, gate,
+                paid_call=False, now_epoch=now_epoch,
+            )
+            _record_gate_decision(instrument, gate)
+            return
+
+        reserved, cap_state = _reserve_paid_call(now_epoch)
+        if not reserved:
+            capped = dict(gate)
+            capped.update({
+                "call": False,
+                "reason": cap_state["state"],
+                "suppression_reasons": [cap_state["state"]],
+            })
+            _benchmark_prepare_cycle(
+                benchmark_cycle,
+                bars=bars_for_benchmark,
+                screenshot_bytes=screenshot_bytes,
+                market_context=market_context,
+                previous_state=None,
+                recent_history=[],
+                deterministic_snapshot=deterministic_snapshot,
+            )
+            if benchmark_cycle is not None:
+                benchmark_cycle["event_gate"] = _safe_copy(capped)
+            _commit_gate_state(
+                instrument, gate_previous, capped,
+                paid_call=False, now_epoch=now_epoch,
+            )
+            _record_gate_decision(instrument, capped, cap=cap_state)
+            logger.warning(
+                "[VISUAL_BRAIN] paid observation suppressed — %s",
+                cap_state["state"],
+            )
+            return
+
+        reservation_id = cap_state.get("reservation_id")
         # ── Fetch history ────────────────────────────────────────────────────
         recent_history = get_history(instrument, limit=_VB_HISTORY_LIMIT)
         # get_history returns newest-first; reverse for chronological model context
@@ -2735,7 +3525,15 @@ def _vb_tick(instrument: str = "MNQ") -> None:
             market_context=market_context,
             previous_state=prev_state,
             recent_history=recent_history,
+            deterministic_snapshot=deterministic_snapshot,
         )
+        if benchmark_cycle is not None:
+            benchmark_cycle["event_gate"] = _safe_copy(gate)
+        _commit_gate_state(
+            instrument, gate_previous, gate,
+            paid_call=True, now_epoch=now_epoch,
+        )
+        _record_gate_decision(instrument, gate, cap=cap_state)
 
         # ── Analyze ──────────────────────────────────────────────────────────
         if benchmark_cycle is not None:
@@ -2747,6 +3545,7 @@ def _vb_tick(instrument: str = "MNQ") -> None:
                 recent_history=recent_history,
                 instrument=instrument,
                 market_context=market_context,
+                _reservation_id=reservation_id,
             )
         except Exception as analyze_exc:
             logger.warning("[VISUAL_BRAIN] analysis failed: %s", analyze_exc)
@@ -2784,9 +3583,48 @@ def _vb_tick(instrument: str = "MNQ") -> None:
         logger.error("[VISUAL_BRAIN] tick error (trading engine unaffected): %s", exc)
 
     finally:
+        _finish_reservation(reservation_id)
         _benchmark_finish_cycle(benchmark_cycle)
+        with _GATE_LOCK:
+            _VB_INFLIGHT.discard(instrument)
         # Single reschedule point — always reached, never duplicated.
         _schedule_next(instrument)
+
+
+def _fire_completed_bar_event(instrument: str, token: str) -> None:
+    """Drain a coalesced completed-bar event without blocking market-data intake."""
+    inst = str(instrument or "").upper()
+    with _GATE_LOCK:
+        if _VB_EVENT_TOKENS.get(inst) != token:
+            return
+        _VB_EVENT_TIMERS.pop(inst, None)
+        _VB_EVENT_TOKENS.pop(inst, None)
+        _VB_PENDING_BAR_EVENTS[inst] = 0
+    _vb_tick(inst, event_driven=True)
+
+
+def notify_completed_bar(instrument: str, _bar: Optional[dict] = None) -> bool:
+    """Accumulate a live completed bar and debounce one local gate evaluation."""
+    if not VISUAL_BRAIN_ENABLED or not VISUAL_BRAIN_EVENT_GATING_ENABLED:
+        return False
+    inst = str(instrument or "").upper()
+    if inst not in _VB_SYMBOLS:
+        return False
+    delay = max(0.0, float(VISUAL_BRAIN_EVENT_DEBOUNCE_SECONDS))
+    token = uuid.uuid4().hex
+    timer = threading.Timer(
+        delay, _fire_completed_bar_event, args=(inst, token)
+    )
+    timer.daemon = True
+    with _GATE_LOCK:
+        _VB_PENDING_BAR_EVENTS[inst] = _VB_PENDING_BAR_EVENTS.get(inst, 0) + 1
+        prior = _VB_EVENT_TIMERS.get(inst)
+        if prior is not None and prior.is_alive():
+            prior.cancel()
+        _VB_EVENT_TIMERS[inst] = timer
+        _VB_EVENT_TOKENS[inst] = token
+        timer.start()
+    return True
 
 
 def _schedule_next(instrument: str = "MNQ", delay: Optional[float] = None) -> None:

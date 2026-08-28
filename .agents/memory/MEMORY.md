@@ -9,7 +9,7 @@
 - [Verdict-history pending chain](verdict-history-pending-chain.md) — a failed queued head cancels descendants and rewinds to the last durable link; never persist dangling chains.
 
 - [Volatility Intelligence Module](volatility-intelligence.md) — Alpha Vantage VIX layer; flag OFF default; 32 tests pass; `volatility_observations` table created; panel in analysis tab.
-- [Visual Brain V1](visual-brain-engine.md) — inject db_conn_fn/price_store/bars_fn at start(); never `import app` from sub-modules; single-flight _schedule_next in finally only; screenshots ephemeral (no temp files).
+- [Visual Brain 2.0](visual-brain-engine.md) — completed bars debounce into a local paid-call gate; retain timer heartbeat fallback, exact retry reservations, dependency injection, and ephemeral screenshots.
 - [Visual Brain SDK transport](visual-brain-sdk-transport.md) — pin OpenAI 3.3.1 + HTTPX 0.28.1; pass an explicit verified, proxy-isolated HTTPX client only to the observer.
 - [Visual Brain cost benchmark](visual-brain-cost-benchmark.md) — default-off in-memory telemetry only; candidates run after canonical persistence on bounded async workers and never feed trading state.
 

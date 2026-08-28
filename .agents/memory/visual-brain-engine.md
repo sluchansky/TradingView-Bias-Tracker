@@ -1,9 +1,23 @@
 ---
-name: Visual Brain V1
-description: MNQ 1-minute stateful market observer — screenshot + vision LLM + structured JSON market state stored in visual_brain_observations table.
+name: Visual Brain 2.0
+description: Event-driven stateful market observer with completed-bar gating, bounded vision spend, and strict isolation from trading state.
 ---
 
-# Visual Brain V1 — Durable Architectural Decisions
+# Visual Brain 2.0 — Durable Architectural Decisions
+
+## Completed-bar events own paid-call timing
+Live Databento completed bars debounce into one per-instrument local gate evaluation. The original fixed timer remains only as a conservative heartbeat/fallback, and every path remains single-flight.
+
+**Why:** Polling every few minutes can collapse meaningful transitions, while running paid vision on every poll wastes spend. Ownership tokens are required on debounce timers so a canceled stale callback cannot clear or dispatch a newer event generation.
+
+**How to apply:** Register through the existing completed-bar callback, return immediately from market-data intake, coalesce events off-thread, and require a newly completed bar plus a meaningful event or active-market maximum-staleness heartbeat before image/model work.
+
+## Paid-attempt caps reserve the full retry budget
+Each observation atomically reserves every allowed model attempt before network work. Attempts settle by reservation identity; unused retries are released, while started attempts with unknown usage remain conservatively estimated.
+
+**Why:** Reserving only one observation while the model can retry lets concurrent instruments exceed spend caps and allows one response to settle another instrument's reservation.
+
+**How to apply:** Keep the reservation ledger at least as large as the maximum configured window cap, distinguish current exposure from next-observation capacity in telemetry, and never let cap state affect anything outside Visual Brain.
 
 ## Dependency injection — never `import app` from sub-modules
 `visual_brain.py` receives `db_conn_fn`, `price_store`, and `bars_fn` as parameters to `start()` and `check_vb_db_ready()`. These are injected from `app.py`'s `__main__` globals at boot. **Why:** when `app.py` runs as `__main__`, doing `import app` from any sub-module loads a SECOND copy of the module with empty globals — breaking DB connections, live price stores, and bar history. All other sub-modules in this codebase that touch live app state must follow the same pattern: inject, don't import.

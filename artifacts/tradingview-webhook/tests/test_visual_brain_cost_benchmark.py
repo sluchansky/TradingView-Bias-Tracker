@@ -24,6 +24,7 @@ def _load_vb(*, benchmark: bool, candidate: bool = False) -> types.ModuleType:
         "VISUAL_BRAIN_ENABLED": "true",
         "VISUAL_BRAIN_BENCHMARK_ENABLED": "true" if benchmark else "false",
         "VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED": "true" if candidate else "false",
+        "VISUAL_BRAIN_EVENT_GATING_ENABLED": "false" if candidate else "true",
         "VISUAL_BRAIN_INTERVAL_SECONDS": "300",
         "AI_INTEGRATIONS_OPENAI_API_KEY": "test-key",
         "AI_INTEGRATIONS_OPENAI_BASE_URL": "https://api.openai.com/v1",
@@ -331,6 +332,10 @@ class VisualBrainBenchmarkTests(unittest.TestCase):
 
     def test_hung_candidate_cannot_delay_reschedule_or_tick_completion(self):
         vb = _load_vb(benchmark=True, candidate=True)
+        # This test isolates the candidate worker's non-blocking behavior.  The
+        # V2 event gate is covered separately and would correctly suppress the
+        # four repeated same-bar cycles below.
+        vb.VISUAL_BRAIN_EVENT_GATING_ENABLED = False
         vb._bars_fn = lambda _instrument: _bars()
         entered = threading.Event()
         release = threading.Event()
