@@ -354,6 +354,173 @@ def test_readback_returns_chronological_rows_for_reconstruction():
     assert rows[1]["event_id"] == 100
 
 
+def test_operator_history_report_exposes_curated_chain_continuity():
+    rows = []
+    for event_id, key, previous, verdict, score, blockers in (
+        (1, "root-key", None, "WAIT", 42, ["structure_confirmed"]),
+        (2, "ready-key", "root-key", "LONG READY", 86, []),
+        (3, "broken-key", "missing-key", "WAIT", 61, ["vwap_confirmed"]),
+    ):
+        row = [None] * len(avh._HISTORY_COLUMNS)
+        values = {
+            "event_id": event_id,
+            "observation_key": key,
+            "previous_observation_key": previous,
+            "instrument": "MNQ",
+            "mode": "SCALP",
+            "verdict": verdict,
+            "wait_ready_state": "READY" if "READY" in verdict else "WAIT",
+            "actionable": "READY" in verdict,
+            "blocked": bool(blockers),
+            "score": score,
+            "grade": "A+" if score >= 85 else "B",
+            "blockers": blockers,
+            "waiting_for": blockers,
+            "recorded_at": f"2026-08-28T04:0{event_id}:00+00:00",
+            "payload": {"must_not": "leak"},
+        }
+        for name, value in values.items():
+            row[avh._HISTORY_COLUMNS.index(name)] = value
+        rows.append(tuple(row))
+
+    conn, _ = _mock_connection(rows=rows)
+    avh._DB_READY = True
+    avh.configure(lambda: conn)
+
+    report = avh.get_history_report("mnq", "scalp", limit=120)
+
+    assert report["ok"] is True
+    assert report["available"] is True
+    assert report["read_only"] is True
+    assert report["observer_only"] is True
+    assert report["chain"] == {
+        "status": "BROKEN", "roots": 1, "contiguous": 1, "breaks": 1,
+        "partial": False,
+    }
+    assert [event["chain_status"] for event in report["events"]] == [
+        "ROOT", "CONTIGUOUS", "BROKEN",
+    ]
+    assert report["events"][2]["chain_expected_previous"] == "ready-key"
+    assert "payload" not in report["events"][0]
+
+
+def test_operator_history_report_distinguishes_empty_from_unavailable():
+    avh._DB_READY = False
+    unavailable = avh.get_history_report("MGC", "INTRADAY_TREND")
+    assert unavailable["available"] is False
+    assert unavailable["error"] == "history_unavailable"
+
+    conn, _ = _mock_connection(rows=[])
+    avh._DB_READY = True
+    avh.configure(lambda: conn)
+    empty = avh.get_history_report("MGC", "INTRADAY_TREND")
+    assert empty["ok"] is True
+    assert empty["available"] is True
+    assert empty["chain"]["status"] == "EMPTY"
+    assert empty["chain"]["partial"] is False
+    assert empty["events"] == []
+
+
+def test_operator_history_report_marks_a_bounded_chain_window_as_partial():
+    rows = []
+    for event_id, key, previous in (
+        (7, "outside-window", "older-key"),
+        (8, "window-first", "outside-window"),
+        (9, "window-second", "window-first"),
+    ):
+        row = [None] * len(avh._HISTORY_COLUMNS)
+        values = {
+            "event_id": event_id,
+            "observation_key": key,
+            "previous_observation_key": previous,
+            "instrument": "MGC",
+            "mode": "SCALP",
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+            "recorded_at": f"2026-08-28T04:0{event_id}:00+00:00",
+        }
+        for name, value in values.items():
+            row[avh._HISTORY_COLUMNS.index(name)] = value
+        rows.append(tuple(row))
+
+    conn, cursor = _mock_connection(rows=rows)
+    avh._DB_READY = True
+    avh.configure(lambda: conn)
+
+    report = avh.get_history_report("MGC", "SCALP", limit=2)
+
+    assert report["chain"] == {
+        "status": "PARTIAL", "roots": 0, "contiguous": 1, "breaks": 0,
+        "partial": True,
+    }
+    assert report["events"][0]["chain_status"] == "WINDOW_START"
+    sql = cursor.execute.call_args.args[0]
+    assert "ORDER BY event_id DESC" in sql
+    assert "ORDER BY event_id ASC" in sql
+
+
+def test_operator_history_report_does_not_mask_a_missing_predecessor_as_partial():
+    row = [None] * len(avh._HISTORY_COLUMNS)
+    values = {
+        "event_id": 1,
+        "observation_key": "orphan",
+        "previous_observation_key": "missing",
+        "instrument": "MYM",
+        "mode": "INTRADAY_TREND",
+        "verdict": "WAIT",
+        "wait_ready_state": "WAIT",
+        "recorded_at": "2026-08-28T04:01:00+00:00",
+    }
+    for name, value in values.items():
+        row[avh._HISTORY_COLUMNS.index(name)] = value
+    conn, _ = _mock_connection(rows=[tuple(row)])
+    avh._DB_READY = True
+    avh.configure(lambda: conn)
+
+    report = avh.get_history_report("MYM", "INTRADAY_TREND", limit=50)
+
+    assert report["chain"]["status"] == "BROKEN"
+    assert report["chain"]["partial"] is False
+    assert report["chain"]["breaks"] == 1
+    assert report["events"][0]["chain_status"] == "BROKEN"
+
+
+def test_operator_history_report_uses_append_order_when_timestamps_invert():
+    rows = []
+    for event_id, key, previous, recorded_at in (
+        (1, "root", None, "2026-08-28T04:02:00+00:00"),
+        (2, "child", "root", "2026-08-28T04:01:00+00:00"),
+    ):
+        row = [None] * len(avh._HISTORY_COLUMNS)
+        values = {
+            "event_id": event_id,
+            "observation_key": key,
+            "previous_observation_key": previous,
+            "instrument": "MNQ",
+            "mode": "SCALP",
+            "verdict": "WAIT",
+            "wait_ready_state": "WAIT",
+            "recorded_at": recorded_at,
+        }
+        for name, value in values.items():
+            row[avh._HISTORY_COLUMNS.index(name)] = value
+        rows.append(tuple(row))
+
+    conn, cursor = _mock_connection(rows=rows)
+    avh._DB_READY = True
+    avh.configure(lambda: conn)
+
+    report = avh.get_history_report("MNQ", "SCALP", limit=50)
+
+    assert report["chain"]["status"] == "VALID"
+    assert [event["observation_key"] for event in report["events"]] == [
+        "root", "child",
+    ]
+    sql = cursor.execute.call_args.args[0]
+    assert "ORDER BY event_id DESC" in sql
+    assert "ORDER BY event_id ASC" in sql
+
+
 def _structure_row(at, *, recorded_at=None, state="REVERSAL_CANDIDATE",
                     blocked=True, score=88, event="BOS continuation",
                     actionable=False, direction="Long", **extra):

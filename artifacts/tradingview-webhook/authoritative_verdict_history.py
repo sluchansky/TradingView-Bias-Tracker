@@ -614,56 +614,199 @@ def _worker_loop() -> None:
             _WORK_QUEUE.task_done()
 
 
-def get_history(instrument: str, mode: str, limit: int = 120) -> List[dict]:
-    """Read immutable rows for reconstruction; never called by live trading."""
+_HISTORY_COLUMNS = (
+    "event_id", "observation_key", "previous_observation_key", "snapshot_hash",
+    "instrument", "mode", "candidate_direction", "actionable_direction",
+    "actionable", "verdict", "wait_ready_state", "blocked", "score", "grade",
+    "confidence", "blockers", "waiting_for", "waiting_for_guidance",
+    "vwap_value", "vwap_status", "vwap_side", "vwap_wording",
+    "structure_cycle_state", "structure_next_event", "structure_context",
+    "freshness", "databento_health", "correlations", "safety_snapshot",
+    "source_timestamp", "source_module", "recorded_at", "payload",
+)
+
+
+def _query_history(
+    instrument: str,
+    mode: str,
+    limit: int = 120,
+    *,
+    newest_window: bool = False,
+) -> List[dict]:
+    """Read immutable rows and surface failures to read-only report callers."""
     if not _DB_READY or not callable(_DB_FN):
-        return []
+        raise RuntimeError("history database unavailable")
     try:
         limit = max(1, min(int(limit), 2000))
     except (TypeError, ValueError):
         limit = 120
-    columns = (
-        "event_id", "observation_key", "previous_observation_key", "snapshot_hash",
-        "instrument", "mode", "candidate_direction", "actionable_direction",
-        "actionable", "verdict", "wait_ready_state", "blocked", "score", "grade",
-        "confidence", "blockers", "waiting_for", "waiting_for_guidance",
-        "vwap_value", "vwap_status", "vwap_side", "vwap_wording",
-        "structure_cycle_state", "structure_next_event", "structure_context",
-        "freshness", "databento_health", "correlations", "safety_snapshot",
-        "source_timestamp", "source_module", "recorded_at", "payload",
-    )
     conn = None
     try:
         conn = _DB_FN()
         if conn is None:
-            return []
+            raise RuntimeError("history database unavailable")
         with conn.cursor() as cur:
-            cur.execute("""
-                SELECT event_id, observation_key, previous_observation_key,
-                       snapshot_hash, instrument, mode, candidate_direction,
-                       actionable_direction, actionable, verdict, wait_ready_state,
-                       blocked, score, grade, confidence, blockers, waiting_for,
-                       waiting_for_guidance, vwap_value, vwap_status, vwap_side,
-                       vwap_wording, structure_cycle_state, structure_next_event,
-                       structure_context, freshness, databento_health, correlations,
-                       safety_snapshot, source_timestamp, source_module, recorded_at,
-                       payload
-                  FROM authoritative_verdict_history
-                 WHERE instrument = %s AND mode = %s
-                 ORDER BY recorded_at ASC, event_id ASC
-                 LIMIT %s
-            """, (str(instrument).upper(), str(mode).upper(), limit))
+            select_columns = """
+                event_id, observation_key, previous_observation_key,
+                snapshot_hash, instrument, mode, candidate_direction,
+                actionable_direction, actionable, verdict, wait_ready_state,
+                blocked, score, grade, confidence, blockers, waiting_for,
+                waiting_for_guidance, vwap_value, vwap_status, vwap_side,
+                vwap_wording, structure_cycle_state, structure_next_event,
+                structure_context, freshness, databento_health, correlations,
+                safety_snapshot, source_timestamp, source_module, recorded_at,
+                payload
+            """
+            if newest_window:
+                cur.execute(f"""
+                    SELECT {select_columns}
+                      FROM (
+                            SELECT {select_columns}
+                              FROM authoritative_verdict_history
+                             WHERE instrument = %s AND mode = %s
+                             ORDER BY event_id DESC
+                             LIMIT %s
+                           ) AS latest_history
+                     ORDER BY event_id ASC
+                """, (str(instrument).upper(), str(mode).upper(), limit))
+            else:
+                cur.execute(f"""
+                    SELECT {select_columns}
+                      FROM authoritative_verdict_history
+                     WHERE instrument = %s AND mode = %s
+                     ORDER BY recorded_at ASC, event_id ASC
+                     LIMIT %s
+                """, (str(instrument).upper(), str(mode).upper(), limit))
             rows = cur.fetchall() or []
-        return [dict(zip(columns, row)) for row in rows]
-    except Exception as exc:
-        logger.debug("AuthoritativeVerdictHistory read failed: %s", exc)
-        return []
+        return [dict(zip(_HISTORY_COLUMNS, row)) for row in rows]
     finally:
         try:
             if conn is not None:
                 conn.close()
         except Exception:
             pass
+
+
+def get_history(instrument: str, mode: str, limit: int = 120) -> List[dict]:
+    """Read immutable rows for reconstruction; never called by live trading."""
+    try:
+        return _query_history(instrument, mode, limit)
+    except Exception as exc:
+        logger.debug("AuthoritativeVerdictHistory read failed: %s", exc)
+        return []
+
+
+def get_history_report(instrument: str, mode: str, limit: int = 120) -> dict:
+    """Return a curated operator timeline with explicit availability and links."""
+    instrument = str(instrument or "").upper()
+    mode = str(mode or "").upper()
+    base = {
+        "ok": False,
+        "available": False,
+        "read_only": True,
+        "observer_only": True,
+        "instrument": instrument,
+        "mode": mode,
+        "count": 0,
+        "chain": {
+            "status": "EMPTY",
+            "roots": 0,
+            "contiguous": 0,
+            "breaks": 0,
+            "partial": False,
+        },
+        "events": [],
+    }
+    if not _DB_READY or not callable(_DB_FN):
+        return {**base, "error": "history_unavailable"}
+
+    try:
+        requested_limit = max(1, min(int(limit), 500))
+    except (TypeError, ValueError):
+        requested_limit = 120
+    try:
+        rows = _query_history(
+            instrument,
+            mode,
+            min(requested_limit + 1, 2000),
+            newest_window=True,
+        )
+    except Exception as exc:
+        logger.debug("AuthoritativeVerdictHistory operator read failed: %s", exc)
+        return {**base, "error": _error_code(exc, "history_query_failed")}
+
+    window_truncated = len(rows) > requested_limit
+    outside_window_key = (
+        _text(rows[0].get("observation_key")) if window_truncated else None
+    )
+    if window_truncated:
+        rows = rows[-requested_limit:]
+
+    events: List[dict] = []
+    roots = contiguous = breaks = 0
+    partial = False
+    prior_key: Optional[str] = None
+    for index, row in enumerate(rows):
+        observation_key = _text(row.get("observation_key")) or ""
+        previous_key = _text(row.get("previous_observation_key"))
+        expected_previous = prior_key
+        if index == 0:
+            if previous_key is None:
+                chain_status = "ROOT"
+                roots += 1
+            elif window_truncated and previous_key == outside_window_key:
+                chain_status = "WINDOW_START"
+                partial = True
+            else:
+                chain_status = "BROKEN"
+                breaks += 1
+        elif previous_key == prior_key:
+            chain_status = "CONTIGUOUS"
+            contiguous += 1
+        else:
+            chain_status = "BROKEN"
+            breaks += 1
+            if previous_key is None:
+                roots += 1
+        events.append({
+            "event_id": _safe(row.get("event_id")),
+            "observation_key": observation_key,
+            "previous_observation_key": previous_key,
+            "recorded_at": _text(row.get("recorded_at")),
+            "source_timestamp": _text(row.get("source_timestamp")),
+            "verdict": _text(row.get("verdict")) or "WAIT",
+            "wait_ready_state": _text(row.get("wait_ready_state")) or "WAIT",
+            "actionable": bool(row.get("actionable")),
+            "blocked": bool(row.get("blocked")),
+            "score": _number(row.get("score")),
+            "grade": _text(row.get("grade")),
+            "confidence": _number(row.get("confidence")),
+            "candidate_direction": _text(row.get("candidate_direction")),
+            "actionable_direction": _text(row.get("actionable_direction")),
+            "blockers": _safe(_list(row.get("blockers"))),
+            "waiting_for": _safe(_list(row.get("waiting_for"))),
+            "chain_status": chain_status,
+            "chain_expected_previous": expected_previous,
+        })
+        prior_key = observation_key
+
+    base.update({
+        "ok": True,
+        "available": True,
+        "count": len(events),
+        "chain": {
+            "status": (
+                "EMPTY" if not events
+                else ("BROKEN" if breaks else ("PARTIAL" if partial else "VALID"))
+            ),
+            "roots": roots,
+            "contiguous": contiguous,
+            "breaks": breaks,
+            "partial": partial,
+        },
+        "events": events,
+    })
+    return base
 
 
 def _diagnostic_datetime(value: Any) -> Optional[datetime]:

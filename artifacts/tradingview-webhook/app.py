@@ -88556,6 +88556,42 @@ def route_authoritative_verdict_history_health():
         }), 500
 
 
+@app.route("/authoritative-verdict-history", methods=["GET"])
+def route_authoritative_verdict_history():
+    """Read-only immutable final-verdict timeline for authenticated operators."""
+    try:
+        import authoritative_verdict_history as _avh  # noqa: PLC0415
+        instrument = request.args.get("instrument", "").strip().upper()
+        mode = request.args.get("mode", "").strip().upper()
+        if instrument not in ("MGC", "MNQ", "MES", "MYM"):
+            return jsonify({
+                "ok": False, "available": False, "read_only": True,
+                "observer_only": True, "error": "invalid_instrument",
+            }), 400
+        if mode not in _avh.SUPPORTED_MODES:
+            return jsonify({
+                "ok": False, "available": False, "read_only": True,
+                "observer_only": True, "error": "invalid_mode",
+            }), 400
+        try:
+            limit = max(1, min(int(request.args.get("limit", 120)), 500))
+        except (TypeError, ValueError):
+            return jsonify({
+                "ok": False, "available": False, "read_only": True,
+                "observer_only": True, "error": "invalid_limit",
+            }), 400
+        return jsonify(_avh.get_history_report(instrument, mode, limit))
+    except Exception as exc:
+        logger.warning("authoritative verdict history read failed: %s", exc)
+        return jsonify({
+            "ok": False,
+            "available": False,
+            "read_only": True,
+            "observer_only": True,
+            "error": "history_unavailable",
+        }), 200
+
+
 @app.route("/structure-confirmation-diagnostics", methods=["GET"])
 def route_structure_confirmation_diagnostics():
     """Read-only reconstruction of high-score structure confirmation waits."""

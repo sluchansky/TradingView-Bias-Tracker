@@ -129,4 +129,14 @@ describe("dashboardAuth", () => {
   it("includes the P4 health diagnostic in the protected Flask proxy whitelist", () => {
     expect(BOT1_ROUTES).toContain("/authoritative-verdict-history-health");
   });
+
+  it("keeps the immutable verdict timeline behind dashboard authentication", () => {
+    process.env.DASHBOARD_PASSWORD = "correct-password";
+
+    const result = invoke({ path: "/authoritative-verdict-history" });
+
+    expect(result.next).toBe(false);
+    expect(result.status).toBe(401);
+    expect(BOT1_ROUTES).toContain("/authoritative-verdict-history");
+  });
 });

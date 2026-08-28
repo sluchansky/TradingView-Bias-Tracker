@@ -29,6 +29,7 @@ export const NAV_ITEMS: readonly NavItem[] = [
   { id: 'intraday',   label: 'INTRADAY',      path: '/main-brain/intraday',  icon: '◫' },
   { id: 'strategy-lab', label: 'Strategy Lab', path: '/main-brain/strategy-lab', icon: '◇' },
   { id: 'research-health', label: 'Research Health', path: '/main-brain/research-health', icon: '◌' },
+  { id: 'verdict-history', label: 'Verdict History', path: '/main-brain/verdict-history', icon: '⌁' },
   { id: 'alerts',     label: 'Alerts',        path: '/main-brain/alerts',    icon: '◉' },
 ] as const;
 

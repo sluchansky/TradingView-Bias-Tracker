@@ -326,3 +326,53 @@ def test_observer_disabled_reports_disabled_state_without_database_access(monkey
     assert body["observer"]["worker_running"] is False
     assert body["persistence"]["total_rows"] is None
     connection.assert_not_called()
+
+
+def test_operator_history_route_validates_scope_and_returns_curated_report(monkeypatch):
+    calls = []
+
+    def report(instrument, mode, limit):
+        calls.append((instrument, mode, limit))
+        return {
+            "ok": True,
+            "available": True,
+            "read_only": True,
+            "observer_only": True,
+            "instrument": instrument,
+            "mode": mode,
+            "count": 0,
+            "chain": {
+                "status": "EMPTY", "roots": 0, "contiguous": 0, "breaks": 0,
+                "partial": False,
+            },
+            "events": [],
+        }
+
+    monkeypatch.setattr(avh, "get_history_report", report)
+    client = app.app.test_client()
+
+    response = client.get(
+        "/authoritative-verdict-history"
+        "?instrument=mnq&mode=intraday_trend&limit=500"
+    )
+    assert response.status_code == 200
+    assert response.get_json()["available"] is True
+    assert calls == [("MNQ", "INTRADAY_TREND", 500)]
+
+    invalid_instrument = client.get(
+        "/authoritative-verdict-history?instrument=ES&mode=SCALP"
+    )
+    assert invalid_instrument.status_code == 400
+    assert invalid_instrument.get_json()["error"] == "invalid_instrument"
+
+    invalid_mode = client.get(
+        "/authoritative-verdict-history?instrument=MGC&mode=SWING"
+    )
+    assert invalid_mode.status_code == 400
+    assert invalid_mode.get_json()["error"] == "invalid_mode"
+
+    invalid_limit = client.get(
+        "/authoritative-verdict-history?instrument=MGC&mode=SCALP&limit=many"
+    )
+    assert invalid_limit.status_code == 400
+    assert invalid_limit.get_json()["error"] == "invalid_limit"

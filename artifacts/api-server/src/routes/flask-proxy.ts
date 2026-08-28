@@ -468,6 +468,9 @@ export const BOT1_ROUTES = [
   // counts only. Read-only, observer-only, owner-authenticated, and never a
   // gate, outcome resolver, strategy, risk, broker, or execution surface.
   "/authoritative-verdict-history-health",
+  // Curated immutable final-verdict timeline. GET-only and read-only; exposes
+  // chain continuity without returning the stored raw payload.
+  "/authoritative-verdict-history",
   // Structure confirmation timing / stale-detector research. GET-only and
   // never a trading input.
   "/structure-confirmation-diagnostics",

@@ -321,6 +321,175 @@ function getAuthHeader(): Record<string, string> {
   } catch { return {}; }
 }
 
+// ── Immutable verdict history (review-only) ───────────────────────────────────
+type VerdictHistoryEvent = {
+  event_id: string | number;
+  observation_key: string;
+  previous_observation_key: string | null;
+  recorded_at: string | null;
+  source_timestamp: string | null;
+  verdict: string;
+  wait_ready_state: string;
+  actionable: boolean;
+  blocked: boolean;
+  score: number | null;
+  grade: string | null;
+  confidence: number | null;
+  candidate_direction: string | null;
+  actionable_direction: string | null;
+  blockers: string[];
+  waiting_for: string[];
+  chain_status: 'ROOT' | 'WINDOW_START' | 'CONTIGUOUS' | 'BROKEN';
+  chain_expected_previous: string | null;
+};
+type VerdictHistoryResponse = {
+  ok: boolean;
+  available: boolean;
+  read_only: boolean;
+  observer_only: boolean;
+  instrument: string;
+  mode: string;
+  count: number;
+  chain: { status: 'EMPTY' | 'VALID' | 'PARTIAL' | 'BROKEN'; roots: number; contiguous: number; breaks: number; partial: boolean };
+  events: VerdictHistoryEvent[];
+  error?: string;
+};
+
+const HISTORY_INSTRUMENTS = ['MGC', 'MNQ', 'MES', 'MYM'] as const;
+const HISTORY_MODES = ['SCALP', 'INTRADAY_TREND'] as const;
+
+function useVerdictHistory(instrument: string, mode: string, limit: number) {
+  const [state, setState] = useState<{ data: VerdictHistoryResponse | null; loading: boolean; error: string | null }>({
+    data: null, loading: true, error: null,
+  });
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    let cancelled = false;
+    setState(s => ({ ...s, loading: true, error: null }));
+    const query = new URLSearchParams({ instrument, mode, limit: String(limit) });
+    fetch(`/api/authoritative-verdict-history?${query.toString()}`, {
+      credentials: 'include', headers: getAuthHeader(),
+    }).then(async response => {
+      if (!response.ok) throw new Error(`History unavailable (${response.status})`);
+      const body = await response.json() as VerdictHistoryResponse;
+      if (!body.available || body.ok === false) throw new Error(body.error || 'History unavailable');
+      return body;
+    }).then(data => {
+      if (!cancelled) setState({ data, loading: false, error: null });
+    }).catch(error => {
+      if (!cancelled) setState({ data: null, loading: false, error: error instanceof Error ? error.message : 'History unavailable' });
+    });
+    return () => { cancelled = true; };
+  }, [instrument, mode, limit, revision]);
+  return { ...state, refresh: () => setRevision(value => value + 1) };
+}
+
+function historyDate(value: string | null): string {
+  if (!value) return 'Timestamp unavailable';
+  const date = new Date(value);
+  return Number.isNaN(date.getTime()) ? 'Timestamp unavailable' : date.toLocaleString('en-US', {
+    month: 'short', day: '2-digit', hour: '2-digit', minute: '2-digit', second: '2-digit',
+    hour12: false, timeZoneName: 'short',
+  });
+}
+
+const VerdictHistoryPage: React.FC = () => {
+  const [instrument, setInstrument] = useState<string>('MGC');
+  const [mode, setMode] = useState<string>('SCALP');
+  const [limit, setLimit] = useState(100);
+  const { data, loading, error, refresh } = useVerdictHistory(instrument, mode, limit);
+  const chain = data?.chain;
+  const chainColor = chain?.status === 'VALID' ? T.green : chain?.status === 'BROKEN' ? T.red : chain?.status === 'PARTIAL' ? T.amber : T.txtMuted;
+  return (
+    <div data-testid="page-verdict-history" style={{ maxWidth: 1320, margin: '0 auto' }}>
+      <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start', gap:16, marginBottom:16, flexWrap:'wrap' }}>
+        <div>
+          <div style={{ color:T.cyan, fontSize:9, fontWeight:800, letterSpacing:'0.16em', marginBottom:6 }}>AUDIT SURFACE / OBSERVER ONLY</div>
+          <h1 data-testid="heading-verdict-history" style={{ margin:0, fontSize:26, letterSpacing:'-0.03em', fontWeight:800 }}>Verdict history</h1>
+          <p style={{ margin:'7px 0 0', color:T.txtMuted, fontSize:12 }}>Immutable final decisions. This view cannot influence trading.</p>
+        </div>
+        <div data-testid="status-read-only" style={{ border:`1px solid ${T.cyan}44`, background:`${T.cyan}0d`, color:T.cyan, borderRadius:6, padding:'7px 10px', fontSize:9, fontWeight:800, letterSpacing:'0.1em' }}>READ ONLY · IMMUTABLE</div>
+      </div>
+      <div data-testid="history-filters" style={{ display:'flex', gap:8, alignItems:'end', flexWrap:'wrap', padding:'11px 12px', marginBottom:12, background:T.panel, border:`1px solid ${T.border}`, borderRadius:9 }}>
+        <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>INSTRUMENT
+          <select data-testid="select-history-instrument" value={instrument} onChange={event => setInstrument(event.target.value)} style={{ ...historySelectStyle, color:T.txtPri }}>
+            {HISTORY_INSTRUMENTS.map(value => <option key={value} value={value}>{value}</option>)}
+          </select>
+        </label>
+        <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>MODE
+          <select data-testid="select-history-mode" value={mode} onChange={event => setMode(event.target.value)} style={{ ...historySelectStyle, color:T.txtPri }}>
+            {HISTORY_MODES.map(value => <option key={value} value={value}>{value}</option>)}
+          </select>
+        </label>
+        <label style={{ display:'grid', gap:5, color:T.txtMuted, fontSize:9, fontWeight:700, letterSpacing:'0.08em' }}>EVENT LIMIT
+          <select data-testid="select-history-limit" value={limit} onChange={event => setLimit(Number(event.target.value))} style={{ ...historySelectStyle, color:T.txtPri }}>
+            {[50, 100, 250, 500].map(value => <option key={value} value={value}>{value}</option>)}
+          </select>
+        </label>
+        <button data-testid="button-refresh-verdict-history" onClick={refresh} style={{ ...historyButtonStyle, marginLeft:'auto' }}>Refresh history</button>
+      </div>
+      {loading ? <HistorySkeleton /> : error ? (
+        <div data-testid="status-history-unavailable" role="status" style={historyEmptyStyle}>
+          <strong style={{ color:T.amber }}>History unavailable</strong>
+          <span style={{ color:T.txtMuted, marginTop:6 }}>{error}. No live or alternate data is shown.</span>
+          <button data-testid="button-retry-verdict-history" onClick={refresh} style={{ ...historyButtonStyle, marginTop:14 }}>Retry</button>
+        </div>
+      ) : !data?.events?.length ? (
+        <div data-testid="status-history-empty" role="status" style={historyEmptyStyle}>
+          <strong style={{ color:T.txtPri }}>No immutable verdicts recorded</strong>
+          <span style={{ color:T.txtMuted, marginTop:6 }}>History is available, but no events exist for this selection.</span>
+        </div>
+      ) : (
+        <>
+          <div data-testid="history-chain-summary" style={{ display:'grid', gridTemplateColumns:'minmax(180px,1.2fr) repeat(4,1fr)', gap:8, marginBottom:12 }}>
+            <div style={{ ...historyMetricStyle, borderColor:`${chainColor}55` }}><span>CHAIN INTEGRITY</span><b data-testid="value-chain-status" style={{ color:chainColor }}>{chain?.status ?? 'EMPTY'}</b></div>
+            <div style={historyMetricStyle}><span>EVENTS</span><b data-testid="value-history-count">{data.count}</b></div>
+            <div style={historyMetricStyle}><span>ROOTS</span><b>{chain?.roots ?? 0}</b></div>
+            <div style={historyMetricStyle}><span>CONTIGUOUS</span><b>{chain?.contiguous ?? 0}</b></div>
+            <div style={historyMetricStyle}><span>BREAKS</span><b style={{ color:(chain?.breaks ?? 0) > 0 ? T.red : T.txtPri }}>{chain?.breaks ?? 0}</b></div>
+          </div>
+          <div data-testid="verdict-history-timeline" style={{ display:'grid', gap:7 }}>
+            {data.events.map((event, index) => <VerdictHistoryRow key={`${event.event_id}-${index}`} event={event} index={index} />)}
+          </div>
+        </>
+      )}
+    </div>
+  );
+};
+
+const historySelectStyle: React.CSSProperties = { minWidth:130, background:T.panelAlt, border:`1px solid ${T.borderMid}`, borderRadius:5, padding:'8px 9px', fontFamily:T.mono, fontSize:11, outline:'none' };
+const historyButtonStyle: React.CSSProperties = { border:`1px solid ${T.cyan}55`, background:`${T.cyan}14`, color:T.cyan, borderRadius:5, padding:'8px 12px', fontSize:10, fontWeight:800, cursor:'pointer' };
+const historyEmptyStyle: React.CSSProperties = { minHeight:180, display:'flex', flexDirection:'column', justifyContent:'center', alignItems:'center', textAlign:'center', background:T.panel, border:`1px solid ${T.border}`, borderRadius:9, fontSize:12 };
+const historyMetricStyle: React.CSSProperties = { display:'grid', gap:5, background:T.panel, border:`1px solid ${T.border}`, borderRadius:7, padding:'10px 11px', minWidth:0 };
+
+const VerdictHistoryRow: React.FC<{ event: VerdictHistoryEvent; index: number }> = ({ event, index }) => {
+  const continuityColor = event.chain_status === 'CONTIGUOUS' ? T.green : event.chain_status === 'BROKEN' ? T.red : event.chain_status === 'WINDOW_START' ? T.amber : T.cyan;
+  const verdictColor = event.actionable ? T.green : event.blocked ? T.amber : T.txtSec;
+  return <article data-testid={`row-verdict-history-${event.event_id}`} style={{ display:'grid', gridTemplateColumns:'26px minmax(190px,1.1fr) minmax(150px,0.8fr) minmax(200px,1.2fr) minmax(170px,1fr)', gap:12, alignItems:'center', padding:'11px 12px', background:T.panel, border:`1px solid ${event.chain_status === 'BROKEN' ? T.red + '66' : T.border}`, borderRadius:7, animation:'mbHistoryIn 0.25s ease both', animationDelay:`${Math.min(index, 8) * 25}ms` }}>
+    <div aria-hidden style={{ height:'100%', minHeight:42, borderLeft:`2px solid ${continuityColor}`, position:'relative' }}><span style={{ position:'absolute', top:0, left:-5, width:8, height:8, borderRadius:'50%', background:continuityColor }} /></div>
+    <div><div style={{ color:T.txtMuted, fontSize:9, letterSpacing:'0.05em' }}>{historyDate(event.recorded_at)}</div><div data-testid={`text-observation-${event.event_id}`} title={event.observation_key} style={{ color:T.txtPri, fontFamily:T.mono, fontSize:10, marginTop:5, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }}>{event.observation_key}</div><div style={{ color:T.txtMuted, fontSize:9, marginTop:3 }}>Event {event.event_id}</div></div>
+    <div><div style={{ color:verdictColor, fontSize:15, fontWeight:800, letterSpacing:'0.02em' }}>{safeStr(event.verdict)}</div><div style={{ color:T.txtMuted, fontSize:10, marginTop:4 }}>{safeStr(event.wait_ready_state)} · {event.actionable ? 'Actionable' : event.blocked ? 'Blocked' : 'Not actionable'}</div><div style={{ color:dirColor(event.actionable_direction ?? event.candidate_direction), fontSize:10, marginTop:3 }}>{safeStr(event.actionable_direction ?? event.candidate_direction)}</div></div>
+    <div style={{ display:'grid', gridTemplateColumns:'repeat(3,1fr)', gap:7 }}><div><small style={historyLabelStyle}>SCORE</small><b style={historyValueStyle}>{event.score == null ? '—' : event.score}</b></div><div><small style={historyLabelStyle}>GRADE</small><b style={historyValueStyle}>{safeStr(event.grade)}</b></div><div><small style={historyLabelStyle}>CONF.</small><b style={historyValueStyle}>{event.confidence == null ? '—' : event.confidence}</b></div><div style={{ gridColumn:'1 / -1', color:T.txtMuted, fontSize:9 }}>Source {historyDate(event.source_timestamp)}</div></div>
+    <div>
+      <div style={{ color:continuityColor, fontSize:9, fontWeight:800, letterSpacing:'0.08em' }}>{event.chain_status.replace('_', ' ')} LINK</div>
+      <div style={{ color:T.txtMuted, fontFamily:T.mono, fontSize:9, marginTop:5, overflow:'hidden', textOverflow:'ellipsis', whiteSpace:'nowrap' }} title={event.previous_observation_key ?? 'Root event'}>{event.chain_status === 'ROOT' ? 'Root observation' : `prev ${safeStr(event.previous_observation_key)}`}</div>
+      {event.chain_status === 'WINDOW_START' && <div style={{ color:T.amber, fontSize:9, marginTop:4 }}>Earlier link is outside this window</div>}
+      {event.chain_status === 'BROKEN' && <div style={{ color:T.red, fontSize:9, marginTop:4 }}>Expected {safeStr(event.chain_expected_previous)}</div>}
+      <div data-testid={`blockers-verdict-history-${event.event_id}`} style={{ marginTop:7 }}>
+        <small style={historyLabelStyle}>BLOCKERS</small>
+        <div style={{ color:event.blockers.length ? T.amber : T.txtMuted, fontSize:9, marginTop:3, lineHeight:1.45, overflowWrap:'anywhere' }}>{event.blockers.map(value => safeStr(value)).join(' · ') || 'None recorded'}</div>
+      </div>
+      <div data-testid={`waiting-verdict-history-${event.event_id}`} style={{ marginTop:6 }}>
+        <small style={historyLabelStyle}>WAITING FOR</small>
+        <div style={{ color:T.txtMuted, fontSize:9, marginTop:3, lineHeight:1.45, overflowWrap:'anywhere' }}>{event.waiting_for.map(value => safeStr(value)).join(' · ') || 'None recorded'}</div>
+      </div>
+    </div>
+  </article>;
+};
+const historyLabelStyle: React.CSSProperties = { display:'block', color:T.txtMuted, fontSize:8, letterSpacing:'0.08em' };
+const historyValueStyle: React.CSSProperties = { display:'block', color:T.txtPri, fontFamily:T.mono, fontSize:12, marginTop:3 };
+const HistorySkeleton: React.FC = () => <div data-testid="status-history-loading" aria-label="Loading verdict history" style={{ display:'grid', gap:7 }}>{[1,2,3,4].map(item => <div key={item} style={{ height:78, borderRadius:7, background:`linear-gradient(90deg, ${T.panel} 25%, ${T.panelAlt} 50%, ${T.panel} 75%)`, backgroundSize:'200% 100%', animation:'mbHistoryShimmer 1.4s ease-in-out infinite' }} />)}</div>;
+
 // ── Payload normalizer ────────────────────────────────────────────────────────
 // Imported from src/lib/mainBrainNormalizer.ts (pure TypeScript, testable).
 // See that module for full documentation and Phase 7C.3 contract tests.
@@ -673,6 +842,7 @@ const MobileNavDrawer: React.FC<{
                 to={item.path}
                 onClick={onClose}
                 className="mb-mobile-nav-item"
+                data-testid={`link-${item.id}`}
                 aria-current={isActive ? 'page' : undefined}
                 style={{
                   background: isActive ? `${T.cyan}14` : 'transparent',
@@ -733,6 +903,7 @@ const SideNav: React.FC<{ systemOk: boolean }> = ({ systemOk }) => {
         const col = isActive ? T.cyan : T.txtSec;
         return (
           <Link key={item.id} to={item.path} style={{ textDecoration:'none', marginBottom:4 }}
+            data-testid={`link-${item.id}`}
             aria-label={item.label} aria-current={isActive ? 'page' : undefined}>
             <div title={item.label} style={{
               display:'flex', flexDirection:'column', alignItems:'center', gap:3,
@@ -15669,6 +15840,8 @@ export default function MainBrain() {
   // never creates a second polling loop or duplicates business logic.
   const renderSectionPanels = (): React.ReactNode => {
     switch (section) {
+      case 'verdict-history':
+        return <VerdictHistoryPage />;
       case 'analysis':
         return (
           <>
@@ -15861,7 +16034,7 @@ export default function MainBrain() {
 
         <main id="main-content" className="mb-main-content" style={{ flex:1, padding:'16px 20px 32px', overflow:'auto' }}>
           {/* Execution and training lanes render immediately — they have their own read-only data sources. */}
-          {(section === 'execution' || section === 'scalp' || section === 'intraday' || section === 'strategy-lab' || section === 'research-health') ? renderSectionPanels() :
+          {(section === 'execution' || section === 'scalp' || section === 'intraday' || section === 'strategy-lab' || section === 'research-health' || section === 'verdict-history') ? renderSectionPanels() :
           isLoading ? <LoadingScreen /> : isError ? <ErrorScreen msg={error} refresh={refresh} /> : (
             <>
               {/* Stale banner */}
@@ -16040,6 +16213,21 @@ export default function MainBrain() {
         @keyframes mbDot {
           0%, 100% { opacity: 0.25; transform: scale(0.8); }
           50%       { opacity: 1;   transform: scale(1.1); }
+        }
+        @keyframes mbHistoryIn {
+          from { opacity: 0; transform: translateY(5px); }
+          to { opacity: 1; transform: translateY(0); }
+        }
+        @keyframes mbHistoryShimmer {
+          0% { background-position: 200% 0; }
+          100% { background-position: -200% 0; }
+        }
+        @media (max-width: 768px) {
+          [data-testid="history-chain-summary"] { grid-template-columns: repeat(2, minmax(0, 1fr)) !important; }
+          [data-testid="verdict-history-timeline"] article { grid-template-columns: 14px 1fr !important; gap: 8px !important; }
+          [data-testid="verdict-history-timeline"] article > div:nth-child(3),
+          [data-testid="verdict-history-timeline"] article > div:nth-child(4) { grid-column: 2; }
+          [data-testid="verdict-history-timeline"] article > div:first-child { grid-row: 1 / span 3; }
         }
         @keyframes bellToastIn {
           from { opacity: 0; transform: translateX(-50%) translateY(10px) scale(0.97); }

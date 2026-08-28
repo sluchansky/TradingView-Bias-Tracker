@@ -19,3 +19,16 @@ write while the trading service itself continues to operate normally.
 coordinator, ghost authority, and SWING evaluation.  Apply its schema externally
 in development and through the Publish schema diff for production; app startup
 may probe/read but must not create or mutate schema.
+
+Read-only chain audits must use immutable append order, not wall-clock timestamps.
+A bounded latest window is PARTIAL only when one extra fetched row proves the
+first retained row's predecessor; an absent or mismatched predecessor is BROKEN.
+
+**Why:** Concurrent observers can assign recording timestamps in the opposite
+order from the lock-protected predecessor chain, and blindly treating any
+non-null first predecessor as truncated can hide real chain corruption.
+
+**How to apply:** Order operator/audit windows by durable event identity, fetch
+one row beyond the displayed limit, and validate that extra row against the
+first displayed previous key. Keep legacy reconstruction ordering unchanged
+unless separately audited.
