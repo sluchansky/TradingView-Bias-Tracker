@@ -53652,6 +53652,119 @@ def _coordinator_persist(kind, record):
             pass
 
 
+def _coordinator_health_aggregate():
+    """Return complete coordinator totals without restoring durable rows.
+
+    The coordinator's in-memory registry is intentionally bounded at boot so
+    it can retain exact deduplication for the active window.  Health totals
+    must not inherit that bound, so this callback uses aggregate SELECTs over
+    the append-only coordinator tables and never mutates coordinator state.
+    """
+    if not (CENTRAL_GHOST_COORDINATOR_DB_READY and LEARNING_DB_ENABLED):
+        return {
+            "db_ready": False,
+            "complete": False,
+            "error": "coordinator persistence unavailable",
+        }
+    conn = _learning_conn()
+    if conn is None:
+        return {
+            "db_ready": False,
+            "complete": False,
+            "error": "database connection unavailable",
+        }
+    try:
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            cur.execute(
+                """SELECT
+                       COUNT(*) AS observation_count,
+                       COUNT(DISTINCT market_opportunity_id) AS opportunity_count,
+                       COUNT(*) FILTER (
+                           WHERE LOWER(COALESCE(context->>'coordinator_evaluation_kind', ''))
+                               = 'gate_check'
+                       ) AS evaluation_transitions,
+                       COALESCE(SUM(
+                           CASE
+                               WHEN LOWER(COALESCE(context->>'coordinator_evaluation_kind', ''))
+                                   = 'gate_check'
+                               AND COALESCE(context->>'evaluation_heartbeat_count', '')
+                                   ~ '^[0-9]+$'
+                               THEN (context->>'evaluation_heartbeat_count')::BIGINT
+                               ELSE 0
+                           END
+                       ), 0) AS evaluation_heartbeats
+                   FROM ghost_coordinator_observations"""
+            )
+            totals = dict(cur.fetchone() or {})
+            cur.execute(
+                """SELECT source_system,
+                          COUNT(*) AS observation_count,
+                          COUNT(DISTINCT market_opportunity_id) AS opportunity_count,
+                          COUNT(*) FILTER (
+                              WHERE LOWER(COALESCE(context->>'coordinator_evaluation_kind', ''))
+                                  = 'gate_check'
+                          ) AS evaluation_transitions,
+                          COALESCE(SUM(
+                              CASE
+                                  WHEN LOWER(COALESCE(context->>'coordinator_evaluation_kind', ''))
+                                      = 'gate_check'
+                                  AND COALESCE(context->>'evaluation_heartbeat_count', '')
+                                      ~ '^[0-9]+$'
+                                  THEN (context->>'evaluation_heartbeat_count')::BIGINT
+                                  ELSE 0
+                              END
+                          ), 0) AS evaluation_heartbeats
+                   FROM ghost_coordinator_observations
+                   GROUP BY source_system
+                   ORDER BY source_system"""
+            )
+            by_source = {}
+            for row in cur.fetchall():
+                source = str(row.get("source_system") or "")
+                if not source:
+                    continue
+                source_row = {
+                    key: int(value or 0)
+                    for key, value in dict(row).items()
+                    if key != "source_system"
+                }
+                source_row["evaluation_checks"] = (
+                    source_row["evaluation_transitions"]
+                    + source_row["evaluation_heartbeats"]
+                )
+                by_source[source] = source_row
+            cur.execute("SELECT COUNT(*) AS telemetry_event_count FROM ghost_coordinator_telemetry_events")
+            telemetry = dict(cur.fetchone() or {})
+        observation_count = int(totals.get("observation_count") or 0)
+        opportunity_count = int(totals.get("opportunity_count") or 0)
+        evaluation_transitions = int(totals.get("evaluation_transitions") or 0)
+        evaluation_heartbeats = int(totals.get("evaluation_heartbeats") or 0)
+        return {
+            "db_ready": True,
+            "complete": True,
+            "scope": "all_durable_rows",
+            "observation_count": observation_count,
+            "opportunity_count": opportunity_count,
+            "evaluation_transitions": evaluation_transitions,
+            "evaluation_heartbeats": evaluation_heartbeats,
+            "evaluation_checks": evaluation_transitions + evaluation_heartbeats,
+            "telemetry_event_count": int(telemetry.get("telemetry_event_count") or 0),
+            "by_source": by_source,
+        }
+    except Exception as exc:
+        logger.debug("ghost coordinator health aggregate unavailable: %s", exc)
+        return {
+            "db_ready": False,
+            "complete": False,
+            "error": str(exc)[:180],
+        }
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+
 def _restore_ghost_coordinator():
     """Restore only the coordinator's own shadow evidence after its probe passes."""
     if not (CENTRAL_GHOST_COORDINATOR_PERSIST_ENABLED
@@ -53665,6 +53778,7 @@ def _restore_ghost_coordinator():
         enabled=CENTRAL_GHOST_COORDINATOR_ENABLED,
         persistence_enabled=True,
         persist_fn=_coordinator_persist,
+        health_aggregate_fn=_coordinator_health_aggregate,
     )
     logger.info(
         "Central Ghost Coordinator persistence configured=%s",
@@ -53683,7 +53797,7 @@ def _restore_ghost_coordinator():
                           direction, signal_time, source_bar_time, entry_price, stop_price,
                           targets, context, experiment_variant
                    FROM ghost_coordinator_observations
-                   ORDER BY created_at ASC LIMIT 50000""")
+                   ORDER BY created_at DESC LIMIT 50000""")
             for row in cur.fetchall():
                 rows.append({
                     "observation_id": row["observation_id"],
@@ -53698,11 +53812,13 @@ def _restore_ghost_coordinator():
                     "stop": float(row["stop_price"]), "targets": tuple(row["targets"] or []),
                     "context": row["context"] or {}, "experiment_variant": row["experiment_variant"],
                 })
+            rows.reverse()
             cur.execute(
                 """SELECT telemetry_id, source_system, event_id
                    FROM ghost_coordinator_telemetry_events
-                   ORDER BY created_at ASC LIMIT 50000""")
+                   ORDER BY created_at DESC LIMIT 50000""")
             telemetry_rows = [dict(row) for row in cur.fetchall()]
+            telemetry_rows.reverse()
     except Exception as exc:
         logger.info("Central Ghost Coordinator restore skipped: %s", exc)
         return 0
@@ -53727,6 +53843,7 @@ def _configure_ghost_coordinator_persistence():
         enabled=CENTRAL_GHOST_COORDINATOR_ENABLED,
         persistence_enabled=enabled,
         persist_fn=_coordinator_persist if enabled else None,
+        health_aggregate_fn=_coordinator_health_aggregate,
     )
     if CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED:
         _register_coordinator_research_sinks()

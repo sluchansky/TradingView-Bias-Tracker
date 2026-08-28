@@ -4872,6 +4872,19 @@ const CanonicalEvidenceHealthPanel: React.FC<{
   const reconciliation = (health?.reconciliation ?? {}) as JsonRecord;
   const outcomes = (health?.outcomes ?? {}) as JsonRecord;
   const coordinator = (health?.coordinator ?? {}) as JsonRecord;
+  const coordinatorHealth = (coordinator.health_totals ?? {}) as JsonRecord;
+  const coordinatorDurable = (coordinator.durable_totals ?? {}) as JsonRecord;
+  const coordinatorSession = (coordinator.restored_session_counts ?? {}) as JsonRecord;
+  const durableTotalsReady = coordinatorHealth.complete === true
+    || coordinatorDurable.complete === true;
+  const durableOpportunities = safeNum(
+    coordinatorHealth.opportunity_count ?? coordinatorDurable.opportunity_count
+  );
+  const durableObservations = safeNum(
+    coordinatorHealth.observation_count ?? coordinatorDurable.observation_count
+  );
+  const sessionOpportunities = safeNum(coordinatorSession.opportunity_count);
+  const sessionObservations = safeNum(coordinatorSession.observation_count);
   const staleAfter = safeNum(health?.stale_after_minutes);
   const status = safeStr(lane?.status ?? health?.health_status, 'UNAVAILABLE');
   const statusColor = status === 'HEALTHY' ? T.green
@@ -4914,11 +4927,21 @@ const CanonicalEvidenceHealthPanel: React.FC<{
             </div>
           </div>
           <div style={{ marginTop: 10, fontSize: 9.5, color: T.txtSec }}>
-            Coordinator: <strong style={{ color: T.cyan }}>{safeNum(coordinator.opportunity_count) ?? 0} opportunities</strong>
+            Coordinator health totals:{' '}
+            <strong style={{ color: durableTotalsReady ? T.cyan : T.amber }}>
+              {durableTotalsReady ? `${durableOpportunities ?? 0} durable opportunities` : 'durable totals unavailable'}
+            </strong>
             {' · '}
-            <strong style={{ color: T.txtPri }}>{safeNum(coordinator.opportunity_observation_count) ?? 0} state observations</strong>
+            <strong style={{ color: durableTotalsReady ? T.txtPri : T.amber }}>
+              {durableTotalsReady ? `${durableObservations ?? 0} durable observations` : 'using restored-session counts'}
+            </strong>
+          </div>
+          <div style={{ marginTop: 5, fontSize: 9.5, color: T.txtMuted }}>
+            Restored session window: {sessionOpportunities ?? safeNum(coordinator.opportunity_count) ?? 0} opportunities
             {' · '}
-            <strong style={{ color: T.amber }}>{safeNum(coordinator.evaluation_heartbeats) ?? 0} evaluation heartbeats</strong>
+            {sessionObservations ?? safeNum(coordinator.opportunity_observation_count) ?? 0} observations
+            {' · '}
+            {safeNum(coordinatorSession.evaluation_heartbeats) ?? safeNum(coordinator.evaluation_heartbeats) ?? 0} heartbeats
           </div>
           <div style={{ marginTop: 6, fontSize: 9.5, color: T.txtMuted }}>
             Overdue means unresolved for more than {staleAfter ?? '—'} minutes. This panel reads evidence only; it cannot route, resolve, size, gate, or execute.
@@ -5057,6 +5080,11 @@ const TrainingLanePanel: React.FC<{
   const opportunities = Array.isArray(data.opportunities?.opportunities)
     ? data.opportunities?.opportunities as JsonRecord[] : [];
   const coordinator = data.coordinator ?? {};
+  const coordinatorDurable = (coordinator.durable_totals ?? {}) as JsonRecord;
+  const coordinatorSession = (coordinator.restored_session_counts ?? {}) as JsonRecord;
+  const coordinatorHealth = (coordinator.health_totals ?? {}) as JsonRecord;
+  const durableTotalsReady = coordinatorHealth.complete === true
+    || coordinatorDurable.complete === true;
   const researchHealth = data.researchHealth ?? {};
   const ghostHealth = (researchHealth.ghost_engine ?? {}) as JsonRecord;
   const edgeHealth = (researchHealth.edge_ledger ?? {}) as JsonRecord;
@@ -5345,6 +5373,11 @@ const TrainingInfrastructurePanel: React.FC<{ authHeader: string }> = ({ authHea
   const ghost = (data.health?.ghost_engine ?? {}) as JsonRecord;
   const edge = (data.health?.edge_ledger ?? {}) as JsonRecord;
   const coordinator = data.coordinator ?? {};
+  const coordinatorDurable = (coordinator.durable_totals ?? {}) as JsonRecord;
+  const coordinatorSession = (coordinator.restored_session_counts ?? {}) as JsonRecord;
+  const coordinatorHealth = (coordinator.health_totals ?? {}) as JsonRecord;
+  const durableTotalsReady = coordinatorHealth.complete === true
+    || coordinatorDurable.complete === true;
   const student = data.student ?? {};
   const freshness = (student.freshness ?? {}) as JsonRecord;
   const studentOutcomes = (student.outcomes ?? {}) as JsonRecord;
@@ -5394,6 +5427,8 @@ const TrainingInfrastructurePanel: React.FC<{ authHeader: string }> = ({ authHea
             <div><span style={{ color: T.txtMuted }}>Persistence:</span> <span style={{ color: T.txtSec }}>{safeStr(coordinator.persistence, 'in-memory shadow only')}</span></div>
             <div><span style={{ color: T.txtMuted }}>DB readiness:</span> <span style={{ color: coordinator.persistence_db_ready === true ? T.green : T.amber }}>{coordinator.persistence_db_ready === true ? 'READY' : 'PENDING'}</span></div>
             <div><span style={{ color: T.txtMuted }}>Fan-out state:</span> <strong style={{ color: coordinator.fanout_enabled === true ? T.red : T.green }}>{coordinator.fanout_enabled === true ? 'ENABLED' : 'DISABLED'}</strong></div>
+            <div><span style={{ color: T.txtMuted }}>Complete durable totals:</span> <strong style={{ color: durableTotalsReady ? T.cyan : T.amber }}>{durableTotalsReady ? `${safeNum((coordinatorHealth.opportunity_count ?? coordinatorDurable.opportunity_count)) ?? 0} opportunities · ${safeNum((coordinatorHealth.observation_count ?? coordinatorDurable.observation_count)) ?? 0} observations` : 'UNAVAILABLE'}</strong></div>
+            <div><span style={{ color: T.txtMuted }}>Restored session window:</span> <span style={{ color: T.txtSec }}>{safeNum(coordinatorSession.opportunity_count) ?? safeNum(coordinator.opportunity_count) ?? 0} opportunities · {safeNum(coordinatorSession.observation_count) ?? safeNum(coordinator.opportunity_observation_count) ?? 0} observations</span></div>
             <div style={{ borderTop: `1px solid ${T.border}`, paddingTop: 8, color: T.txtMuted }}>The dashboard reports this boundary; it does not reconfigure it.</div>
           </div>
         </Panel>

@@ -102,6 +102,7 @@ class CentralGhostCoordinator:
         self._enabled = bool(enabled)
         self._persistence_enabled = False
         self._persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None
+        self._health_aggregate_fn: Optional[Callable[[], Mapping[str, Any]]] = None
         self._lock = threading.Lock()
         self._requests_received = 0
         self._duplicates = 0
@@ -134,7 +135,8 @@ class CentralGhostCoordinator:
         self._delivery_last_error: Dict[str, str] = {}
 
     def configure(self, *, enabled: bool, persistence_enabled: Optional[bool] = None,
-                  persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None) -> None:
+                  persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None,
+                  health_aggregate_fn: Optional[Callable[[], Mapping[str, Any]]] = None) -> None:
         """Enable shadow intake without clearing its optional storage boundary.
 
         Callers that omit ``persistence_enabled`` are changing intake only. This
@@ -149,6 +151,8 @@ class CentralGhostCoordinator:
                 self._persist_fn = persist_fn
             elif persist_fn is not None:
                 self._persist_fn = persist_fn
+            if health_aggregate_fn is not None:
+                self._health_aggregate_fn = health_aggregate_fn
 
     @property
     def enabled(self) -> bool:
@@ -432,6 +436,20 @@ class CentralGhostCoordinator:
         """Return a JSON-safe read-only comparison report."""
         safe_limit = max(1, min(int(limit), 500))
         with self._lock:
+            health_aggregate_fn = self._health_aggregate_fn
+        durable_totals: Dict[str, Any] = {}
+        if health_aggregate_fn is not None:
+            try:
+                candidate = health_aggregate_fn()
+                if isinstance(candidate, Mapping):
+                    durable_totals = dict(candidate)
+            except Exception as exc:
+                durable_totals = {
+                    "db_ready": False,
+                    "complete": False,
+                    "error": str(exc)[:180],
+                }
+        with self._lock:
             source_systems = sorted(set(self._source_counts) | set(self._source_unique) | set(self._source_errors))
             rows = [{
                 "source_system": source,
@@ -502,6 +520,63 @@ class CentralGhostCoordinator:
                     "last_error": self._delivery_last_error.get(destination),
                 } for destination in sorted(set(self._deliveries) | set(self._delivery_attempts)
                                               | set(self._delivery_errors))],
+                # The in-memory values above intentionally remain session-scoped:
+                # they are the exact deduplication window restored at boot.  A
+                # host may provide a SELECT-only aggregate over the full durable
+                # store for complete health totals without loading all rows.
+                "restored_session_counts": {
+                    "opportunity_count": len(self._opportunities),
+                    "observation_count": len(self._observations),
+                    "evaluation_checks": self._evaluation_checks,
+                    "evaluation_heartbeats": self._evaluation_heartbeats,
+                    "evaluation_transitions": self._evaluation_transitions,
+                    "telemetry_event_count": len(self._telemetry_events),
+                    "restored_observations": self._restored_observations,
+                },
+                "durable_totals": durable_totals,
+                "health_totals": {
+                    "source": (
+                        "durable"
+                        if durable_totals.get("db_ready") and durable_totals.get("complete")
+                        else "restored_session"
+                    ),
+                    "complete": bool(
+                        durable_totals.get("db_ready") and durable_totals.get("complete")
+                    ),
+                    "opportunity_count": int(
+                        durable_totals.get("opportunity_count", len(self._opportunities))
+                        or 0
+                    ) if durable_totals.get("db_ready") and durable_totals.get("complete")
+                    else len(self._opportunities),
+                    "observation_count": int(
+                        durable_totals.get("observation_count", len(self._observations))
+                        or 0
+                    ) if durable_totals.get("db_ready") and durable_totals.get("complete")
+                    else len(self._observations),
+                    "evaluation_checks": int(
+                        durable_totals.get("evaluation_checks", self._evaluation_checks)
+                        or 0
+                    ) if durable_totals.get("db_ready") and durable_totals.get("complete")
+                    else self._evaluation_checks,
+                    "evaluation_heartbeats": int(
+                        durable_totals.get(
+                            "evaluation_heartbeats", self._evaluation_heartbeats
+                        ) or 0
+                    ) if durable_totals.get("db_ready") and durable_totals.get("complete")
+                    else self._evaluation_heartbeats,
+                    "evaluation_transitions": int(
+                        durable_totals.get(
+                            "evaluation_transitions", self._evaluation_transitions
+                        ) or 0
+                    ) if durable_totals.get("db_ready") and durable_totals.get("complete")
+                    else self._evaluation_transitions,
+                    "telemetry_event_count": int(
+                        durable_totals.get(
+                            "telemetry_event_count", len(self._telemetry_events)
+                        ) or 0
+                    ) if durable_totals.get("db_ready") and durable_totals.get("complete")
+                    else len(self._telemetry_events),
+                },
             }
 
     @staticmethod
@@ -706,10 +781,12 @@ _DEFAULT_COORDINATOR = CentralGhostCoordinator(enabled=False)
 
 
 def configure(*, enabled: bool, persistence_enabled: Optional[bool] = None,
-              persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None) -> None:
+              persist_fn: Optional[Callable[[str, Mapping[str, Any]], bool]] = None,
+              health_aggregate_fn: Optional[Callable[[], Mapping[str, Any]]] = None) -> None:
     """Configure the module-level coordinator used by legacy shadow adapters."""
     _DEFAULT_COORDINATOR.configure(
-        enabled=enabled, persistence_enabled=persistence_enabled, persist_fn=persist_fn)
+        enabled=enabled, persistence_enabled=persistence_enabled, persist_fn=persist_fn,
+        health_aggregate_fn=health_aggregate_fn)
 
 
 def submit_shadow(request: ObservationRequest) -> SubmissionResult:

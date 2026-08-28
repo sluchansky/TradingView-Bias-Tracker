@@ -47,6 +47,68 @@ def test_deterministic_ids_and_deduplication():
     assert report["duplicate_submissions"] == 1
 
 
+def test_durable_health_totals_are_separate_from_restored_session_window():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.configure(
+        enabled=True,
+        health_aggregate_fn=lambda: {
+            "db_ready": True,
+            "complete": True,
+            "scope": "all_durable_rows",
+            "opportunity_count": 120,
+            "observation_count": 240,
+            "evaluation_checks": 300,
+            "evaluation_heartbeats": 60,
+            "evaluation_transitions": 240,
+            "telemetry_event_count": 12,
+        },
+    )
+
+    assert coordinator.submit(_request()).accepted
+    report = coordinator.report()
+
+    assert report["opportunity_count"] == 1
+    assert report["opportunity_observation_count"] == 1
+    assert report["restored_session_counts"]["opportunity_count"] == 1
+    assert report["restored_session_counts"]["observation_count"] == 1
+    assert report["durable_totals"]["opportunity_count"] == 120
+    assert report["durable_totals"]["observation_count"] == 240
+    assert report["health_totals"] == {
+        "source": "durable",
+        "complete": True,
+        "opportunity_count": 120,
+        "observation_count": 240,
+        "evaluation_checks": 300,
+        "evaluation_heartbeats": 60,
+        "evaluation_transitions": 240,
+        "telemetry_event_count": 12,
+    }
+
+    # The aggregate path is reporting-only; the restored in-memory identity
+    # remains the source of exact duplicate detection.
+    duplicate = coordinator.submit(_request())
+    assert duplicate.duplicate is True
+
+
+def test_health_totals_fall_back_to_restored_session_when_aggregate_is_unavailable():
+    coordinator = gc.CentralGhostCoordinator(enabled=True)
+    coordinator.configure(
+        enabled=True,
+        health_aggregate_fn=lambda: {
+            "db_ready": False,
+            "complete": False,
+            "error": "database unavailable",
+        },
+    )
+    assert coordinator.submit(_request()).accepted
+
+    report = coordinator.report()
+    assert report["health_totals"]["source"] == "restored_session"
+    assert report["health_totals"]["complete"] is False
+    assert report["health_totals"]["opportunity_count"] == 1
+    assert report["health_totals"]["observation_count"] == 1
+
+
 def _gate_evaluation_request(**overrides):
     context = {
         "coordinator_evaluation_kind": "gate_check",

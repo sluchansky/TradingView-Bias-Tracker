@@ -493,6 +493,27 @@ class CanonicalGhostAuthority:
         coordinator = dict(coordinator_report or {})
         durable = dict(durable_report or {})
         legacy = dict(legacy_report or {})
+        coordinator_durable = coordinator.get("durable_totals")
+        if not isinstance(coordinator_durable, Mapping):
+            coordinator_durable = {}
+        coordinator_session = coordinator.get("restored_session_counts")
+        if not isinstance(coordinator_session, Mapping):
+            coordinator_session = {
+                "opportunity_count": coordinator.get(
+                    "opportunity_count",
+                    coordinator.get("unique_market_opportunities", 0),
+                ),
+                "observation_count": coordinator.get(
+                    "opportunity_observation_count",
+                    coordinator.get("unique_observations", 0),
+                ),
+                "evaluation_checks": coordinator.get("evaluation_checks", 0),
+                "evaluation_heartbeats": coordinator.get("evaluation_heartbeats", 0),
+                "evaluation_transitions": coordinator.get("evaluation_transitions", 0),
+            }
+        coordinator_health = coordinator.get("health_totals")
+        if not isinstance(coordinator_health, Mapping):
+            coordinator_health = {}
 
         with self._lock:
             opportunities_by_mode: Dict[str, list[tuple[Dict[str, Any], list[Dict[str, Any]], list[Dict[str, Any]]]]] = defaultdict(list)
@@ -774,6 +795,12 @@ class CanonicalGhostAuthority:
                 "malformed_or_rejected": int(coordinator.get("malformed_or_rejected", 0) or 0),
                 "persistence_errors": int(coordinator.get("persistence_errors", 0) or 0),
                 "fanout_enabled": coordinator.get("routing_mode") == "research_fanout",
+                # Preserve both scopes.  The coordinator's restored session is
+                # intentionally bounded for exact deduplication; its durable
+                # aggregate is the complete health source when available.
+                "health_totals": dict(coordinator_health),
+                "durable_totals": dict(coordinator_durable),
+                "restored_session_counts": dict(coordinator_session),
             },
             "ignored_noncanonical_events": ignored_events,
             "unmatched_legacy_references": unmatched_references,
