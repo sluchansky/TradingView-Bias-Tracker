@@ -218,6 +218,18 @@ Visual Brain candidate benchmarking. The launcher
 refuses stale listeners and verifies direct Flask and browser-facing chart
 parity before it opens the browser.
 
+To deliberately run one advisory-only Visual Brain worker, add the explicit
+switch:
+
+```powershell
+.\scripts\windows\Start-WindowsDashboard.ps1 -EnableDatabento -EnableVisualBrain
+```
+
+This does not grant entry or execution authority. The launcher still forces
+execution, manual orders, live runner, Discord delivery, coordinator fan-out,
+and Visual Brain benchmark duplication off. Use the Visual Brain event gate,
+call-window limit, and daily spend cap to bound paid observations.
+
 ### Flexible development topology
 
 For local development or custom local ports, use the task-specific coordinator:

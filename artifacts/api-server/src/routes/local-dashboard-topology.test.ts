@@ -108,7 +108,7 @@ describe("local dashboard topology", () => {
     expect(vite).toContain('proxy:');
   });
 
-  it("keeps paid Visual Brain evaluation off in the release-safe Windows launcher", () => {
+  it("keeps paid Visual Brain evaluation explicit and benchmark duplication off", () => {
     const launcher = readFileSync(
       resolve(root, "scripts/windows/Start-WindowsDashboard.ps1"),
       "utf8",
@@ -117,14 +117,19 @@ describe("local dashboard topology", () => {
       resolve(root, "scripts/windows/Test-WindowsDashboard.ps1"),
       "utf8",
     );
+    expect(launcher).toContain('[switch]$EnableVisualBrain');
+    expect(launcher).toContain(
+      'SetEnvironmentVariable("VISUAL_BRAIN_ENABLED", "1", "Process")',
+    );
+    expect(launcher).toContain('Set-SafeDefault "VISUAL_BRAIN_ENABLED" "0"');
     for (const name of [
-      "VISUAL_BRAIN_ENABLED",
       "VISUAL_BRAIN_BENCHMARK_ENABLED",
       "VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED",
     ]) {
       expect(launcher).toContain(`Set-SafeDefault "${name}" "0"`);
       expect(smoke).toContain(`"${name}" = "0"`);
     }
+    expect(smoke).toContain('"VISUAL_BRAIN_ENABLED" = "0"');
   });
 
   it("keeps the PowerShell install path native and locks both supported toolchains", () => {

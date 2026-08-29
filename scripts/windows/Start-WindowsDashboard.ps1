@@ -10,6 +10,7 @@ param(
     [int]$DashboardPort = 24319,
 
     [switch]$EnableDatabento,
+    [switch]$EnableVisualBrain,
     [switch]$SkipEnvFile,
     [switch]$NoBrowser,
     # Automation-only: return after all local services pass their readiness checks.
@@ -84,7 +85,14 @@ Set-SafeDefault "DISCORD_LIVE_ENABLED" "0"
 # A copied Replit environment must never turn this local launcher into a sender.
 Set-SafeDefault "REPLIT_DEPLOYMENT" "0"
 Set-SafeDefault "CENTRAL_GHOST_COORDINATOR_FANOUT_ENABLED" "0"
-Set-SafeDefault "VISUAL_BRAIN_ENABLED" "0"
+if ($EnableVisualBrain) {
+    # Explicit opt-in only. Visual Brain is advisory/observation-only; the
+    # launcher still forces execution, manual orders, live runner, Discord,
+    # benchmark duplication, and coordinator fan-out off.
+    [Environment]::SetEnvironmentVariable("VISUAL_BRAIN_ENABLED", "1", "Process")
+} else {
+    Set-SafeDefault "VISUAL_BRAIN_ENABLED" "0"
+}
 Set-SafeDefault "VISUAL_BRAIN_BENCHMARK_ENABLED" "0"
 Set-SafeDefault "VISUAL_BRAIN_BENCHMARK_CANDIDATE_ENABLED" "0"
 if ($EnableDatabento) {
@@ -282,6 +290,7 @@ try {
     Write-Host "Windows dashboard ready: $dashboardUrl"
     Write-Host "Express chart proxy:      http://127.0.0.1:$ApiPort/api/main-brain/chart"
     Write-Host "Flask chart source:       http://127.0.0.1:$FlaskPort/main-brain/chart"
+    Write-Host "Visual Brain:             $(if ($EnableVisualBrain) { 'enabled by explicit switch (advisory only)' } else { 'disabled' })"
     Write-Host "Keep this PowerShell window open. Press Ctrl+C to stop processes started by this launcher."
     if (-not $NoBrowser) {
         Start-Process $dashboardUrl | Out-Null
