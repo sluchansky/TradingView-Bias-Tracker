@@ -98,13 +98,23 @@ function mainBrainFixture(state: DecisionState) {
     candidate_preview: { status: ready ? 'POTENTIAL' : 'READY', direction: ready ? 'Short' : 'Long' },
     strategy_scanner: {},
     left_brain: {},
-    thesis: {},
+    thesis: {
+      direction: ready ? 'LONG' : 'LONG',
+      confidence: ready ? 61 : 53,
+      lifecycle_status: ready ? 'CONFIRMED' : 'FORMING',
+      mode: 'SCALP',
+      reason: ready ? 'Long thesis confirmed.' : 'Long thesis remains active while confirmation develops.',
+    },
     active_trades: { trades: [] },
   };
 }
 
 async function installAuthenticatedFixture(page: Page, current: { state: DecisionState }) {
   let authenticatedCalls = 0;
+  const mockAuth = process.env.OPERATOR_CONSOLE_MOCK_AUTH === '1';
+  if (mockAuth) {
+    await page.route('**/api/operator-console-auth-check', route => route.fulfill({ status: 204 }));
+  }
   const handler = async (route: Route) => {
     const request = route.request();
     const authorization = request.headers().authorization;
@@ -112,11 +122,13 @@ async function installAuthenticatedFixture(page: Page, current: { state: Decisio
       await route.continue();
       return;
     }
-    const authCheck = await page.request.get('/api/operator-console-auth-check', {
-      headers: { Authorization: authorization },
-    });
-    if (authCheck.status() !== 204) {
-      throw new Error(`Protected development endpoint rejected the dashboard credential (${authCheck.status()}).`);
+    if (!mockAuth) {
+      const authCheck = await page.request.get('/api/operator-console-auth-check', {
+        headers: { Authorization: authorization },
+      });
+      if (authCheck.status() !== 204) {
+        throw new Error(`Protected development endpoint rejected the dashboard credential (${authCheck.status()}).`);
+      }
     }
     authenticatedCalls += 1;
     const fixture = request.url().includes('/api/main-brain')
@@ -177,12 +189,24 @@ const consumers = [
     name: 'Main Brain',
     path: '/',
     wait: async (page: Page) => {
-      await expect(page.getByTestId('main-brain-candidate-label')).toHaveText('SHORT CANDIDATE — WAIT');
+      await page.getByTestId('link-desk').click();
+      await expect(page.getByTestId('active-persistent-thesis-headline')).toHaveText('LONG');
+      await expect(page.getByTestId('authoritative-entry-status')).toContainText('WAIT');
+      await expect(page.getByTestId('live-entry-candidate')).toHaveText('SHORT 68/110 — WAIT');
+      await expect(page.getByTestId('opposing-candidate-note')).toHaveText(
+        'Opposing SHORT candidate detected; thesis remains LONG.',
+      );
+      await expect(page.getByTestId('main-brain-candidate-label').first()).toHaveText('SHORT CANDIDATE — WAIT');
       await expect(page.getByText('WAIT_CANONICAL_REASON: structure confirmation pending', { exact: false }).first()).toBeVisible();
       await expect(page.getByTestId('main-brain-vwap')).toHaveText('Price below VWAP — bearish regime');
     },
     ready: async (page: Page) => {
-      await expect(page.getByTestId('main-brain-candidate-label')).toHaveText('LONG CANDIDATE — READY');
+      await page.getByTestId('link-desk').click();
+      await expect(page.getByTestId('active-persistent-thesis-headline')).toHaveText('LONG');
+      await expect(page.getByTestId('authoritative-entry-status')).toContainText('READY');
+      await expect(page.getByTestId('live-entry-candidate')).toHaveText('LONG 82/110 — READY');
+      await expect(page.getByTestId('opposing-candidate-note')).toHaveCount(0);
+      await expect(page.getByTestId('main-brain-candidate-label').first()).toHaveText('LONG CANDIDATE — READY');
       await expect(page.getByText('READY_CANONICAL_REASON: all strict gates aligned', { exact: false }).first()).toBeVisible();
       await expect(page.getByTestId('main-brain-vwap')).toHaveText('Price above VWAP — bullish regime');
     },

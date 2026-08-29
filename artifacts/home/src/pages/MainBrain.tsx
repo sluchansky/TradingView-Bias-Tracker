@@ -15162,15 +15162,14 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
   // Authoritative verdict — from p.verdict (not candidate_preview)
   const isAuthReady  = v.is_actionable === true;
-  const isAuthEarly  = !isAuthReady && safeStr(v.verdict_label ?? v.readiness, '').toUpperCase().includes('EARLY');
   const authDir      = safeStr(v.direction ?? cp.direction ?? sc.selected, '');
   const strictReason = safeStr(v.strict_reason, '');
   const vwapWording  = safeStr(
     ((op.vwap ?? v.vwap ?? {}) as Record<string, unknown>).wording,
     ''
   );
-  const authVLabel   = isAuthReady ? '✓ READY' : isAuthEarly ? '⚡ EARLY' : '— WAIT';
-  const authVCol     = isAuthReady ? T.green   : isAuthEarly ? T.amber   : T.txtMuted;
+  const authVLabel   = isAuthReady ? '✓ READY' : '— WAIT';
+  const authVCol     = isAuthReady ? T.green : T.txtMuted;
 
   // Left Brain thesis
   const lbDir    = safeStr(lb.direction, 'NEUTRAL');
@@ -15186,7 +15185,6 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
   // remains the strict verdict above; entryStatus is copied from the backend.
   const ptDir       = safeStr(pt.direction, 'NEUTRAL');
   const ptStatus    = safeStr(pt.lifecycle_status ?? pt.status, 'NO THESIS');
-  const ptEntry     = safeStr(pt.entry_status ?? pt.entryStatus, 'WAIT');
   const ptMode      = safeStr(pt.mode, '');
   const ptReason    = safeStr(pt.reason, '');
   const ptConf      = safeNum(pt.confidence) ?? 0;
@@ -15195,6 +15193,12 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
                     : ptStatus === 'INVALIDATED' ? T.red
                     : ptStatus === 'PENDING_REVERSAL' ? T.amber
                     : T.cyan;
+  const normalizedPtDir = ptDir.toUpperCase();
+  const normalizedCandidateDir = safeStr(op.candidate_direction ?? dir ?? authDir, '').toUpperCase();
+  const candidateOpposesThesis =
+    (normalizedPtDir === 'LONG' && normalizedCandidateDir === 'SHORT') ||
+    (normalizedPtDir === 'SHORT' && normalizedCandidateDir === 'LONG');
+  const liveCandidateStatus = isAuthReady ? 'READY' : 'WAIT';
 
   // Trade plan levels.
   // cp.entry_zone is a formatted range string ("4423.5–4424.0") — not parseable by safeNum.
@@ -15272,72 +15276,40 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
   return (
     <>
-      {/* ═══════════════════════ MINI VERDICT PANEL ═══════════════════════ */}
+      {/* ═══════════════════════ PERSISTENT THESIS + ENTRY AUTHORITY ═══════ */}
       <div style={{
         ...card,
-        display: 'flex', alignItems: 'center', gap: 10,
-        flexWrap: 'wrap', padding: '10px 14px',
+        padding: '14px 16px', border: `1px solid ${ptColor}55`,
+        background: `linear-gradient(135deg, ${ptColor}12 0%, #060f22 55%)`,
       }}>
-        <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.10em' }}>
-          ENTRY STATUS
+        <div style={{ ...sLbl, marginBottom: 7 }}>
+          ACTIVE PERSISTENT THESIS · {ptMode || 'CURRENT MODE'}
         </div>
-        {/* Authoritative verdict badge */}
-        <div style={{
-          background: authVCol + '20', border: `1px solid ${authVCol}55`,
-          borderRadius: 6, padding: '5px 14px',
-          fontSize: 13, fontWeight: 900, color: authVCol, letterSpacing: '0.08em', flexShrink: 0,
-        }}>
-          {authVLabel}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 10, flexWrap: 'wrap' }}>
+          <div data-testid="active-persistent-thesis-headline" style={{
+            fontSize: 26, fontWeight: 900, color: ptColor, lineHeight: 1, letterSpacing: '0.03em',
+          }}>{normalizedPtDir}</div>
+          <div style={{ fontSize: 18, fontFamily: T.mono, fontWeight: 800, color: ptColor }}>{ptConf}%</div>
+          <div style={{ ...pill(ptStatusCol, ptStatus), fontSize: 11, padding: '3px 9px' }}>
+            {ptStatus.replaceAll('_', ' ')}
+          </div>
         </div>
-
-        {/* Score */}
-        <div style={{ fontFamily: T.mono, fontSize: 26, fontWeight: 900, color: gradeColor, lineHeight: 1 }}>
-          {score > 0 ? score : '—'}
+        <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, flexWrap: 'wrap' }}>
+          <div style={{ fontSize: 8, color: T.txtMuted, fontWeight: 700, letterSpacing: '0.10em' }}>ENTRY STATUS</div>
+          <div data-testid="authoritative-entry-status" style={{
+            background: authVCol + '20', border: `1px solid ${authVCol}55`, borderRadius: 6,
+            padding: '4px 12px', fontSize: 12, fontWeight: 900, color: authVCol, letterSpacing: '0.08em',
+          }}>{authVLabel}</div>
+          {!isAuthReady && strictReason && (
+            <div style={{ fontSize: 9, color: T.amber, flex: 1 }}>⚠ {strictReason}</div>
+          )}
+          {isAuthReady && (
+            <div style={{ marginLeft: 'auto', fontSize: 9, color: T.green, fontFamily: T.mono }}>LIVE ●</div>
+          )}
         </div>
-
-        {/* Grade */}
-        {grade && (
-          <div style={{ fontSize: 14, fontWeight: 700, color: gradeColor }}>{grade}</div>
-        )}
-
-        {/* Direction */}
-        {authDir && (
-          <div style={{
-            fontSize: 11, fontWeight: 700, padding: '3px 10px', borderRadius: 4,
-            color: /long/i.test(authDir) ? T.green : T.red,
-            background: (/long/i.test(authDir) ? T.green : T.red) + '15',
-            border: `1px solid ${(/long/i.test(authDir) ? T.green : T.red)}40`,
-          }}>
-            {authDir.toUpperCase()}
-          </div>
-        )}
-        {op.candidate_label != null && (
-          <div data-testid="main-brain-candidate-label" style={{ fontSize: 9, color: T.txtSec }}>
-            {safeStr(op.candidate_label, '')}
-          </div>
-        )}
-
-        {/* Backend-owned price/VWAP relationship, never inferred by the UI. */}
-        {vwapWording && (
-          <div style={{ fontSize: 9, color: T.cyan, whiteSpace: 'nowrap' }}>
-            {vwapWording}
-          </div>
-        )}
-
-        {/* Why WAIT (strict_reason) */}
-        {!isAuthReady && strictReason && (
-          <div style={{
-            fontSize: 9, color: T.amber, flex: 1,
-            overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
-          }}>
-            ⚠ {strictReason}
-          </div>
-        )}
-
-        {/* READY confirmations count */}
-        {isAuthReady && (
-          <div style={{ marginLeft: 'auto', fontSize: 9, color: T.green, fontFamily: T.mono }}>
-            LIVE ●
+        {ptReason && (
+          <div style={{ marginTop: 8, fontSize: 9, color: T.txtSec, lineHeight: 1.4 }}>
+            {ptReason}
           </div>
         )}
       </div>
@@ -15347,7 +15319,7 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
 
       {/* ═══════════════════════ SETUP ANALYSIS ═══════════════════════════ */}
       <div style={card}>
-        <div style={sLbl}>CURRENT MARKET CANDIDATE · STRICT EVALUATOR</div>
+        <div style={sLbl}>LIVE ENTRY CANDIDATE · SECONDARY SIGNAL</div>
 
         {/* Verdict + score row */}
         <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 10 }}>
@@ -15358,44 +15330,29 @@ const TradingDeskView: React.FC<{ p: Record<string, unknown> }> = ({ p }) => {
           }}>
             {isReady ? '✓ READY' : isPot ? '⚡ FORMING' : '— WAIT'}
           </div>
-          <div style={{ fontSize: 28, fontWeight: 900, color: gradeColor, lineHeight: 1, fontFamily: T.mono }}>
-            {score > 0 ? score : '—'}
+          <div data-testid="live-entry-candidate" style={{ fontSize: 13, fontWeight: 800, color: gradeColor, lineHeight: 1 }}>
+            {normalizedCandidateDir || 'NO DIRECTION'} {score > 0 ? `${score}/110` : ''} — {liveCandidateStatus}
           </div>
-          {grade && <div style={{ fontSize: 14, fontWeight: 700, color: gradeColor }}>{grade}</div>}
-          {dir && (
-            <div style={{
-              fontSize: 10, fontWeight: 700,
-              color: /long/i.test(dir) ? T.green : T.red,
-              background: (/long/i.test(dir) ? T.green : T.red) + '14',
-              border: `1px solid ${/long/i.test(dir) ? T.green : T.red}44`,
-              borderRadius: 4, padding: '2px 8px',
-            }}>{dir.toUpperCase()}</div>
-          )}
+          {grade && <div style={{ fontSize: 10, fontWeight: 700, color: gradeColor }}>{grade}</div>}
           {marketRegime && (
             <div style={{ marginLeft: 'auto', fontSize: 8, color: T.txtMuted }}>{marketRegime}</div>
           )}
         </div>
 
-        {/* Deterministic persistent thesis — continuity, never an entry promotion. */}
-        <div style={{
-          marginBottom: 8,
-          padding: '7px 10px', background: '#040c1c', borderRadius: 7, border: `1px solid ${T.border}`,
-        }}>
-          <div style={{ ...sLbl, marginBottom: 5 }}>ACTIVE PERSISTENT THESIS · {ptMode || 'CURRENT MODE'}</div>
-          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-            <div style={{ fontSize: 12, fontWeight: 800, color: ptColor }}>{ptDir}</div>
-            <div style={pill(ptStatusCol, ptStatus)}>{ptStatus.replaceAll('_', ' ')}</div>
-            <div style={{ fontSize: 9, fontFamily: T.mono, color: ptColor }}>{ptConf}%</div>
-            <div style={{ fontSize: 8, color: ptEntry === 'READY' ? T.green : T.amber }}>
-              ENTRY {ptEntry}
-            </div>
+        {candidateOpposesThesis && (
+          <div data-testid="opposing-candidate-note" style={{
+            marginBottom: 9, padding: '6px 9px', borderRadius: 6,
+            background: T.amber + '10', border: `1px solid ${T.amber}35`, fontSize: 9, color: T.amber,
+          }}>
+            Opposing {normalizedCandidateDir} candidate detected; thesis remains {normalizedPtDir}.
           </div>
-          {ptReason && (
-            <div style={{ marginTop: 5, fontSize: 8, color: T.txtSec, lineHeight: 1.4 }}>
-              {ptReason}
-            </div>
-          )}
-        </div>
+        )}
+        {op.candidate_label != null && (
+          <div data-testid="main-brain-candidate-label" style={{ fontSize: 9, color: T.txtSec, marginBottom: 6 }}>
+            {safeStr(op.candidate_label, '')}
+          </div>
+        )}
+        {vwapWording && <div style={{ fontSize: 9, color: T.cyan, marginBottom: 8 }}>{vwapWording}</div>}
 
         {/* Advisory systems are clearly separated from deterministic authority. */}
         <div style={{
